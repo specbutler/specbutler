@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specbutler"
-version = "0.3.0"
+version = "0.3.1"
 description = "Local spec-to-merge workflow for coding agents"
 authors = [{name = "Thiago Hirai"}]
 requires-python = ">=3.11"
