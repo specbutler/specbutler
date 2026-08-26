@@ -66,6 +66,7 @@ class FakeBackend:
         self.identity = type("Identity", (), {"backend": "container"})()
         self.commands: list[CommandRequest] = []
         self.cleaned = False
+        self.cleanup_allow_unpushed_work = False
         self.fail_cleanup = fail_cleanup
         self.workspace = WorkspaceHandle(
             path=Path("/tmp/spec-smoke/source"),
@@ -93,9 +94,10 @@ class FakeBackend:
             {"returncode": 0, "stdout": f"{output}\n", "stderr": "", "argv": request.argv},
         )()
 
-    def cleanup(self, workspace: WorkspaceHandle) -> None:
+    def cleanup(self, workspace: WorkspaceHandle, *, allow_unpushed_work: bool = False) -> None:
         assert workspace is self.workspace
         self.cleaned = True
+        self.cleanup_allow_unpushed_work = allow_unpushed_work
         if self.fail_cleanup:
             raise RuntimeError("cleanup failed")
 
@@ -742,6 +744,7 @@ def test_smoke_invokes_backend_and_cleans_up() -> None:
 
     assert code == 0
     assert backend.cleaned is True
+    assert backend.cleanup_allow_unpushed_work is True
     argv = [request.argv for request in backend.commands]
     assert ["git", "--version"] in argv
     assert any(
@@ -769,6 +772,7 @@ def test_smoke_cleans_up_after_command_failure() -> None:
 
     assert code == 1
     assert backend.cleaned is True
+    assert backend.cleanup_allow_unpushed_work is True
 
 
 def test_smoke_rejects_worker_spec_version_drift(capsys: pytest.CaptureFixture[str]) -> None:

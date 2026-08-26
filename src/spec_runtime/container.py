@@ -662,7 +662,11 @@ def run_smoke(
         if workspace is not None:
             start = time.monotonic()
             try:
-                backend.cleanup(workspace)
+                # Smoke workspaces are disposable by definition. Bootstrap and
+                # verify commands commonly create normal untracked artifacts
+                # such as egg-info and __pycache__, which must not trip the
+                # implementation-work loss guard during smoke cleanup.
+                backend.cleanup(workspace, allow_unpushed_work=True)
             finally:
                 timings["cleanup"] = time.monotonic() - start
         timings["total"] = time.monotonic() - overall_start
