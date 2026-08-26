@@ -1,0 +1,39 @@
+[
+  {
+    "method": "item/agentMessage/delta",
+    "params": {
+      "itemId": "item-agent-1",
+      "delta": "codex-stream-ok"
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "type": "commandExecution",
+        "command": "printf command-ok",
+        "aggregatedOutput": "command-ok",
+        "exitCode": 0,
+        "status": "completed"
+      }
+    }
+  },
+  {
+    "method": "item/completed",
+    "params": {
+      "item": {
+        "type": "fileChange",
+        "changes": [
+          {
+            "path": "/tmp/spec-web-chat/audit.txt",
+            "kind": {
+              "type": "add"
+            },
+            "diff": "file-ok\n"
+          }
+        ],
+        "status": "completed"
+      }
+    }
+  }
+]

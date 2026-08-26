@@ -1,0 +1,21 @@
+title = "Spec Butler secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Audited synthetic values used by credential-redaction regression fixtures"
+regexTarget = "match"
+regexes = [
+  '''"abc123SECRETVAL"''',
+  # The built-in GitHub PAT rule captures the canonical 40-character token
+  # prefix from the deliberately overlong fixture value.
+  '''^ghp_ABCDEF1234567890ABCDEF1234567890ABCD$''',
+  '''--token=hunter2SECRETVALUE"''',
+  '''--token=ghp_ABCDEF1234567890ABCDEF1234567890ABCDEF"''',
+  '''PGPASSWORD=secretDBPW123 ''',
+  '''"secretDBPW123"''',
+  '''secretDBPW123", "hunter2PWSECRET"''',
+  '''curl -u alice:secret(?:``| )''',
+  '''curl -u alice:supersecretCURLVAL ''',
+]

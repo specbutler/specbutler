@@ -1,0 +1,221 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  skip-check:
+    name: skip-check
+    runs-on: ubuntu-latest
+    outputs:
+      is_version_bump: ${{ steps.check.outputs.is_version_bump }}
+    steps:
+      - name: Check for version bump PR
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Branch must be release/version-bump from the same repo (not a fork)
+          if [ "$HEAD_REF" != "release/version-bump" ] || [ "$HEAD_REPO" != "$REPO" ]; then
+            echo "is_version_bump=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Verify the PR only touches the version field in pyproject.toml
+          python3 - <<'PY'
+          import json, os, re, sys
+          from urllib import request
+          from urllib.error import URLError
+
+          repo = os.environ["REPO"]
+          pr_number = os.environ["PR_NUMBER"]
+          token = os.environ["GITHUB_TOKEN"]
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+          }
+
+          url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files"
+          req = request.Request(url, headers=headers)
+          try:
+              with request.urlopen(req, timeout=30) as resp:
+                  files = json.loads(resp.read().decode())
+          except (URLError, OSError, ValueError) as exc:
+              print(f"GitHub API request failed ({exc}); defaulting to is_version_bump=false")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("is_version_bump=false\n")
+              raise SystemExit(0)
+
+          filenames = [f["filename"] for f in files]
+          if filenames != ["pyproject.toml"]:
+              print(f"Version bump PR touches unexpected files: {filenames}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("is_version_bump=false\n")
+              raise SystemExit(0)
+
+          # Verify the patch only modifies the version line
+          patch = files[0].get("patch")
+          if patch is None:
+              print("GitHub omitted patch text — cannot verify version-only change")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("is_version_bump=false\n")
+              raise SystemExit(0)
+          diff_lines = [
+              line for line in patch.splitlines()
+              if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+          ]
+          version_re = re.compile(r'^[+-]version\s*=\s*"[^"]*"\s*$')
+          non_version = [l for l in diff_lines if not version_re.match(l)]
+          if non_version:
+              print(f"Version bump PR modifies non-version lines: {non_version}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("is_version_bump=false\n")
+              raise SystemExit(0)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("is_version_bump=true\n")
+          PY
+
+  lint:
+    name: lint
+    needs: [skip-check]
+    if: needs.skip-check.outputs.is_version_bump != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - name: Validate GitHub Actions workflows with actionlint v1.7.12
+        env:
+          ACTIONLINT_ARCHIVE_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_VERSION: 1.7.12
+        run: |
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          binary="$RUNNER_TEMP/actionlint"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_ARCHIVE_SHA256}  ${archive}" | sha256sum --check --strict -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          test "$($binary -version | head -1)" = "$ACTIONLINT_VERSION"
+          "$binary"
+
+  test:
+    name: test
+    needs: [skip-check]
+    if: needs.skip-check.outputs.is_version_bump != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev,tui,web]"
+      - run: pytest tests/ -v
+
+  package:
+    name: package
+    needs: [skip-check]
+    if: needs.skip-check.outputs.is_version_bump != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build distributions
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m build
+      - name: Smoke-test wheel and audit dependencies
+        run: |
+          wheel_path="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          test -n "$wheel_path"
+          python -m venv "$RUNNER_TEMP/spec-wheel-smoke"
+          "$RUNNER_TEMP/spec-wheel-smoke/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/spec-wheel-smoke/bin/python" -m pip install "${wheel_path}[tui,web]" pip-audit
+          "$RUNNER_TEMP/spec-wheel-smoke/bin/python" -m pip check
+          "$RUNNER_TEMP/spec-wheel-smoke/bin/python" -m pip_audit
+          "$RUNNER_TEMP/spec-wheel-smoke/bin/spec" --help >/dev/null
+          "$RUNNER_TEMP/spec-wheel-smoke/bin/python" -c "from spec_runtime.web.server import create_app"
+
+  security:
+    name: security
+    needs: [skip-check]
+    if: needs.skip-check.outputs.is_version_bump != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install verified gitleaks v8.29.1
+        env:
+          GITLEAKS_ARCHIVE_SHA256: e4eb209d04e20339d77122a3bdf9cd41351255cfb27ebcb75e85325e04f88924
+          GITLEAKS_VERSION: 8.29.1
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          binary="$RUNNER_TEMP/gitleaks"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_ARCHIVE_SHA256}  ${archive}" | sha256sum --check --strict -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+          test "$("$binary" version)" = "$GITLEAKS_VERSION"
+      - name: Scan repository history and checked-out tree
+        run: |
+          "$RUNNER_TEMP/gitleaks" git --config .gitleaks.toml --redact --no-banner --timeout 120 .
+          "$RUNNER_TEMP/gitleaks" dir --config .gitleaks.toml --redact --no-banner --timeout 120 .
+
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    needs:
+      - skip-check
+      - lint
+      - test
+      - package
+      - security
+    steps:
+      - name: Enforce required job results
+        env:
+          IS_VERSION_BUMP: ${{ needs.skip-check.outputs.is_version_bump }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          PACKAGE_RESULT: ${{ needs.package.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+        run: |
+          echo "is_version_bump=$IS_VERSION_BUMP"
+          echo "lint=$LINT_RESULT"
+          echo "test=$TEST_RESULT"
+          echo "package=$PACKAGE_RESULT"
+          echo "security=$SECURITY_RESULT"
+          if [ "$IS_VERSION_BUMP" = "true" ]; then
+            echo "Version bump PR — skipping lint and test checks."
+            exit 0
+          fi
+          if [ "$LINT_RESULT" != "success" ] || \
+             [ "$TEST_RESULT" != "success" ] || \
+             [ "$PACKAGE_RESULT" != "success" ] || \
+             [ "$SECURITY_RESULT" != "success" ]; then
+            echo "One or more required jobs did not succeed."
+            exit 1
+          fi

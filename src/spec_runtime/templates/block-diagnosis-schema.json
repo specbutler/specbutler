@@ -1,0 +1,47 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "root_cause",
+    "confidence",
+    "category",
+    "evidence",
+    "next_best_action",
+    "requires_human_attention",
+    "needs_new_commit",
+    "blocker_signature"
+  ],
+  "properties": {
+    "summary": {
+      "type": "string"
+    },
+    "root_cause": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": "number"
+    },
+    "category": {
+      "type": "string"
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_best_action": {
+      "type": "string"
+    },
+    "requires_human_attention": {
+      "type": "boolean"
+    },
+    "needs_new_commit": {
+      "type": "boolean"
+    },
+    "blocker_signature": {
+      "type": "string"
+    }
+  }
+}

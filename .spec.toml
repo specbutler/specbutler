@@ -1,0 +1,31 @@
+base_ref = "origin/main"
+
+[paths]
+specs_dir = "specs"
+task_specs_dir = "specs/tasks"
+state_dir = ".spec-state"
+worktrees_dir = ".worktrees"
+
+[retry]
+cap = 20
+no_progress_retry_threshold = 2
+
+[agents]
+default = "claude"
+review_default = "codex"
+allowed = ["claude", "codex"]
+
+[bootstrap]
+install_command = "python -m venv .venv && .venv/bin/pip install -e ."
+
+[verify]
+
+[[verify.gates]]
+name = "test"
+command = "pytest"
+parallel = true
+
+[[verify.gates]]
+name = "lint"
+command = "ruff check ."
+parallel = true

@@ -1,0 +1,83 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "specbutler"
+version = "0.3.0"
+description = "Local spec-to-merge workflow for coding agents"
+authors = [{name = "Thiago Hirai"}]
+requires-python = ">=3.11"
+dependencies = [
+    "packaging>=24.0",
+    "PyYAML>=6.0",
+]
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["agents", "development-workflow", "spec-driven-development"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/specbutler/specbutler"
+Repository = "https://github.com/specbutler/specbutler"
+Issues = "https://github.com/specbutler/specbutler/issues"
+Documentation = "https://github.com/specbutler/specbutler#readme"
+Security = "https://github.com/specbutler/specbutler/blob/main/SECURITY.md"
+
+[project.optional-dependencies]
+tui = ["textual>=8.2", "rich>=14.2"]
+web = [
+    "uvicorn>=0.30",
+    "starlette>=0.40",
+    "markdown>=3.5",
+    "claude-agent-sdk>=0.1.68",
+]
+dev = [
+    "build>=1.2.2",
+    "pip-audit>=2.7.3",
+    "pytest>=8.2",
+    "ruff>=0.12",
+]
+
+[project.scripts]
+# The `spec` command is the primary interface for humans and agents.
+# Command name note: `spec` is not taken by any widely-used CLI tool in the
+# Python/shell ecosystem. The distribution name `specbutler` avoids collision
+# with the abandoned PyPI `spec` package. If a naming conflict is
+# discovered in a target environment, the console_scripts entry can be
+# renamed here without changing the library code (the entry point is
+# spec_runtime.cli:main regardless of the binary name).
+spec = "spec_runtime.cli:main"
+spec-backfill-merge-tags = "spec_runtime.backfill_merge_tags:main"
+spec-table = "spec_runtime.spec_table:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+spec_runtime = ["templates/*.md", "templates/*.json", "examples/*.toml", "web/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

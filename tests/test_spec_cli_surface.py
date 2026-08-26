@@ -1,0 +1,1257 @@
+"""Tests for the spec CLI surface, forge adapter, and agent adapter boundaries.
+
+Covers the new public CLI entry point (``spec_runtime.cli``), the forge
+adapter boundary (``spec_runtime.forge``), and the agent adapter boundary
+(``spec_runtime.agent_adapter``).  All tests are pure-unit — no network,
+no git repos, no subprocesses.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from spec_runtime.agent_adapter import (
+    _AGENT_REGISTRY,
+    AgentAdapter,
+    ClaudeAgent,
+    CodexAgent,
+    _codex_git_metadata_dirs,
+    get_agent_adapter,
+    register_agent_adapter,
+)
+from spec_runtime.config import SpecConfigNotFoundError
+from spec_runtime.forge import (
+    AUTO_MERGE_ARM_TIMEOUT_SECONDS,
+    ForgeAdapter,
+    GitHubForge,
+    PullRequest,
+    PushResult,
+    get_forge_adapter,
+    set_forge_adapter,
+)
+
+# ---------------------------------------------------------------------------
+# Forge adapter tests
+# ---------------------------------------------------------------------------
+
+
+class TestGitHubForgeFindPr:
+    """Tests for GitHubForge.find_pr_for_branch — including cwd propagation."""
+
+    def _make_forge(self, run_fn):
+        return GitHubForge(run_fn=run_fn)
+
+    def test_find_pr_passes_cwd_to_runner(self, tmp_path):
+        """The cwd kwarg must reach the underlying subprocess runner."""
+        captured = {}
+
+        def spy_run(cmd, cwd=None, **kw):
+            captured["cmd"] = cmd
+            captured["cwd"] = cwd
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        forge = self._make_forge(spy_run)
+        forge.find_pr_for_branch("feature/x", cwd=tmp_path)
+
+        assert captured["cwd"] == tmp_path
+        assert "--head" in captured["cmd"]
+        assert "feature/x" in captured["cmd"]
+
+    def test_find_pr_returns_none_on_empty_list(self):
+        def run_fn(cmd, cwd=None, **kw):
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        forge = self._make_forge(run_fn)
+        result = forge.find_pr_for_branch("no-pr-branch")
+        assert result is None
+
+    def test_find_pr_returns_pr_on_json_result(self):
+        pr_json = json.dumps(
+            [
+                {
+                    "number": 42,
+                    "url": "https://github.com/org/repo/pull/42",
+                    "headRefName": "feat/x",
+                    "baseRefName": "master",
+                    "title": "My PR",
+                    "state": "OPEN",
+                    "isDraft": False,
+                }
+            ]
+        )
+
+        def run_fn(cmd, cwd=None, **kw):
+            return subprocess.CompletedProcess(cmd, 0, stdout=pr_json, stderr="")
+
+        forge = self._make_forge(run_fn)
+        result = forge.find_pr_for_branch("feat/x")
+
+        assert result is not None
+        assert result.number == 42
+        assert result.url == "https://github.com/org/repo/pull/42"
+        assert result.head_branch == "feat/x"
+        assert result.title == "My PR"
+        assert result.is_draft is False
+
+    def test_find_pr_returns_none_on_failure(self):
+        def run_fn(cmd, cwd=None, **kw):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="error")
+
+        forge = self._make_forge(run_fn)
+        result = forge.find_pr_for_branch("broken")
+        assert result is None
+
+    def test_find_pr_passes_base_branch(self):
+        captured = {}
+
+        def spy_run(cmd, cwd=None, **kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        forge = self._make_forge(spy_run)
+        forge.find_pr_for_branch("feat/x", base_branch="develop")
+
+        assert "--base" in captured["cmd"]
+        idx = captured["cmd"].index("--base")
+        assert captured["cmd"][idx + 1] == "develop"
+
+    def test_find_pr_defaults_to_configured_base_branch(self):
+        captured = {}
+
+        def spy_run(cmd, cwd=None, **kw):
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        forge = self._make_forge(spy_run)
+        with patch("spec_runtime.forge.load_spec_runtime_config") as mock_load:
+            mock_load.return_value = MagicMock(pr_base_branch="main")
+            forge.find_pr_for_branch("feat/x")
+
+        assert "--base" in captured["cmd"]
+        idx = captured["cmd"].index("--base")
+        assert captured["cmd"][idx + 1] == "main"
+
+
+class TestGitHubForgePushBranch:
+    def test_push_branch_passes_cwd(self, tmp_path):
+        captured = {}
+
+        def spy_run(cmd, cwd=None, **kw):
+            captured["cwd"] = cwd
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        forge = GitHubForge(run_fn=spy_run)
+        result = forge.push_branch("my-branch", cwd=tmp_path)
+
+        assert result.ok is True
+        assert captured["cwd"] == tmp_path
+
+    def test_push_branch_returns_failure_on_error(self, tmp_path):
+        def run_fn(cmd, cwd=None, **kw):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="rejected")
+
+        forge = GitHubForge(run_fn=run_fn)
+        result = forge.push_branch("my-branch", cwd=tmp_path)
+
+        assert result.ok is False
+        assert "rejected" in result.message
+
+
+class TestGitHubForgeCreatePr:
+    def test_create_pr_returns_pr(self, tmp_path):
+        def run_fn(cmd, cwd=None, **kw):
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="https://github.com/org/repo/pull/99\n",
+                stderr="",
+            )
+
+        forge = GitHubForge(run_fn=run_fn)
+        pr = forge.create_pr(
+            title="Test PR",
+            body="body",
+            head="feat/x",
+            base="master",
+            cwd=tmp_path,
+        )
+
+        assert pr.number == 99
+        assert pr.head_branch == "feat/x"
+
+    def test_create_pr_raises_on_failure(self, tmp_path):
+        def run_fn(cmd, cwd=None, **kw):
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="fail")
+
+        forge = GitHubForge(run_fn=run_fn)
+        with pytest.raises(RuntimeError, match="fail"):
+            forge.create_pr(
+                title="Test PR",
+                body="body",
+                head="feat/x",
+                base="master",
+                cwd=tmp_path,
+            )
+
+
+class TestGitHubForgeProtocol:
+    def test_github_forge_implements_forge_adapter(self):
+        """GitHubForge must satisfy the ForgeAdapter protocol."""
+        assert isinstance(GitHubForge(), ForgeAdapter)
+
+    def test_mark_pr_ready_uses_gh_pr_ready(self, tmp_path):
+        captured = {}
+
+        def run_fn(cmd, cwd=None, **kw):
+            captured["cmd"] = cmd
+            captured["cwd"] = cwd
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        forge = GitHubForge(run_fn=run_fn)
+
+        assert forge.mark_pr_ready(12, cwd=tmp_path) is True
+        assert captured["cmd"] == ["gh", "pr", "ready", "12"]
+        assert captured["cwd"] == tmp_path
+
+    def test_mark_pr_draft_uses_gh_pr_ready_undo(self, tmp_path):
+        captured = {}
+
+        def run_fn(cmd, cwd=None, **kw):
+            captured["cmd"] = cmd
+            captured["cwd"] = cwd
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        forge = GitHubForge(run_fn=run_fn)
+
+        assert forge.mark_pr_draft(12, cwd=tmp_path) is True
+        assert captured["cmd"] == ["gh", "pr", "ready", "12", "--undo"]
+        assert captured["cwd"] == tmp_path
+
+    def test_merge_pr_can_match_expected_head(self, tmp_path):
+        captured = {}
+
+        def run_fn(cmd, cwd=None, **kw):
+            captured["cmd"] = cmd
+            captured["cwd"] = cwd
+            captured["timeout"] = kw.get("timeout")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        forge = GitHubForge(run_fn=run_fn)
+
+        result = forge.merge_pr(12, method="squash", auto=True, expected_head_sha="abc123", cwd=tmp_path)
+
+        assert result.ok is True
+        assert captured["cmd"] == [
+            "gh",
+            "pr",
+            "merge",
+            "12",
+            "--squash",
+            "--auto",
+            "--match-head-commit",
+            "abc123",
+        ]
+        assert captured["cwd"] == tmp_path
+        assert captured["timeout"] == AUTO_MERGE_ARM_TIMEOUT_SECONDS
+
+    def test_merge_pr_auto_timeout_returns_after_confirming_auto_merge_is_armed(self, tmp_path):
+        calls = []
+
+        def run_fn(cmd, cwd=None, **kw):
+            calls.append((cmd, cwd, kw))
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+            assert cmd == [
+                "gh",
+                "pr",
+                "view",
+                "12",
+                "--json",
+                "state,autoMergeRequest,headRefOid",
+            ]
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    '{"state":"OPEN","headRefOid":"abc123",'
+                    '"autoMergeRequest":{"enabledAt":"2026-08-18T01:00:00Z"}}'
+                ),
+                stderr="",
+            )
+
+        result = GitHubForge(run_fn=run_fn).merge_pr(
+            12,
+            auto=True,
+            expected_head_sha="abc123",
+            cwd=tmp_path,
+        )
+
+        assert result.ok is True
+        assert "auto-merge armed" in result.message
+        assert calls[0][2]["timeout"] == AUTO_MERGE_ARM_TIMEOUT_SECONDS
+        assert "timeout" not in calls[1][2]
+
+    def test_merge_pr_auto_timeout_fails_closed_when_state_cannot_be_confirmed(self, tmp_path):
+        def run_fn(cmd, cwd=None, **kw):  # noqa: ARG001
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"state":"OPEN","autoMergeRequest":null}',
+                stderr="",
+            )
+
+        result = GitHubForge(run_fn=run_fn).merge_pr(12, auto=True, cwd=tmp_path)
+
+        assert result.ok is False
+        assert "enablePullRequestAutoMerge timed out" in result.message
+
+    def test_merge_pr_auto_timeout_fails_closed_when_expected_head_changed(self, tmp_path):
+        def run_fn(cmd, cwd=None, **kw):  # noqa: ARG001
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    '{"state":"OPEN","headRefOid":"changed",'
+                    '"autoMergeRequest":{"enabledAt":"2026-08-18T01:00:00Z"}}'
+                ),
+                stderr="",
+            )
+
+        result = GitHubForge(run_fn=run_fn).merge_pr(
+            12,
+            auto=True,
+            expected_head_sha="reviewed",
+            cwd=tmp_path,
+        )
+
+        assert result.ok is False
+        assert "resulting PR state could be confirmed" in result.message
+
+
+class TestForgeFactory:
+    def test_get_forge_adapter_returns_github_by_default(self):
+        # Reset the global singleton so we test fresh
+        import spec_runtime.forge as forge_mod
+
+        old = forge_mod._FORGE_ADAPTER
+        try:
+            forge_mod._FORGE_ADAPTER = None
+            adapter = get_forge_adapter()
+            assert isinstance(adapter, GitHubForge)
+        finally:
+            forge_mod._FORGE_ADAPTER = old
+
+    def test_set_forge_adapter_overrides(self):
+        import spec_runtime.forge as forge_mod
+
+        old = forge_mod._FORGE_ADAPTER
+        try:
+            mock_adapter = MagicMock(spec=ForgeAdapter)
+            set_forge_adapter(mock_adapter)
+            assert get_forge_adapter() is mock_adapter
+        finally:
+            forge_mod._FORGE_ADAPTER = old
+
+
+# ---------------------------------------------------------------------------
+# Agent adapter tests
+# ---------------------------------------------------------------------------
+
+
+class TestClaudeAgent:
+    def test_name(self):
+        assert ClaudeAgent().name == "claude"
+
+    def test_capabilities(self):
+        caps = ClaudeAgent().capabilities
+        assert caps.name == "claude"
+        assert caps.supports_stream_json is True
+        assert caps.supports_mcp is True
+        assert caps.supports_dangerously_skip_permissions is True
+
+    def test_build_implement_command_basic(self, tmp_path):
+        agent = ClaudeAgent()
+        cmd = agent.build_implement_command(
+            prompt="Do the work",
+            worktree_path=tmp_path,
+            state_dir=tmp_path / ".state",
+        )
+        assert cmd[0] == "claude"
+        assert "-p" in cmd
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--add-dir" in cmd
+        assert str(tmp_path / ".state") in cmd
+        assert cmd[-1] == "Do the work"
+
+    def test_build_implement_command_with_stream_json(self, tmp_path):
+        agent = ClaudeAgent()
+        cmd = agent.build_implement_command(
+            prompt="Do the work",
+            worktree_path=tmp_path,
+            state_dir=tmp_path / ".state",
+            stream_json=True,
+        )
+        assert "--output-format" in cmd
+        assert "stream-json" in cmd
+        assert "--verbose" in cmd
+
+    def test_build_implement_command_with_mcp(self, tmp_path):
+        mcp_path = tmp_path / "mcp.json"
+        agent = ClaudeAgent()
+        cmd = agent.build_implement_command(
+            prompt="Do the work",
+            worktree_path=tmp_path,
+            state_dir=tmp_path / ".state",
+            mcp_config_path=mcp_path,
+        )
+        assert "--mcp-config" in cmd
+        assert str(mcp_path) in cmd
+        assert "--strict-mcp-config" in cmd
+
+    def test_build_authoring_command(self, tmp_path):
+        agent = ClaudeAgent()
+        cmd = agent.build_authoring_command(
+            prompt="Author a spec",
+            worktree_path=tmp_path,
+            initial_prompt="Start here",
+        )
+        assert cmd[0] == "claude"
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--append-system-prompt" in cmd
+        assert "Author a spec" in cmd
+        assert "Start here" in cmd
+
+    def test_build_review_command_without_mcp_config_is_unchanged(self, tmp_path):
+        agent = ClaudeAgent()
+        cmd = agent.build_review_command(
+            prompt="Review please",
+            output_path=tmp_path / "review.json",
+        )
+        assert cmd == ["claude", "-p", "--dangerously-skip-permissions", "Review please"]
+
+    def test_build_review_command_with_mcp_config(self, tmp_path):
+        agent = ClaudeAgent()
+        mcp_path = tmp_path / "mcp.json"
+        cmd = agent.build_review_command(
+            prompt="Review please",
+            output_path=tmp_path / "review.json",
+            mcp_config_path=mcp_path,
+        )
+        assert cmd[0] == "claude"
+        assert "-p" in cmd
+        assert "--dangerously-skip-permissions" in cmd
+        assert "--mcp-config" in cmd
+        assert str(mcp_path) in cmd
+        assert "--strict-mcp-config" in cmd
+        assert cmd[-1] == "Review please"
+
+    def test_implements_protocol(self):
+        assert isinstance(ClaudeAgent(), AgentAdapter)
+
+
+class TestCodexAgent:
+    def test_name(self):
+        assert CodexAgent().name == "codex"
+
+    def test_capabilities(self):
+        caps = CodexAgent().capabilities
+        assert caps.name == "codex"
+        assert caps.supports_stream_json is False
+        assert caps.supports_mcp is True
+        assert caps.supports_network_access is True
+
+    def test_build_implement_command(self, tmp_path):
+        agent = CodexAgent()
+        cmd = agent.build_implement_command(
+            prompt="Do the work",
+            worktree_path=tmp_path,
+            state_dir=tmp_path / ".state",
+        )
+        assert cmd[0] == "codex"
+        assert "exec" in cmd
+        assert "--json" in cmd
+        assert "--add-dir" in cmd
+        assert "Do the work" in cmd
+
+    def test_build_implement_command_adds_linked_worktree_git_metadata(self, tmp_path):
+        worktree = tmp_path / ".worktrees" / "feature"
+        gitdir = tmp_path / ".git" / "worktrees" / "feature"
+        common_git = tmp_path / ".git"
+        worktree.mkdir(parents=True)
+        gitdir.mkdir(parents=True)
+        (worktree / ".git").write_text(f"gitdir: {gitdir}\n")
+        (gitdir / "commondir").write_text("../..\n")
+
+        cmd = CodexAgent().build_implement_command(
+            prompt="Do the work",
+            worktree_path=worktree,
+            state_dir=tmp_path / ".spec-state",
+        )
+
+        add_dirs = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "--add-dir"]
+        assert str(tmp_path / ".spec-state") in add_dirs
+        assert str(gitdir.resolve()) in add_dirs
+        assert str(common_git.resolve()) in add_dirs
+
+        config_overrides = [
+            cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-c"
+        ]
+        writable_roots = next(
+            value
+            for value in config_overrides
+            if value.startswith("sandbox_workspace_write.writable_roots=")
+        )
+        assert f'"{tmp_path / ".spec-state"}"' in writable_roots
+        assert f'"{gitdir.resolve()}"' in writable_roots
+        assert f'"{common_git.resolve()}"' in writable_roots
+
+    def test_build_authoring_command_adds_git_metadata(self, tmp_path):
+        worktree = tmp_path / "checkout"
+        gitdir = worktree / ".git"
+        gitdir.mkdir(parents=True)
+
+        cmd = CodexAgent().build_authoring_command(
+            prompt="Author a spec",
+            worktree_path=worktree,
+            state_dir=tmp_path / ".spec-state",
+        )
+
+        add_dirs = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "--add-dir"]
+        assert str(tmp_path / ".spec-state") in add_dirs
+        assert str(gitdir.resolve()) in add_dirs
+
+        config_overrides = [
+            cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-c"
+        ]
+        writable_roots = next(
+            value
+            for value in config_overrides
+            if value.startswith("sandbox_workspace_write.writable_roots=")
+        )
+        assert f'"{tmp_path / ".spec-state"}"' in writable_roots
+        assert f'"{gitdir.resolve()}"' in writable_roots
+
+    def test_codex_git_metadata_dirs_ignores_non_git_directory(self, tmp_path):
+        assert _codex_git_metadata_dirs(tmp_path) == []
+
+    def test_build_implement_command_uses_codex_default_linux_sandbox(self, tmp_path):
+        agent = CodexAgent()
+        cmd = agent.build_implement_command(
+            prompt="Do the work",
+            worktree_path=tmp_path,
+            state_dir=tmp_path / ".state",
+        )
+        assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "workspace-write"
+        assert "features.use_legacy_landlock=true" not in cmd
+
+    def test_build_review_command_uses_codex_default_linux_sandbox(self, tmp_path):
+        agent = CodexAgent()
+        cmd = agent.build_review_command(
+            prompt="Review the work",
+            output_path=tmp_path / "review.json",
+        )
+        assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "read-only"
+        assert "features.use_legacy_landlock=true" not in cmd
+
+    def test_build_implement_command_keeps_default_sandbox(self, tmp_path):
+        agent = CodexAgent()
+        cmd = agent.build_implement_command(
+            prompt="Do the work",
+            worktree_path=tmp_path,
+            state_dir=tmp_path / ".state",
+        )
+        assert "features.use_legacy_landlock=true" not in cmd
+
+    def test_build_authoring_command(self, tmp_path):
+        agent = CodexAgent()
+        cmd = agent.build_authoring_command(
+            prompt="Author a spec",
+            worktree_path=tmp_path,
+            initial_prompt="Start here",
+        )
+        assert cmd[0] == "codex"
+        # The combined prompt should contain both prompts
+        assert any("Author a spec" in arg and "Start here" in arg for arg in cmd)
+        # Interactive operator sessions may request approval,
+        # unlike unattended implement runs which stay -a never.
+        assert cmd[cmd.index("-a") + 1] == "on-request"
+        implement_cmd = CodexAgent().build_implement_command(
+            prompt="do it", worktree_path=tmp_path, state_dir=tmp_path / ".spec-state"
+        )
+        assert implement_cmd[implement_cmd.index("-a") + 1] == "never"
+
+    def test_build_implement_command_does_not_set_env(self, tmp_path):
+        """CodexAgent stays argv-only — env mutation is the orchestrator's job."""
+        import os
+        before = dict(os.environ)
+        cmd = CodexAgent().build_implement_command(
+            prompt="Do the work",
+            worktree_path=tmp_path,
+            state_dir=tmp_path / ".state",
+        )
+        assert cmd[0] == "codex"
+        # CODEX_HOME is owned by the orchestrator, not the adapter.
+        assert "CODEX_HOME" not in [a.split("=", 1)[0] for a in cmd]
+        assert os.environ == before
+
+    def test_implements_protocol(self):
+        assert isinstance(CodexAgent(), AgentAdapter)
+
+
+class TestRenderCodexMcpToml:
+    """Tests for the file-write counterpart to _codex_mcp_server_overrides."""
+
+    def test_empty_input_returns_empty_string(self):
+        from spec_runtime.agent_adapter import _render_codex_mcp_toml
+
+        assert _render_codex_mcp_toml({}) == ""
+        assert _render_codex_mcp_toml(None) == ""
+
+    def test_renders_command_server_with_args_and_env(self):
+        from spec_runtime.agent_adapter import _render_codex_mcp_toml
+
+        body = _render_codex_mcp_toml(
+            {
+                "playwright": {
+                    "command": "/usr/local/bin/node",
+                    "args": ["/path/to/cli.js", "--headless"],
+                    "env": {"DEBUG": "1"},
+                }
+            }
+        )
+        assert "[mcp_servers.playwright]" in body
+        assert 'command = "/usr/local/bin/node"' in body
+        assert 'args = ["/path/to/cli.js", "--headless"]' in body
+        assert 'default_tools_approval_mode = "approve"' in body
+        assert "[mcp_servers.playwright.env]" in body
+        assert 'DEBUG = "1"' in body
+
+    def test_renders_url_server_with_bearer_token(self):
+        from spec_runtime.agent_adapter import _render_codex_mcp_toml
+
+        body = _render_codex_mcp_toml(
+            {
+                "remote": {
+                    "url": "https://example.com/mcp",
+                    "bearer_token_env_var": "REMOTE_TOKEN",
+                }
+            }
+        )
+        assert "experimental_use_rmcp_client = true" in body
+        assert "[mcp_servers.remote]" in body
+        assert 'url = "https://example.com/mcp"' in body
+        assert 'bearer_token_env_var = "REMOTE_TOKEN"' in body
+
+    def test_skips_server_with_invalid_name(self):
+        from spec_runtime.agent_adapter import _render_codex_mcp_toml
+
+        body = _render_codex_mcp_toml(
+            {
+                "bad name with spaces": {
+                    "command": "/usr/bin/true",
+                },
+                "ok-name": {
+                    "command": "/usr/bin/true",
+                },
+            }
+        )
+        assert "bad name with spaces" not in body
+        assert "[mcp_servers.ok-name]" in body
+
+
+class TestAgentAdapterFactory:
+    def test_get_claude_adapter(self):
+        _AGENT_REGISTRY.clear()
+        adapter = get_agent_adapter("claude")
+        assert adapter.name == "claude"
+
+    def test_get_codex_adapter(self):
+        _AGENT_REGISTRY.clear()
+        adapter = get_agent_adapter("codex")
+        assert adapter.name == "codex"
+
+    def test_unknown_agent_raises(self):
+        _AGENT_REGISTRY.clear()
+        with pytest.raises(ValueError, match="Unknown agent"):
+            get_agent_adapter("unknown-agent")
+
+    def test_register_custom_adapter(self):
+        _AGENT_REGISTRY.clear()
+        mock = MagicMock(spec=AgentAdapter)
+        mock.name = "custom"
+        register_agent_adapter("custom", mock)
+        assert get_agent_adapter("custom") is mock
+        _AGENT_REGISTRY.clear()
+
+
+# ---------------------------------------------------------------------------
+# CLI tests
+# ---------------------------------------------------------------------------
+
+
+class TestCLIMain:
+    """Tests for spec_runtime.cli.main() dispatch."""
+
+    def _import_cli(self):
+        """Import (or reimport) the CLI module."""
+        sys.modules.pop("spec_runtime.cli", None)
+        from spec_runtime import cli
+
+        return cli
+
+    def test_version_flag_prints_version_without_config(self, capsys):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config") as mock_config:
+            with patch("importlib.metadata.version", return_value="1.2.3"):
+                rc = cli.main(["--version"])
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "1.2.3"
+        mock_config.assert_not_called()
+
+    def test_source_id_flag_prints_identity_without_config(self, capsys):
+        cli = self._import_cli()
+        with (
+            patch.object(cli, "_lazy_config") as mock_config,
+            patch(
+                "spec_runtime.execution_backend.host_spec_runtime_source_id",
+                return_value="1.2.3@abc123",
+            ),
+        ):
+            rc = cli.main(["--source-id"])
+
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "1.2.3@abc123"
+        mock_config.assert_not_called()
+
+    def test_update_command_dispatches_without_config(self):
+        cli = self._import_cli()
+        with (
+            patch.object(cli, "_lazy_config") as mock_config,
+            patch.object(cli, "_cmd_update", return_value=0) as mock_update,
+        ):
+            rc = cli.main(["update"])
+        assert rc == 0
+        mock_update.assert_called_once()
+        mock_config.assert_not_called()
+
+    def test_init_runs_update_notice_before_dispatch(self):
+        cli = self._import_cli()
+        with (
+            patch.object(cli, "_maybe_print_update_notice_for_init") as mock_notice,
+            patch.object(cli, "_cmd_init", return_value=0) as mock_init,
+            patch.object(cli, "_lazy_config") as mock_config,
+        ):
+            rc = cli.main(["init"])
+        assert rc == 0
+        mock_notice.assert_called_once_with()
+        mock_init.assert_called_once()
+        mock_config.assert_not_called()
+
+    def test_init_update_notice_falls_back_to_default_config_when_config_lookup_fails(self):
+        cli = self._import_cli()
+
+        with (
+            patch("spec_runtime.config.load_spec_runtime_config", side_effect=RuntimeError("boom")),
+            patch("spec_runtime.update.maybe_print_update_notice") as notice_mock,
+            patch.object(cli, "_resolve_repo_root", return_value=Path("/tmp/repo")),
+        ):
+            cli._maybe_print_update_notice_for_init()
+
+        notice_args = notice_mock.call_args.args
+        assert notice_args[0] == Path("/tmp/repo")
+        assert notice_args[1].paths.state_dir == ".spec-state"
+
+    def test_non_init_commands_still_emit_update_notice_when_config_is_missing(self, capsys):
+        cli = self._import_cli()
+
+        with (
+            patch.object(
+                cli,
+                "_lazy_config",
+                side_effect=SpecConfigNotFoundError("missing .spec.toml"),
+            ),
+            patch("spec_runtime.update.maybe_print_update_notice") as notice_mock,
+            patch.object(cli, "_resolve_repo_root", return_value=Path("/tmp/repo")),
+        ):
+            rc = cli.main(["list"])
+
+        assert rc == 1
+        assert "missing .spec.toml" in capsys.readouterr().err
+        notice_args = notice_mock.call_args.args
+        assert notice_args[0] == Path("/tmp/repo")
+        assert notice_args[1].paths.state_dir == ".spec-state"
+
+    def test_non_init_commands_still_emit_update_notice_before_other_config_failures(self):
+        cli = self._import_cli()
+
+        with (
+            patch.object(cli, "_lazy_config", side_effect=RuntimeError("boom")),
+            patch("spec_runtime.update.maybe_print_update_notice") as notice_mock,
+            patch.object(cli, "_resolve_repo_root", return_value=Path("/tmp/repo")),
+        ):
+            with pytest.raises(RuntimeError, match="boom"):
+                cli.main(["list"])
+
+        notice_args = notice_mock.call_args.args
+        assert notice_args[0] == Path("/tmp/repo")
+        assert notice_args[1].paths.state_dir == ".spec-state"
+
+    def test_no_command_prints_help_and_returns_1(self):
+        cli = self._import_cli()
+        with patch.object(
+            cli,
+            "_lazy_config",
+            return_value=MagicMock(
+                agents=MagicMock(default="claude"),
+                base_ref="master",
+                retry_cap=5,
+                paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+            ),
+        ):
+            rc = cli.main([])
+        assert rc == 1
+
+    def test_list_command_dispatches(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_cmd_list", return_value=0) as mock_list,
+        ):
+            rc = cli.main(["list"])
+        assert rc == 0
+        mock_list.assert_called_once()
+
+    def test_show_command_dispatches(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_cmd_show", return_value=0) as mock_show,
+        ):
+            rc = cli.main(["show", "--spec", "my-spec"])
+        assert rc == 0
+        mock_show.assert_called_once()
+
+    def test_clean_command_dispatches(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_cmd_clean", return_value=0) as mock_clean,
+        ):
+            rc = cli.main(["clean", "--spec", "old-spec"])
+        assert rc == 0
+        mock_clean.assert_called_once()
+
+    def test_steer_command_dispatches_to_orchestrator(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        mock_orch = MagicMock()
+        mock_orch.cmd_steer.return_value = 0
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_lazy_orchestrator", return_value=mock_orch),
+        ):
+            rc = cli.main(["steer", "--spec", "my-spec", "--message", "Prefer the smallest retry first."])
+        assert rc == 0
+        mock_orch.cmd_steer.assert_called_once()
+
+    def test_implement_command_dispatches_to_orchestrator(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude", review_default="codex"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        mock_orch = MagicMock()
+        mock_orch.cmd_run.return_value = 0
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_lazy_orchestrator", return_value=mock_orch),
+        ):
+            rc = cli.main(["implement", "--spec", "my-spec"])
+        assert rc == 0
+        mock_orch.cmd_run.assert_called_once()
+        forwarded_args = mock_orch.cmd_run.call_args.args[0]
+        assert forwarded_args.review_agent == "codex"
+
+    def test_implement_command_accepts_explicit_review_agent(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude", review_default="codex"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        mock_orch = MagicMock()
+        mock_orch.cmd_run.return_value = 0
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_lazy_orchestrator", return_value=mock_orch),
+        ):
+            rc = cli.main(["implement", "--spec", "my-spec", "--review-agent", "claude"])
+        assert rc == 0
+        forwarded_args = mock_orch.cmd_run.call_args.args[0]
+        assert forwarded_args.review_agent == "claude"
+
+    def test_status_command_dispatches_to_orchestrator(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        mock_orch = MagicMock()
+        mock_orch.cmd_status.return_value = 0
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_lazy_orchestrator", return_value=mock_orch),
+        ):
+            rc = cli.main(["status", "--spec", "my-spec"])
+        assert rc == 0
+        mock_orch.cmd_status.assert_called_once()
+
+    def test_report_command_dispatches_to_orchestrator(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        mock_orch = MagicMock()
+        mock_orch.cmd_report.return_value = 0
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_lazy_orchestrator", return_value=mock_orch),
+        ):
+            rc = cli.main(["report", "--status", "ok"])
+        assert rc == 0
+        mock_orch.cmd_report.assert_called_once()
+
+    def test_phase_command_dispatches_to_orchestrator(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        mock_orch = MagicMock()
+        mock_orch.cmd_step.return_value = 0
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_lazy_orchestrator", return_value=mock_orch),
+        ):
+            rc = cli.main(["phase", "--spec", "my-spec", "--phase", "implement"])
+        assert rc == 0
+        mock_orch.cmd_step.assert_called_once()
+
+    def test_input_command_preserves_missing_agent_override(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_cmd_input", return_value=0) as mock_input,
+        ):
+            rc = cli.main(["input", "--spec", "my-spec"])
+
+        assert rc == 0
+        forwarded_args = mock_input.call_args.args[0]
+        assert forwarded_args.spec == "my-spec"
+        assert forwarded_args.agent is None
+
+    def test_input_command_accepts_explicit_agent_override(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_cmd_input", return_value=0) as mock_input,
+        ):
+            rc = cli.main(["input", "--spec", "my-spec", "--agent", "codex"])
+
+        assert rc == 0
+        forwarded_args = mock_input.call_args.args[0]
+        assert forwarded_args.spec == "my-spec"
+        assert forwarded_args.agent == "codex"
+
+
+class TestCLIShowCommand:
+    """Test _cmd_show with a fake spec file on disk."""
+
+    def test_show_prints_spec_content(self, tmp_path, capsys):
+        from spec_runtime.cli import _cmd_show
+
+        # Set up a fake spec directory
+        spec_dir = tmp_path / "specs"
+        spec_dir.mkdir()
+        spec_file = spec_dir / "my-spec.md"
+        spec_file.write_text("# My Spec\nSome content\n")
+
+        mock_config = MagicMock()
+        mock_config.paths.specs_dir = "specs"
+        mock_config.paths.task_specs_dir = "specs/tasks"
+
+        args = MagicMock()
+        args.spec = "my-spec"
+
+        with (
+            patch("spec_runtime.cli._resolve_repo_root", return_value=tmp_path),
+            patch("spec_runtime.cli._lazy_config", return_value=mock_config),
+        ):
+            rc = _cmd_show(args)
+
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "# My Spec" in captured.out
+        assert "Some content" in captured.out
+
+    def test_show_returns_1_for_missing_spec(self, tmp_path, capsys):
+        from spec_runtime.cli import _cmd_show
+
+        spec_dir = tmp_path / "specs"
+        spec_dir.mkdir()
+        task_dir = tmp_path / "specs" / "tasks"
+        task_dir.mkdir()
+
+        mock_config = MagicMock()
+        mock_config.paths.specs_dir = "specs"
+        mock_config.paths.task_specs_dir = "specs/tasks"
+
+        args = MagicMock()
+        args.spec = "nonexistent"
+
+        with (
+            patch("spec_runtime.cli._resolve_repo_root", return_value=tmp_path),
+            patch("spec_runtime.cli._lazy_config", return_value=mock_config),
+        ):
+            rc = _cmd_show(args)
+
+        assert rc == 1
+        captured = capsys.readouterr()
+        assert "not found" in captured.err.lower()
+
+
+class TestResolveRepoRoot:
+    def test_normalizes_linked_worktree_to_common_root(self, tmp_path):
+        from spec_runtime import cli
+
+        repo = tmp_path / "repo"
+        worktree = repo / ".worktrees" / "code-my-feature"
+
+        result = subprocess.CompletedProcess(
+            ["git", "rev-parse", "--show-toplevel"],
+            0,
+            stdout=str(worktree) + "\n",
+            stderr="",
+        )
+
+        with (
+            patch.object(cli.subprocess, "run", return_value=result),
+            patch("spec_runtime.git_common.resolve_common_root", return_value=repo) as mock_common_root,
+        ):
+            assert cli._resolve_repo_root() == repo
+
+        mock_common_root.assert_called_once_with(worktree)
+
+
+class TestPhasePublishCwdPropagation:
+    """Verify that phase_publish passes cwd=worktree_path to forge.find_pr_for_branch."""
+
+    def test_publish_passes_worktree_cwd_to_find_pr(self, tmp_path):
+        """Regression test for F1: find_pr_for_branch must receive cwd."""
+        from spec_runtime import orchestrator as orch
+
+        # Build a minimal RunState
+        run = MagicMock()
+        run.branch = "code/test-spec--abc"
+        run.spec_id = "test-spec"
+        run.run_id = "test-spec-abc"
+        run.run_mode = "spec"
+        run.publish_as_draft = False
+        run.attempts = 1
+        run.retry_cap = 5
+        run.review_expected_head_sha = ""
+        run.review_decision_status = ""
+        run.last_error = ""
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        # Create a minimal spec file
+        spec_dir = worktree / "specs"
+        spec_dir.mkdir()
+        spec_file = spec_dir / "test-spec.md"
+        spec_file.write_text("# Test\n- [ ] item\n")
+
+        # Track what cwd is passed to find_pr_for_branch
+        find_pr_cwd = {}
+        mock_forge = MagicMock()
+        mock_forge.find_pr_for_branch.return_value = PullRequest(number=10, url="http://pr/10")
+        mock_forge.update_pr.return_value = True
+        mock_forge.push_branch.return_value = PushResult(ok=True)
+
+        def capture_find_pr(branch, **kwargs):
+            find_pr_cwd["cwd"] = kwargs.get("cwd")
+            return PullRequest(number=10, url="http://pr/10", is_draft=True)
+
+        mock_forge.find_pr_for_branch.side_effect = capture_find_pr
+
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch, "_worktree_branch_alignment_error", return_value=""),
+            patch.object(orch, "_active_spec_path", return_value=spec_file),
+            patch.object(orch, "_spec_path_in_tree", return_value=spec_file),
+            patch.object(orch, "_ensure_run_spec_committed", return_value=True),
+            patch.object(orch, "_extract_acceptance_checklist", return_value="- [ ] check"),
+            patch.object(orch, "_forge", return_value=mock_forge),
+            patch.object(orch, "_check_forge_auth", return_value=""),
+            patch.object(orch, "_known_issues_markdown", return_value="None"),
+            patch.object(orch, "_spec_path_for_run", return_value="specs/test-spec.md"),
+            patch.object(orch, "format_pr_review_owner", return_value="@reviewer"),
+            patch.object(orch, "_head_sha", return_value="abc123"),
+            patch.object(orch, "_gate_status_path", return_value=tmp_path / "gate.json"),
+        ):
+            orch.phase_publish(run, tmp_path)
+
+        # The critical assertion: cwd must be the worktree path
+        assert find_pr_cwd.get("cwd") == worktree, (
+            f"find_pr_for_branch must receive cwd=worktree_path, got {find_pr_cwd.get('cwd')}"
+        )
+        mock_forge.mark_pr_draft.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# CLI dispatch tests for unified autopilot commands (watch, gc, auto)
+# ---------------------------------------------------------------------------
+
+
+class TestCLIAutopilotCommands:
+    """Tests that the unified autopilot commands dispatch correctly."""
+
+    def _mock_config(self):
+        return MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+
+    def _import_cli(self):
+        sys.modules.pop("spec_runtime.cli", None)
+        from spec_runtime import cli
+
+        return cli
+
+    def test_watch_help_exits_0(self):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config", return_value=self._mock_config()):
+            with pytest.raises(SystemExit, match="0"):
+                cli.main(["watch", "--help"])
+
+    def test_gc_help_exits_0(self):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config", return_value=self._mock_config()):
+            with pytest.raises(SystemExit, match="0"):
+                cli.main(["gc", "--help"])
+
+    def test_auto_run_help_exits_0(self):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config", return_value=self._mock_config()):
+            with pytest.raises(SystemExit, match="0"):
+                cli.main(["auto", "run", "--help"])
+
+    def test_auto_stop_help_exits_0(self):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config", return_value=self._mock_config()):
+            with pytest.raises(SystemExit, match="0"):
+                cli.main(["auto", "stop", "--help"])
+
+    def test_auto_no_subcommand_exits_nonzero(self):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config", return_value=self._mock_config()):
+            rc = cli.main(["auto"])
+        assert rc != 0
+
+    def test_watch_dispatches_to_watch_command(self):
+        cli = self._import_cli()
+        with (
+            patch.object(cli, "_lazy_config", return_value=self._mock_config()),
+            patch.object(cli, "_cmd_watch", return_value=0) as mock_watch,
+        ):
+            rc = cli.main(["watch"])
+        assert rc == 0
+        mock_watch.assert_called_once()
+
+    def test_gc_dispatches_to_gc_command(self):
+        cli = self._import_cli()
+        with (
+            patch.object(cli, "_lazy_config", return_value=self._mock_config()),
+            patch.object(cli, "_cmd_gc", return_value=0) as mock_gc,
+        ):
+            rc = cli.main(["gc"])
+        assert rc == 0
+        mock_gc.assert_called_once()
+
+    def test_auto_run_dispatches_to_run_loop(self):
+        cli = self._import_cli()
+        with (
+            patch.object(cli, "_lazy_config", return_value=self._mock_config()),
+            patch("spec_runtime.autopilot.run_loop", return_value=0) as mock_run,
+            patch("spec_runtime.autopilot.parse_notify_backends", return_value=["macos"]),
+        ):
+            rc = cli.main(["auto", "run"])
+        assert rc == 0
+        mock_run.assert_called_once()
+
+    def test_auto_stop_dispatches_to_stop_command(self):
+        cli = self._import_cli()
+        with (
+            patch.object(cli, "_lazy_config", return_value=self._mock_config()),
+            patch("spec_runtime.autopilot.stop_command", return_value=0) as mock_stop,
+        ):
+            rc = cli.main(["auto", "stop"])
+        assert rc == 0
+        mock_stop.assert_called_once()

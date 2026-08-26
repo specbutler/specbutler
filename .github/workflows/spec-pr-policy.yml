@@ -1,0 +1,165 @@
+name: spec-pr-policy
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions: read-all
+
+jobs:
+  spec-pr-policy:
+    name: spec-pr-policy
+    if: github.head_ref != 'release/version-bump' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          path: trusted
+          persist-credentials: false
+
+      - name: Fetch untrusted PR head as data
+        env:
+          HEAD_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: git -C trusted fetch --no-tags "$HEAD_REPO_URL" "$HEAD_SHA"
+
+      - name: Validate spec PR policy
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          PYTHONPATH=trusted/src python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          from spec_runtime.spec_identity import (
+              classify_pr_head_ref,
+              extract_spec_id_from_pr_body,
+              spec_id_from_implementation_branch,
+          )
+
+          head_ref = os.environ["GITHUB_HEAD_REF"]
+          base_sha = os.environ["BASE_SHA"]
+          head_sha = os.environ["HEAD_SHA"]
+          event_path = os.environ["GITHUB_EVENT_PATH"]
+          event = json.loads(Path(event_path).read_text())
+          body = (event.get("pull_request", {}).get("body") or "").strip()
+          branch_role = classify_pr_head_ref(head_ref, body)
+
+          if branch_role == "authoring":
+              diff_output = subprocess.check_output(
+                  ["git", "diff", "--name-only", f"{base_sha}...{head_sha}"],
+                  cwd="trusted",
+                  text=True,
+              ).strip()
+              allowed_prefixes = (
+                  "specs/",
+                  "prompts/",
+                  ".github/prompts/",
+              )
+              def is_allowed(path: str) -> bool:
+                  return any(path.startswith(prefix) for prefix in allowed_prefixes)
+
+              non_spec_files = [
+                  file_path for file_path in diff_output.splitlines() if file_path and not is_allowed(file_path)
+              ]
+              if non_spec_files:
+                  print(
+                      f"Spec authoring branch '{head_ref}' touches non-spec files:",
+                      file=sys.stderr,
+                  )
+                  for file_path in non_spec_files:
+                      print(f"  - {file_path}", file=sys.stderr)
+                  print(
+                      "Spec branches (spec/<id>) must only add or edit files under specs/, prompts/, or .github/prompts/. "
+                      "Use a code/<id>--<token> branch for spec implementation or fix/<name> for ad-hoc changes.",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              print(
+                  f"Spec authoring branch '{head_ref}': only spec/prompt files changed. Passing."
+              )
+              raise SystemExit(0)
+
+          if branch_role == "task":
+              errors = []
+              required_sections = ["## Spec", "## Acceptance Criteria", "## Known Issues"]
+              for section in required_sections:
+                  if section not in body:
+                      errors.append(f"Missing required section: {section}")
+              if not re.search(r"^- \[[ xX]\]", body, flags=re.MULTILINE):
+                  errors.append("Acceptance criteria checklist is missing checkbox items (- [ ] or - [x]).")
+              if errors:
+                  print("Task PR policy validation failed:", file=sys.stderr)
+                  for err in errors:
+                      print(f" - {err}", file=sys.stderr)
+                  sys.exit(1)
+              print(f"Task branch '{head_ref}': structural sections present. Passing.")
+              raise SystemExit(0)
+
+          if branch_role != "implementation":
+              print(
+                  f"Non-implementation branch '{head_ref}': spec-pr-policy is not applicable. Passing deterministically."
+              )
+              raise SystemExit(0)
+
+          errors = []
+          branch_spec_id = spec_id_from_implementation_branch(head_ref)
+          body_spec_id = extract_spec_id_from_pr_body(body)
+          expected_spec_id = body_spec_id or branch_spec_id
+
+          if not expected_spec_id:
+              errors.append("Could not resolve the target spec from the PR body or branch name.")
+          else:
+              expected_spec_path = f"specs/{expected_spec_id}.md"
+              spec_exists = subprocess.run(
+                  ["git", "cat-file", "-e", f"{head_sha}:{expected_spec_path}"],
+                  cwd="trusted",
+                  check=False,
+              ).returncode == 0
+              if not spec_exists:
+                  print(
+                      f"Spec file does not exist for branch '{head_ref}': {expected_spec_path}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+          if body_spec_id and branch_spec_id and body_spec_id != branch_spec_id:
+              errors.append(
+                  f"Spec-ID metadata '{body_spec_id}' does not match branch '{head_ref}'"
+              )
+
+          required_sections = ["## Spec", "## Acceptance Criteria", "## Known Issues"]
+          for section in required_sections:
+              if section not in body:
+                  errors.append(f"Missing required section: {section}")
+
+          matches = re.findall(r"specs/([A-Za-z0-9._-]+)\.md", body)
+          if expected_spec_id and not matches:
+              errors.append(f"Missing spec reference to specs/{expected_spec_id}.md")
+          elif expected_spec_id and expected_spec_id not in matches:
+              found = ", ".join(sorted(set(matches)))
+              errors.append(
+                  f"Spec reference does not match branch '{head_ref}'. Expected '{expected_spec_id}', found [{found}]"
+              )
+
+          if not re.search(r"^- \[[ xX]\]", body, flags=re.MULTILINE):
+              errors.append("Acceptance criteria checklist is missing checkbox items (- [ ] or - [x]).")
+
+          if errors:
+              print("Spec PR policy validation failed:", file=sys.stderr)
+              for err in errors:
+                  print(f" - {err}", file=sys.stderr)
+              sys.exit(1)
+
+          print("Spec PR policy validation passed.")
+          PY

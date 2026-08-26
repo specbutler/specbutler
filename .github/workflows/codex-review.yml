@@ -1,0 +1,582 @@
+name: Codex Review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: read-all
+
+jobs:
+  skip-check:
+    name: skip-check
+    runs-on: ubuntu-latest
+    outputs:
+      is_version_bump: ${{ steps.check.outputs.is_version_bump }}
+    steps:
+      - name: Check for version bump PR
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # Branch must be release/version-bump from the same repo (not a fork)
+          if [ "$HEAD_REF" != "release/version-bump" ] || [ "$HEAD_REPO" != "$REPO" ]; then
+            echo "is_version_bump=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Verify the PR only touches the version field in pyproject.toml
+          python3 - <<'PY'
+          import json, os, re, sys
+          from urllib import request
+          from urllib.error import URLError
+
+          repo = os.environ["REPO"]
+          pr_number = os.environ["PR_NUMBER"]
+          token = os.environ["GITHUB_TOKEN"]
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+          }
+
+          url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files"
+          req = request.Request(url, headers=headers)
+          try:
+              with request.urlopen(req, timeout=30) as resp:
+                  files = json.loads(resp.read().decode())
+          except (URLError, OSError, ValueError) as exc:
+              print(f"GitHub API request failed ({exc}); defaulting to is_version_bump=false")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("is_version_bump=false\n")
+              raise SystemExit(0)
+
+          filenames = [f["filename"] for f in files]
+          if filenames != ["pyproject.toml"]:
+              print(f"Version bump PR touches unexpected files: {filenames}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("is_version_bump=false\n")
+              raise SystemExit(0)
+
+          # Verify the patch only modifies the version line
+          patch = files[0].get("patch")
+          if patch is None:
+              print("GitHub omitted patch text — cannot verify version-only change")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("is_version_bump=false\n")
+              raise SystemExit(0)
+          diff_lines = [
+              line for line in patch.splitlines()
+              if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+          ]
+          version_re = re.compile(r'^[+-]version\s*=\s*"[^"]*"\s*$')
+          non_version = [l for l in diff_lines if not version_re.match(l)]
+          if non_version:
+              print(f"Version bump PR modifies non-version lines: {non_version}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+                  fh.write("is_version_bump=false\n")
+              raise SystemExit(0)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("is_version_bump=true\n")
+          PY
+
+  version-bump-gate:
+    name: version-bump-gate
+    needs: [skip-check]
+    if: needs.skip-check.outputs.is_version_bump == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Publish success status for review-decision-gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib import request
+
+          repo = os.environ["REPO"]
+          head_sha = os.environ["HEAD_SHA"]
+          token = os.environ["GITHUB_TOKEN"]
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "Content-Type": "application/json; charset=utf-8",
+              "User-Agent": "spec-version-bump-skip",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+          payload = {
+              "state": "success",
+              "context": "review-decision-gate",
+              "description": "Skipped — version bump PR",
+              "target_url": os.environ["RUN_URL"],
+          }
+          req = request.Request(
+              f"https://api.github.com/repos/{repo}/statuses/{head_sha}",
+              data=json.dumps(payload).encode("utf-8"),
+              method="POST",
+              headers=headers,
+          )
+          with request.urlopen(req, timeout=30):
+              pass
+          print(f"Published success status for review-decision-gate on {head_sha[:12]}")
+          PY
+
+  determine-review-routing:
+    name: determine-review-routing
+    needs: [skip-check]
+    if: needs.skip-check.outputs.is_version_bump != 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      local_review_owned: ${{ steps.routing.outputs.local_review_owned }}
+      dependabot_owned: ${{ steps.routing.outputs.dependabot_owned }}
+    steps:
+      - name: Determine review routing
+        id: routing
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          review_owner_re = re.compile(
+              r"(?im)^Review-Owner:\s*(?P<owner>[A-Za-z0-9][A-Za-z0-9-]*)\s*$"
+          )
+          match = review_owner_re.search(os.environ.get("PR_BODY", ""))
+          owner = match.group("owner").strip().lower() if match else ""
+          local_review_owned = owner == "local"
+          dependabot_owned = (
+              os.environ.get("PR_AUTHOR") == "dependabot[bot]"
+              and os.environ.get("PR_AUTHOR_TYPE") == "Bot"
+              and os.environ.get("HEAD_REPO") == os.environ.get("REPO")
+              and os.environ.get("HEAD_REF", "").startswith("dependabot/")
+          )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as fh:
+              fh.write(f"local_review_owned={'true' if local_review_owned else 'false'}\n")
+              fh.write(f"dependabot_owned={'true' if dependabot_owned else 'false'}\n")
+          PY
+
+  seed-local-review-status:
+    name: seed-local-review-status
+    needs: [determine-review-routing]
+    if: needs.determine-review-routing.outputs.local_review_owned == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Publish pending local-review status
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib import request
+
+          repo = os.environ["REPO"]
+          head_sha = os.environ["HEAD_SHA"]
+          token = os.environ["GITHUB_TOKEN"]
+          context = "review-decision-gate"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "Content-Type": "application/json; charset=utf-8",
+              "User-Agent": "spec-local-review-routing",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          status_url = f"https://api.github.com/repos/{repo}/commits/{head_sha}/statuses"
+          req = request.Request(status_url, method="GET", headers=headers)
+          with request.urlopen(req, timeout=30) as resp:
+              statuses = json.loads(resp.read().decode("utf-8"))
+
+          for status in statuses:
+              if status.get("context") == context:
+                  # Preserve a final status published by the local orchestrator,
+                  # but reset stale cloud-review results to pending when the PR
+                  # body flips ownership to local review for the same SHA.
+                  target_url = str(status.get("target_url") or "")
+                  is_local_review_status = "/pull/" in target_url
+                  if status["state"] in ("success", "failure", "error") and is_local_review_status:
+                      print(
+                          f"Skipping pending seed: {context} already has "
+                          f"final state '{status['state']}' on {head_sha[:12]}"
+                      )
+                      raise SystemExit(0)
+                  break
+
+          payload = {
+              "state": "pending",
+              "context": context,
+              "description": "Waiting for the orchestrator to publish local review.",
+              "target_url": os.environ["RUN_URL"],
+          }
+          req = request.Request(
+              f"https://api.github.com/repos/{repo}/statuses/{head_sha}",
+              data=json.dumps(payload).encode("utf-8"),
+              method="POST",
+              headers=headers,
+          )
+          with request.urlopen(req, timeout=30):
+              pass
+          PY
+
+      - name: Note local-review ownership
+        run: |
+          {
+            echo "Cloud Codex review skipped because the PR body declares \`Review-Owner: local\`."
+            echo "The workflow seeded a pending \`review-decision-gate\` commit status for this head SHA."
+            echo "That status remains blocking until the local orchestrator publishes the final review result."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  review-decision-gate:
+    name: review-decision-gate
+    needs: [determine-review-routing]
+    if: needs.determine-review-routing.outputs.local_review_owned != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: write
+    outputs:
+      decision: ${{ steps.publish.outputs.decision }}
+      machine_summary: ${{ steps.publish.outputs.machine_summary }}
+    env:
+      REVIEW_TMP_DIR: /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}
+      TRUSTED_ROOT: /tmp/spec-trusted-${{ github.run_id }}-${{ github.run_attempt }}
+      RAW_REVIEW_PATH: /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/codex-review.json
+      REVIEW_RESULT_PATH: /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/review-decision.json
+      REVIEW_SUMMARY_PATH: /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/review-decision-summary.json
+      REVIEW_JOB_SUMMARY_PATH: /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/review-decision-summary.md
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_REF: ${{ github.head_ref }}
+      PR_BODY: ${{ github.event.pull_request.body }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      DEPENDABOT_OWNED: ${{ needs.determine-review-routing.outputs.dependabot_owned }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          # The checked-out tree is attacker-controlled review input. Keep the
+          # forge token out of it; trusted prompts, schema, and evaluator code
+          # are materialized separately from the base commit below.
+          persist-credentials: false
+
+      - name: Verify checkout SHA matches event head
+        run: |
+          actual_head="$(git rev-parse HEAD)"
+          if [ "$actual_head" != "$HEAD_SHA" ]; then
+            echo "Checked out SHA ($actual_head) does not match event head SHA ($HEAD_SHA)." >&2
+            exit 1
+          fi
+
+      - name: Materialize trusted review code and prompt
+        run: |
+          # The pull-request checkout is untrusted data. Do not import its
+          # Python modules, execute its build hooks, or take the prompt/schema
+          # from it before handing the API credential to the review action.
+          test ! -e "$TRUSTED_ROOT"
+          mkdir -p "$TRUSTED_ROOT" "$REVIEW_TMP_DIR"
+          git archive "$BASE_SHA" | tar -x -C "$TRUSTED_ROOT"
+
+          cd "$TRUSTED_ROOT"
+          PYTHONPATH="$TRUSTED_ROOT/src" python3 -P - <<'PY'
+          import os
+          from pathlib import Path
+
+          from spec_runtime.spec_identity import resolve_spec_id_for_pr
+
+          trusted_root = Path(os.environ["TRUSTED_ROOT"])
+          template_candidates = [
+              trusted_root / ".github/prompts/review.md",
+              trusted_root / ".github/prompts/codex-review.md",
+          ]
+          template_path = next((path for path in template_candidates if path.is_file()), None)
+          if template_path is None:
+              raise SystemExit("Missing review prompt template under .github/prompts/")
+
+          rendered_path = Path(os.environ["REVIEW_TMP_DIR"]) / "prompt.md"
+          head_ref = os.environ["HEAD_REF"]
+          spec_id = resolve_spec_id_for_pr(head_ref, os.environ.get("PR_BODY", "")) or ""
+          rendered = template_path.read_text()
+          replacements = {
+              "${REPO}": os.environ["REPO"],
+              "${PR_NUMBER}": os.environ["PR_NUMBER"],
+              "${BASE_SHA}": os.environ["BASE_SHA"],
+              "${HEAD_SHA}": os.environ["HEAD_SHA"],
+              "${HEAD_REF}": head_ref,
+              "${SPEC_ID}": spec_id,
+          }
+          for needle, value in replacements.items():
+              rendered = rendered.replace(needle, value)
+          rendered_path.write_text(rendered)
+          PY
+
+      - name: Validate trusted Dependabot update
+        if: needs.determine-review-routing.outputs.dependabot_owned == 'true'
+        env:
+          UNTRUSTED_ROOT: ${{ github.workspace }}
+        run: |
+          cd "$TRUSTED_ROOT"
+          PYTHONPATH="$TRUSTED_ROOT/src" python3 -P -m spec_runtime.dependabot_review \
+            --repo "$UNTRUSTED_ROOT" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
+            --output "$RAW_REVIEW_PATH"
+
+      - name: Check OPENAI_API_KEY
+        id: key
+        if: needs.determine-review-routing.outputs.dependabot_owned != 'true'
+        env:
+          REVIEW_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$REVIEW_API_KEY" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run Codex reviewer
+        id: codex
+        if: >-
+          needs.determine-review-routing.outputs.dependabot_owned != 'true' &&
+          steps.key.outputs.present == 'true'
+        continue-on-error: true
+        uses: openai/codex-action@86365089eb2b84e0a8fb0717b304f8bdcb13b20e # v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/prompt.md
+          output-file: /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/codex-review.json
+          output-schema-file: /tmp/spec-trusted-${{ github.run_id }}-${{ github.run_attempt }}/.github/schemas/codex-review.schema.json
+          sandbox: read-only
+          safety-strategy: drop-sudo
+          # Pin the repository-validated review model for reproducible gates.
+          model: gpt-5.5
+
+      - name: Synthesize failed payload when reviewer cannot run
+        if: >-
+          needs.determine-review-routing.outputs.dependabot_owned != 'true' &&
+          (steps.key.outputs.present != 'true' || steps.codex.outcome != 'success')
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          key_present = os.environ.get("KEY_PRESENT", "false")
+          codex_outcome = os.environ.get("CODEX_OUTCOME", "skipped")
+          if key_present != "true":
+              summary = (
+                  "OPENAI_API_KEY secret is missing; cannot run blocking Codex review."
+              )
+          else:
+              summary = (
+                  "Codex reviewer step failed to run successfully "
+                  f"(outcome={codex_outcome})."
+              )
+          payload = {
+              "schema_version": "v1",
+              "decision": "failed",
+              "summary": summary,
+              "reviewed_base_sha": os.environ["BASE_SHA"],
+              "reviewed_head_sha": os.environ["HEAD_SHA"],
+              "findings": [],
+              "reviewer_role": "independent-review",
+              "reviewer_agent": "codex",
+              "reviewed_at": datetime.now(timezone.utc).isoformat(),
+          }
+          out_path = Path(os.environ["RAW_REVIEW_PATH"])
+          out_path.parent.mkdir(parents=True, exist_ok=True)
+          out_path.write_text(json.dumps(payload, indent=2) + "\n")
+          PY
+        env:
+          KEY_PRESENT: ${{ steps.key.outputs.present }}
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+
+      - name: Ensure raw review output exists
+        if: always()
+        run: |
+          if [ -s "$RAW_REVIEW_PATH" ]; then
+            exit 0
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          payload = {
+              "schema_version": "v1",
+              "decision": "failed",
+              "summary": "Missing Codex review output artifact.",
+              "reviewed_base_sha": os.environ["BASE_SHA"],
+              "reviewed_head_sha": os.environ["HEAD_SHA"],
+              "findings": [],
+              "reviewer_role": "independent-review",
+              "reviewer_agent": "codex",
+              "reviewed_at": datetime.now(timezone.utc).isoformat(),
+          }
+          out_path = Path(os.environ["RAW_REVIEW_PATH"])
+          out_path.parent.mkdir(parents=True, exist_ok=True)
+          out_path.write_text(json.dumps(payload, indent=2) + "\n")
+          PY
+
+      - name: Upload raw Codex review artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: codex-review-raw
+          path: |
+            /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/codex-review.json
+            /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/prompt.md
+          if-no-files-found: error
+
+      - name: Evaluate review-decision-gate
+        if: always()
+        id: gate
+        continue-on-error: true
+        run: |
+          cd "$TRUSTED_ROOT"
+          PYTHONPATH="$TRUSTED_ROOT/src" python3 -P -m spec_runtime.review_gate \
+            --input "$RAW_REVIEW_PATH" \
+            --schema "$TRUSTED_ROOT/.github/schemas/codex-review.schema.json" \
+            --expected-head-sha "$HEAD_SHA" \
+            --expected-base-sha "$BASE_SHA" \
+            --check-name "review-decision-gate" \
+            --check-url "$RUN_URL" \
+            --output "$REVIEW_RESULT_PATH" \
+            --summary-output "$REVIEW_SUMMARY_PATH" \
+            --job-summary-output "$REVIEW_JOB_SUMMARY_PATH"
+
+      - name: Upload review gate artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: review-decision-gate-result
+          path: |
+            /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/review-decision.json
+            /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/review-decision-summary.json
+            /tmp/spec-review-${{ github.run_id }}-${{ github.run_attempt }}/review-decision-summary.md
+          if-no-files-found: error
+
+      - name: Publish gate summaries
+        if: always()
+        id: publish
+        run: |
+          if [ -f "$REVIEW_JOB_SUMMARY_PATH" ]; then
+            cat "$REVIEW_JOB_SUMMARY_PATH" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          summary_path = Path(os.environ["REVIEW_SUMMARY_PATH"])
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+
+          if not summary_path.exists():
+              output_path.write_text("decision=failed\nmachine_summary={\"error\":\"missing summary\"}\n")
+              raise SystemExit(0)
+
+          summary = json.loads(summary_path.read_text())
+          decision = str(summary.get("decision", "failed"))
+          machine_summary = json.dumps(summary, separators=(",", ":"), sort_keys=True)
+          with output_path.open("a") as fh:
+              fh.write(f"decision={decision}\n")
+              fh.write(f"machine_summary={machine_summary}\n")
+          PY
+
+      - name: Enforce blocking decision
+        if: always()
+        run: |
+          if [ "${{ steps.gate.outcome }}" != "success" ]; then
+            echo "review-decision-gate failed (decision was not approved or payload validation failed)."
+            exit 1
+          fi
+
+  publish-sticky-review-comment:
+    name: publish-sticky-review-comment
+    if: always() && needs.determine-review-routing.outputs.local_review_owned != 'true'
+    needs: [determine-review-routing, review-decision-gate]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: write
+    env:
+      REVIEW_RESULT_PATH: .tmp/codex-review-artifact/review-decision.json
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Verify trusted publisher checkout
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          actual_head="$(git rev-parse HEAD)"
+          if [ "$actual_head" != "$BASE_SHA" ]; then
+            echo "Checked out SHA ($actual_head) does not match trusted base SHA ($BASE_SHA)." >&2
+            exit 1
+          fi
+
+      - name: Download review gate artifact
+        id: artifact
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: review-decision-gate-result
+          path: .tmp/codex-review-artifact
+
+      - name: Publish sticky review comment
+        id: publish
+        if: steps.artifact.outcome == 'success'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          PYTHONPATH=src python3 -m spec_runtime.review_gate_sticky_comment \
+            --review-result "$REVIEW_RESULT_PATH" \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER"
+
+      - name: Note sticky comment status
+        if: always() && (steps.artifact.outcome != 'success' || steps.publish.outcome == 'failure')
+        run: |
+          echo "Sticky PR comment publication failed or was skipped. \`review-decision-gate\` remains the only merge authority." >> "$GITHUB_STEP_SUMMARY"

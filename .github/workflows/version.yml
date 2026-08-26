@@ -1,0 +1,279 @@
+name: Version Bump
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+
+permissions: read-all
+
+jobs:
+  bump-pr:
+    runs-on: ubuntu-latest
+    if: >-
+      vars.SPEC_BUTLER_AUTOMATED_RELEASES == 'true' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      !startsWith(github.event.workflow_run.head_commit.message, 'chore: bump version')
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Validate release token
+        env:
+          VERSION_BUMP_TOKEN: ${{ secrets.VERSION_BUMP_TOKEN }}
+        run: |
+          if [ -n "$VERSION_BUMP_TOKEN" ]; then
+            exit 0
+          fi
+
+          echo "::error::Missing VERSION_BUMP_TOKEN secret."
+          echo "::error::Use a PAT or GitHub App token that can push a release/* branch and open pull requests."
+          echo "::error::PRs created by GITHUB_TOKEN do not trigger the required pull_request workflows in this repository."
+          echo "::error::Set the token before enabling the SPEC_BUTLER_AUTOMATED_RELEASES repository variable."
+          exit 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          token: ${{ secrets.VERSION_BUMP_TOKEN }}
+
+      - name: Create or update release PR
+        env:
+          CI_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ secrets.VERSION_BUMP_TOKEN }}
+          RELEASE_BRANCH: release/version-bump
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main
+
+          # Guard: the CI-validated SHA must be in main's lineage
+          if ! git merge-base --is-ancestor "$CI_SHA" "$(git rev-parse origin/main)"; then
+            echo "::warning::CI SHA $CI_SHA is not in main's lineage — skipping"
+            exit 0
+          fi
+
+          # Skip any main commit that already changed the packaged version.
+          # This covers release PR merges regardless of merge method, plus any
+          # intentional manual version edits.
+          commit_version="$(git show "$CI_SHA:pyproject.toml" | sed -n 's/^version = \"\(.*\)\"/\1/p' | head -1 || true)"
+          parent_version=""
+          if git rev-parse "${CI_SHA}^1" >/dev/null 2>&1; then
+            parent_version="$(git show "${CI_SHA}^1:pyproject.toml" | sed -n 's/^version = \"\(.*\)\"/\1/p' | head -1 || true)"
+          fi
+          if [ -n "$commit_version" ] && [ -n "$parent_version" ] && [ "$commit_version" != "$parent_version" ]; then
+            echo "Commit $CI_SHA already changed the package version ($parent_version -> $commit_version) — skipping"
+            exit 0
+          fi
+
+          # Idempotency after the release PR lands: preserve the original
+          # trigger in the bump commit body and look for it in main history.
+          if git log --grep="trigger-sha: $CI_SHA" --format='%H' origin/main | head -1 | grep -q .; then
+            echo "Already bumped for $CI_SHA — skipping"
+            exit 0
+          fi
+
+          repo="${GITHUB_REPOSITORY:?}"
+          repo_owner="${repo%%/*}"
+          release_head="${repo_owner}:${RELEASE_BRANCH}"
+
+          gh_api_retry() {
+            local attempt
+            for attempt in $(seq 1 6); do
+              if gh api "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -eq 6 ]; then
+                return 1
+              fi
+              echo "::warning::GitHub API request failed; retrying ($attempt/6)" >&2
+              sleep "$((attempt * 5))"
+            done
+          }
+
+          find_open_release_pr() {
+            gh_api_retry -X GET "repos/${repo}/pulls" \
+              -f state=open \
+              -f base=main \
+              -f head="$release_head" \
+              -F per_page=1 \
+              --jq '.[0].number // empty'
+          }
+
+          existing_pr_number="$(find_open_release_pr)"
+          if [ -n "$existing_pr_number" ]; then
+            existing_pr_body="$(
+              gh_api_retry "repos/${repo}/pulls/${existing_pr_number}" --jq '.body // ""'
+            )"
+            existing_trigger_sha="$(printf '%s\n' "$existing_pr_body" | sed -n 's/^trigger-sha: //p' | head -1)"
+            if [ "$existing_trigger_sha" = "$CI_SHA" ]; then
+              echo "Release PR #$existing_pr_number already tracks $CI_SHA — skipping"
+              exit 0
+            fi
+          fi
+
+          # Rebuild the release branch from the latest protected main so the
+          # version bump itself goes through the normal PR checks.
+          git checkout -B "$RELEASE_BRANCH" origin/main
+
+          current="$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          echo "Current version: $current"
+
+          IFS='.' read -r major minor patch <<< "$current"
+          new_version="${major}.${minor}.$((patch + 1))"
+          echo "New version: $new_version"
+
+          sed -i "s/^version = \"${current}\"/version = \"${new_version}\"/" pyproject.toml
+
+          git add pyproject.toml
+          git commit -m "chore: bump version to ${new_version}" \
+                     -m "trigger-sha: $CI_SHA"
+          git push --force-with-lease origin "$RELEASE_BRANCH"
+
+          pr_title="chore: bump version to ${new_version}"
+          pr_body="$(cat <<EOF
+          Automated patch version bump after CI passed on main.
+
+          Version: ${new_version}
+          trigger-sha: ${CI_SHA}
+
+          This PR is generated by \`.github/workflows/version.yml\`.
+          Rebase auto-merge is preferred, but the workflow also skips any main
+          commit that already changes the packaged version.
+          EOF
+          )"
+
+          if [ -n "$existing_pr_number" ]; then
+            gh_api_retry -X PATCH "repos/${repo}/pulls/${existing_pr_number}" \
+              -f title="$pr_title" \
+              -f body="$pr_body" \
+              --silent
+            pr_number="$existing_pr_number"
+          else
+            pr_number=""
+            for attempt in $(seq 1 6); do
+              if pr_number="$(
+                gh api -X POST "repos/${repo}/pulls" \
+                  -f base=main \
+                  -f head="$RELEASE_BRANCH" \
+                  -f title="$pr_title" \
+                  -f body="$pr_body" \
+                  --jq '.number'
+              )"; then
+                break
+              fi
+
+              # A timed-out POST may still have created the PR. Reconcile by
+              # branch before retrying the non-idempotent request.
+              echo "::warning::GitHub API request failed during PR create; checking for a created PR ($attempt/6)" >&2
+              pr_number="$(find_open_release_pr)"
+              if [ -n "$pr_number" ]; then
+                break
+              fi
+              sleep "$((attempt * 5))"
+            done
+            if [ -z "$pr_number" ]; then
+              echo "::error::Unable to create or recover the release PR after 6 attempts"
+              exit 1
+            fi
+          fi
+
+          # GitHub's GraphQL and REST frontends fail independently. Keep the
+          # release path REST-only and let branch protection refuse the merge
+          # until the generated PR's required checks are green.
+          release_head_sha="$(git rev-parse HEAD)"
+          for attempt in $(seq 1 90); do
+            if gh api -X PUT "repos/${repo}/pulls/${pr_number}/merge" \
+              -f merge_method=rebase \
+              -f sha="$release_head_sha" \
+              --silent; then
+              echo "Release PR #$pr_number merged"
+              exit 0
+            fi
+
+            pr_state="$(
+              gh_api_retry "repos/${repo}/pulls/${pr_number}" \
+                --jq 'if .merged_at then "merged" else .state end'
+            )"
+            if [ "$pr_state" = "merged" ]; then
+              echo "Release PR #$pr_number was merged concurrently"
+              exit 0
+            fi
+            if [ "$pr_state" != "open" ]; then
+              echo "::error::Release PR #$pr_number entered unexpected state: $pr_state"
+              exit 1
+            fi
+
+            echo "Release PR #$pr_number is waiting for required checks (attempt $attempt/90)"
+            sleep 10
+          done
+
+          echo "::error::Timed out waiting to merge release PR #$pr_number"
+          exit 1
+
+  tag-release:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Create tag for merged version bump
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          git fetch --tags origin
+
+          version="$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+          parent_version=""
+          if git rev-parse HEAD^1 >/dev/null 2>&1; then
+            parent_version="$(git show HEAD^1:pyproject.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1 || true)"
+          fi
+          if [ -z "$parent_version" ] || [ "$version" = "$parent_version" ]; then
+            echo "Packaged version did not change in this commit; skipping tag and release"
+            exit 0
+          fi
+          tag_name="v${version}"
+
+          if git rev-parse "$tag_name" >/dev/null 2>&1; then
+            echo "Tag $tag_name already exists"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            git tag -a "$tag_name" -m "$tag_name"
+            git push origin "$tag_name"
+          fi
+
+          for attempt in $(seq 1 6); do
+            if gh release view "$tag_name" >/dev/null 2>&1; then
+              echo "GitHub Release $tag_name already exists"
+              exit 0
+            fi
+            if gh release create "$tag_name" --verify-tag --generate-notes --title "$tag_name"; then
+              exit 0
+            fi
+            echo "::warning::GitHub release request failed; reconciling before retry ($attempt/6)" >&2
+            sleep "$((attempt * 5))"
+          done
+
+          echo "::error::Unable to create or recover GitHub Release $tag_name after 6 attempts"
+          exit 1

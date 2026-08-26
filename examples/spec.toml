@@ -1,0 +1,119 @@
+# Spec Butler configuration
+# Place this file as `.spec.toml` in your repo root.
+
+# Git ref used as the base for new implementation branches.
+# The orchestrator creates branches from this ref and targets PRs at the
+# branch name after the last '/'.
+base_ref = "origin/main"
+
+# ---------------------------------------------------------------------------
+# Paths (all relative to repo root)
+# ---------------------------------------------------------------------------
+[paths]
+
+# Directory containing spec markdown files.
+specs_dir = "specs"
+
+# Directory for lightweight task specs (created by `spec task`).
+task_specs_dir = "specs/tasks"
+
+# Directory for orchestrator run state (run records, intake answers, etc.).
+# Add this to .gitignore.
+state_dir = ".spec-state"
+
+# Directory for git worktrees used during implementation.
+# Add this to .gitignore.
+worktrees_dir = ".worktrees"
+
+# ---------------------------------------------------------------------------
+# Retry behavior
+# ---------------------------------------------------------------------------
+[retry]
+
+# Maximum number of retries across verify failures, review change requests,
+# and merge conflicts before the orchestrator gives up and creates a draft PR.
+cap = 20
+
+# Number of consecutive retries with no new commits before the orchestrator
+# stops retrying the implement phase (prevents infinite loops when the agent
+# makes no progress).
+no_progress_retry_threshold = 2
+
+# ---------------------------------------------------------------------------
+# Agent configuration
+# ---------------------------------------------------------------------------
+[agents]
+
+# Default agent to use when --agent is not specified.
+default = "claude"
+
+# Default agent for independent review. It must also appear in `allowed`.
+review_default = "codex"
+
+# Agents allowed for implementation. The CLI will reject unknown agent names.
+allowed = ["claude", "codex"]
+
+# ---------------------------------------------------------------------------
+# Bootstrap
+# ---------------------------------------------------------------------------
+[bootstrap]
+
+# Command to install dependencies in a fresh worktree. Runs once during the
+# bootstrap phase before the agent starts implementing. Leave empty (or omit)
+# if your project doesn't need a separate install step.
+#
+# Examples:
+#   install_command = "python -m venv .venv && .venv/bin/python -m pip install -e '.[dev]'"
+#   install_command = "npm ci"
+#   install_command = "make install"
+install_command = "python -m venv .venv && .venv/bin/python -m pip install -e '.[dev]'"
+
+# Optional container image cache optimization. The normal install_command above
+# runs in the full workspace and is the compatibility path. This cache command
+# runs earlier during container image build against dependency inputs only.
+#
+# [bootstrap.cache]
+# enabled = false
+# command = "python -m pip install -r requirements.txt"
+# inputs = ["requirements.txt"]
+
+# ---------------------------------------------------------------------------
+# Verify gates
+# ---------------------------------------------------------------------------
+# Each gate runs a command during the verify phase. Gates with parallel = true
+# run concurrently; sequential gates (parallel = false) run after all parallel
+# gates complete.
+#
+# The `role` field is optional — it gives the gate a semantic role ("test",
+# "lint", "e2e") used for diagnostics. Defaults to the gate name.
+
+[verify]
+
+[[verify.gates]]
+name = "test"
+command = ".venv/bin/python -m pytest"
+parallel = true
+
+[[verify.gates]]
+name = "lint"
+command = ".venv/bin/python -m ruff check ."
+parallel = true
+
+# Example: an end-to-end gate that must run sequentially
+# [[verify.gates]]
+# name = "e2e"
+# command = "playwright test"
+# parallel = false
+
+# ---------------------------------------------------------------------------
+# Coordination (optional)
+# ---------------------------------------------------------------------------
+# Configure this only when multiple machines share a coordinator. Keep secrets
+# such as bearer tokens in `.spec.local.toml` (gitignored by `spec init`) or in
+# environment variables, never in committed `.spec.toml`.
+#
+# [coordination]
+# backend = "http"
+# url = "http://<coordinator-tailscale-ip>:8765"
+# repo_id = "github.com/acme/widget"
+# machine_id = "alice-mbp"

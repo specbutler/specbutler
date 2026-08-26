@@ -1,0 +1,62 @@
+name: Feature request
+description: Describe a problem or need that this project should address
+labels: ["enhancement", "triage"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - orchestrator
+        - cli
+        - forge
+        - agent
+        - review
+        - autopilot
+        - web
+        - container
+        - coordination
+        - config
+        - packaging
+        - docs
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: >
+        What problem are you running into, or what need is unmet?
+        Be specific about the situation and why it matters.
+      placeholder: |
+        When I run `spec implement` on a repo with slow CI, the verify
+        phase retries immediately and hits rate limits. This wastes CI
+        resources and makes runs fail unnecessarily.
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: >
+        Who does this affect and how badly? How are you working around
+        it today, if at all?
+      placeholder: |
+        This affects any repo with CI that takes >5 minutes. Currently
+        I have to manually space out retries by pausing the orchestrator.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: >
+        Anything else that helps understand the problem — logs, config,
+        screenshots, links to related issues. Remove tokens, credentials,
+        private repository content, and other sensitive data first.
+    validations:
+      required: false
