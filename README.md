@@ -125,34 +125,72 @@ spec coord status                      # show coordinator config/connectivity
 spec coord serve --db PATH             # run SQLite coordinator service
 ```
 
-### Autopilot
+### Running multiple specs
 
-Dispatch multiple specs in parallel:
+Runs for different specs are independent. You can start several at once in
+separate terminals; autopilot is not required for parallel execution:
 
 ```bash
-spec auto run                          # dispatch loop (computed safe concurrency)
-spec auto run --concurrency 4          # limit parallelism
-spec auto stop                         # graceful shutdown
+# Run each command in a separate terminal.
+spec implement --spec api
+spec implement --spec frontend
+```
+
+### Autopilot: automatic dispatch
+
+`spec auto run` watches the dispatchable specs in `specs/`, determines which
+ones are ready because all of their dependencies are satisfied, and starts
+ready work until it reaches its concurrency limit. As specs merge and unblock
+their dependents, the dispatcher picks up the newly ready specs automatically.
+
+```bash
+spec auto run                          # dispatch ready specs as capacity permits
+spec auto run --concurrency 4          # cap the number of concurrent runs
+spec auto stop                         # gracefully stop the dispatcher
+```
+
+Without an explicit limit, safe concurrency is computed from the backend, CPU,
+and available memory: worktree mode can use up to 8 workers, while clone and
+container modes use lower caps.
+
+### Monitoring and maintenance
+
+These commands work for manually started and automatically dispatched runs:
+
+```bash
 spec watch                             # interactive TUI dashboard
-spec gc --apply                        # clean up stale run state
-spec web start --open                  # launch the local browser dashboard
+spec web start --open                  # local browser dashboard and chat
+spec gc                                # preview stale-state reconciliation
+spec gc --apply                        # apply the proposed cleanup
+```
+
+The interactive TUI requires the `tui` extra. The browser dashboard requires
+the `web` extra; see [Web dashboard and chat](docs/web.md).
+
+### Container backend
+
+Container execution is an optional isolation backend, independent of how runs
+are dispatched or monitored:
+
+```bash
 spec container init                    # generate a baseline worker image
 # Then enable backend = "container" in .spec.toml.
 spec container doctor                  # validate container backend readiness
 spec container smoke --verify-gates    # exercise the configured worker
 ```
 
-The default concurrency is computed from the backend, CPU, and available
-memory: worktree mode can use up to 8 workers, while clone and container modes
-use lower caps.
-
-The interactive TUI requires the `tui` extra. A browser dashboard is also
-available through the `web` extra; see [Web dashboard and chat](docs/web.md).
-
 ### Coordinator Service
 
-`spec coord serve` runs a small authenticated HTTP service backed by a local
-SQLite database owned by the coordinator process:
+Spec's normal locks coordinate runs that share one checkout, but those locks
+are invisible to another checkout or machine. The optional coordinator closes
+that gap: it arbitrates per-spec leases so two workers do not implement the
+same spec at the same time, and records ownership and heartbeats so operators
+can see where work is running.
+
+`spec coord serve` runs that small authenticated HTTP service, backed by a
+SQLite database owned by the coordinator process. It is not a scheduler or a
+remote execution service; workers still run `spec implement` or
+`spec auto run` normally with their own checkout, agents, and credentials.
 
 ```bash
 spec coord token create --db ~/.local/state/spec/coord.sqlite --name worker-main --scope worker
