@@ -2357,7 +2357,7 @@ def _write_pid_file(path: Path, identity: ProcessIdentity, *, instance_id: str =
         payload["instance_id"] = instance_id
     if nonce:
         payload["nonce"] = nonce
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def ensure_pid_file(repo_root: Path, *, instance_id: str = "", nonce: str = "") -> None:
@@ -2491,6 +2491,23 @@ def run_loop(args: argparse.Namespace) -> int:
                 )
             )
 
+    def wait_for_next_poll(seconds: float) -> None:
+        """Wait responsively so an out-of-process stop is observed promptly."""
+        nonlocal stop_requested, force_shutdown
+        if seconds <= 0:
+            # Preserve a scheduler yield for zero-interval operation and tests.
+            time.sleep(0)
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            requested = shutdown_tracker.state()
+            if requested.phase in {ShutdownPhase.GRACEFUL, ShutdownPhase.FORCED}:
+                stop_requested = True
+                force_shutdown = requested.phase is ShutdownPhase.FORCED
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.25))
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
@@ -2722,7 +2739,7 @@ def run_loop(args: argparse.Namespace) -> int:
                             )
                         )
                         low_memory_active = True
-                    time.sleep(args.poll_interval)
+                    wait_for_next_poll(args.poll_interval)
                     continue
                 if low_memory_active:
                     print(format_status_line("resume", "memory recovered; scheduling resumes"))
@@ -2916,7 +2933,7 @@ def run_loop(args: argparse.Namespace) -> int:
                         detail += f" run={candidate.run_id}"
                     print(format_status_line("start", detail))
 
-            time.sleep(args.poll_interval)
+            wait_for_next_poll(args.poll_interval)
     finally:
         write_active_state(repo_root, active)
         remove_pid_file(repo_root)

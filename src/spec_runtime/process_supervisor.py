@@ -646,8 +646,8 @@ class ManagedProcess:
     def close(self) -> None:
         if self._job is not None:
             tree = _windows_tree_identities(self.token.identity.pid)
-            _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
             self._job.close()
+            _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
             self._job = None
             _wait_for_identities_exit(tree)
 

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import spec_runtime.process_supervisor as process_supervisor
 from spec_runtime.process_supervisor import (
     LifetimeMode,
     ProcessIdentity,
@@ -114,6 +115,28 @@ def test_token_persists_explicit_job_name() -> None:
     assert restored.identity == keeper
     assert restored.payload == payload
     assert restored.job_name == token.job_name
+
+
+def test_managed_process_keeps_live_job_registered_when_close_handle_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = ProcessIdentity(42, "created")
+    token = SupervisionToken(LifetimeMode.RUN_OWNED, identity, 7, "owner", "close-failure")
+
+    class FailingJob:
+        def close(self) -> None:
+            raise OSError("CloseHandle failed")
+
+    job = FailingJob()
+    key = (identity.pid, identity.started_at)
+    monkeypatch.setitem(process_supervisor._LIVE_WINDOWS_JOBS, key, job)
+    managed = process_supervisor.ManagedProcess(object(), token, job)  # type: ignore[arg-type]
+
+    with pytest.raises(OSError, match="CloseHandle failed"):
+        managed.close()
+
+    assert process_supervisor._LIVE_WINDOWS_JOBS[key] is job
+    assert managed._job is job
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")
