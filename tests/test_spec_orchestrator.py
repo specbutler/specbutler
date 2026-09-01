@@ -17938,7 +17938,7 @@ class TestLocalReviewPhase:
         review_worktree = tmp_path / "review"
         review_worktree.mkdir()
         if venv_present:
-            (review_worktree / ".venv" / "bin").mkdir(parents=True)
+            orch._worktree_venv_executable_dir(review_worktree).mkdir(parents=True)
 
         raw_review_json = json.dumps(
             {
@@ -17986,10 +17986,15 @@ class TestLocalReviewPhase:
 
         assert review_result.status == "approved"
         prompt_arg = captured["cmd"][-1]
+        expected_pytest_command = (
+            r".venv\Scripts\python.exe -m pytest"
+            if os.name == "nt"
+            else ".venv/bin/pytest"
+        )
         if venv_present:
-            assert ".venv/bin/pytest" in prompt_arg
+            assert expected_pytest_command in prompt_arg
         else:
-            assert ".venv/bin/pytest" not in prompt_arg
+            assert expected_pytest_command not in prompt_arg
 
     def test_windows_review_prompt_uses_scripts_python(self, tmp_path: Path):
         review_worktree = tmp_path / "review"
