@@ -91,6 +91,30 @@ Use `--verbose` while diagnosing provider startup or event-protocol problems:
 spec web start --verbose
 ```
 
+### Credentialed Linux Claude regression
+
+Maintainers can opt into a real-provider regression that creates a temporary
+Git repository, starts the actual authenticated web server, and uses one real
+Claude session for three context-dependent HTTP/SSE turns. The second turn must
+recall a random marker supplied only in turn one; the third must recall that
+marker and a second marker supplied only in turn two. The test also stops the
+session and server and verifies that their exact provider processes are gone.
+
+Install the development and web dependencies, authenticate Claude Code, and
+install the Linux sandbox prerequisites (`bubblewrap` and `socat`). Then run:
+
+```bash
+SPEC_LINUX_CLAUDE_REAL_PROVIDER=1 \
+pytest -m linux_claude_real_provider \
+  tests/test_linux_claude_real_provider.py -v
+```
+
+The test is skipped unless the opt-in variable is exactly `1`. It inherits the
+operator's existing Claude authentication without copying credentials into the
+fixture repository. It discards server/provider output rather than recording
+the authenticated startup URL, prompts, model responses, or provider output,
+and removes the temporary web token during cleanup.
+
 ## Troubleshooting
 
 - **The page shows the login form:** run `spec web token` and paste the token,
