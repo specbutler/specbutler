@@ -292,27 +292,31 @@ def _recover_launch(repo_root: Path, *, readiness_timeout: float = 1.0) -> objec
         expected_helper.unlink(missing_ok=True)
         return None
 
-    if helper_live and payload_live:
-        _wait_for_ready_record(
+    ready_token = None
+    if helper_live:
+        ready_token = _wait_for_ready_record(
             repo_root,
             nonce=nonce,
             token=token,
+            host=host,
+            port=port,
             timeout=readiness_timeout,
         )
-    try:
-        ready = json.loads(_ready_path(repo_root).read_text(encoding="utf-8"))
-        payload_live = identity_matches(token.payload)
-        authenticated_ready = (
-            ready.get("nonce") == nonce
-            and ready.get("host") == host
-            and int(ready.get("port", -1)) == port
-            and ready.get("listener") == listener
-            and ready.get("payload_identity") == token.payload.to_dict()
-            and payload_live
-            and _wait_for_port(host, port, timeout=0.25)
+    if isinstance(ready_token, SupervisionToken):
+        token = ready_token
+    authenticated_ready = (
+        isinstance(ready_token, SupervisionToken)
+        and _ready_record_matches(
+            repo_root,
+            nonce=nonce,
+            token=token,
+            host=host,
+            port=port,
         )
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        authenticated_ready = False
+        and identity_matches(token.identity)
+        and identity_matches(token.payload)
+        and _wait_for_port(_connectable_host(host), port, timeout=0.25)
+    )
     if not authenticated_ready:
         return token
 
@@ -342,27 +346,86 @@ def _publish_ready_record(repo_root: Path, *, nonce: str, host: str, port: int) 
     atomic_write_text(_ready_path(repo_root), json.dumps(payload, sort_keys=True) + "\n")
 
 
-def _wait_for_ready_record(repo_root: Path, *, nonce: str, token: object, timeout: float = 10.0) -> bool:
+def _ready_record_matches(
+    repo_root: Path,
+    *,
+    nonce: str,
+    token: object,
+    host: str,
+    port: int,
+) -> bool:
     from spec_runtime.process_supervisor import SupervisionToken, identity_matches
 
     if not isinstance(token, SupervisionToken):
         return False
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
+    try:
+        payload = json.loads(_ready_path(repo_root).read_text(encoding="utf-8"))
+        return bool(
+            payload.get("nonce") == nonce
+            and payload.get("host") == host
+            and int(payload.get("port", -1)) == port
+            and payload.get("listener") == f"{host}:{port}"
+            and payload.get("payload_identity") == token.payload.to_dict()
+            and identity_matches(token.payload)
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
+def _wait_for_ready_record(
+    repo_root: Path,
+    *,
+    nonce: str,
+    token: object,
+    host: str,
+    port: int,
+    timeout: float = 10.0,
+) -> object | None:
+    from spec_runtime.process_supervisor import (
+        ProcessIdentity,
+        SupervisionToken,
+        identity_matches,
+        promote_payload_identity,
+    )
+
+    if not isinstance(token, SupervisionToken):
+        return None
+    deadline = time.monotonic() + max(0.0, timeout)
+    first_attempt = True
+    while first_attempt or time.monotonic() < deadline:
+        first_attempt = False
         try:
             payload = json.loads(_ready_path(repo_root).read_text(encoding="utf-8"))
             if (
                 payload.get("nonce") == nonce
-                and payload.get("payload_identity") == token.payload.to_dict()
-                and identity_matches(token.payload)
+                and payload.get("host") == host
+                and int(payload.get("port", -1)) == port
+                and payload.get("listener") == f"{host}:{port}"
+                and isinstance(payload.get("payload_identity"), dict)
             ):
-                return True
-        except (OSError, TypeError, json.JSONDecodeError):
+                candidate = ProcessIdentity.from_dict(payload["payload_identity"])
+                if os.name == "nt":
+                    promoted = promote_payload_identity(token, candidate)
+                elif candidate == token.payload and identity_matches(candidate):
+                    promoted = token
+                else:
+                    promoted = None
+                if promoted is not None and _ready_record_matches(
+                    repo_root,
+                    nonce=nonce,
+                    token=promoted,
+                    host=host,
+                    port=port,
+                ):
+                    return promoted
+        except (OSError, TypeError, ValueError, json.JSONDecodeError, ProcessLookupError):
             pass
         if not identity_matches(token.identity):
-            return False
-        time.sleep(0.02)
-    return False
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.02, remaining))
+    return None
 
 
 def write_supervision_token(repo_root: Path, token: object) -> None:
@@ -644,7 +707,7 @@ def run_server(
             pass  # Good — port is free
 
         if os.name == "nt":
-            from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+            from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor, SupervisionToken
 
             state_dir = _web_state_dir(repo_root)
             state_dir.mkdir(parents=True, exist_ok=True)
@@ -690,7 +753,29 @@ def run_server(
                 )
             finally:
                 log_handle.close()
-            if not _wait_for_ready_record(repo_root, nonce=ready_nonce, token=managed.token):
+            ready_token = _wait_for_ready_record(
+                repo_root,
+                nonce=ready_nonce,
+                token=managed.token,
+                host=host,
+                port=port,
+            )
+            if isinstance(ready_token, SupervisionToken):
+                # Keep failure cleanup on the same identity that was atomically
+                # promoted in helper state.
+                managed.token = ready_token
+            ready_confirmed = (
+                isinstance(ready_token, SupervisionToken)
+                and _ready_record_matches(
+                    repo_root,
+                    nonce=ready_nonce,
+                    token=ready_token,
+                    host=host,
+                    port=port,
+                )
+                and _wait_for_port(probe_host, port, timeout=0.5)
+            )
+            if not ready_confirmed:
                 managed.terminate(grace_seconds=0.5)
                 from spec_runtime.process_supervisor import identity_matches
 
@@ -701,7 +786,7 @@ def run_server(
                 return 1
             # Publish only after readiness. Publishing earlier makes the child
             # observe its own durable token and reject startup as a duplicate.
-            write_supervision_token(repo_root, managed.token)
+            write_supervision_token(repo_root, ready_token)
             _launch_path(repo_root).unlink(missing_ok=True)
             helper_path.unlink(missing_ok=True)
             print(f"spec web running on http://{probe_host}:{port}", file=sys.stderr)

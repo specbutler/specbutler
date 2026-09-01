@@ -75,6 +75,11 @@ def _kernel32() -> Any:
         "SetInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
         "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
         "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        "QueryInformationJobObject": (
+            [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)],
+            wintypes.BOOL,
+        ),
+        "GenerateConsoleCtrlEvent": ([wintypes.DWORD, wintypes.DWORD], wintypes.BOOL),
         "GlobalMemoryStatusEx": ([ctypes.c_void_p], wintypes.BOOL),
         "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
         "Process32FirstW": ([wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
@@ -515,7 +520,10 @@ class _WindowsJob:
     @classmethod
     def open(cls, name: str) -> _WindowsJob | None:
         kernel32 = _kernel32()
-        handle = kernel32.OpenJobObjectW(0x8, False, name)  # JOB_OBJECT_TERMINATE
+        # Query access is part of the ownership proof: a named Job is useful
+        # only when the candidate payload can be shown to be one of its active
+        # members.  Never fall back to trusting a PID from persisted state.
+        handle = kernel32.OpenJobObjectW(0xC, False, name)  # QUERY | TERMINATE
         if not handle:
             return None
         job = cls.__new__(cls)
@@ -533,6 +541,57 @@ class _WindowsJob:
         if not self._kernel32.TerminateJobObject(self.handle, code):
             raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
 
+    def active_process_ids(self) -> tuple[int, ...]:
+        """Return the Job's active members from the kernel-owned membership list."""
+        from ctypes import wintypes
+
+        capacity = 16
+        pointer_size = ctypes.sizeof(ctypes.c_size_t)
+        while True:
+            size = 8 + capacity * pointer_size
+            buffer = ctypes.create_string_buffer(size)
+            returned = wintypes.DWORD()
+            ok = self._kernel32.QueryInformationJobObject(
+                self.handle,
+                3,  # JobObjectBasicProcessIdList
+                buffer,
+                size,
+                ctypes.byref(returned),
+            )
+            assigned = ctypes.c_uint32.from_buffer(buffer, 0).value
+            included = ctypes.c_uint32.from_buffer(buffer, 4).value
+            if ok and included >= assigned:
+                if included == 0:
+                    return ()
+                array_type = ctypes.c_size_t * included
+                members = array_type.from_buffer(buffer, 8)
+                return tuple(int(pid) for pid in members)
+            if assigned > capacity:
+                capacity = assigned
+                continue
+            if not ok:
+                raise OSError(ctypes.get_last_error(), "QueryInformationJobObject failed")
+            # The Job grew between the query and the returned snapshot. Grow
+            # geometrically rather than accepting an incomplete membership
+            # list at a security boundary.
+            capacity *= 2
+
+    def active_identities(self) -> list[ProcessIdentity]:
+        return [identity for pid in self.active_process_ids() if (identity := inspect_process(pid)) is not None]
+
+    def contains(self, identity: ProcessIdentity) -> bool:
+        return identity_matches(identity) and identity.pid in self.active_process_ids()
+
+    def wait_empty(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if not self.active_process_ids():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+
     def close(self) -> None:
         if self.handle:
             handle = self.handle
@@ -547,6 +606,42 @@ _CURRENT_WINDOWS_JOBS: dict[str, _WindowsJob] = {}
 
 def _windows_job_name(token: str) -> str:
     return f"Local\\SpecButler-{token}"
+
+
+def _send_windows_break(process_group_id: int) -> bool:
+    """Signal a Windows console group even after its leader shim has exited."""
+    if process_group_id <= 0:
+        return False
+    return bool(_kernel32().GenerateConsoleCtrlEvent(1, process_group_id))  # CTRL_BREAK_EVENT
+
+
+def _terminate_held_windows_job(token: SupervisionToken, job: _WindowsJob, grace_seconds: float) -> bool:
+    """Gracefully, then forcibly, stop a Job held by this trusted process."""
+    try:
+        if not job.active_process_ids():
+            return True
+    except OSError:
+        # The retained handle is still an ownership capability. A query
+        # failure prevents graceful proof but must not prevent hard cleanup.
+        pass
+    try:
+        _send_windows_break(token.pgid)
+    except OSError:
+        pass
+    try:
+        if job.wait_empty(grace_seconds):
+            return True
+    except OSError:
+        pass
+    try:
+        identities = job.active_identities()
+    except OSError:
+        identities = []
+    try:
+        job.terminate()
+    except OSError:
+        return False
+    return _wait_for_identities_exit(identities) if identities else True
 
 
 def claim_current_process(supervision_id: str) -> SupervisionToken:
@@ -634,19 +729,17 @@ class ManagedProcess:
         self._close_lock = threading.Lock()
 
     def terminate(self, grace_seconds: float = 5.0) -> None:
-        if os.name == "nt" and self._job is not None and identity_matches(self.token.identity):
-            try:
-                self.process.send_signal(signal.CTRL_BREAK_EVENT)
-            except (OSError, ValueError):
-                pass
-        terminate(self.token, grace_seconds=grace_seconds, job=self._job)
+        if os.name == "nt" and self._job is not None:
+            _terminate_held_windows_job(self.token, self._job, grace_seconds)
+            return
+        terminate(self.token, grace_seconds=grace_seconds)
 
     def kill(self) -> None:
         """Kill the complete owned tree, never just the Popen leader."""
-        if self._job is not None and identity_matches(self.token.identity):
+        if self._job is not None:
             self._job.terminate()
         else:
-            terminate(self.token, grace_seconds=0, job=self._job)
+            terminate(self.token, grace_seconds=0)
 
     def communicate(self, input: Any = None, timeout: float | None = None) -> tuple[Any, Any]:
         """Mirror Popen.communicate while releasing ownership on completion.
@@ -665,8 +758,14 @@ class ManagedProcess:
         except subprocess.TimeoutExpired:
             raise
         except BaseException:
-            self.kill()
-            self.close()
+            try:
+                self.kill()
+            except BaseException:
+                pass
+            try:
+                self.close()
+            except BaseException:
+                pass
             raise
         self.close()
         return result
@@ -676,17 +775,31 @@ class ManagedProcess:
         self.close()
 
     def wait(self, timeout: float | None = None) -> int:
-        tree = _windows_tree_identities(self.token.identity.pid)
+        tree = self._owned_tree_identities()
         returncode = int(self.process.wait(timeout=timeout))
         self.close()
         _wait_for_identities_exit(tree)
         return returncode
 
+    def owned_tree_active(self) -> bool:
+        """Whether the retained ownership boundary still has live members."""
+        if os.name == "nt" and self._job is not None:
+            return bool(self._job.active_process_ids())
+        return self.process.poll() is None
+
+    def _owned_tree_identities(self) -> list[ProcessIdentity]:
+        if os.name == "nt" and self._job is not None:
+            try:
+                return self._job.active_identities()
+            except OSError:
+                pass
+        return _windows_tree_identities(self.token.identity.pid)
+
     def close(self) -> None:
         with self._close_lock:
             if self._job is None:
                 return
-            tree = _windows_tree_identities(self.token.identity.pid)
+            tree = self._owned_tree_identities()
             self._job.close()
             _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
             self._job = None
@@ -745,18 +858,44 @@ class ManagedAsyncProcess:
         self.process = process
         self.token = token
         self._job = job
+        self._close_lock = threading.Lock()
 
     def terminate(self) -> None:
-        terminate(self.token, job=self._job)
+        # Match asyncio.subprocess.Process.terminate: initiate graceful
+        # cancellation and return immediately so the event loop can enforce
+        # its own timeout and escalation policy.
+        if self.token.identity.started_at == "test-double":
+            terminator = getattr(self.process, "terminate", None)
+            if callable(terminator):
+                terminator()
+            return
+        if os.name == "nt" and self._job is not None:
+            try:
+                _send_windows_break(self.token.pgid)
+            except OSError:
+                pass
+            return
+        if os.name == "posix" and identity_matches(self.token.identity):
+            try:
+                os.killpg(self.token.pgid or self.token.identity.pid, signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+            return
+        terminate(self.token, grace_seconds=0)
 
     def kill(self) -> None:
-        if self._job is not None and identity_matches(self.token.identity):
+        if self.token.identity.started_at == "test-double":
+            killer = getattr(self.process, "kill", None)
+            if callable(killer):
+                killer()
+            return
+        if self._job is not None:
             self._job.terminate()
         else:
-            terminate(self.token, grace_seconds=0, job=self._job)
+            terminate(self.token, grace_seconds=0)
 
     async def wait(self) -> int:
-        tree = _windows_tree_identities(self.token.identity.pid)
+        tree = self._owned_tree_identities()
         returncode = int(await self.process.wait())
         self.close()
         if tree:
@@ -764,27 +903,49 @@ class ManagedAsyncProcess:
         return returncode
 
     async def communicate(self, input: bytes | None = None) -> tuple[bytes | None, bytes | None]:
+        if os.name == "nt" and self._job is not None:
+            asyncio.create_task(self._close_job_after_leader())
         try:
             result = await self.process.communicate(input)
         except BaseException:
             try:
                 self.kill()
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
-            except (OSError, asyncio.TimeoutError):
+            except BaseException:
                 pass
-            finally:
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+            except BaseException:
+                pass
+            try:
                 self.close()
+            except BaseException:
+                pass
             raise
         self.close()
         return result
 
+    async def _close_job_after_leader(self) -> None:
+        await self.process.wait()
+        try:
+            self.close()
+        except OSError:
+            pass
+
+    def _owned_tree_identities(self) -> list[ProcessIdentity]:
+        if os.name == "nt" and self._job is not None:
+            try:
+                return self._job.active_identities()
+            except OSError:
+                pass
+        return _windows_tree_identities(self.token.identity.pid)
+
     def close(self) -> None:
-        if self._job is not None:
-            tree = _windows_tree_identities(self.token.identity.pid)
+        with self._close_lock:
+            if self._job is None:
+                return
             _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
             self._job.close()
             self._job = None
-            _wait_for_identities_exit(tree)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.process, name)
@@ -853,7 +1014,15 @@ class ProcessSupervisor:
                 raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
             owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())
             owner = owner or ProcessIdentity(os.getpid(), "unavailable")
-            pgid = 0 if is_test_double else os.getpgid(process.pid) if os.name == "posix" else 0
+            pgid = (
+                0
+                if is_test_double
+                else os.getpgid(process.pid)
+                if os.name == "posix"
+                else process.pid
+                if job is not None
+                else 0
+            )
             payload_identity = identity
             helper_token: SupervisionToken | None = None
             if metadata_path is not None and not is_test_double:
@@ -896,11 +1065,22 @@ class ProcessSupervisor:
                 _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
             self._children.append(managed)
             return managed
-        except Exception:
+        except BaseException:
             if job is not None:
-                job.close()
-            if hasattr(process, "kill"):
-                process.kill()
+                try:
+                    job.terminate()
+                except BaseException:
+                    pass
+                try:
+                    job.close()
+                except BaseException:
+                    pass
+            try:
+                killer = getattr(process, "kill", None)
+                if callable(killer):
+                    killer()
+            except BaseException:
+                pass
             raise
 
     async def spawn_async(self, argv: Sequence[str], **kwargs: Any) -> ManagedAsyncProcess:
@@ -950,12 +1130,24 @@ class ProcessSupervisor:
                     job.close()
                     job = None
             is_test_double = not isinstance(process, asyncio.subprocess.Process)
-            identity = ProcessIdentity(process.pid, "test-double") if is_test_double else inspect_process(process.pid)
+            identity = (
+                ProcessIdentity(int(getattr(process, "pid", os.getpid())), "test-double")
+                if is_test_double
+                else inspect_process(process.pid)
+            )
             if identity is None:
                 raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
             owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())
             owner = owner or ProcessIdentity(os.getpid(), "unavailable")
-            pgid = 0 if is_test_double else os.getpgid(process.pid) if os.name == "posix" else 0
+            pgid = (
+                0
+                if is_test_double
+                else os.getpgid(process.pid)
+                if os.name == "posix"
+                else process.pid
+                if job is not None
+                else 0
+            )
             payload_identity = identity
             helper_token: SupervisionToken | None = None
             if metadata_path is not None and not is_test_double:
@@ -991,11 +1183,25 @@ class ProcessSupervisor:
                 _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
             self._children.append(managed)
             return managed
-        except Exception:
+        except BaseException:
             if job is not None:
-                job.close()
-            process.kill()
-            await process.wait()
+                try:
+                    job.terminate()
+                except BaseException:
+                    pass
+                try:
+                    job.close()
+                except BaseException:
+                    pass
+            try:
+                killer = getattr(process, "kill", None)
+                if callable(killer):
+                    killer()
+                waiter = getattr(process, "wait", None)
+                if callable(waiter):
+                    await asyncio.wait_for(waiter(), timeout=5.0)
+            except BaseException:
+                pass
             raise
 
     def close(self) -> None:
@@ -1012,32 +1218,41 @@ class ProcessSupervisor:
 
 def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _WindowsJob | None = None) -> bool:
     """Revalidate identity, request cancellation, then kill the owned tree."""
-    if not identity_matches(token.identity):
-        return False
-    if job is None and os.name == "nt":
-        job = _LIVE_WINDOWS_JOBS.get((token.identity.pid, token.identity.started_at))
-    tree = _windows_tree_identities(token.payload.pid)
-    request_id = ""
-    control_path: Path | None = None
-    if os.name == "posix":
-        try:
-            os.killpg(token.pgid or token.identity.pid, signal.SIGTERM)
-        except (OSError, ValueError):
-            pass
-    elif token.control_relpath and token.control_nonce:
+    if os.name == "nt":
+        held_job = job or _LIVE_WINDOWS_JOBS.get((token.identity.pid, token.identity.started_at))
+        if held_job is not None:
+            return _terminate_held_windows_job(token, held_job, grace_seconds)
+        # Persisted tokens are not capabilities by themselves. Reopen only the
+        # canonical Job, authenticate the locked helper record, and require its
+        # current exact payload identity to be a live Job member before either
+        # a graceful request or hard termination is permitted.
+        if not identity_matches(token.identity):
+            return False
+        reopened_job = _WindowsJob.open(token.job_name or _windows_job_name(token.token))
+        if reopened_job is None:
+            return False
         request_id = uuid.uuid4().hex
         control_path = _control_path(token.control_relpath)
-        with FileLock(control_path.with_suffix(".lock")):
-            try:
-                state = json.loads(control_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError, TypeError):
-                state = {}
-            if (
-                state.get("supervision_id") == token.token
-                and state.get("nonce") == token.control_nonce
-                and state.get("keeper_identity") == token.identity.to_dict()
-                and state.get("payload_identity") == token.payload.to_dict()
-            ):
+        authenticated_payload: ProcessIdentity | None = None
+        try:
+            with FileLock(control_path.with_suffix(".lock")):
+                try:
+                    state = json.loads(control_path.read_text(encoding="utf-8"))
+                    payload_value = state.get("payload_identity")
+                    if not isinstance(payload_value, dict):
+                        raise ValueError("missing payload identity")
+                    current_payload = ProcessIdentity.from_dict(payload_value)
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    return False
+                if (
+                    state.get("schema") != 2
+                    or state.get("supervision_id") != token.token
+                    or state.get("nonce") != token.control_nonce
+                    or state.get("keeper_identity") != token.identity.to_dict()
+                    or not reopened_job.contains(current_payload)
+                ):
+                    return False
+                authenticated_payload = current_payload
                 state["request"] = {
                     "id": request_id,
                     "operation": "stop",
@@ -1045,43 +1260,179 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
                     "grace_seconds": max(0.0, grace_seconds),
                 }
                 atomic_write_text(control_path, json.dumps(state, sort_keys=True))
+
+            deadline = time.monotonic() + max(0.0, grace_seconds)
+            while time.monotonic() < deadline:
+                if not reopened_job.active_process_ids():
+                    return True
+                try:
+                    state = json.loads(control_path.read_text(encoding="utf-8"))
+                    if state.get("ack") == request_id and not reopened_job.active_process_ids():
+                        return True
+                except (OSError, json.JSONDecodeError, TypeError):
+                    pass
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(0.05, remaining))
+            if not identity_matches(token.identity):
+                # The open Job handle preserves the owned tree if the keeper
+                # vanished, but a changed keeper identity invalidates the
+                # persisted authorization rather than broadening it.
+                return False
+            if authenticated_payload is None or not reopened_job.contains(authenticated_payload):
+                return False
+            identities = reopened_job.active_identities()
+            reopened_job.terminate()
+            return _wait_for_identities_exit(identities) if identities else True
+        except (OSError, ValueError):
+            return False
+        finally:
+            try:
+                reopened_job.close()
+            except OSError:
+                pass
+
+    if not identity_matches(token.identity):
+        return False
+    # Preserve the established POSIX process-group path independently of the
+    # stricter Windows persisted-Job protocol above.
+    tree = _windows_tree_identities(token.payload.pid)
+    try:
+        os.killpg(token.pgid or token.identity.pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
     deadline = time.monotonic() + max(0.0, grace_seconds)
     while time.monotonic() < deadline:
         if not identity_matches(token.identity):
             return _wait_for_identities_exit(tree) if tree else True
-        if control_path is not None and request_id:
-            try:
-                state = json.loads(control_path.read_text(encoding="utf-8"))
-                if state.get("ack") == request_id and not identity_matches(token.payload):
-                    return True
-            except (OSError, json.JSONDecodeError, TypeError):
-                pass
         time.sleep(0.05)
     if not identity_matches(token.identity):
         return _wait_for_identities_exit(tree) if tree else True
-    reopened_job = None
-    if os.name == "nt" and job is None:
-        reopened_job = _WindowsJob.open(token.job_name or _windows_job_name(token.token))
-        job = reopened_job
-        if job is None:
-            # A live payload with no reopenable ownership primitive must never
-            # degrade to signaling a PID (including the helper PID).
-            return False
     try:
-        if os.name == "posix":
-            os.killpg(token.pgid or token.identity.pid, signal.SIGKILL)
-        elif job is not None:
-            job.terminate()
-        else:
-            return False
+        os.killpg(token.pgid or token.identity.pid, signal.SIGKILL)
     except (OSError, ValueError):
-        if reopened_job is not None:
-            reopened_job.close()
         return False
-    result = _wait_for_identities_exit(tree) if tree else True
-    if reopened_job is not None:
-        reopened_job.close()
-    return result
+    return _wait_for_identities_exit(tree) if tree else True
+
+
+def _same_durable_boundary(left: SupervisionToken, right: SupervisionToken) -> bool:
+    return (
+        left.version == right.version == 2
+        and left.mode == right.mode
+        and left.token == right.token
+        and left.identity == right.identity
+        and left.job_name == right.job_name
+        and left.control_relpath == right.control_relpath
+        and left.control_nonce == right.control_nonce
+    )
+
+
+def promote_payload_identity(token: SupervisionToken, candidate: ProcessIdentity) -> SupervisionToken:
+    """Promote a durable payload only after proving canonical Job membership.
+
+    Windows venv and app-execution launchers may exit after creating the real
+    interpreter.  The ready child may identify that interpreter, but its PID is
+    untrusted until the kernel confirms membership in the token's named Job and
+    the locked helper state confirms the same immutable ownership boundary.
+    """
+    if token.version != 2 or token.mode not in {LifetimeMode.ADOPTABLE, LifetimeMode.DETACHED}:
+        raise ValueError("payload promotion requires a durable V2 supervision token")
+    expected_job_name = _windows_job_name(token.token)
+    if token.job_name != expected_job_name:
+        raise ValueError("payload promotion requires the canonical named Job")
+    if not identity_matches(token.identity):
+        raise ProcessLookupError(token.identity.pid)
+    if not identity_matches(candidate):
+        raise ProcessLookupError(candidate.pid)
+
+    job = _WindowsJob.open(expected_job_name)
+    if job is None:
+        raise ValueError("payload promotion requires a live canonical named Job")
+    try:
+        if not job.contains(candidate):
+            raise ValueError("candidate payload is not an active member of the supervised Job")
+        control_path = _control_path(token.control_relpath)
+        metadata_path = durable_metadata_path(token.token)
+        with FileLock(control_path.with_suffix(".lock")):
+            # Revalidate after acquiring the serialization lock. Keeping the
+            # Job handle open also prevents kill-on-close from disappearing in
+            # the middle of the two durable atomic replacements.
+            if not identity_matches(token.identity) or not job.contains(candidate):
+                raise ValueError("supervision identities changed during payload promotion")
+            try:
+                control_text = control_path.read_text(encoding="utf-8")
+                state = json.loads(control_text)
+                metadata_text = metadata_path.read_text(encoding="utf-8")
+                metadata_token = SupervisionToken.from_dict(json.loads(metadata_text))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("payload promotion requires valid durable helper state") from exc
+
+            expected_control = {
+                "schema": 2,
+                "supervision_id": token.token,
+                "nonce": token.control_nonce,
+                "keeper_identity": token.identity.to_dict(),
+            }
+            if any(state.get(key) != value for key, value in expected_control.items()):
+                raise ValueError("payload promotion control record does not match")
+            if state.get("request"):
+                raise ValueError("payload promotion refused while stop is pending")
+            if not _same_durable_boundary(token, metadata_token):
+                raise ValueError("payload promotion metadata does not match")
+
+            # Either file may already contain the candidate if a prior process
+            # died between the two atomic replacements. Accept only the exact
+            # old-or-new identities, then converge both files while locked.
+            old_payload = token.payload.to_dict()
+            new_payload = candidate.to_dict()
+            if state.get("payload_identity") not in (old_payload, new_payload):
+                raise ValueError("payload promotion control identity does not match")
+            if metadata_token.payload.to_dict() not in (old_payload, new_payload):
+                raise ValueError("payload promotion metadata identity does not match")
+
+            promoted = SupervisionToken(
+                token.mode,
+                token.identity,
+                token.owner_pid,
+                token.owner_started_at,
+                token.token,
+                token.pgid,
+                candidate,
+                version=token.version,
+                job_name=token.job_name,
+                control_relpath=token.control_relpath,
+                control_nonce=token.control_nonce,
+            )
+            promoted_metadata = SupervisionToken(
+                metadata_token.mode,
+                metadata_token.identity,
+                metadata_token.owner_pid,
+                metadata_token.owner_started_at,
+                metadata_token.token,
+                metadata_token.pgid,
+                candidate,
+                version=metadata_token.version,
+                job_name=metadata_token.job_name,
+                control_relpath=metadata_token.control_relpath,
+                control_nonce=metadata_token.control_nonce,
+            )
+            promoted_state = dict(state)
+            promoted_state["payload_identity"] = new_payload
+            try:
+                atomic_write_text(control_path, json.dumps(promoted_state, sort_keys=True))
+                atomic_write_text(metadata_path, json.dumps(promoted_metadata.to_dict(), sort_keys=True))
+            except Exception:
+                # Best-effort rollback for ordinary I/O failures. The
+                # old-or-new convergence rule above handles process death.
+                try:
+                    atomic_write_text(metadata_path, metadata_text)
+                    atomic_write_text(control_path, control_text)
+                except OSError:
+                    pass
+                raise
+            return promoted
+    finally:
+        job.close()
 
 
 def adopt(token: SupervisionToken) -> SupervisionToken:
@@ -1133,6 +1484,32 @@ def adopt(token: SupervisionToken) -> SupervisionToken:
     return adopted
 
 
+def _stabilize_windows_payload_identity(child: ManagedProcess, timeout: float = 0.2) -> ProcessIdentity:
+    """Resolve a fast-exiting launcher shim to the oldest remaining Job member."""
+    initial = child.token.identity
+    if child._job is None:
+        return initial
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not identity_matches(initial):
+            try:
+                members = child._job.active_identities()
+            except OSError:
+                return initial
+            if not members:
+                return initial
+
+            def creation_key(identity: ProcessIdentity) -> tuple[int, str, int]:
+                try:
+                    return (0, f"{int(identity.started_at):020d}", identity.pid)
+                except ValueError:
+                    return (1, identity.started_at, identity.pid)
+
+            return min(members, key=creation_key)
+        time.sleep(0.01)
+    return initial
+
+
 def _durable_helper(
     metadata_path: Path,
     supervision_id: str,
@@ -1144,6 +1521,7 @@ def _durable_helper(
     """Own one Windows Job for the full lifetime of a durable payload."""
     with ProcessSupervisor(LifetimeMode.RUN_OWNED, supervision_id=supervision_id) as supervisor:
         child = supervisor.spawn(argv)
+        payload = _stabilize_windows_payload_identity(child)
         keeper = inspect_process(os.getpid())
         if keeper is None:
             raise RuntimeError("Could not inspect durable supervisor identity")
@@ -1153,7 +1531,7 @@ def _durable_helper(
             0,
             "",
             supervision_id,
-            payload_identity=child.token.identity,
+            payload_identity=payload,
             job_name=child.token.job_name,
             control_relpath=control_relpath,
             control_nonce=control_nonce,
@@ -1171,7 +1549,10 @@ def _durable_helper(
         with FileLock(control_path.with_suffix(".lock")):
             atomic_write_text(control_path, json.dumps(state, sort_keys=True))
         atomic_write_text(metadata_path, json.dumps(token.to_dict()))
-        while child.poll() is None:
+        # A Windows launcher shim may exit while its real interpreter remains
+        # an active Job member. The helper owns the Job, not just Popen.pid, so
+        # it must stay alive until the kernel says the entire Job is empty.
+        while child.owned_tree_active():
             request_id = ""
             with FileLock(control_path.with_suffix(".lock")):
                 try:
