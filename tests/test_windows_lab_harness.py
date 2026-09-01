@@ -77,6 +77,8 @@ def test_windows_lab_has_complete_controller_surface() -> None:
 
     assert "reset_lab \"$LAB_BASELINE\"" in controller
     assert 'require_free_space "$STATE_ROOT"' in controller
+    assert 'local timeout="${LAB_SHUTDOWN_TIMEOUT_SECONDS:-600}"' in controller
+    assert 'vm_running || break' in controller
     assert 'local keep="${LAB_PROOF_TRASH_KEEP:-1}"' in controller
     assert 'trash_keep="$(proof_trash_keep)"' in controller
     assert 'proof_trash_retention "$trash_keep" apply' in controller
@@ -174,6 +176,7 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     ]
     assert "require_stopped" in retention
     env_example = (LAB_ROOT / "lab.env.example").read_text(encoding="utf-8")
+    assert "LAB_SHUTDOWN_TIMEOUT_SECONDS=600" in env_example
     assert "LAB_PROOF_TRASH_KEEP=1" in env_example
     proof_run = controller[
         controller.index("run_proof() {") : controller.index('command="${1:-help}"')

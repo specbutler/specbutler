@@ -152,6 +152,11 @@ unknown entries, symlinks, nested mounts, or an unavailable or ambiguous Docker
 state query. Sanitized evidence and raw collected logs are outside the overlay
 trash and are not affected.
 
+Clean shutdown allows 600 seconds by default because Windows may need more than
+three minutes even when it exits successfully. Set the positive integer
+`LAB_SHUTDOWN_TIMEOUT_SECONDS` in `lab.env` to tune that fail-closed deadline;
+the controller never resets or prunes after an unconfirmed shutdown.
+
 Provisioning uses the administrative SSH control plane. Interactive proof jobs
 use the logged-on account's filtered, non-elevated token and fail unless they are
 in a real desktop session; this matches the documented day-to-day Windows tier.

@@ -50,6 +50,12 @@ require_free_space() {
     fi
 }
 
+shutdown_timeout_seconds() {
+    local timeout="${LAB_SHUTDOWN_TIMEOUT_SECONDS:-600}"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "LAB_SHUTDOWN_TIMEOUT_SECONDS must be a positive integer"
+    printf '%s\n' "$timeout"
+}
+
 load_config() {
     test -f "$CONFIG_FILE" || die "copy lab.env.example to lab.env and fill every placeholder"
     set -a
@@ -273,9 +279,17 @@ wait_ssh() {
 shutdown_lab() {
     vm_running || return 0
     guest_ssh 'Stop-Computer -Force' || true
-    local deadline=$((SECONDS + 180))
+    local timeout deadline
+    timeout="$(shutdown_timeout_seconds)"
+    deadline=$((SECONDS + timeout))
     while vm_running; do
-        (( SECONDS < deadline )) || die "the guest did not power off within three minutes"
+        if (( SECONDS >= deadline )); then
+            # Avoid declaring failure at the same polling boundary at which
+            # QEMU is completing an otherwise clean guest shutdown.
+            sleep 5
+            vm_running || break
+            die "the guest did not power off within $timeout seconds"
+        fi
         sleep 3
     done
     compose down --timeout 30
