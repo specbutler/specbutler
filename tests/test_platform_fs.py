@@ -306,6 +306,10 @@ def test_installed_wheel_read_only_cli_smoke(tmp_path: Path) -> None:
     target = tmp_path / "installed"
     subprocess.run([sys.executable, "-m", "pip", "install", "--target", str(target), str(wheel)], check=True)
     env = os.environ.copy()
+    # The root conftest points SPEC_CONFIG at a synthetic POSIX path so unit
+    # tests use defaults. An installed CLI subprocess must instead observe the
+    # same environment a real Windows user gets outside a repository.
+    env.pop("SPEC_CONFIG", None)
     env["PYTHONPATH"] = str(target)
     outside_repo = tmp_path / "outside"
     outside_repo.mkdir()

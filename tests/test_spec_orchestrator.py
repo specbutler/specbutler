@@ -33314,9 +33314,8 @@ class TestCodexIsolatedHomeRequiresAuthCopy:
             backend_explicit=False,
         )
 
-    def test_returns_false_for_worktree_backend(self):
-        """WorktreeExecutionBackend launches the agent as a host subprocess —
-        an absolute auth.json symlink resolves correctly, no copy needed."""
+    def test_worktree_backend_copies_auth_only_on_native_windows(self):
+        """Host worktrees avoid privileged Windows symlinks."""
 
         class _Fake:
             pass
@@ -33324,17 +33323,21 @@ class TestCodexIsolatedHomeRequiresAuthCopy:
         _Fake.__name__ = "WorktreeExecutionBackend"
         fake = _Fake()
         fake.identity = self._identity("container")
-        assert orch._codex_isolated_home_requires_auth_copy(fake) is False
+        assert orch._codex_isolated_home_requires_auth_copy(fake) is (
+            sys.platform == "win32"
+        )
 
-    def test_returns_false_for_local_backend(self):
-        """Non-container identities never bind-mount; the symlink works."""
+    def test_local_backend_copies_auth_only_on_native_windows(self):
+        """Local host launches avoid privileged Windows symlinks."""
 
         class _Fake:
             pass
 
         fake = _Fake()
         fake.identity = self._identity("local")
-        assert orch._codex_isolated_home_requires_auth_copy(fake) is False
+        assert orch._codex_isolated_home_requires_auth_copy(fake) is (
+            sys.platform == "win32"
+        )
 
     def test_returns_true_for_container_backend(self):
         """ContainerExecutionBackend bind-mounts the worktree but not the user
