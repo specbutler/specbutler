@@ -264,7 +264,7 @@ def evaluate_review_gate(
         )
 
     try:
-        raw_text = input_path.read_text()
+        raw_text = input_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return _build_failed_evaluation(
             summary=f"Could not read review output artifact: {input_path} ({exc})",

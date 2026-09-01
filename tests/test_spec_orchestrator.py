@@ -5560,6 +5560,7 @@ class TestReviewWorktreeBootstrap:
 
         def popen(argv, **kwargs):
             captured["argv"] = argv
+            captured.update(kwargs)
             return Process()
 
         with (
@@ -5579,6 +5580,8 @@ class TestReviewWorktreeBootstrap:
 
         assert warning == ""
         assert captured["argv"] == ["sh", "-lc", "echo ok"]
+        assert captured["encoding"] == "utf-8"
+        assert captured["errors"] == "replace"
 
     def test_bootstrap_cannot_read_real_home_credentials(self, tmp_path: Path):
         """Stripping named credential env vars is not enough on its own: build
@@ -17425,6 +17428,8 @@ class TestLocalReviewHelpers:
 
         assert result.returncode == -15
         assert "start_new_session" not in spawn_process.call_args.kwargs
+        assert spawn_process.call_args.kwargs["encoding"] == "utf-8"
+        assert spawn_process.call_args.kwargs["errors"] == "replace"
         register_process.assert_called_once()
         prune_processes.assert_called_once_with(repo, worktree)
         payload = json.loads(artifact_paths["process_debug"].read_text())

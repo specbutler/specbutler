@@ -4485,6 +4485,8 @@ def _run_local_review_subprocess(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     proc: subprocess.Popen[str] | None = None
     try:
@@ -18932,6 +18934,8 @@ def _bootstrap_review_worktree(
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                 )
                 try:
                     stdout_text, stderr_text = proc.communicate(
@@ -19188,7 +19192,9 @@ def _run_local_review(
                 expected_base_sha=expected_base_sha,
                 reviewer_agent=review_agent,
             )
-        elif not artifact_paths["raw_review"].is_file() or not artifact_paths["raw_review"].read_text().strip():
+        elif not artifact_paths["raw_review"].is_file() or not artifact_paths[
+            "raw_review"
+        ].read_text(encoding="utf-8", errors="replace").strip():
             _write_failed_local_review_payload(
                 artifact_paths["raw_review"],
                 summary="Missing review output artifact.",

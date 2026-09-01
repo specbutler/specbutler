@@ -14,6 +14,7 @@ from spec_runtime.git_common import (
     is_github_cli_command,
     subprocess_text_kwargs,
 )
+from spec_runtime.review_gate import evaluate_review_gate
 
 
 def test_utf8_cli_detection_accepts_resolved_paths_exe_suffix_and_case() -> None:
@@ -114,3 +115,42 @@ def test_injected_forge_runner_contract_does_not_gain_text_kwargs() -> None:
     assert "encoding" not in captured
     assert "errors" not in captured
     assert "text" not in captured
+
+
+def test_review_gate_replaces_non_utf8_agent_text_without_skipping_schema(
+    tmp_path: Path,
+) -> None:
+    head_sha = "a" * 40
+    base_sha = "b" * 40
+    schema_path = (
+        Path(__file__).resolve().parent.parent
+        / "src"
+        / "spec_runtime"
+        / "templates"
+        / "review-schema.json"
+    )
+    input_path = tmp_path / "review.json"
+    payload = {
+        "schema_version": "v1",
+        "decision": "approved",
+        "summary": "No issues - native review",
+        "reviewed_base_sha": base_sha,
+        "reviewed_head_sha": head_sha,
+        "findings": [],
+        "reviewer_role": "independent-review",
+        "reviewer_agent": "codex",
+        "reviewed_at": "2026-09-01T00:00:00Z",
+    }
+    encoded = json.dumps(payload).encode("utf-8").replace(b" - native", b" \x97 native")
+    input_path.write_bytes(encoded)
+
+    evaluation = evaluate_review_gate(
+        input_path=input_path,
+        schema_path=schema_path,
+        expected_head_sha=head_sha,
+        expected_base_sha=base_sha,
+    )
+
+    assert evaluation.exit_code == 0
+    assert evaluation.result_payload["decision"] == "approved"
+    assert "\ufffd" in evaluation.result_payload["summary"]
