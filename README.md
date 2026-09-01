@@ -370,6 +370,15 @@ your project needs; see [Execution backends](docs/execution-backends.md).
 - Codex implementation and authoring sessions run with workspace-write access
   and network access enabled. Codex local review runs are stricter and use a
   read-only sandbox.
+- Before a local review, `spec` may install the pull-request checkout so the
+  reviewer can run tests. Package build hooks are untrusted, so this review
+  bootstrap runs through Codex's model-free sandbox command with no network,
+  an allowlisted environment, operator-home reads denied, and writes limited
+  to the disposable review worktree. If that sandbox or permission profile is
+  unavailable, `spec` skips installation, records a review-environment warning,
+  and continues with a diff-only review; it never falls back to a direct host
+  install. This boundary requires a current Codex CLI even when Claude is the
+  selected reviewer.
 - Claude sessions run with the Claude sandbox enabled, network access limited
   to a built-in allowlist, and a small denylist for dangerous git commands such
   as force-push and `git reset --hard`.
@@ -379,11 +388,13 @@ your project needs; see [Execution backends](docs/execution-backends.md).
 
 ### Security and trust model
 
-`spec` is an automation tool for repositories you trust, not a sandbox for
-hostile code. Specs, agent output, and repository-defined bootstrap, setup,
-teardown, and verify commands can execute code. Review changes from untrusted
-contributors before launching a run against them, and do not expose the web
-operator interface as a public service.
+`spec` is an automation tool for repositories you trust, not a general sandbox
+for hostile code. Specs, agent output, and repository-defined implementation
+bootstrap, setup, teardown, and verify commands can execute code. The isolated
+local-review bootstrap described above is a narrow exception; it does not make
+the rest of a run safe for an untrusted repository. Review changes from
+untrusted contributors before launching a run against them, and do not expose
+the web operator interface as a public service.
 
 Forge credentials and merge operations stay in the host orchestrator; they are
 not intentionally copied into worker images or non-interactive agent MCP

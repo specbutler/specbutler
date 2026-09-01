@@ -149,9 +149,12 @@ def test_cmd_hook_metadata_requires_environment_or_direct_argv() -> None:
 
 def test_cmd_launch_materializes_and_removes_batch_file(tmp_path: Path) -> None:
     command = CommandSpec("script", '"C:\\Program Files\\tool.exe" "path with space"', "cmd")
-    with command.launch_argv(cwd=tmp_path, windows=True) as argv:
+    batch_dir = tmp_path / "sandbox-write-root"
+    batch_dir.mkdir()
+    with command.launch_argv(cwd=tmp_path, windows=True, temp_dir=batch_dir) as argv:
         assert argv[:3] == ["cmd.exe", "/d", "/c"]
         script_path = Path(argv[3])
+        assert script_path.parent == batch_dir
         assert script_path.suffix == ".cmd"
         assert script_path.read_text().strip() == str(command.value)
         assert str(command.value) not in argv

@@ -16,6 +16,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -40,6 +41,10 @@ from spec_runtime.control_plane import save_run_lease
 from spec_runtime.control_plane.lease import build_lease
 from spec_runtime.coordination import CoordinatorError, CoordinatorLeaseConflictError
 from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+from spec_runtime.review_bootstrap import (
+    PreparedReviewBootstrapSandbox,
+    build_review_bootstrap_environment,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -5418,6 +5423,33 @@ class TestBootstrapGuards:
 class TestReviewWorktreeBootstrap:
     """Bootstrap of the local review worktree before launching the reviewer."""
 
+    @pytest.fixture(autouse=True)
+    def _hermetic_sandbox_boundary(self, monkeypatch: pytest.MonkeyPatch):
+        """Keep command-behavior tests independent of the installed Codex CLI.
+
+        Enforcement and fail-closed construction are covered in the dedicated
+        review-bootstrap boundary tests. These tests exercise orchestration,
+        environment contents, timeout handling, and warning artifacts.
+        """
+
+        @contextmanager
+        def passthrough(review_worktree: Path, command_argv: list[str]):  # noqa: ARG001
+            runtime_root = Path(
+                tempfile.mkdtemp(prefix=".spec-review-bootstrap-test-", dir=review_worktree)
+            )
+            env = build_review_bootstrap_environment(
+                inherited_env=os.environ,
+                runtime_root=runtime_root,
+                codex_home=runtime_root / "codex-home",
+                windows=os.name == "nt",
+            )
+            try:
+                yield PreparedReviewBootstrapSandbox((), env, runtime_root)
+            finally:
+                shutil.rmtree(runtime_root, ignore_errors=True)
+
+        monkeypatch.setattr(orch, "isolated_review_bootstrap_sandbox", passthrough)
+
     @staticmethod
     def _config_with_install(
         command: str,
@@ -5608,6 +5640,44 @@ class TestReviewWorktreeBootstrap:
         payload = json.loads(warning_path.read_text())
         assert "boom: build hook failed" in payload["command"]
         assert "boom: build hook failed" in payload["detail"]
+
+    def test_unavailable_security_boundary_skips_command_and_records_diff_only_warning(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        worktree = tmp_path / "review-worktree"
+        worktree.mkdir()
+        warning_path = tmp_path / "warning.json"
+
+        @contextmanager
+        def unavailable(review_worktree: Path, command_argv: list[str]):  # noqa: ARG001
+            raise orch.ReviewBootstrapSandboxUnavailable("native sandbox setup is unavailable")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(orch, "isolated_review_bootstrap_sandbox", unavailable)
+        with (
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    "echo must-not-run",
+                    windows_argv=(sys.executable, "-c", "raise AssertionError('must not run')"),
+                ),
+            ),
+            patch.object(orch.ProcessSupervisor, "spawn") as spawn,
+        ):
+            warning = orch._bootstrap_review_worktree(
+                tmp_path / "repo",
+                worktree,
+                warning_path=warning_path,
+            )
+
+        assert "enforceable sandbox is unavailable" in warning
+        spawn.assert_not_called()
+        payload = json.loads(warning_path.read_text())
+        assert payload["summary"] == warning
+        assert payload["detail"] == "native sandbox setup is unavailable"
 
     def test_records_warning_on_timeout(self, tmp_path: Path):
         worktree = tmp_path / "review-worktree"

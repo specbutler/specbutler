@@ -123,6 +123,10 @@ from .process_supervisor import (
     terminate_legacy_process_group,
 )
 from .process_supervisor import run as run_supervised
+from .review_bootstrap import (
+    ReviewBootstrapSandboxUnavailable,
+    isolated_review_bootstrap_sandbox,
+)
 from .spec_identity import (
     SPEC_ID_RE,
     authoring_branch_identity,
@@ -18634,18 +18638,15 @@ def _bootstrap_review_worktree(
     (and anything it references) is attacker-controlled. The bootstrap command
     is therefore sourced from trusted configuration — the orchestrator host's
     own ``SPEC_RUNTIME_CONFIG`` (loaded from the base checkout), never the tree
-    under review — and it runs with review-scoped credentials stripped (see
-    ``_build_local_review_env``). Even so, ``pip install -e .`` executes the PR
-    head's build hooks, so this is treated as untrusted code execution.
+    under review. Even so, ``pip install -e .`` executes the PR head's build
+    hooks, so this is hostile code rather than an ordinary trusted setup step.
 
-    Stripping named credential *env vars* (forge tokens, agent auth keys) is
-    not sufficient on its own: build hooks run as the same OS user with the
-    same ``$HOME``, so they can read credential files straight off disk
-    (``~/.ssh``, ``~/.codex/auth.json``, ``~/.aws/credentials``, ``~/.netrc``,
-    ``~/.config/gh``, ...) regardless of which env vars are set. So the
-    bootstrap subprocess additionally gets an isolated, empty ``HOME`` (and
-    the credential-path overrides that could point back at the real one) for
-    the duration of the install command, then the temp dir is removed.
+    Environment scrubbing, a temporary profile, chmod, and process supervision
+    are not filesystem security boundaries. The command therefore runs only
+    through :func:`isolated_review_bootstrap_sandbox`, with write access scoped
+    to this temporary review worktree, minimal system reads, operator-home
+    reads denied, and network disabled. If that policy cannot be enforced, the
+    command is not run at all.
 
     Bootstrap is best-effort: on failure (or timeout) the failure is recorded as
     a review-environment warning and the empty string is returned so review
@@ -18667,50 +18668,6 @@ def _bootstrap_review_worktree(
     if SPEC_RUNTIME_CONFIG.bootstrap_install.select() is None:
         install_display = str(SPEC_RUNTIME_CONFIG.bootstrap_install_command).strip()
 
-    # Credentials stripped (no forge tokens) — reuse the hardened env the
-    # reviewer subprocess runs with, then additionally drop the portable agent
-    # auth keys. The reviewer subprocess legitimately keeps those (it launches
-    # an agent), but the bootstrap runs the PR head's untrusted build hooks
-    # (``pip install -e .``), so it must not inherit any agent auth.
-    env = _build_local_review_env()
-    for key in _CLAUDE_PORTABLE_AUTH_ENV_KEYS:
-        env.pop(key, None)
-
-    isolated_home = tempfile.mkdtemp(prefix="spec-review-bootstrap-home-")
-    env["HOME"] = isolated_home
-    if os.name == "nt":
-        # Windows-native tools commonly ignore HOME and resolve credentials
-        # through USERPROFILE / APPDATA instead.  Point every standard profile
-        # root at the same disposable directory so an untrusted build backend
-        # cannot discover the operator's real profile through platform APIs.
-        isolated_profile = Path(isolated_home)
-        roaming = isolated_profile / "AppData" / "Roaming"
-        local = isolated_profile / "AppData" / "Local"
-        roaming.mkdir(parents=True, exist_ok=True)
-        local.mkdir(parents=True, exist_ok=True)
-        drive, tail = os.path.splitdrive(str(isolated_profile))
-        env["USERPROFILE"] = str(isolated_profile)
-        env["APPDATA"] = str(roaming)
-        env["LOCALAPPDATA"] = str(local)
-        if drive:
-            env["HOMEDRIVE"] = drive
-            env["HOMEPATH"] = tail or "\\"
-        else:
-            env.pop("HOMEDRIVE", None)
-            env.pop("HOMEPATH", None)
-    for key in (
-        "CODEX_HOME",
-        "NETRC",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_DATA_HOME",
-        "AWS_SHARED_CREDENTIALS_FILE",
-        "AWS_CONFIG_FILE",
-        "DOCKER_CONFIG",
-        "KUBECONFIG",
-    ):
-        env.pop(key, None)
-
     def _record_warning(summary: str, detail: str) -> str:
         payload = {
             "recorded_at": _now_iso(),
@@ -18731,21 +18688,20 @@ def _bootstrap_review_worktree(
         )
         return summary
 
-    # The install command is untrusted PR-head code (build hooks can fork
-    # children that outlive the shell, e.g. a detached PEP 517 build
-    # backend). Run it in its own process group and, on timeout, kill the
-    # whole group — killing only the ``sh`` process (as a plain
-    # ``subprocess.run(..., timeout=...)`` would) leaves those descendants
-    # holding the stdout/stderr pipes open, so draining them to EOF after
-    # the kill blocks forever and defeats the timeout entirely.
+    # The outer sandbox launcher remains supervised as one owned process tree:
+    # build hooks can fork descendants that outlive their immediate parent and
+    # keep stdout/stderr open after a timeout.
     try:
-        try:
-            launch_argv = install_command.launch_argv(cwd=review_worktree)
-            with launch_argv as argv:
+        launch_argv = install_command.launch_argv(
+            cwd=review_worktree,
+            temp_dir=review_worktree,
+        )
+        with launch_argv as argv:
+            with isolated_review_bootstrap_sandbox(review_worktree, argv) as sandbox:
                 proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
-                    argv,
+                    sandbox.wrap(argv),
                     cwd=review_worktree,
-                    env=env,
+                    env=sandbox.env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -18762,22 +18718,26 @@ def _bootstrap_review_worktree(
                         "tests (falling back to diff-only review).",
                         f"Timed out after {REVIEW_BOOTSTRAP_TIMEOUT_SECONDS:.0f}s",
                     )
-        except OSError as exc:
-            return _record_warning(
-                "Review worktree bootstrap could not be launched; reviewer may not be "
-                "able to run tests (falling back to diff-only review).",
-                str(exc),
-            )
-        if proc.returncode != 0:
-            detail = (stderr_text or "").strip() or (stdout_text or "").strip()
-            return _record_warning(
-                "Review worktree bootstrap failed; reviewer may not be able to run "
-                "tests (falling back to diff-only review).",
-                detail or f"exit_code={proc.returncode}",
-            )
-        return ""
-    finally:
-        remove_tree(isolated_home, ignore_errors=True)
+    except ReviewBootstrapSandboxUnavailable as exc:
+        return _record_warning(
+            "Review worktree bootstrap skipped because an enforceable sandbox is unavailable; "
+            "continuing with diff-only review.",
+            str(exc),
+        )
+    except OSError as exc:
+        return _record_warning(
+            "Review worktree bootstrap could not be launched; reviewer may not be "
+            "able to run tests (falling back to diff-only review).",
+            str(exc),
+        )
+    if proc.returncode != 0:
+        detail = (stderr_text or "").strip() or (stdout_text or "").strip()
+        return _record_warning(
+            "Review worktree bootstrap failed; reviewer may not be able to run "
+            "tests (falling back to diff-only review).",
+            detail or f"exit_code={proc.returncode}",
+        )
+    return ""
 
 
 def _review_env_prompt_note(

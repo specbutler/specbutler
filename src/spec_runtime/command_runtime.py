@@ -104,6 +104,7 @@ class CommandSpec:
         which: Callable[[str], str | None] = shutil.which,
         windows: bool | None = None,
         arguments: tuple[str, ...] = (),
+        temp_dir: Path | None = None,
     ) -> Iterator[list[str]]:
         """Materialize any launch-only resources and yield the process argv.
 
@@ -119,7 +120,11 @@ class CommandSpec:
         if arguments:
             # Keep the targeted configuration error from argv().
             self.argv(which=which, windows=windows, arguments=arguments)
-        fd, raw_path = tempfile.mkstemp(prefix="spec-command-", suffix=".cmd")
+        fd, raw_path = tempfile.mkstemp(
+            prefix="spec-command-",
+            suffix=".cmd",
+            dir=temp_dir,
+        )
         script_path = Path(raw_path)
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n") as handle:
