@@ -243,7 +243,11 @@ def test_required_claude_without_sandbox_dependencies_is_blocked(
     check = _checks_by_name(report)["agent runtime (claude)"]
     assert check.status == "error"
     assert "bubblewrap" in " ".join(check.remediation)
-    assert "socat" in check.detail
+    if sys.platform == "win32":
+        assert "host sandbox is not supported" in check.detail
+        assert "socat" in " ".join(check.remediation)
+    else:
+        assert "socat" in check.detail
     assert report.exit_code == 1
 
 

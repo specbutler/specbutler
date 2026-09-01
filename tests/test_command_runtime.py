@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -151,6 +152,7 @@ def test_missing_declared_powershell_is_targeted() -> None:
         command.argv(which=lambda _name: None, windows=True)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires a POSIX shell")
 def test_sh_hook_metadata_starts_at_one_in_real_process(tmp_path: Path) -> None:
     output = tmp_path / "hook metadata.json"
     command = CommandSpec(
@@ -169,6 +171,28 @@ def test_sh_hook_metadata_starts_at_one_in_real_process(tmp_path: Path) -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(output.read_text()) == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows PowerShell")
+def test_powershell_hook_metadata_is_available_in_real_process(tmp_path: Path) -> None:
+    output = tmp_path / "hook metadata.json"
+    command = CommandSpec(
+        "script",
+        "$values = @($args | Select-Object -Skip 1); "
+        "[IO.File]::WriteAllText($args[0], "
+        "(ConvertTo-Json -Compress -InputObject $values))",
+        "powershell",
+    )
+    expected = ["spec-id", "run-id", "path with space"]
+    completed = subprocess.run(
+        command.argv(arguments=(str(output), *expected)),
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output.read_text(encoding="utf-8-sig")) == expected
 
 
 def shlex_quote(value: str) -> str:
