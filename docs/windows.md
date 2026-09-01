@@ -85,6 +85,14 @@ command = '.venv\Scripts\python.exe -m pytest'
 parallel = true
 ```
 
+The implementation bootstrap may download dependencies. The same command is
+also attempted before local review inside Codex's model-free sandbox, where
+network access and operator-profile reads are deliberately denied. If the
+command requires a package download, Spec Butler records a review-environment
+warning and continues with a diff-only review. To let the reviewer run tests,
+make the bootstrap satisfiable from already installed packages or a trusted
+local wheel/cache; do not enable network access for the review sandbox.
+
 Run a small spec manually before enabling unattended dispatch:
 
 ```powershell
