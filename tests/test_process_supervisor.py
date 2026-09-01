@@ -7,6 +7,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -628,6 +629,43 @@ def test_current_process_retirement_requires_exact_claim(
     assert process_supervisor._retire_current_process_control(token, control_path)
     assert not control_path.exists()
     assert not control_path.with_suffix(".lock").exists()
+
+
+def test_current_process_claim_quiesces_monitor_before_retirement(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        ProcessIdentity(os.getpid(), "current-start", sys.executable),
+        os.getpid(),
+        "current-start",
+        "quiesce-current-monitor",
+    )
+    control_path = tmp_path / "control.json"
+    monitor_stop = threading.Event()
+    calls: list[object] = []
+
+    class MonitorThread:
+        def join(self, *, timeout: float) -> None:
+            calls.append(("join", timeout, monitor_stop.is_set()))
+
+    monkeypatch.setattr(
+        process_supervisor,
+        "_retire_current_process_control",
+        lambda candidate, path: calls.append(("retire", candidate, path)) or True,
+    )
+
+    assert process_supervisor._retire_current_process_claim(
+        token,
+        control_path,
+        monitor_stop,
+        MonitorThread(),  # type: ignore[arg-type]
+    )
+    assert calls == [
+        ("join", 1.0, True),
+        ("retire", token, control_path),
+    ]
 
 
 def test_detached_durable_token_publication_is_opt_in(

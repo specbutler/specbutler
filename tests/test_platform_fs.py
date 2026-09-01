@@ -84,7 +84,7 @@ def test_atomic_write_text_uses_bounded_temp_basename(
     assert json.loads(read_path.read_text()) == {"version": 2}
     assert len(replaced_from) == 2
     for temporary in replaced_from:
-        assert temporary.parent == path.parent
+        assert temporary.parent == read_path.parent
         assert path.name not in temporary.name
         assert len(temporary.name) <= 32
 

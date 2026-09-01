@@ -1398,7 +1398,11 @@ def _ensure_control_state_reconciled() -> None:
 def _retire_current_process_control(token: SupervisionToken, control_path: Path) -> bool:
     """Remove an exact current-process claim during normal interpreter exit."""
     try:
-        if token.identity.pid != os.getpid() or not identity_matches(token.identity):
+        # The callback and its unguessable nonce live in the claiming process.
+        # Re-inspecting that same process during interpreter teardown adds no
+        # PID-reuse protection and can fail transiently as Windows dismantles
+        # process state before running every Python exit hook.
+        if token.identity.pid != os.getpid():
             return False
         # Avoid creating a new lock file when a newer claim's atexit callback
         # already retired this shared supervision ID.
@@ -1430,6 +1434,23 @@ def _retire_current_process_control(token: SupervisionToken, control_path: Path)
         return removed
     except BaseException:
         return False
+
+
+def _retire_current_process_claim(
+    token: SupervisionToken,
+    control_path: Path,
+    monitor_stop: threading.Event,
+    monitor_thread: threading.Thread,
+) -> bool:
+    """Quiesce the monitor before deleting its Windows control record."""
+    monitor_stop.set()
+    if monitor_thread is not threading.current_thread():
+        # The monitor performs only bounded Win32 identity queries and local
+        # file operations.  Joining prevents its read handle from racing the
+        # control-file unlink on Windows, while the timeout keeps interpreter
+        # shutdown fail-safe if an unexpected platform call stalls.
+        monitor_thread.join(timeout=1.0)
+    return _retire_current_process_control(token, control_path)
 
 
 def _establish_current_posix_process_group() -> int:
@@ -1514,8 +1535,10 @@ def claim_current_process(supervision_id: str) -> SupervisionToken:
     with FileLock(control_path.with_suffix(".lock")):
         atomic_write_text(control_path, json.dumps(state, sort_keys=True))
 
+    monitor_stop = threading.Event()
+
     def monitor() -> None:
-        while identity_matches(identity):
+        while not monitor_stop.is_set() and identity_matches(identity):
             try:
                 current = json.loads(control_path.read_text(encoding="utf-8"))
                 request = current.get("request")
@@ -1541,13 +1564,25 @@ def claim_current_process(supervision_id: str) -> SupervisionToken:
                     return
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
-            time.sleep(0.05)
+            if monitor_stop.wait(0.05):
+                return
 
-    threading.Thread(target=monitor, name=f"spec-stop-{supervision_id}", daemon=True).start()
+    monitor_thread = threading.Thread(
+        target=monitor,
+        name=f"spec-stop-{supervision_id}",
+        daemon=True,
+    )
+    monitor_thread.start()
     # Install retirement after the monitor starts so it is the final lifecycle
     # hook registered by this claim. This ordering matters for short-lived
     # native Windows interpreters and is covered by a subprocess test.
-    atexit.register(_retire_current_process_control, token, control_path)
+    atexit.register(
+        _retire_current_process_claim,
+        token,
+        control_path,
+        monitor_stop,
+        monitor_thread,
+    )
     return token
 
 
