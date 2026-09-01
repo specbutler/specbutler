@@ -290,6 +290,7 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "Expected a single-link file" in console_session
     assert "Assert-TrustedExistingPath" in console_session
     assert "grants write access to an untrusted principal" in console_session
+    assert "FileSystemRights]::DeleteSubdirectoriesAndFiles" in console_session
     assert "'/T' '/C'" not in console_session
     assert "if (-not (Test-Path -LiteralPath $winlogon))" in console_session
     assert "New-Item -Path $winlogon -Force" not in console_session
