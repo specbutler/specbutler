@@ -78,7 +78,7 @@ def classify_pr_head_ref(branch: str, body: str = "") -> str:
 def implementation_branch_identity(branch: str) -> BranchIdentity | None:
     branch = branch.strip()
     code = IMPLEMENTATION_BRANCH_RE.match(branch)
-    if code:
+    if code and SPEC_ID_RE.fullmatch(code.group("spec_id")):
         return BranchIdentity(
             kind="code",
             spec_id=code.group("spec_id"),
@@ -86,7 +86,7 @@ def implementation_branch_identity(branch: str) -> BranchIdentity | None:
         )
 
     task = TASK_BRANCH_RE.match(branch)
-    if task:
+    if task and SPEC_ID_RE.fullmatch(task.group("spec_id")):
         return BranchIdentity(
             kind="task",
             spec_id=task.group("spec_id"),
@@ -94,7 +94,7 @@ def implementation_branch_identity(branch: str) -> BranchIdentity | None:
         )
 
     specrun = SPEC_RUN_BRANCH_RE.match(branch)
-    if specrun:
+    if specrun and SPEC_ID_RE.fullmatch(specrun.group("spec_id")):
         return BranchIdentity(
             kind="specrun",
             spec_id=specrun.group("spec_id"),
@@ -107,7 +107,7 @@ def implementation_branch_identity(branch: str) -> BranchIdentity | None:
 def authoring_branch_identity(branch: str) -> BranchIdentity | None:
     branch = branch.strip()
     match = SPEC_AUTHORING_BRANCH_RE.match(branch)
-    if match:
+    if match and SPEC_ID_RE.fullmatch(match.group("spec_id")):
         return BranchIdentity(kind="spec", spec_id=match.group("spec_id"))
 
     match = SPEC_AUTHORING_SESSION_BRANCH_RE.match(branch)
@@ -119,7 +119,7 @@ def authoring_branch_identity(branch: str) -> BranchIdentity | None:
         )
 
     match = SPECDOC_BRANCH_RE.match(branch)
-    if not match:
+    if not match or not SPEC_ID_RE.fullmatch(match.group("spec_id")):
         return None
     return BranchIdentity(kind="specdoc", spec_id=match.group("spec_id"))
 
@@ -164,7 +164,8 @@ def extract_spec_id_from_pr_body(body: str) -> str | None:
     match = PR_BODY_SPEC_ID_RE.search(body or "")
     if not match:
         return None
-    return match.group("spec_id")
+    spec_id = match.group("spec_id")
+    return spec_id if SPEC_ID_RE.fullmatch(spec_id) else None
 
 
 def extract_review_owner_from_pr_body(body: str) -> str | None:

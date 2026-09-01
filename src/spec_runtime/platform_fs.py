@@ -78,7 +78,8 @@ class FileLock:
 
     def acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = self.path.open("a+b")
+        descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o666)
+        self.file = os.fdopen(descriptor, "r+b")
         try:
             if _WINDOWS:
                 import msvcrt
@@ -100,6 +101,16 @@ class FileLock:
                             self.file = None
                             return False
                         time.sleep(_DELAYS[0])
+                # Older POSIX lock files stored JSON beginning at byte zero.
+                # Once byte zero is locked, migrate that content behind the
+                # Windows sentinel before callers read or replace metadata.
+                self.file.seek(0)
+                content = self.file.read()
+                if content and not content.startswith(b"\0"):
+                    self.file.seek(0)
+                    self.file.write(b"\0" + content)
+                    self.file.truncate()
+                    self.file.flush()
             else:
                 import fcntl
 

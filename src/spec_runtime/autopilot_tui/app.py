@@ -48,6 +48,7 @@ from spec_runtime.autopilot_tui.dashboard import (  # noqa: F401 — re-exported
 from spec_runtime.config import load_repo_spec_runtime_config
 from spec_runtime.container import container_image_source
 from spec_runtime.platform_fs import remove_tree
+from spec_runtime.spec_identity import SPEC_ID_RE
 from spec_runtime.spec_metadata import iter_spec_metadata
 
 
@@ -1249,6 +1250,8 @@ def _parse_explicit_operator_steering(
         match = re.match(pattern, stripped, flags=re.IGNORECASE | re.DOTALL)
         if match is not None:
             target_spec = match.group(1).strip()
+            if not SPEC_ID_RE.fullmatch(target_spec):
+                return None
             guidance = match.group(2).strip()
             return ChatCommand(name="record_steering", spec_id=target_spec, guidance=guidance)
     if not spec_id:

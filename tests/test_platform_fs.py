@@ -129,6 +129,28 @@ def test_windows_contender_reads_owner_after_locked_byte(monkeypatch: pytest.Mon
     assert owner.command == "spec implement"
 
 
+def test_windows_lock_migrates_legacy_metadata(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from spec_runtime import platform_fs
+
+    path = tmp_path / "legacy.lock"
+    legacy = b'{"pid": 4321, "command": "spec implement"}\n'
+    path.write_bytes(legacy)
+    fake_msvcrt = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=lambda *_args: None)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(platform_fs, "_WINDOWS", True)
+
+    lock = FileLock(path, blocking=False)
+    assert lock.acquire()
+    try:
+        assert path.read_bytes() == b"\0" + legacy
+        assert json.loads(platform_fs.read_lock_metadata(path)) == {
+            "pid": 4321,
+            "command": "spec implement",
+        }
+    finally:
+        lock.release()
+
+
 def test_remove_tree_repairs_read_only_file(tmp_path: Path) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()

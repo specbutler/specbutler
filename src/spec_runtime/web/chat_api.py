@@ -1150,13 +1150,12 @@ async def implement_chat_task(request: Request) -> Response:
 
     # Validate the spec id the same way the CLI does in
     # _resolve_scoped_task_spec / _assert_task_spec_id_is_unambiguous.
-    import re as _re  # noqa: I001
-
     from spec_runtime.orchestrator import (  # noqa: I001
         TASK_SPEC_DIR as _TASK_SPEC_DIR,
         _read_slug_from_spec,
         _specs_root,
     )
+    from spec_runtime.spec_identity import SPEC_ID_RE
 
     wt = Path(session.worktree_path)
     spec_file_for_validation = wt / _TASK_SPEC_DIR / f"{spec_id}.md"
@@ -1171,7 +1170,7 @@ async def implement_chat_task(request: Request) -> Response:
         )
 
     # Must be valid kebab-case
-    if not _re.fullmatch(r"[a-z0-9][a-z0-9-]*", spec_id):
+    if not SPEC_ID_RE.fullmatch(spec_id):
         session.status = "active"
         return _json(
             {"error": f"Task spec id '{spec_id}' is invalid; use lowercase kebab-case."},

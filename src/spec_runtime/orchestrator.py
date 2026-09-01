@@ -110,6 +110,7 @@ from .git_common import resolve_common_root
 from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
 from .spec_identity import (
     SPEC_ID_RE,
+    authoring_branch_identity,
     format_pr_review_owner,
     implementation_branch_identity,
     is_authoring_branch,
@@ -5503,13 +5504,8 @@ def _spec_authoring_session_token_from_branch(branch: str) -> str | None:
 
 
 def _spec_id_from_authoring_branch(branch: str) -> str | None:
-    match = re.fullmatch(
-        rf"{re.escape(SPEC_AUTHORING_BRANCH_PREFIX)}([a-z0-9][a-z0-9-]*)",
-        branch,
-    )
-    if match is None:
-        return None
-    return match.group(1)
+    identity = authoring_branch_identity(branch)
+    return identity.spec_id if identity is not None and identity.kind == "spec" else None
 
 
 def _registered_worktrees(repo_root: Path) -> tuple[list[tuple[Path, str]], str]:
@@ -7324,7 +7320,7 @@ class OrchestratorRequest:
 
     def validate(self) -> list[str]:
         errors = []
-        if not re.match(r"^[a-z0-9][a-z0-9-]*$", self.spec_id):
+        if not SPEC_ID_RE.fullmatch(self.spec_id):
             errors.append(f"Invalid spec_id: {self.spec_id!r}")
         if not re.match(
             (
@@ -13256,7 +13252,7 @@ def _resolve_scoped_task_spec(
         raise RuntimeError(
             f"Task spec file path `{task_spec.name}` does not match frontmatter id `{frontmatter_slug}`."
         )
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", chosen_slug):
+    if not SPEC_ID_RE.fullmatch(chosen_slug):
         raise RuntimeError(f"Task spec id '{chosen_slug}' is invalid; use lowercase kebab-case.")
     _assert_task_spec_id_is_unambiguous(
         repo_root,
@@ -13369,7 +13365,7 @@ def phase_scoping(run: RunState, repo_root: Path) -> str:
 
     # Read slug from the task spec file and rename branch to match.
     chosen_slug = _read_slug_from_spec(scoped_spec) or scoped_spec.stem
-    if chosen_slug and re.fullmatch(r"[a-z0-9][a-z0-9-]*", chosen_slug):
+    if chosen_slug and SPEC_ID_RE.fullmatch(chosen_slug):
         old_branch = run.branch
         # Extract the run token from the current branch.
         # Branch format: task/<spec_id>--<token>

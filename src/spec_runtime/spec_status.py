@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -23,7 +22,7 @@ from pathlib import Path
 
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config, load_spec_runtime_config, resolve_spec_path
 from .git_common import resolve_common_root as _resolve_common_root
-from .spec_identity import implementation_branch_identity, parse_worktree_name
+from .spec_identity import SPEC_ID_RE, implementation_branch_identity, parse_worktree_name
 from .spec_metadata import SpecMetadata, parse_spec_metadata
 
 VALID_STATUSES = ("not-started", "in-progress", "needs-attention", "merged", "obsolete")
@@ -456,7 +455,7 @@ def _collect_orphaned_local_branches(
         identity = implementation_branch_identity(branch)
         if identity:
             spec_id = identity.spec_id
-        elif re.fullmatch(r"[a-z0-9][a-z0-9-]*", branch):
+        elif SPEC_ID_RE.fullmatch(branch):
             spec_id = branch
 
         if not spec_id:
