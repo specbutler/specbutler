@@ -628,9 +628,10 @@ def _windows_command_checks(
     which: ExecutableResolver,
 ) -> list[DoctorCheck]:
     """Validate exactly the typed command variants native Windows will run."""
+    bootstrap_command = config.bootstrap_install.select(windows=True)
     configured: list[tuple[str, CommandSpec | None, str, str]] = [
         (
-            "bootstrap command", config.bootstrap_install.select(windows=True),
+            "bootstrap command", bootstrap_command,
             "[bootstrap]", "install_",
         ),
         (
@@ -680,9 +681,31 @@ def _windows_command_checks(
             continue
         executable = argv[0]
         if _resolve_command_executable(executable, repo_root, which) is None:
-            checks.append(
-                _error(name, f"missing executable: `{executable}`", f"Install it or update `{location}`.")
-            )
+            normalized_executable = executable.replace("\\", "/").casefold()
+            bootstrap_value = ""
+            if bootstrap_command is not None:
+                bootstrap_value = (
+                    " ".join(bootstrap_command.value)
+                    if isinstance(bootstrap_command.value, tuple)
+                    else bootstrap_command.value
+                )
+            bootstrap_value = bootstrap_value.replace("\\", "/").casefold()
+            if (
+                name.startswith("verify command (")
+                and "/" in normalized_executable
+                and normalized_executable in bootstrap_value
+            ):
+                checks.append(
+                    _ok(
+                        name,
+                        f"selected command: {command.display(windows=True)}; "
+                        f"pending bootstrap: {executable}",
+                    )
+                )
+            else:
+                checks.append(
+                    _error(name, f"missing executable: `{executable}`", f"Install it or update `{location}`.")
+                )
         else:
             checks.append(_ok(name, f"selected command: {command.display(windows=True)}"))
     return checks

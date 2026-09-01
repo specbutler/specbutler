@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
-import socket as _socket
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -383,35 +381,29 @@ def test_doctor_warns_when_build_ssh_set_without_agent(tmp_path: Path) -> None:
 
 def test_doctor_passes_when_build_ssh_set_with_agent(tmp_path: Path) -> None:
     sock_path = tmp_path / "agent.sock"
-    server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    try:
-        # AF_UNIX sun_path is capped at 104 bytes on macOS; pytest's tmp_path
-        # can exceed that, so bind via a short relative path from tmp_path.
-        with contextlib.chdir(tmp_path):
-            server.bind("agent.sock")
-        config = _config(
-            execution=ExecutionConfig(
-                backend="container",
-                backend_explicit=True,
-                container=ContainerExecutionConfig(
-                    image="example/spec-worker:latest",
-                    build_ssh="default",
-                ),
-            )
+    sock_path.touch()
+    config = _config(
+        execution=ExecutionConfig(
+            backend="container",
+            backend_explicit=True,
+            container=ContainerExecutionConfig(
+                image="example/spec-worker:latest",
+                build_ssh="default",
+            ),
         )
+    )
 
-        with patch("shutil.which", return_value="/usr/bin/docker"):
-            checks = container.run_doctor_checks(
-                tmp_path,
-                config,
-                runner=FakeRunner(),
-                system_name="Darwin",
-                env={"SSH_AUTH_SOCK": str(sock_path)},
-            )
-    finally:
-        server.close()
-        if sock_path.exists():
-            sock_path.unlink()
+    with (
+        patch("shutil.which", return_value="/usr/bin/docker"),
+        patch.object(container.stat, "S_ISSOCK", return_value=True),
+    ):
+        checks = container.run_doctor_checks(
+            tmp_path,
+            config,
+            runner=FakeRunner(),
+            system_name="Darwin",
+            env={"SSH_AUTH_SOCK": str(sock_path)},
+        )
 
     ssh_check = next(check for check in checks if check.name == "build SSH agent")
     assert ssh_check.ok is True

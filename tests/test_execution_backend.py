@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Sequence
@@ -529,12 +530,16 @@ class TestWorktreeBackend:
         (worktree / "marker.txt").write_text("ok")
         result = backend.run_command(
             eb.CommandRequest(
-                argv=["ls", "marker.txt"],
+                argv=[
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; print(Path('marker.txt').read_text())",
+                ],
                 cwd=worktree,
             )
         )
         assert result.returncode == 0
-        assert "marker.txt" in result.stdout
+        assert result.stdout.strip() == "ok"
 
     def test_cleanup_is_noop(self, tmp_path: Path):
         backend = self._make()
@@ -1178,7 +1183,7 @@ class TestCloneBackend:
         untracked_dir = Path(manifest["artifacts"]["untracked_dir"])
         saved = untracked_dir / "escape_link"
         assert saved.is_symlink()
-        assert os.readlink(saved) == str(outside)
+        assert os.path.samefile(saved, outside)
         # The outside content must not have been copied into the rescue tree.
         assert not any(
             p.is_file() and not p.is_symlink() and "CONTENT FROM OUTSIDE" in p.read_text()
@@ -1397,7 +1402,11 @@ class _FakeContainerRunner:
                 "",
             )
             if snapshot_mount:
-                snapshot_dir = Path(snapshot_mount.split(":", 1)[0])
+                snapshot_dir = Path(
+                    snapshot_mount.removesuffix(
+                        ":/workspace/service-volume-snapshot"
+                    )
+                )
                 snapshot_dir.mkdir(parents=True, exist_ok=True)
                 command = argv[-1]
                 marker = "/workspace/service-volume-snapshot/"
@@ -2737,7 +2746,14 @@ class TestContainerBackend:
         # environments, coincidentally equals the container's internal
         # ``/workspace/source`` working dir and would trip the check).
         host_home = "/host/home/agent"
-        with patch("shutil.which", return_value="/usr/bin/docker"):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch.object(
+                backend,
+                "_container_user_mapping",
+                return_value="1000:1000",
+            ),
+        ):
             handle = backend.prepare_workspace(
                 run_id="my-feature-abc",
                 spec_id="my-feature",
@@ -2746,26 +2762,26 @@ class TestContainerBackend:
                 base_ref="master",
             )
 
-        result = backend.run_command(
-            eb.CommandRequest(
-                argv=["pytest", "-q"],
-                cwd=handle.path,
-                env={
-                    "APP_FEATURE_FLAG": "enabled",
-                    "DATABASE_URL": "postgres://worker-db",
-                    "GH_TOKEN": "forge-secret",
-                    "GITHUB_TOKEN": "forge-secret",
-                    "HOME": host_home,
-                    "OPENAI_API_KEY": "agent-secret",
-                    "PATH": "/host/bin",
-                    "SIM_TEST_DATABASE_URL": "postgres://worker-test",
-                    "SPEC_SECRET_TOKEN": "spec-secret",
-                    "SPEC_TEST": "1",
-                    "TEST_DATABASE_URL": "postgres://worker-test-db",
-                    "TERM": "xterm-256color",
-                },
+            result = backend.run_command(
+                eb.CommandRequest(
+                    argv=["pytest", "-q"],
+                    cwd=handle.path,
+                    env={
+                        "APP_FEATURE_FLAG": "enabled",
+                        "DATABASE_URL": "postgres://worker-db",
+                        "GH_TOKEN": "forge-secret",
+                        "GITHUB_TOKEN": "forge-secret",
+                        "HOME": host_home,
+                        "OPENAI_API_KEY": "agent-secret",
+                        "PATH": "/host/bin",
+                        "SIM_TEST_DATABASE_URL": "postgres://worker-test",
+                        "SPEC_SECRET_TOKEN": "spec-secret",
+                        "SPEC_TEST": "1",
+                        "TEST_DATABASE_URL": "postgres://worker-test-db",
+                        "TERM": "xterm-256color",
+                    },
+                )
             )
-        )
 
         run_call = runner.calls[-1]
         start_call = next(call for call in runner.calls if call[:2] == ["docker", "run"] and "sleep infinity" in call)
@@ -2778,7 +2794,7 @@ class TestContainerBackend:
         assert "--tmpfs" in start_call
         assert "/workspace/source/.spec-state:rw,noexec,nosuid,nodev,mode=1777" in start_call
         assert "--user" in start_call
-        assert start_call[start_call.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
+        assert start_call[start_call.index("--user") + 1] == "1000:1000"
         # Non-agent commands must not see the live completion outbox (fixture
         # tests exercising `spec report` would pollute it) and get HOME pinned
         # to the isolated home instead of the container default.
@@ -3061,7 +3077,14 @@ class TestContainerBackend:
         _init_clone_source(repo)
         runner = _FakeContainerRunner()
         backend = self._make(runner, workspace_mode="bind", system_name="Linux")
-        with patch("shutil.which", return_value="/usr/bin/docker"):
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch.object(
+                backend,
+                "_container_user_mapping",
+                return_value="1000:1000",
+            ),
+        ):
             handle = backend.prepare_workspace(
                 run_id="my-feature-abc",
                 spec_id="my-feature",
@@ -3070,13 +3093,18 @@ class TestContainerBackend:
                 base_ref="master",
             )
 
-        backend.run_command(eb.CommandRequest(argv=["sh", "-lc", "touch out"], cwd=handle.path))
+            backend.run_command(
+                eb.CommandRequest(
+                    argv=["sh", "-lc", "touch out"],
+                    cwd=handle.path,
+                )
+            )
 
         run_call = runner.calls[-1]
         start_call = next(call for call in runner.calls if call[:2] == ["docker", "run"] and "sleep infinity" in call)
         assert run_call[:2] == ["docker", "exec"]
         assert "--user" in start_call
-        assert start_call[start_call.index("--user") + 1] == f"{os.getuid()}:{os.getgid()}"
+        assert start_call[start_call.index("--user") + 1] == "1000:1000"
         assert f"{handle.path}:/workspace/source" in start_call
         assert f"{handle.outbox_path}:/workspace/outbox" in start_call
         assert f"{handle.outbox_path.parent / 'logs'}:/workspace/logs" in start_call

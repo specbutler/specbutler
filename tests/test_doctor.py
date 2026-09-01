@@ -29,12 +29,27 @@ def _config_text(
     worktrees_dir: str = ".worktrees",
     workspace_root: str = ".spec-workspaces",
     bootstrap_command: str = "python -m pip --version",
+    bootstrap_command_windows: str = "",
     verify_command: str = "python -m pytest --version",
+    verify_argv_windows: tuple[str, ...] = (),
     backend: str = "worktree",
     safety_mode: str = "",
     container_block: str = "",
 ) -> str:
     allowed = ", ".join(f'"{agent}"' for agent in allowed_agents)
+    bootstrap_windows = (
+        f'install_command_windows = "{bootstrap_command_windows}"\n'
+        'install_shell_windows = "powershell"\n'
+        if bootstrap_command_windows
+        else ""
+    )
+    verify_windows = (
+        "argv_windows = ["
+        + ", ".join(f'"{item}"' for item in verify_argv_windows)
+        + "]\n"
+        if verify_argv_windows
+        else ""
+    )
     return f"""
 base_ref = "{base_ref}"
 
@@ -48,11 +63,13 @@ allowed = [{allowed}]
 
 [bootstrap]
 install_command = "{bootstrap_command}"
+{bootstrap_windows}
 
 [verify]
 [[verify.gates]]
 name = "test"
 command = "{verify_command}"
+{verify_windows}
 
 [execution]
 backend = "{backend}"
@@ -92,12 +109,15 @@ def _resolver(
     claude: bool = False,
     claude_sandbox: bool = False,
     docker: bool = False,
+    powershell: bool = False,
 ):
     paths = {
         "codex": "/usr/bin/codex",
         "gh": "/usr/bin/gh",
         "python": sys.executable,
     }
+    if powershell:
+        paths["powershell.exe"] = sys.executable
     if claude:
         paths["claude"] = "/usr/bin/claude"
     if claude_sandbox:
@@ -185,6 +205,37 @@ setup_shell = "sh"
     assert setup.status == "error"
     assert "clearly POSIX" in setup.detail
     assert "setup" in " ".join(setup.remediation)
+
+
+def test_windows_command_checks_allow_gate_executable_created_by_bootstrap(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(
+        tmp_path,
+        _config_text(
+            bootstrap_command=(
+                "python -m venv .venv && "
+                ".venv/bin/python -m pip install -e . pytest"
+            ),
+            bootstrap_command_windows=(
+                "python -m venv .venv; "
+                "& ./.venv/Scripts/python.exe -m pip install -e . pytest"
+            ),
+            verify_command=".venv/bin/python -m pytest",
+            verify_argv_windows=(
+                ".venv/Scripts/python.exe",
+                "-m",
+                "pytest",
+            ),
+        ),
+    )
+    config = load_repo_spec_runtime_config(repo, require=True)
+
+    checks = doctor._windows_command_checks(repo, config, _resolver(powershell=True))
+    verify = next(check for check in checks if check.name == "verify command (test)")
+
+    assert verify.status == "ok"
+    assert "pending bootstrap: .venv/Scripts/python.exe" in verify.detail
 
 
 def test_doctor_happy_path_has_no_blockers_or_warnings(tmp_path: Path) -> None:
@@ -307,13 +358,17 @@ def test_bootstrap_only_requires_the_initial_launcher_before_first_run(
                 "python -m venv .venv && "
                 ".venv/bin/pip install -e ."
             ),
+            bootstrap_command_windows=(
+                "python -m venv .venv; "
+                "& ./.venv/Scripts/python.exe -m pip install -e ."
+            ),
         ),
     )
 
     report = doctor.run_doctor_checks(
         repo,
         runner=_Runner(),
-        which=_resolver(),
+        which=_resolver(powershell=True),
     )
 
     check = _checks_by_name(report)["bootstrap command"]
@@ -332,19 +387,31 @@ def test_verify_executable_created_by_bootstrap_is_ready_before_first_run(
                 "python -m venv .venv && "
                 ".venv/bin/python -m pip install -e . pytest"
             ),
+            bootstrap_command_windows=(
+                "python -m venv .venv; "
+                "& ./.venv/Scripts/python.exe -m pip install -e . pytest"
+            ),
             verify_command=".venv/bin/python -m pytest",
+            verify_argv_windows=(
+                ".venv/Scripts/python.exe",
+                "-m",
+                "pytest",
+            ),
         ),
     )
 
     report = doctor.run_doctor_checks(
         repo,
         runner=_Runner(),
-        which=_resolver(),
+        which=_resolver(powershell=True),
     )
 
     check = _checks_by_name(report)["verify command (test)"]
     assert check.status == "ok"
-    assert "pending bootstrap: .venv/bin/python" in check.detail
+    expected_python = (
+        ".venv/Scripts/python.exe" if sys.platform == "win32" else ".venv/bin/python"
+    )
+    assert f"pending bootstrap: {expected_python}" in check.detail
     assert report.exit_code == 0
 
 

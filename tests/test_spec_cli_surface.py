@@ -511,9 +511,10 @@ class TestCodexAgent:
             for value in config_overrides
             if value.startswith("sandbox_workspace_write.writable_roots=")
         )
-        assert f'"{tmp_path / ".spec-state"}"' in writable_roots
-        assert f'"{gitdir.resolve()}"' in writable_roots
-        assert f'"{common_git.resolve()}"' in writable_roots
+        roots = json.loads(writable_roots.partition("=")[2])
+        assert str(tmp_path / ".spec-state") in roots
+        assert str(gitdir.resolve()) in roots
+        assert str(common_git.resolve()) in roots
 
     def test_build_authoring_command_adds_git_metadata(self, tmp_path):
         worktree = tmp_path / "checkout"
@@ -538,8 +539,9 @@ class TestCodexAgent:
             for value in config_overrides
             if value.startswith("sandbox_workspace_write.writable_roots=")
         )
-        assert f'"{tmp_path / ".spec-state"}"' in writable_roots
-        assert f'"{gitdir.resolve()}"' in writable_roots
+        roots = json.loads(writable_roots.partition("=")[2])
+        assert str(tmp_path / ".spec-state") in roots
+        assert str(gitdir.resolve()) in roots
 
     def test_codex_git_metadata_dirs_ignores_non_git_directory(self, tmp_path):
         assert _codex_git_metadata_dirs(tmp_path) == []

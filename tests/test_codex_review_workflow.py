@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -62,8 +63,15 @@ def _review_routing(
         }
     )
     env["GITHUB_OUTPUT"] = str(github_output)
+    script = _determine_review_routing_script()
+    match = re.fullmatch(
+        r"\s*python3 - <<'PY'\n(?P<body>.*)\nPY\s*",
+        script,
+        flags=re.DOTALL,
+    )
+    assert match is not None, "routing step must remain a self-contained Python heredoc"
     result = subprocess.run(
-        ["/bin/sh", "-lc", _determine_review_routing_script()],
+        [sys.executable, "-c", match.group("body")],
         cwd=WORKFLOW_PATH.parent.parent,
         env=env,
         capture_output=True,
@@ -301,11 +309,6 @@ def test_dependabot_route_never_receives_openai_secret():
 
 
 def test_dependabot_route_cannot_import_pr_head_python(tmp_path: Path):
-    validation = next(
-        step
-        for step in _review_gate_steps()
-        if step.get("name") == "Validate trusted Dependabot update"
-    )
     repo = tmp_path / "untrusted"
     workflow = repo / ".github" / "workflows" / "ci.yml"
     workflow.parent.mkdir(parents=True)
@@ -355,10 +358,24 @@ def test_dependabot_route_cannot_import_pr_head_python(tmp_path: Path):
         "TRUSTED_ROOT": str(REPO_ROOT),
         "UNTRUSTED_ROOT": str(repo),
     }
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
 
     result = subprocess.run(
-        ["bash", "-e", "-c", str(validation["run"])],
-        cwd=repo,
+        [
+            sys.executable,
+            "-P",
+            "-m",
+            "spec_runtime.dependabot_review",
+            "--repo",
+            str(repo),
+            "--base-sha",
+            base_sha,
+            "--head-sha",
+            head_sha,
+            "--output",
+            str(tmp_path / "review.json"),
+        ],
+        cwd=REPO_ROOT,
         env=env,
         capture_output=True,
         text=True,
