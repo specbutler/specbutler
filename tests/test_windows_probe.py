@@ -909,9 +909,13 @@ with patch("spec_runtime.update.resolve_repo_slug", return_value="fixture/spec")
         timeout=60,
         expected={1, 2},
     )
-    assert "needs-input" in (
-        repo / ".spec-state" / "runs" / f"{run_id}.json"
-    ).read_text(encoding="utf-8")
+    waiting_payload = json.loads(
+        (repo / ".spec-state" / "runs" / f"{run_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert waiting_payload["status"] == "waiting-for-input"
+    assert waiting_payload["input_question"] == "Choose fixture behavior A or B"
     waiting_status = _cli(repo, "status", "--spec", lifecycle_id, env=env)
     assert "waiting-for-input" in waiting_status.stdout
     assert "Choose fixture behavior A or B" in waiting_status.stdout
