@@ -3063,7 +3063,7 @@ def _create_merge_tag(repo_root: Path, spec_id: str, branch: str) -> bool:
         merge_commit_sha=merge_commit_sha,
         pr_number=pr_data.get("number") if isinstance(pr_data.get("number"), int) else None,
         source_branch=str(pr_data.get("headRefName", "") or "").strip() or branch,
-        actor=merged_by or os.getenv("USER") or "autopilot",
+        actor=merged_by or os.getenv("USER") or os.getenv("USERNAME") or "autopilot",
         timestamp=str(pr_data.get("mergedAt", "") or "").strip() or utc_timestamp_now(),
     )
 

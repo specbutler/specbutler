@@ -65,7 +65,13 @@ def _git_stdout(*args: str, cwd: Path) -> str:
 
 
 def _current_actor() -> str:
-    return os.getenv("SPEC_ACTOR") or os.getenv("USER") or os.getenv("LOGNAME") or "unknown"
+    return (
+        os.getenv("SPEC_ACTOR")
+        or os.getenv("USER")
+        or os.getenv("LOGNAME")
+        or os.getenv("USERNAME")
+        or "unknown"
+    )
 
 
 def _short_sha(value: str) -> str:

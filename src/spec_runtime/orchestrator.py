@@ -4953,6 +4953,43 @@ def _user_codex_home() -> Path:
     return Path.home() / ".codex"
 
 
+def _is_windows_reparse_point(path: Path) -> bool:
+    """Return whether *path* is a Windows junction or other reparse point."""
+    if os.name != "nt":
+        return False
+    try:
+        attributes = int(getattr(os.lstat(path), "st_file_attributes", 0))
+    except OSError:
+        return False
+    return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)))
+
+
+def _replace_with_exclusive_file(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
+    """Replace an agent-controlled path without following links or hardlinks."""
+    if path.is_symlink() or path.exists():
+        path.unlink()
+    descriptor = os.open(
+        str(path),
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0),
+        mode,
+    )
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        path.chmod(mode)
+    except OSError:
+        # The containing user-profile/worktree ACL remains the Windows
+        # security boundary; chmod is an additional POSIX restriction.
+        if os.name != "nt":
+            raise
+
+
 def _user_mcp_servers_for_passthrough(
     agent_name: str,
     allow_from_user: tuple[str, ...] | Sequence[str],
@@ -5019,23 +5056,36 @@ def _write_codex_isolated_home(
     *,
     mcp_servers: dict[str, dict[str, object]] | None,
     source_home: Path | None = None,
-    copy_auth: bool = False,
+    copy_auth: bool | None = None,
 ) -> Path:
     """Materialize the per-worktree isolated ``CODEX_HOME``.
 
-    Writes ``config.toml`` containing only the supplied MCP servers and (by
-    default) symlinks ``auth.json`` from ``source_home`` (default ``~/.codex``)
-    so the Codex CLI keeps its credentials. The directory is created if missing
-    and the config file is rewritten on every call so it never goes stale. A
-    missing source ``auth.json`` is logged as a warning but does not raise —
-    Codex will surface the auth issue itself if it tries to use the network.
+    Writes ``config.toml`` containing only the supplied MCP servers and makes
+    ``auth.json`` available from ``source_home`` (defaulting to the operator's
+    effective ``CODEX_HOME``). The directory is created if missing and the
+    config file is rewritten on every call so it never goes stale. A missing
+    source ``auth.json`` is logged as a warning but does not raise — Codex will
+    surface the auth issue itself if it tries to use the network.
 
-    When *copy_auth* is true, copy the auth file instead of symlinking. This
-    is required for container backends: the worker bind-mounts the worktree
-    into ``/workspace/source`` but not the host's ``~/.codex``, so an absolute
-    symlink target is unreachable inside the container.
+    When *copy_auth* is true, copy the auth file instead of symlinking. This is
+    required for container backends and native Windows, where creating a
+    symlink normally requires Developer Mode or elevated privileges. ``None``
+    selects the safe platform default (copy on Windows, symlink elsewhere).
+    Callers that launch an agent must remove the materialized auth path after
+    the child exits via ``_remove_codex_isolated_auth``.
     """
     home = codex_isolated_home(worktree_path)
+    # A previous agent attempt controls the worktree and could have planted a
+    # directory symlink before the orchestrator stages credentials. Replace a
+    # link-like or non-directory home before writing any config or auth data.
+    # Staging happens while no agent for this worktree is running, so there is
+    # no legitimate concurrent writer to preserve here.
+    if home.is_symlink():
+        home.unlink()
+    elif _is_windows_reparse_point(home):
+        os.rmdir(home)
+    elif home.exists() and not home.is_dir():
+        home.unlink()
     home.mkdir(parents=True, exist_ok=True)
 
     # Make the directory self-ignoring so a copied auth.json (or any other
@@ -5043,28 +5093,34 @@ def _write_codex_isolated_home(
     # whose top-level .gitignore predates this change. A `.gitignore`
     # containing `*` here ignores every file in the directory, including
     # itself, regardless of the parent repo's .gitignore.
-    (home / ".gitignore").write_text("*\n")
+    gitignore_path = home / ".gitignore"
+    _replace_with_exclusive_file(gitignore_path, b"*\n")
 
     config_body = _render_codex_mcp_toml(mcp_servers or {})
-    (home / "config.toml").write_text(config_body)
+    config_path = home / "config.toml"
+    _replace_with_exclusive_file(config_path, config_body.encode("utf-8"))
 
-    src_home = source_home if source_home is not None else Path.home() / ".codex"
+    src_home = source_home if source_home is not None else _user_codex_home()
     src_auth = src_home / "auth.json"
     dst_auth = home / "auth.json"
+    effective_copy_auth = sys.platform == "win32" if copy_auth is None else copy_auth
     if src_auth.exists():
         try:
-            if dst_auth.is_symlink() or dst_auth.exists():
-                dst_auth.unlink()
-            if copy_auth:
-                shutil.copy2(src_auth, dst_auth)
+            if effective_copy_auth:
+                # The destination is inside an agent-writable worktree. Open
+                # it exclusively and without following a final-component
+                # symlink so a racing planted link fails closed instead of
+                # redirecting the operator's credential material.
+                payload = src_auth.read_bytes()
+                _replace_with_exclusive_file(dst_auth, payload)
             else:
+                if dst_auth.is_symlink() or dst_auth.exists():
+                    dst_auth.unlink()
                 dst_auth.symlink_to(src_auth)
         except OSError as exc:
-            logger.warning(
-                "Could not materialize Codex auth.json in isolated home %s: %s",
-                home,
-                exc,
-            )
+            raise RuntimeError(
+                f"Could not securely materialize Codex auth.json in isolated home {home}: {exc}"
+            ) from exc
     else:
         logger.warning(
             "Codex source home %s is missing auth.json; the isolated session "
@@ -5072,6 +5128,25 @@ def _write_codex_isolated_home(
             src_home,
         )
     return home
+
+
+def _remove_codex_isolated_auth(worktree_path: Path) -> None:
+    """Remove transient Codex credentials after an agent launch.
+
+    The isolated config remains reusable, but copied credentials (and POSIX
+    links to operator credentials) must not become failed-run or cleanup
+    remnants. Cleanup is idempotent so prelaunch failures and normal process
+    finalizers can both call it.
+    """
+    home = codex_isolated_home(worktree_path)
+    try:
+        (home / "auth.json").unlink(missing_ok=True)
+    except OSError as exc:
+        logger.error(
+            "Could not remove transient Codex auth.json from isolated home %s: %s",
+            home,
+            exc,
+        )
 
 
 def _subprocess_env_with_codex_home(
@@ -5221,13 +5296,15 @@ def _codex_isolated_home_requires_auth_copy(backend: ExecutionBackend) -> bool:
     """Return True when ``auth.json`` must be copied (not symlinked) into the
     isolated ``CODEX_HOME``.
 
-    Containerized worker backends bind-mount the worktree into the container
-    but not the host's ``~/.codex``, so an absolute symlink target is broken
-    inside the worker. Copy the auth file in that case so Codex can read it
-    through the worktree bind mount. All other backends keep the symlink so
-    Codex's atomic-rename token refreshes propagate back to the real home.
+    Native Windows does not grant ordinary users symlink privileges unless
+    Developer Mode is enabled. Containerized worker backends also bind-mount
+    the worktree but not the host's Codex home. Copy in either case; POSIX
+    host-process backends retain the link behavior so Codex token refreshes
+    propagate to the real home.
     """
-    return not _backend_uses_provider_sandbox_config(backend)
+    return sys.platform == "win32" or not _backend_uses_provider_sandbox_config(
+        backend
+    )
 
 
 def _sync_orchestrator_paths_into_workspace(
@@ -5973,7 +6050,13 @@ def _resolve_completed_multi_spec_authoring_result(
 
 
 def _current_actor() -> str:
-    return os.getenv("SPEC_ACTOR") or os.getenv("USER") or os.getenv("LOGNAME") or "unknown"
+    return (
+        os.getenv("SPEC_ACTOR")
+        or os.getenv("USER")
+        or os.getenv("LOGNAME")
+        or os.getenv("USERNAME")
+        or "unknown"
+    )
 
 
 def _state_root(repo_root: Path) -> Path:
@@ -9937,7 +10020,6 @@ def _stage_block_debugger_isolated_config(
         codex_home = _write_codex_isolated_home(
             debug_worktree,
             mcp_servers={},
-            copy_auth=False,
         )
         return None, codex_home
     return None, None
@@ -14225,8 +14307,18 @@ def _launch_implement_attempt(
             _set_active_agent_process(None)
             _prune_registered_worktree_processes(repo_root, worktree_path)
 
-    result = backend.launch_agent(request, monitor=_supervise)
-    return result.returncode
+    try:
+        result = backend.launch_agent(request, monitor=_supervise)
+        return result.returncode
+    finally:
+        if run.agent == "codex":
+            _remove_codex_isolated_auth(worktree_path)
+            # Volume-mode containers received a staged copy before launch.
+            # Re-sync the credential-free home so a reusable workspace cannot
+            # retain auth after the provider process exits.
+            _sync_orchestrator_paths_into_workspace(
+                backend, worktree_path, (".spec-codex-home",),
+            )
 
 
 def _record_implement_attempt_outcome(
@@ -14954,6 +15046,8 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
             )
         return result
     finally:
+        if run.agent == "codex":
+            _remove_codex_isolated_auth(worktree_path)
         if should_run_teardown:
             _run_implement_teardown_command(run, worktree_path)
             _prune_registered_worktree_processes(repo_root, worktree_path)
@@ -15307,6 +15401,8 @@ def _attempt_no_handshake_recovery(
         run.last_error = impl_result.summary or "Agent reported failure during handshake recovery"
         return "failed"
     finally:
+        if run.agent == "codex":
+            _remove_codex_isolated_auth(worktree_path)
         _run_implement_teardown_command(run, worktree_path)
         _prune_registered_worktree_processes(repo_root, worktree_path)
 

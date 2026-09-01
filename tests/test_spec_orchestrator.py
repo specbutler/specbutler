@@ -54,6 +54,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # ---------------------------------------------------------------------------
 
 
+def test_windows_username_is_actor_fallback(monkeypatch: pytest.MonkeyPatch):
+    for name in ("SPEC_ACTOR", "USER", "LOGNAME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("USERNAME", "specadmin")
+
+    assert orch._current_actor() == "specadmin"
+    assert spec_backfill._current_actor() == "specadmin"
+
+
 def _run_git(*args: str, cwd: Path) -> None:
     """Run a git command, raising on failure."""
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
@@ -30075,6 +30084,18 @@ class TestMultiSpecAuthoring:
         template = (resource_files("spec_runtime") / "templates" / "TEMPLATE.md").read_text()
         assert "draft" not in template.lower()
 
+    def test_bundled_template_uses_runtime_checklist_syntax(self):
+        """Template-following specs must populate implementation PR criteria."""
+        from importlib.resources import files as resource_files
+
+        template_path = resource_files("spec_runtime") / "templates" / "TEMPLATE.md"
+        criteria = orch._extract_acceptance_checklist_items(Path(str(template_path)))
+        assert criteria == [
+            "- [ ] First concrete, testable requirement",
+            "- [ ] Second requirement",
+            "- [ ] Third requirement",
+        ]
+
     def test_build_spec_authoring_command_multi_spec_initial_prompt(self, repo: Path):
         """Anonymous session initial prompt mentions multiple specs."""
         worktree = repo / ".worktrees" / "spec-session-20260312T101112131415"
@@ -32717,7 +32738,7 @@ class TestDefaultClaudeMcpServers:
 class TestCodexIsolatedHome:
     """Per-worktree CODEX_HOME setup for non-interactive Codex sessions."""
 
-    def test_write_codex_isolated_home_creates_config_and_symlinks_auth(
+    def test_write_codex_isolated_home_uses_platform_safe_auth_materialization(
         self, tmp_path: Path
     ):
         worktree = tmp_path / "worktree"
@@ -32742,9 +32763,116 @@ class TestCodexIsolatedHome:
         config_text = (home / "config.toml").read_text()
         assert "[mcp_servers.kubectl]" in config_text
         assert 'command = "/usr/local/bin/kubectl"' in config_text
-        auth_link = home / "auth.json"
-        assert auth_link.is_symlink()
-        assert auth_link.resolve() == (source_home / "auth.json").resolve()
+        auth_path = home / "auth.json"
+        if sys.platform == "win32":
+            assert auth_path.is_file()
+            assert not auth_path.is_symlink()
+            assert auth_path.read_text() == '{"token":"x"}'
+        else:
+            assert auth_path.is_symlink()
+            assert auth_path.resolve() == (source_home / "auth.json").resolve()
+
+    def test_write_codex_isolated_home_honors_operator_codex_home(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_home = tmp_path / "custom-codex"
+        source_home.mkdir()
+        (source_home / "auth.json").write_text('{"token":"custom"}')
+
+        with patch.dict(os.environ, {"CODEX_HOME": str(source_home)}):
+            home = orch._write_codex_isolated_home(
+                worktree,
+                mcp_servers={},
+                copy_auth=True,
+            )
+
+        assert (home / "auth.json").read_text() == '{"token":"custom"}'
+
+    def test_windows_default_copies_auth_without_symlink_privilege(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_home = tmp_path / "user-codex"
+        source_home.mkdir()
+        (source_home / "auth.json").write_text('{"token":"x"}')
+
+        with patch.object(orch.sys, "platform", "win32"):
+            home = orch._write_codex_isolated_home(
+                worktree,
+                mcp_servers={},
+                source_home=source_home,
+            )
+
+        auth_path = home / "auth.json"
+        assert auth_path.is_file()
+        assert not auth_path.is_symlink()
+        assert auth_path.read_text() == '{"token":"x"}'
+
+    def test_write_codex_isolated_home_replaces_hardlinked_config(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        home = worktree / ".spec-codex-home"
+        home.mkdir(parents=True)
+        outside = tmp_path / "outside.toml"
+        outside.write_text("do-not-overwrite")
+        os.link(outside, home / "config.toml")
+
+        orch._write_codex_isolated_home(
+            worktree,
+            mcp_servers={"safe": {"command": "safe-mcp"}},
+            source_home=tmp_path / "missing-source",
+        )
+
+        assert outside.read_text() == "do-not-overwrite"
+        assert "safe-mcp" in (home / "config.toml").read_text()
+        assert not os.path.samefile(outside, home / "config.toml")
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows junction variant covers native")
+    def test_write_codex_isolated_home_replaces_planted_home_symlink(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (worktree / ".spec-codex-home").symlink_to(outside, target_is_directory=True)
+
+        home = orch._write_codex_isolated_home(
+            worktree,
+            mcp_servers={},
+            source_home=tmp_path / "missing-source",
+        )
+
+        assert not home.is_symlink()
+        assert list(outside.iterdir()) == []
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+    def test_write_codex_isolated_home_replaces_planted_windows_junction(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        home = worktree / ".spec-codex-home"
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(home), str(outside)],
+            check=True,
+            capture_output=True,
+        )
+
+        staged = orch._write_codex_isolated_home(
+            worktree,
+            mcp_servers={},
+            source_home=tmp_path / "missing-source",
+        )
+
+        assert not orch._is_windows_reparse_point(staged)
+        assert list(outside.iterdir()) == []
 
     def test_write_codex_isolated_home_warns_on_missing_auth(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -32869,6 +32997,55 @@ class TestCodexIsolatedHome:
             cwd=worktree, check=True, capture_output=True, text=True,
         )
         assert ".gitignore" in check.stdout
+
+    def test_remove_codex_isolated_auth_leaves_config_only(self, tmp_path: Path):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_home = tmp_path / "user-codex"
+        source_home.mkdir()
+        (source_home / "auth.json").write_text('{"token":"x"}')
+        home = orch._write_codex_isolated_home(
+            worktree,
+            mcp_servers={},
+            source_home=source_home,
+            copy_auth=True,
+        )
+
+        orch._remove_codex_isolated_auth(worktree)
+        orch._remove_codex_isolated_auth(worktree)
+
+        assert not (home / "auth.json").exists()
+        assert (home / "config.toml").is_file()
+
+    def test_agent_launch_removes_transient_auth_even_when_backend_fails(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        home = worktree / ".spec-codex-home"
+        home.mkdir(parents=True)
+        (home / "auth.json").write_text('{"token":"secret"}')
+        run = SimpleNamespace(agent="codex", implement_launches=1, attempts=1, run_id="run-1")
+        plan = orch.ImplementLaunchPlan(
+            use_stream_json=False,
+            agent_env={},
+            agent_cmd=["codex"],
+            popen_kwargs={"cwd": worktree, "env": {}},
+        )
+
+        class FailingBackend:
+            def launch_agent(self, _request, *, monitor):
+                raise RuntimeError("launch failed")
+
+        backend = FailingBackend()
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+            patch.object(orch, "_sync_orchestrator_paths_into_workspace") as sync,
+            pytest.raises(RuntimeError, match="launch failed"),
+        ):
+            orch._launch_implement_attempt(run, tmp_path, worktree, plan)
+
+        assert not (home / "auth.json").exists()
+        sync.assert_called_once_with(backend, worktree, (".spec-codex-home",))
 
 
 class TestClaudeIsolatedHome:
@@ -33170,6 +33347,16 @@ class TestCodexIsolatedHomeRequiresAuthCopy:
         fake = _Fake()
         fake.identity = self._identity("container")
         assert orch._codex_isolated_home_requires_auth_copy(fake) is True
+
+    def test_returns_true_for_native_windows_worktree_backend(self):
+        class _Fake:
+            pass
+
+        _Fake.__name__ = "WorktreeExecutionBackend"
+        fake = _Fake()
+        fake.identity = self._identity("container")
+        with patch.object(orch.sys, "platform", "win32"):
+            assert orch._codex_isolated_home_requires_auth_copy(fake) is True
 
 
 class TestSyncOrchestratorPathsIntoWorkspace:
