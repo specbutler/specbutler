@@ -29,6 +29,7 @@ from .execution_backend import (
     host_spec_runtime_source_id,
     host_spec_runtime_version,
 )
+from .process_supervisor import run as run_supervised
 from .source_repository import runtime_repository_https_url
 
 WORKER_DOCKERFILE_TEMPLATE = """\
@@ -118,7 +119,7 @@ class _SubprocessContainerRunner:
         input_text: str | None = None,
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return run_supervised(
             argv,
             cwd=cwd,
             env=env,

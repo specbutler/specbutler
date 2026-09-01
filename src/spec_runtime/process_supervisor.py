@@ -476,6 +476,26 @@ class ManagedProcess:
     def terminate(self, grace_seconds: float = 5.0) -> None:
         terminate(self.token, grace_seconds=grace_seconds, job=self._job)
 
+    def kill(self) -> None:
+        """Kill the complete owned tree, never just the Popen leader."""
+        if self._job is not None and identity_matches(self.token.identity):
+            self._job.terminate()
+        else:
+            terminate(self.token, grace_seconds=0, job=self._job)
+
+    def communicate(self, input: Any = None, timeout: float | None = None) -> tuple[Any, Any]:
+        """Mirror Popen.communicate while releasing ownership on completion.
+
+        A timeout deliberately retains the handle so the caller can kill the
+        tree and call communicate again, matching subprocess.run semantics.
+        """
+        try:
+            result = self.process.communicate(input=input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise
+        self.close()
+        return result
+
     def wait(self, timeout: float | None = None) -> int:
         tree = _windows_tree_identities(self.token.identity.pid)
         returncode = int(self.process.wait(timeout=timeout))
@@ -493,6 +513,41 @@ class ManagedProcess:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.process, name)
+
+
+def run(
+    argv: Sequence[str],
+    *,
+    input: Any = None,
+    capture_output: bool = False,
+    timeout: float | None = None,
+    check: bool = False,
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[Any]:
+    """A tree-safe equivalent of subprocess.run for owned commands."""
+    if input is not None:
+        if kwargs.get("stdin") is not None:
+            raise ValueError("stdin and input arguments may not both be used")
+        kwargs["stdin"] = subprocess.PIPE
+    if capture_output:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+            raise ValueError("stdout and stderr arguments may not be used with capture_output")
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(argv, **kwargs)
+    try:
+        stdout, stderr = managed.communicate(input=input, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        managed.kill()
+        stdout, stderr = managed.communicate()
+        exc.stdout = stdout
+        exc.stderr = stderr
+        exc.output = stdout
+        raise
+    completed = subprocess.CompletedProcess(argv, managed.returncode, stdout, stderr)
+    if check:
+        completed.check_returncode()
+    return completed
 
 
 class ManagedAsyncProcess:

@@ -40,6 +40,7 @@ from .config import (
 )
 from .platform_fs import FileLock, remove_tree
 from .process_supervisor import LifetimeMode, ProcessSupervisor
+from .process_supervisor import run as run_supervised
 
 CONTAINER_WORKER_ENV_DENYLIST = frozenset(
     {
@@ -869,7 +870,7 @@ class CloneExecutionBackend:
         elif request.env is not None:
             env = dict(request.env)
         stdin = subprocess.DEVNULL if request.stdin_devnull and request.input_text is None else None
-        completed = subprocess.run(
+        completed = run_supervised(
             request.argv,
             cwd=request.cwd,
             env=env,

@@ -109,7 +109,9 @@ from .execution_backend import get_execution_backend as _factory_get_execution_b
 from .forge import GitHubForge, PushResult
 from .git_common import resolve_common_root
 from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
-from .process_supervisor import LifetimeMode, ProcessSupervisor, SupervisionToken
+from .process_supervisor import LifetimeMode, ProcessSupervisor, SupervisionToken, inspect_process
+from .process_supervisor import run as run_supervised
+from .process_supervisor import terminate as terminate_supervised
 from .spec_identity import (
     SPEC_ID_RE,
     authoring_branch_identity,
@@ -4400,7 +4402,8 @@ def run_subprocess(
             kwargs["stdin"] = subprocess.DEVNULL
         else:
             kwargs["input"] = input_text
-        return subprocess.run(
+        runner = run_supervised if timeout is not None else subprocess.run
+        return runner(
             cmd,
             **kwargs,
         )
@@ -6410,7 +6413,13 @@ def _orchestrator_sigterm_guard(
 def _ensure_orchestrator_process_group(run: RunState, repo_root: Path) -> None:
     if os.name != "posix":
         run.pgid = None
-        run.process_started_at = ""
+        identity = inspect_process(os.getpid())
+        if identity is None:
+            raise RuntimeError("Could not record orchestrator process identity")
+        run.process_started_at = identity.started_at
+        run.supervision_token = SupervisionToken(
+            LifetimeMode.DETACHED, identity, identity.pid, identity.started_at, f"orchestrator-{run.run_id}"
+        ).to_dict()
         run.save(repo_root)
         return
 
@@ -7034,12 +7043,23 @@ def stop_run(spec_id: str, *, repo_root: Path | None = None) -> RunState:
     if latest is None:
         raise RuntimeError(f"No non-superseded run found for spec '{spec_id}'.")
 
-    process_group = _resolve_recorded_process_group(root, latest)
-    if process_group is None:
+    if os.name != "posix" and latest.supervision_token:
+        token = SupervisionToken.from_dict(latest.supervision_token)
+        process_was_alive = is_pid_alive(token.identity.pid, token.identity.started_at)
+        if process_was_alive and not terminate_supervised(token, grace_seconds=RUN_STOP_GRACE_SECONDS):
+            raise RuntimeError(f"Failed to stop live supervised process for spec '{spec_id}'.")
+        process_group = None
+    else:
+        process_group = _resolve_recorded_process_group(root, latest)
+
+    if process_group is None and not (os.name != "posix" and latest.supervision_token):
         raise RuntimeError(f"Spec '{spec_id}' does not have a recorded orchestrator process group.")
-    pgid, leader_started_at = process_group
-    process_was_alive = is_pid_alive(pgid, leader_started_at)
-    group_was_alive = _is_process_group_alive(pgid, pgid, leader_started_at)
+    if process_group is not None:
+        pgid, leader_started_at = process_group
+        process_was_alive = is_pid_alive(pgid, leader_started_at)
+        group_was_alive = _is_process_group_alive(pgid, pgid, leader_started_at)
+    else:
+        pgid, leader_started_at, group_was_alive = 0, "", False
     if not process_was_alive and group_was_alive:
         raise RuntimeError(
             f"Recorded leader {pgid} for spec '{spec_id}' has exited or changed identity, "
@@ -7467,6 +7487,7 @@ class RunState:
     retry_cap: int = RETRY_CAP
     pgid: int | None = None
     process_started_at: str = ""
+    supervision_token: dict[str, object] = field(default_factory=dict)
     intake_reset_requested: bool = False
     slug_was_provided: bool = False
     updated_at: str = field(default_factory=_now_iso)
@@ -7569,6 +7590,7 @@ class RunState:
         )
         payload["pgid"] = _coerce_optional_int(payload.get("pgid"))
         payload.setdefault("process_started_at", "")
+        payload.setdefault("supervision_token", {})
         payload.setdefault("intake_reset_requested", False)
         payload.setdefault("slug_was_provided", False)
         payload.setdefault("input_question", "")
@@ -15980,6 +16002,19 @@ def _start_codex_progress_thread(
 def _terminate_agent_process(proc: subprocess.Popen[str]) -> None:
     """Terminate an agent process group, escalating to SIGKILL if needed."""
     pid = getattr(proc, "pid", None)
+    if os.name != "posix" and pid is not None:
+        token = getattr(proc, "token", None)
+        if token is None:
+            identity = inspect_process(pid)
+            if identity is not None:
+                token = SupervisionToken(LifetimeMode.RUN_OWNED, identity, os.getpid(), "", f"agent-{pid}")
+        if token is not None:
+            terminate_supervised(token, grace_seconds=AGENT_TERMINATE_TIMEOUT_SECONDS)
+            try:
+                proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.error("Agent process %s did not terminate after hard termination", pid)
+            return
     terminated = False
     if pid is not None:
         try:

@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import html as html_mod
 import json
-import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 from dataclasses import asdict
@@ -458,12 +456,11 @@ async def stop_spec(request: Request) -> Response:
             return _json({"spec_id": spec_id, "status": "not_found"}, 404)
     else:
         try:
-            os.killpg(os.getpgid(leader_pid), signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                os.kill(leader_pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                return _json({"spec_id": spec_id, "status": "not_found"}, 404)
+            from spec_runtime.orchestrator import stop_run
+
+            stop_run(spec_id, repo_root=repo_root)
+        except (RuntimeError, ProcessLookupError, PermissionError, OSError):
+            return _json({"spec_id": spec_id, "status": "not_found"}, 404)
 
     # Wait briefly for the process to exit so the persisted run record
     # has a chance to update before we read it back.

@@ -2133,7 +2133,7 @@ def current_process_identity() -> ProcessIdentity:
     identity = read_process_identity(os.getpid())
     if identity is None:
         raise RuntimeError("Could not determine autopilot process identity.")
-    return identity
+    return ProcessIdentity(identity.pid, identity.started_at, " ".join(shlex.quote(arg) for arg in sys.argv))
 
 
 def _command_tokens(command: str) -> list[str]:
@@ -3391,7 +3391,8 @@ def watch_command(args: argparse.Namespace) -> int:
 
 def _signal_autopilot(pid: int) -> int:
     try:
-        os.kill(pid, signal.SIGTERM)
+        graceful_signal = signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM
+        os.kill(pid, graceful_signal)
     except OSError as exc:
         print(f"Failed to stop autopilot pid {pid}: {exc}", file=sys.stderr)
         print(f"Stop it manually with: kill -TERM {pid}", file=sys.stderr)

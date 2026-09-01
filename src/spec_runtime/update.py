@@ -787,15 +787,18 @@ def _start_refresh_subprocess(repo_root: Path, cache_path: Path, lock_path: Path
         "from spec_runtime.update import _background_refresh_entry; "
         "_background_refresh_entry(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))"
     )
+    from .platform_fs import atomic_write_text
     from .process_supervisor import LifetimeMode, ProcessSupervisor
 
-    ProcessSupervisor(LifetimeMode.DETACHED).spawn(
+    managed = ProcessSupervisor(LifetimeMode.DETACHED).spawn(
         [sys.executable, "-I", "-c", script, str(repo_root), str(cache_path), str(lock_path)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
         cwd="/",
     )
+    token_path = lock_path.with_suffix(lock_path.suffix + ".supervision.json")
+    atomic_write_text(token_path, json.dumps(managed.token.to_dict(), sort_keys=True) + "\n")
 
 
 def _spawn_cache_refresh(repo_root: Path, config: SpecRuntimeConfig) -> None:
