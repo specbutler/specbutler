@@ -32,6 +32,24 @@ from spec_runtime.config import (
 # ---------------------------------------------------------------------------
 
 
+def test_container_path_translation_accepts_native_windows_separators() -> None:
+    translated = eb.ContainerExecutionBackend._translate_container_paths(
+        r"C:\src\project\frontend\node_modules\@playwright\mcp\cli.js",
+        [("C:/src/project", "/workspace/source")],
+    )
+
+    assert translated == "/workspace/source/frontend/node_modules/@playwright/mcp/cli.js"
+
+
+def test_container_path_translation_does_not_rewrite_prefix_collisions() -> None:
+    untouched = eb.ContainerExecutionBackend._translate_container_paths(
+        r"C:\src\project-other\tool.exe",
+        [("C:/src/project", "/workspace/source")],
+    )
+
+    assert untouched == r"C:\src\project-other\tool.exe"
+
+
 class TestExecutionConfigDefaults:
     def test_default_when_section_missing(self, tmp_path: Path):
         (tmp_path / ".git").mkdir()

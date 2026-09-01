@@ -55,6 +55,34 @@ def test_atomic_write_text_replaces_with_parseable_json(tmp_path: Path) -> None:
     atomic_write_text(path, '{"version": 2}\n')
     assert json.loads(path.read_text()) == {"version": 2}
     assert not list(tmp_path.glob(".state.json.tmp-*"))
+    assert not list(tmp_path.glob(".spec-*.tmp"))
+
+
+def test_atomic_write_text_uses_bounded_temp_basename(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A long destination name must not be repeated in the sibling temp path."""
+    from spec_runtime import platform_fs
+
+    replaced_from: list[Path] = []
+    real_replace = platform_fs.os.replace
+
+    def capture_replace(source: Path, target: Path) -> None:
+        replaced_from.append(Path(source))
+        real_replace(source, target)
+
+    monkeypatch.setattr(platform_fs.os, "replace", capture_replace)
+    path = tmp_path / f"{('long-run-state-' * 10)}.json"
+
+    atomic_write_text(path, '{"ok": true}\n')
+
+    assert json.loads(path.read_text()) == {"ok": True}
+    assert len(replaced_from) == 1
+    temporary = replaced_from[0]
+    assert temporary.parent == path.parent
+    assert path.name not in temporary.name
+    assert len(temporary.name) <= 32
 
 
 def test_locked_state_updates_survive_multiple_processes(tmp_path: Path) -> None:

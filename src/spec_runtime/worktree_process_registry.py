@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .platform_fs import atomic_write_text
 from .process_supervisor import (
     LifetimeMode,
     ProcessIdentity,
@@ -73,13 +74,7 @@ def _read_json_dict(path: Path) -> dict | None:
 
 
 def _write_json_file_atomically(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp_path, path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def read_process_identity(pid: int) -> ProcessIdentity | None:

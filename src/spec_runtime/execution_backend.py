@@ -1686,9 +1686,29 @@ def _is_container_worker_env_allowed(key: str) -> bool:
 def _replace_host_path_reference(value: str, *, host_path: str, container_path: str) -> str:
     if not host_path:
         return value
-    path_boundary = r"A-Za-z0-9_~/-"
-    pattern = re.compile(rf"(?<![{path_boundary}]){re.escape(host_path)}(?=$|/|[^{path_boundary}])")
-    return pattern.sub(container_path, value)
+    path_boundary = r"A-Za-z0-9_~\\/-"
+    variants = sorted(
+        {
+            host_path,
+            host_path.replace("\\", "/"),
+            host_path.replace("/", "\\"),
+        },
+        key=len,
+        reverse=True,
+    )
+    translated = value
+    for variant in variants:
+        pattern = re.compile(
+            rf"(?<![{path_boundary}]){re.escape(variant)}(?=$|[\\/]|[^{path_boundary}])"
+        )
+        translated, count = pattern.subn(container_path, translated)
+        if count:
+            # The replacement target is a Linux container path.  A native
+            # Windows argument retains backslashes in the suffix after the
+            # rewritten worktree prefix unless the whole argv element is
+            # normalized here.
+            translated = translated.replace("\\", "/")
+    return translated
 
 
 def _redact_log_text(text: str, redactions: Sequence[str]) -> str:

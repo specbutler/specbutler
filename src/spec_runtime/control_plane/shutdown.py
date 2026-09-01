@@ -9,13 +9,12 @@ reconcile a previous interrupted shutdown into a clean retry.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
-from spec_runtime.platform_fs import FileLock
+from spec_runtime.platform_fs import FileLock, atomic_write_text
 
 
 class ShutdownPhase(str, Enum):
@@ -85,15 +84,9 @@ def _load(state_run_dir: Path) -> ShutdownState:
 
 def _save(state_run_dir: Path, state: ShutdownState) -> Path:
     path = shutdown_state_path(state_run_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(state)
     payload["phase"] = state.phase.value
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return path
 
 

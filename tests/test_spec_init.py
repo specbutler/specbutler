@@ -290,6 +290,12 @@ class TestDetectVerifyGates:
             g["name"] == "test" and g["command"] == ".venv/bin/python -m pytest"
             for g in gates
         )
+        test_gate = next(g for g in gates if g["name"] == "test")
+        assert test_gate["argv_windows"] == [
+            ".venv/Scripts/python.exe",
+            "-m",
+            "pytest",
+        ]
 
     def test_detects_ruff_from_pyproject(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text('[tool.ruff]\ntarget-version = "py311"\n')
@@ -298,6 +304,14 @@ class TestDetectVerifyGates:
             g["name"] == "lint" and g["command"] == ".venv/bin/python -m ruff check ."
             for g in gates
         )
+        lint_gate = next(g for g in gates if g["name"] == "lint")
+        assert lint_gate["argv_windows"] == [
+            ".venv/Scripts/python.exe",
+            "-m",
+            "ruff",
+            "check",
+            ".",
+        ]
 
     def test_detects_makefile_targets(self, tmp_path):
         (tmp_path / "Makefile").write_text("test:\n\tpytest\n\nlint:\n\truff check .\n")
@@ -524,6 +538,49 @@ class TestGenerateSpecToml:
         assert selected is not None
         assert selected.shell == "powershell"
         assert r".\.venv\Scripts\python.exe" in str(selected.value)
+
+    def test_generated_python_commands_preserve_windows_dev_install_and_gates(
+        self,
+        tmp_path: Path,
+    ):
+        from spec_runtime.config import load_repo_spec_runtime_config
+
+        content = _generate_spec_toml(
+            base_ref="origin/main",
+            default_agent="codex",
+            review_default="codex",
+            allowed_agents=["codex"],
+            gates=[
+                {
+                    "name": "test",
+                    "command": ".venv/bin/python -m pytest",
+                    "argv_windows": [
+                        ".venv/Scripts/python.exe",
+                        "-m",
+                        "pytest",
+                    ],
+                    "parallel": True,
+                }
+            ],
+            install_command=(
+                "python -m venv .venv && "
+                ".venv/bin/python -m pip install -e '.[dev]'"
+            ),
+        )
+        (tmp_path / ".spec.toml").write_text(content)
+
+        config = load_repo_spec_runtime_config(tmp_path, require=True)
+        install = config.bootstrap_install.select(windows=True)
+        gate = config.verify_gates[0].command_variants.select(windows=True)
+
+        assert install is not None
+        assert "'.[dev]'" in str(install.value)
+        assert gate is not None
+        assert gate.argv(windows=True) == [
+            ".venv/Scripts/python.exe",
+            "-m",
+            "pytest",
+        ]
 
     def test_escapes_backslashes_in_commands(self):
         """Backslashes must be escaped for valid TOML (F2)."""

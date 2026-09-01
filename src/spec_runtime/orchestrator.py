@@ -260,7 +260,7 @@ LOCAL_MERGEABILITY_WORKTREE_PREFIX = "spec-mergeability-"
 LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX = "spec-block-debugger-"
 BLOCK_DEBUGGER_PRIVATE_CLONE_MARKER = ".spec-block-debugger-owner.json"
 BLOCK_DEBUGGER_AUTO_RESUME_LIMIT = 1
-LOCAL_REVIEW_WORKTREE_ROOT = Path("/tmp").resolve()
+LOCAL_REVIEW_WORKTREE_ROOT = Path(tempfile.gettempdir()).resolve()
 GITHUB_API_VERSION = "2022-11-28"
 LOCAL_REVIEW_DISABLED_CREDENTIAL_ENV_VARS = (
     "GH_ENTERPRISE_TOKEN",
@@ -3170,7 +3170,7 @@ def _diagnostic_note(message: str) -> str:
 
 def _test_gate_diagnostic_command(worktree_path: Path) -> list[str]:
     """Mirror `make test` by running pytest via the worktree virtualenv."""
-    return [str(worktree_path / ".venv" / "bin" / "python"), *TEST_GATE_DIAGNOSTIC_ARGS]
+    return [str(_worktree_venv_python(worktree_path)), *TEST_GATE_DIAGNOSTIC_ARGS]
 
 
 def _test_gate_targeted_diagnostic_command(
@@ -3178,7 +3178,7 @@ def _test_gate_targeted_diagnostic_command(
     nodeid: str,
 ) -> list[str]:
     return [
-        str(worktree_path / ".venv" / "bin" / "python"),
+        str(_worktree_venv_python(worktree_path)),
         "-m",
         "pytest",
         "--tb=short",
@@ -4650,11 +4650,30 @@ def _parse_exported_env(output: str) -> dict[str, str]:
     return parsed
 
 
+def _worktree_venv_executable_dir(
+    worktree_path: Path,
+    *,
+    windows: bool | None = None,
+) -> Path:
+    """Return the platform's executable directory for a worktree virtualenv."""
+    use_windows = os.name == "nt" if windows is None else windows
+    return worktree_path / ".venv" / ("Scripts" if use_windows else "bin")
+
+
+def _worktree_venv_python(
+    worktree_path: Path,
+    *,
+    windows: bool | None = None,
+) -> Path:
+    executable = "python.exe" if (os.name == "nt" if windows is None else windows) else "python"
+    return _worktree_venv_executable_dir(worktree_path, windows=windows) / executable
+
+
 @contextmanager
 def _inject_worktree_venv_into_env(env: dict[str, str], worktree_path: Path) -> None:
     """Prefer the worktree virtualenv for implement-agent subprocesses."""
     venv_dir = worktree_path / ".venv"
-    venv_bin = venv_dir / "bin"
+    venv_bin = _worktree_venv_executable_dir(worktree_path)
 
     current_path = env.get("PATH") or os.environ.get("PATH", "")
     path_entries = [entry for entry in current_path.split(os.pathsep) if entry]
@@ -18751,6 +18770,26 @@ def _bootstrap_review_worktree(
 
     isolated_home = tempfile.mkdtemp(prefix="spec-review-bootstrap-home-")
     env["HOME"] = isolated_home
+    if os.name == "nt":
+        # Windows-native tools commonly ignore HOME and resolve credentials
+        # through USERPROFILE / APPDATA instead.  Point every standard profile
+        # root at the same disposable directory so an untrusted build backend
+        # cannot discover the operator's real profile through platform APIs.
+        isolated_profile = Path(isolated_home)
+        roaming = isolated_profile / "AppData" / "Roaming"
+        local = isolated_profile / "AppData" / "Local"
+        roaming.mkdir(parents=True, exist_ok=True)
+        local.mkdir(parents=True, exist_ok=True)
+        drive, tail = os.path.splitdrive(str(isolated_profile))
+        env["USERPROFILE"] = str(isolated_profile)
+        env["APPDATA"] = str(roaming)
+        env["LOCALAPPDATA"] = str(local)
+        if drive:
+            env["HOMEDRIVE"] = drive
+            env["HOMEPATH"] = tail or "\\"
+        else:
+            env.pop("HOMEDRIVE", None)
+            env.pop("HOMEPATH", None)
     for key in (
         "CODEX_HOME",
         "NETRC",
@@ -18833,7 +18872,11 @@ def _bootstrap_review_worktree(
         remove_tree(isolated_home, ignore_errors=True)
 
 
-def _review_env_prompt_note(review_worktree: Path) -> str:
+def _review_env_prompt_note(
+    review_worktree: Path,
+    *,
+    windows: bool | None = None,
+) -> str:
     """Return a prompt suffix telling the reviewer how to run the bootstrapped gates.
 
     Putting the worktree venv on the reviewer subprocess ``PATH`` (see
@@ -18847,14 +18890,28 @@ def _review_env_prompt_note(review_worktree: Path) -> str:
     any PATH reset. When there is no venv (bootstrap skipped or failed), return
     an empty string so the prompt does not falsely promise a runnable project.
     """
-    venv_bin = review_worktree / ".venv" / "bin"
+    use_windows = os.name == "nt" if windows is None else windows
+    venv_bin = _worktree_venv_executable_dir(
+        review_worktree,
+        windows=use_windows,
+    )
     if not venv_bin.is_dir():
         return ""
+    if use_windows:
+        tool_examples = (
+            r"`.venv\Scripts\python.exe -m pytest` and "
+            r"`.venv\Scripts\python.exe -m ruff check .`"
+        )
+        executable_dir_name = "Scripts"
+    else:
+        tool_examples = "`.venv/bin/pytest` and `.venv/bin/ruff check .`"
+        executable_dir_name = "bin"
     return (
         "\n\nReview environment: the project under review has been installed "
-        "into a local virtualenv at `.venv` in this worktree. Its `bin` is on "
+        "into a local virtualenv at `.venv` in this worktree. Its "
+        f"`{executable_dir_name}` is on "
         "PATH, but because some shells reset PATH, prefer invoking gate tools by "
-        "absolute path — e.g. `.venv/bin/pytest` and `.venv/bin/ruff check .` — "
+        f"an explicit virtualenv path — e.g. {tool_examples} — "
         "to actually exercise the changed behavior. If a gate command still "
         "cannot be found or run, note that and continue with diff-only review "
         "rather than returning `blocked`."

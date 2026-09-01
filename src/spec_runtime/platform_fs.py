@@ -6,8 +6,8 @@ import errno
 import os
 import shutil
 import stat
+import tempfile
 import time
-import uuid
 from pathlib import Path
 
 _DELAYS = (0.01, 0.025, 0.05, 0.1, 0.2)
@@ -33,11 +33,24 @@ def _retry(operation) -> None:
 
 
 def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
-    """Replace a file atomically using a unique sibling temporary file."""
+    """Replace a file atomically using a short, unique sibling temp file.
+
+    The temporary basename deliberately does not include the destination
+    basename.  Appending a PID and UUID to a long run-state filename can push
+    an otherwise valid path over the legacy Windows ``MAX_PATH`` boundary.
+    ``mkstemp`` still gives concurrent writers a unique sibling, which keeps
+    the final ``os.replace`` atomic without spending that path-length budget.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    descriptor, raw_temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=".spec-",
+        suffix=".tmp",
+        text=True,
+    )
+    temporary = Path(raw_temporary)
     try:
-        with temporary.open("w", encoding=encoding, newline="") as stream:
+        with os.fdopen(descriptor, "w", encoding=encoding, newline="") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())

@@ -192,7 +192,14 @@ def _detect_verify_gates(repo_root: Path) -> list[dict]:
                 test_command = (
                     ".venv/bin/python -m pytest" if uses_project_venv else "pytest"
                 )
-                gates.append({"name": "test", "command": test_command, "parallel": True})
+                gate = {"name": "test", "command": test_command, "parallel": True}
+                if uses_project_venv:
+                    gate["argv_windows"] = [
+                        ".venv/Scripts/python.exe",
+                        "-m",
+                        "pytest",
+                    ]
+                gates.append(gate)
                 seen_names.add("test")
             if has_ruff:
                 lint_command = (
@@ -200,7 +207,16 @@ def _detect_verify_gates(repo_root: Path) -> list[dict]:
                     if uses_project_venv
                     else "ruff check ."
                 )
-                gates.append({"name": "lint", "command": lint_command, "parallel": True})
+                gate = {"name": "lint", "command": lint_command, "parallel": True}
+                if uses_project_venv:
+                    gate["argv_windows"] = [
+                        ".venv/Scripts/python.exe",
+                        "-m",
+                        "ruff",
+                        "check",
+                        ".",
+                    ]
+                gates.append(gate)
                 seen_names.add("lint")
         except Exception:
             pass
@@ -321,9 +337,16 @@ def _generate_spec_toml(
     ]
     if install_command:
         lines.append(f'install_command = "{_toml_escape(install_command)}"')
+        windows_install_command = (
+            install_command.replace(" && ", "; ", 1).replace(
+                ".venv/bin/python",
+                r".\.venv\Scripts\python.exe",
+            )
+            if install_command.startswith("python -m venv .venv && .venv/bin/python ")
+            else r"python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -e ."
+        )
         lines.append(
-            'install_command_windows = "python -m venv .venv; '
-            '.\\\\.venv\\\\Scripts\\\\python.exe -m pip install -e ."'
+            f'install_command_windows = "{_toml_escape(windows_install_command)}"'
         )
         lines.append('install_shell_windows = "powershell"')
     else:
@@ -361,6 +384,11 @@ def _generate_spec_toml(
             lines.append("[[verify.gates]]")
             lines.append(f'name = "{_toml_escape(gate["name"])}"')
             lines.append(f'command = "{_toml_escape(gate["command"])}"')
+            if gate.get("argv_windows"):
+                lines.append(
+                    "argv_windows = "
+                    + json.dumps(gate["argv_windows"], ensure_ascii=False)
+                )
             lines.append(f"parallel = {'true' if gate.get('parallel') else 'false'}")
     else:
         lines.append("")

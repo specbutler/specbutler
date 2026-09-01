@@ -5299,20 +5299,41 @@ class TestReviewWorktreeBootstrap:
     """Bootstrap of the local review worktree before launching the reviewer."""
 
     @staticmethod
-    def _config_with_install(command: str):
-        return replace(orch.SPEC_RUNTIME_CONFIG, bootstrap_install_command=command)
+    def _config_with_install(
+        command: str,
+        *,
+        windows_argv: tuple[str, ...] = (),
+    ):
+        return replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            bootstrap_install_command=command,
+            bootstrap_install=CommandVariants(
+                command=command,
+                windows_argv=windows_argv,
+                source="test review bootstrap",
+            ),
+        )
 
     def test_runs_trusted_bootstrap_command_with_stripped_env(self, tmp_path: Path):
         worktree = tmp_path / "review-worktree"
         worktree.mkdir()
         warning_path = tmp_path / "warning.json"
         marker = worktree / "env-dump.txt"
+        dump_env = (
+            "import os, sys; "
+            "from pathlib import Path; "
+            "Path(sys.argv[1]).write_text('\\n'.join(f'{key}={value}' "
+            "for key, value in sorted(os.environ.items())), encoding='utf-8')"
+        )
 
         with (
             patch.object(
                 orch,
                 "SPEC_RUNTIME_CONFIG",
-                self._config_with_install(f"env > {marker}"),
+                self._config_with_install(
+                    f"env > {marker}",
+                    windows_argv=(sys.executable, "-c", dump_env, str(marker)),
+                ),
             ),
             patch.dict(
                 os.environ,
@@ -5359,7 +5380,14 @@ class TestReviewWorktreeBootstrap:
             return Process()
 
         with (
-            patch.object(orch, "SPEC_RUNTIME_CONFIG", self._config_with_install("echo ok")),
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    "echo ok",
+                    windows_argv=(sys.executable, "-c", "print('ok')"),
+                ),
+            ),
             patch.object(orch.subprocess, "Popen", side_effect=popen),
         ):
             warning = orch._bootstrap_review_worktree(
@@ -5367,7 +5395,11 @@ class TestReviewWorktreeBootstrap:
             )
 
         assert warning == ""
-        assert captured["argv"] == ["sh", "-lc", "echo ok"]
+        assert captured["argv"] == (
+            [sys.executable, "-c", "print('ok')"]
+            if os.name == "nt"
+            else ["sh", "-lc", "echo ok"]
+        )
 
     def test_bootstrap_cannot_read_real_home_credentials(self, tmp_path: Path):
         """Stripping named credential env vars is not enough on its own: build
@@ -5392,9 +5424,30 @@ class TestReviewWorktreeBootstrap:
             f'echo "$HOME" > {observed_home}; '
             f'[ -f "$HOME/.codex/auth.json" ] && cp "$HOME/.codex/auth.json" {found_marker} || true'
         )
+        windows_probe = (
+            "import shutil, sys; "
+            "from pathlib import Path; "
+            "home = Path.home(); "
+            "Path(sys.argv[1]).write_text(str(home), encoding='utf-8'); "
+            "secret = home / '.codex' / 'auth.json'; "
+            "shutil.copy2(secret, sys.argv[2]) if secret.is_file() else None"
+        )
 
         with (
-            patch.object(orch, "SPEC_RUNTIME_CONFIG", self._config_with_install(install_cmd)),
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    install_cmd,
+                    windows_argv=(
+                        sys.executable,
+                        "-c",
+                        windows_probe,
+                        str(observed_home),
+                        str(found_marker),
+                    ),
+                ),
+            ),
             patch.dict(
                 os.environ,
                 {"HOME": str(real_home), "CODEX_HOME": str(real_home / ".codex")},
@@ -5420,7 +5473,14 @@ class TestReviewWorktreeBootstrap:
         with patch.object(
             orch,
             "SPEC_RUNTIME_CONFIG",
-            self._config_with_install("echo 'boom: build hook failed' >&2; exit 1"),
+            self._config_with_install(
+                "echo 'boom: build hook failed' >&2; exit 1",
+                windows_argv=(
+                    sys.executable,
+                    "-c",
+                    "import sys; print('boom: build hook failed', file=sys.stderr); raise SystemExit(1)",
+                ),
+            ),
         ):
             warning = orch._bootstrap_review_worktree(
                 tmp_path / "repo", worktree, warning_path=warning_path
@@ -5429,7 +5489,7 @@ class TestReviewWorktreeBootstrap:
         assert warning
         assert warning_path.is_file()
         payload = json.loads(warning_path.read_text())
-        assert payload["command"] == "echo 'boom: build hook failed' >&2; exit 1"
+        assert "boom: build hook failed" in payload["command"]
         assert "boom: build hook failed" in payload["detail"]
 
     def test_records_warning_on_timeout(self, tmp_path: Path):
@@ -5438,7 +5498,18 @@ class TestReviewWorktreeBootstrap:
         warning_path = tmp_path / "warning.json"
 
         with (
-            patch.object(orch, "SPEC_RUNTIME_CONFIG", self._config_with_install("sleep 30")),
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    "sleep 30",
+                    windows_argv=(
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(30)",
+                    ),
+                ),
+            ),
             patch.object(orch, "REVIEW_BOOTSTRAP_TIMEOUT_SECONDS", 0.2),
         ):
             started = time.monotonic()
@@ -11798,7 +11869,7 @@ class TestImplementSetupTeardownHelpers:
         assert seen["env"]["SPEC_WORKTREE"] == str(repo)
         assert seen["env"]["SPEC_ATTEMPT"] == "1"
 
-    def test_windows_setup_override_does_not_change_posix_argv(self, repo: Path):
+    def test_setup_selects_the_matching_platform_variant(self, repo: Path):
         run = self._run()
         variants = CommandVariants(
             command="scripts/setup.sh 'literal && value'",
@@ -11824,10 +11895,16 @@ class TestImplementSetupTeardownHelpers:
         ):
             orch._run_implement_setup_command(run, repo)
 
-        assert run_command.call_args.args[0][:2] == [
-            "scripts/setup.sh",
-            "literal && value",
-        ]
+        launched = run_command.call_args.args[0]
+        if os.name == "nt":
+            assert Path(launched[0]).name.lower() in {"powershell", "powershell.exe"}
+            assert "Write-Output setup" in launched[-1]
+            assert "scripts/setup.sh" not in launched
+        else:
+            assert launched[:2] == [
+                "scripts/setup.sh",
+                "literal && value",
+            ]
 
     def test_run_setup_command_returns_failure_on_nonzero_exit(self, repo: Path):
         run = self._run()
@@ -13991,7 +14068,7 @@ class TestImplementSetupTeardownHelpers:
         assert seen["env"]["SPEC_WORKTREE"] == str(repo)
         assert seen["env"]["SPEC_ATTEMPT"] == "1"
 
-    def test_windows_teardown_override_does_not_change_posix_argv(self, repo: Path):
+    def test_teardown_selects_the_matching_platform_variant(self, repo: Path):
         run = self._run()
         variants = CommandVariants(
             command="scripts/teardown.sh 'literal && value'",
@@ -14017,12 +14094,18 @@ class TestImplementSetupTeardownHelpers:
         ):
             orch._run_implement_teardown_command(run, repo)
 
-        assert run_command.call_args.args[0][:2] == [
-            "scripts/teardown.sh",
-            "literal && value",
-        ]
+        launched = run_command.call_args.args[0]
+        if os.name == "nt":
+            assert Path(launched[0]).name.lower() in {"powershell", "powershell.exe"}
+            assert "Write-Output teardown" in launched[-1]
+            assert "scripts/teardown.sh" not in launched
+        else:
+            assert launched[:2] == [
+                "scripts/teardown.sh",
+                "literal && value",
+            ]
 
-    def test_windows_verify_override_does_not_change_posix_argv(self):
+    def test_verify_selects_the_matching_platform_variant(self):
         variants = CommandVariants(
             command="pytest 'literal && value'",
             windows_command="Write-Output verify",
@@ -14035,7 +14118,12 @@ class TestImplementSetupTeardownHelpers:
             patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
             patch.dict(orch.VERIFY_GATE_COMMANDS, {"test": variants.command}),
         ):
-            assert orch._verify_gate_command_args("test") == [
+            launched = orch._verify_gate_command_args("test")
+        if os.name == "nt":
+            assert Path(launched[0]).name.lower() in {"powershell", "powershell.exe"}
+            assert launched[-1] == "Write-Output verify"
+        else:
+            assert launched == [
                 "pytest",
                 "literal && value",
             ]
@@ -15007,6 +15095,13 @@ class TestVerifyPreflightMerge:
             str(worktree / ".venv" / "bin" / "python"),
             *orch.TEST_GATE_DIAGNOSTIC_ARGS,
         ]
+
+    def test_windows_test_gate_diagnostic_uses_scripts_python(self, repo: Path):
+        worktree = repo / ".worktrees" / "my-feature"
+
+        assert orch._worktree_venv_python(worktree, windows=True) == (
+            worktree / ".venv" / "Scripts" / "python.exe"
+        )
 
     def test_verify_allows_preflight_noop(self, repo: Path):
         run = self._make_run()
@@ -17820,7 +17915,7 @@ class TestLocalReviewPhase:
 
         assert review_result.status == "approved"
         env = captured["env"]
-        venv_bin = str(review_worktree / ".venv" / "bin")
+        venv_bin = str(orch._worktree_venv_executable_dir(review_worktree))
         assert env["PATH"].split(os.pathsep)[0] == venv_bin
         assert env["VIRTUAL_ENV"] == str(review_worktree / ".venv")
 
@@ -17895,6 +17990,15 @@ class TestLocalReviewPhase:
             assert ".venv/bin/pytest" in prompt_arg
         else:
             assert ".venv/bin/pytest" not in prompt_arg
+
+    def test_windows_review_prompt_uses_scripts_python(self, tmp_path: Path):
+        review_worktree = tmp_path / "review"
+        (review_worktree / ".venv" / "Scripts").mkdir(parents=True)
+
+        note = orch._review_env_prompt_note(review_worktree, windows=True)
+
+        assert r".venv\Scripts\python.exe -m pytest" in note
+        assert ".venv/bin/pytest" not in note
 
     def test_run_local_review_uses_distinct_review_agent_when_configured(
         self,
@@ -27434,7 +27538,7 @@ class TestNoStatusesJsonDependency:
 
     def test_orchestrator_no_json_imports(self):
         """The runtime driver must not import JSON status writers."""
-        src = Path(orch.__file__).read_text()
+        src = Path(orch.__file__).read_text(encoding="utf-8")
         assert "write_spec_status" not in src
         assert "status_file_path" not in src
         assert "set_spec_status" not in src
