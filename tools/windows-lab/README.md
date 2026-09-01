@@ -232,6 +232,21 @@ macOS/Linux, or real-Claude runs. Until independently produced artifacts for
 the exact staged revision are retained beside the VM evidence, the fail-closed
 audit reports those criteria as `unproven`.
 
+Produce the real-Claude artifact on an authenticated Linux host from the same
+clean revision, then retain it beside the collected VM evidence:
+
+```bash
+revision="$(git rev-parse HEAD)"
+python tools/linux_claude_web_evidence.py \
+  --expected-revision "$revision" \
+  --output "tools/windows-lab/artifacts/<run-name>/linux-claude-web-result.json"
+```
+
+This command runs the marked test rather than translating an operator claim
+into JSON. It publishes only after the live HTTP/SSE context and process-reap
+checks pass, and its `source_revision` must match the revision supplied to the
+final acceptance audit.
+
 ## Controller commands
 
 | Command | Purpose |

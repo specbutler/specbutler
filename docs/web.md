@@ -115,6 +115,24 @@ fixture repository. It discards server/provider output rather than recording
 the authenticated startup URL, prompts, model responses, or provider output,
 and removes the temporary web token during cleanup.
 
+For retained release evidence, use the checked-in runner from a completely
+clean checkout and name the revision independently:
+
+```bash
+revision="$(git rev-parse HEAD)"
+python tools/linux_claude_web_evidence.py \
+  --expected-revision "$revision" \
+  --output /path/to/evidence/linux-claude-web-result.json
+```
+
+The runner selects the one marked real-provider test itself. The test writes a
+private, single-run receipt only after all three dependent HTTP/SSE turns prove
+their random context markers and both the Claude provider and web-server
+processes are reaped. The runner binds that receipt to the clean checkout's
+exact commit before atomically publishing the result. A failure, skip, dirty
+checkout, revision mismatch, or incomplete receipt removes any stale output and
+leaves no passing artifact.
+
 ## Troubleshooting
 
 - **The page shows the login form:** run `spec web token` and paste the token,

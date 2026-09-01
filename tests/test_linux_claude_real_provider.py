@@ -11,11 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -36,6 +38,14 @@ from spec_runtime.process_supervisor import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_PROVIDER_ENV = "SPEC_LINUX_CLAUDE_REAL_PROVIDER"
+RECEIPT_PATH_ENV = "SPEC_LINUX_CLAUDE_PROOF_RECEIPT"
+EXPECTED_REVISION_ENV = "SPEC_LINUX_CLAUDE_EXPECTED_REVISION"
+CHALLENGE_ENV = "SPEC_LINUX_CLAUDE_PROOF_CHALLENGE"
+REAL_PROVIDER_TEST_NODE = (
+    "tests/test_linux_claude_real_provider.py::"
+    "test_linux_real_claude_web_chat_preserves_context_and_reaps_provider"
+)
+REVISION_RE = re.compile(r"[0-9a-f]{40}")
 
 
 class _ProofFailure(AssertionError):
@@ -336,6 +346,68 @@ def _wait_for_group_exit(pgid: int, timeout: float = 15) -> None:
         raise _ProofFailure("web server process group survived shutdown")
 
 
+def _write_proof_receipt(payload: dict[str, Any]) -> None:
+    """Write the runner's private receipt only from a clean exact checkout."""
+    receipt_value = os.environ.get(RECEIPT_PATH_ENV)
+    if not receipt_value:
+        return
+    expected_revision = os.environ.get(EXPECTED_REVISION_ENV, "").lower()
+    challenge = os.environ.get(CHALLENGE_ENV, "")
+    if not REVISION_RE.fullmatch(expected_revision) or not challenge:
+        raise _ProofFailure("evidence runner did not supply exact proof provenance")
+    receipt_path = Path(receipt_value)
+    if not receipt_path.is_absolute() or not receipt_path.parent.is_dir():
+        raise _ProofFailure("evidence runner supplied an invalid proof receipt path")
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if revision.returncode != 0 or revision.stdout.strip().lower() != expected_revision:
+        raise _ProofFailure("tested checkout does not match the requested proof revision")
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=REPO_ROOT,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if status.returncode != 0 or status.stdout:
+        raise _ProofFailure("tested checkout changed while the real-provider proof ran")
+
+    receipt = {
+        **payload,
+        "source_revision": expected_revision,
+        "proof_test": REAL_PROVIDER_TEST_NODE,
+        "run_challenge_sha256": _digest(challenge),
+    }
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=receipt_path.parent,
+            prefix=f".{receipt_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            json.dump(receipt, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            temporary = Path(handle.name)
+        temporary.replace(receipt_path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 @pytest.mark.linux_claude_real_provider
 @pytest.mark.skipif(
     not sys.platform.startswith("linux"),
@@ -364,6 +436,11 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
     sessions: list[str] = []
     managed = None
     stopped_cleanly = False
+    provider_identities: list[ProcessIdentity] = []
+    turn_1_marker_returned = False
+    turn_2_retained_turn_1 = False
+    turn_2_marker_returned = False
+    turn_3_retained_turns_1_and_2 = False
 
     # Foreground startup prints an authenticated URL containing the web token.
     # Discard all server/provider output so the credentialed proof never records
@@ -422,6 +499,7 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
             _send_turn(base_url, token, session_id, first_prompt)
             first_text = _assistant_text(base_url, token, session_id)
             _assert_contains(first_text, marker_one, turn=1)
+            turn_1_marker_returned = True
 
             second_prompt = (
                 "Return the exact marker supplied only in my prior turn. Then memorize exact "
@@ -430,6 +508,8 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
             _send_turn(base_url, token, session_id, second_prompt)
             second_text = _assistant_text(base_url, token, session_id)
             _assert_contains(second_text, marker_one, marker_two, turn=2)
+            turn_2_retained_turn_1 = True
+            turn_2_marker_returned = True
 
             third_prompt = (
                 "Return both exact markers learned in my two prior turns, in first-then-second "
@@ -438,6 +518,7 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
             _send_turn(base_url, token, session_id, third_prompt)
             third_text = _assistant_text(base_url, token, session_id)
             _assert_contains(third_text, marker_one, marker_two, turn=3)
+            turn_3_retained_turns_1_and_2 = True
 
             provider_identities = _new_provider_identities(pgid, baseline_pids)
             if not provider_identities:
@@ -517,3 +598,27 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
     assert stopped_cleanly
     assert not token_path.exists()
     assert not list(repo.rglob(".credentials.json"))
+    provider_processes_remaining = sum(
+        1 for identity in provider_identities if identity_matches(identity)
+    )
+    assert provider_processes_remaining == 0
+    assert not is_process_group_alive(pgid)
+    _write_proof_receipt(
+        {
+            "status": "passed",
+            "backend": "claude",
+            "real_provider": True,
+            "transport": "http-sse",
+            "dependent_turns": 3,
+            "turn_1_marker_returned": turn_1_marker_returned,
+            "turn_2_retained_turn_1": turn_2_retained_turn_1,
+            "turn_2_marker_returned": turn_2_marker_returned,
+            "turn_3_retained_turns_1_and_2": turn_3_retained_turns_1_and_2,
+            "provider_processes_observed": len(provider_identities),
+            "provider_processes_remaining": provider_processes_remaining,
+            "server_processes_remaining": 0,
+            "server_stopped_cleanly": stopped_cleanly,
+            "web_token_removed": not token_path.exists(),
+            "credential_files_copied": len(list(repo.rglob(".credentials.json"))),
+        }
+    )
