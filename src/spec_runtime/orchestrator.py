@@ -2495,7 +2495,7 @@ def _run_implement_setup_command(
     # lets the agent launch with diagnostics instead of aborting the phase.
     try:
         split_command = (
-            selected.argv(arguments=tuple(args))
+            selected.argv(arguments=_shell_metadata_arguments(selected, args))
             if typed and selected is not None
             else [*shlex.split(command), *args]
         )
@@ -2917,7 +2917,7 @@ def _run_implement_teardown_command(run: RunState, worktree_path: Path) -> None:
     _inject_worktree_venv_into_env(env, worktree_path)
     typed = selected is not None and _selected_command_uses_typed_runtime(variants, selected)
     teardown_cmd = (
-        selected.argv(arguments=tuple(args))
+        selected.argv(arguments=_shell_metadata_arguments(selected, args))
         if typed and selected is not None
         else [*shlex.split(command), *args]
     )
@@ -17081,6 +17081,16 @@ def _selected_command_uses_typed_runtime(
         or variants.shell
         or (os.name == "nt" and variants.windows_command)
     )
+
+
+def _shell_metadata_arguments(selected: CommandSpec, arguments: list[str]) -> tuple[str, ...]:
+    """Return positional metadata only for shells that preserve its boundary.
+
+    cmd hooks receive the same metadata through SPEC_ID, SPEC_RUN_ID, SPEC_PATH,
+    and SPEC_WORKTREE in their environment. Direct argv and PowerShell hooks
+    retain positional metadata for backward compatibility.
+    """
+    return () if selected.mode == "script" and selected.shell == "cmd" else tuple(arguments)
 
 
 def _run_verify_subprocess_with_timeout(

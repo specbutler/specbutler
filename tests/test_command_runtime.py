@@ -122,7 +122,6 @@ def test_native_windows_runs_simple_legacy_command_as_direct_argv() -> None:
     [
         ("powershell", "powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]),
         ("pwsh", "pwsh", ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"]),
-        ("cmd", "cmd.exe", ["/d", "/s", "/c"]),
     ],
 )
 def test_windows_shell_argv_preserves_script_and_metadata(
@@ -137,13 +136,15 @@ def test_windows_shell_argv_preserves_script_and_metadata(
     assert argv == [
         executable,
         *prefix,
-        "Write-Output $args",
-        "C:\\path with space\\",
-        'a"quote',
-        "snowman-☃",
-        "$HOME",
-        "x&y",
+        "& { Write-Output $args } 'C:\\path with space\\' 'a\"quote' "
+        "'snowman-☃' '$HOME' 'x&y'",
     ]
+
+
+def test_cmd_hook_metadata_requires_environment_or_direct_argv() -> None:
+    command = CommandSpec("script", "echo ok", "cmd")
+    with pytest.raises(CommandConfigurationError, match="SPEC_ID.*argv_windows"):
+        command.argv(windows=True, arguments=("path with space", "x&y"))
 
 
 def test_missing_declared_powershell_is_targeted() -> None:
@@ -183,7 +184,14 @@ def test_powershell_hook_metadata_is_available_in_real_process(tmp_path: Path) -
         "(ConvertTo-Json -Compress -InputObject $values))",
         "powershell",
     )
-    expected = ["spec-id", "run-id", "path with space"]
+    expected = [
+        "path with space",
+        "percent% and $dollar",
+        "semi; amp&",
+        "single' and double\"",
+        "snowman-☃",
+        "C:\\trailing\\",
+    ]
     completed = subprocess.run(
         command.argv(arguments=(str(output), *expected)),
         cwd=tmp_path,
@@ -193,6 +201,41 @@ def test_powershell_hook_metadata_is_available_in_real_process(tmp_path: Path) -
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(output.read_text(encoding="utf-8-sig")) == expected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native cmd.exe")
+def test_cmd_hook_metadata_is_lossless_via_environment(tmp_path: Path) -> None:
+    output = tmp_path / "hook metadata.json"
+    helper = tmp_path / "read metadata.py"
+    helper.write_text(
+        "import json, os, pathlib, sys\n"
+        "keys = ('SPEC_ID', 'SPEC_RUN_ID', 'SPEC_PATH', 'SPEC_WORKTREE')\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.environ[k] for k in keys]))\n",
+        encoding="utf-8",
+    )
+    expected = [
+        "space percent% $dollar",
+        "semi; amp&",
+        "single' double\" snowman-☃",
+        "C:\\trailing\\",
+    ]
+    env = os.environ.copy()
+    env.update(dict(zip(("SPEC_ID", "SPEC_RUN_ID", "SPEC_PATH", "SPEC_WORKTREE"), expected)))
+    command = CommandSpec(
+        "script",
+        f'"{sys.executable}" "{helper}" "{output}"',
+        "cmd",
+    )
+    completed = subprocess.run(
+        command.argv(windows=True),
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(output.read_text()) == expected
 
 
 def shlex_quote(value: str) -> str:

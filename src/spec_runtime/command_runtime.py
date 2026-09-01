@@ -57,14 +57,29 @@ class CommandSpec:
                 else ["sh", shell_option, script]
             )
         if shell == "cmd":
-            return ["cmd.exe", "/d", "/s", "/c", script, *arguments]
+            if arguments:
+                raise CommandConfigurationError(
+                    "cmd scripts do not support positional hook metadata safely; "
+                    "read SPEC_ID, SPEC_RUN_ID, SPEC_PATH, and SPEC_WORKTREE from the "
+                    "environment, or configure an argv_windows command"
+                )
+            return ["cmd.exe", "/d", "/s", "/c", script]
         executable = "powershell.exe" if shell == "powershell" else "pwsh"
         resolved = which(executable)
         if resolved is None:
             raise FileNotFoundError(f"declared shell {shell!r} is not installed")
+        if arguments:
+            # Windows PowerShell treats every native argv element following
+            # -Command as more source text.  Invoke one scriptblock and encode
+            # metadata as PowerShell literals so spaces and metacharacters
+            # cannot change the command boundary.
+            source = f"& {{ {script} }} " + " ".join(
+                _powershell_literal(argument) for argument in arguments
+            )
+        else:
+            source = script
         return [
-            resolved, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script,
-            *arguments,
+            resolved, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", source,
         ]
 
     def display(self, *, windows: bool | None = None) -> str:
@@ -188,6 +203,11 @@ def _string(value: object, location: str) -> str:
     if not isinstance(value, str):
         raise CommandConfigurationError(f"{location} must be a string")
     return value.strip()
+
+
+def _powershell_literal(value: str) -> str:
+    """Encode a value as a non-interpolating PowerShell string literal."""
+    return "'" + value.replace("'", "''") + "'"
 
 
 def _argv(value: object, location: str) -> tuple[str, ...]:
