@@ -708,7 +708,8 @@ def test_installed_artifact_cli_matrix(tmp_path: Path) -> None:
     assert "Created .spec.toml" in initialized.stdout
     assert (repo / ".spec.toml").is_file()
     doctor = _cli(repo, "doctor", env=env)
-    assert "0 error" in doctor.stdout.lower()
+    assert "0 blocker(s)" in doctor.stdout.lower()
+    assert "0 warning(s)" in doctor.stdout.lower()
 
     lifecycle_id = "windows-cli-flow"
     lifecycle_spec = repo / "specs" / f"{lifecycle_id}.md"
