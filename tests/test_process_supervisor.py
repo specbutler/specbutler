@@ -123,7 +123,16 @@ def test_detached_durable_token_publication_is_opt_in(
         published = SupervisionToken.from_dict(
             json.loads(metadata_path.read_text(encoding="utf-8"))
         )
-        assert published == managed.token
+        assert process_supervisor._same_durable_owner(published, managed.token)
+        assert published.payload == managed.token.payload
+        if os.name == "posix":
+            # POSIX publishes the launcher's exact token. The Windows helper
+            # publishes before a launcher owner exists; the launcher records
+            # its own logical ownership only in the returned token.
+            assert published == managed.token
+        else:
+            assert published.owner_pid == 0
+            assert published.owner_started_at == ""
         assert identity_matches(published.identity)
     finally:
         managed.terminate(grace_seconds=0.1)

@@ -107,6 +107,26 @@ def _managed_process_double(
     )
 
 
+def _minimal_process_environment(**overrides: str) -> dict[str, str]:
+    """Keep only platform roots required by pathlib and process creation."""
+    keys = (
+        "COMSPEC",
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "WINDIR",
+    )
+    env = {key: os.environ[key] for key in keys if key in os.environ}
+    env.update(overrides)
+    return env
+
+
 def _create_annotated_merge_tag(
     cwd: Path,
     *,
@@ -2108,7 +2128,7 @@ class TestPhaseImplementHandshake:
             patch.object(
                 orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn(captured_env=captured_env)
             ),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2130,7 +2150,9 @@ class TestPhaseImplementHandshake:
         )
         register_setup_processes.assert_called_once_with(repo, worktree, manifest)
         assert captured_env["VIRTUAL_ENV"] == str(worktree / ".venv")
-        assert captured_env["PATH"].split(os.pathsep)[0] == str(worktree / ".venv" / "bin")
+        assert captured_env["PATH"].split(os.pathsep)[0] == str(
+            orch._worktree_venv_python(worktree).parent
+        )
         assert (
             captured_env["DATABASE_URL"] == "postgresql://example:secret@/example_app?host=/tmp/example-pg&port=55433"
         )
@@ -2182,7 +2204,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2253,7 +2275,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2323,7 +2345,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2400,7 +2422,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4140,9 +4162,14 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_write_sandbox_config"),
             patch.object(orch, "_build_agent_command", return_value=["agent"]),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
+            patch.object(orch, "_recent_commit_lines", return_value=[]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
             patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
-            patch.dict(orch.os.environ, {"BASE_ENV": "present"}, clear=True),
+            patch.dict(
+                orch.os.environ,
+                _minimal_process_environment(BASE_ENV="present"),
+                clear=True,
+            ),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4350,7 +4377,7 @@ class TestPhaseImplementHandshake:
                 "spawn",
                 side_effect=_make_fake_managed_spawn(returncode=0, captured_env=captured_env),
             ),
-            patch.dict(orch.os.environ, {"PATH": "/usr/bin:/bin"}, clear=True),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4358,7 +4385,9 @@ class TestPhaseImplementHandshake:
         assert calls == ["setup", "teardown"]
         assert captured_env["DATABASE_URL"] == "postgres://db"
         assert captured_env["VIRTUAL_ENV"] == str(worktree / ".venv")
-        assert captured_env["PATH"].split(os.pathsep)[0] == str(worktree / ".venv" / "bin")
+        assert captured_env["PATH"].split(os.pathsep)[0] == str(
+            orch._worktree_venv_python(worktree).parent
+        )
 
 
 # ---------------------------------------------------------------------------
