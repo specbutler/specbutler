@@ -616,13 +616,16 @@ class TestCodexBridge:
 
             exec_args = []
 
-            async def fake_create_subprocess_exec(*args, **_kwargs):
+            async def fake_spawn_async(_supervisor, args, **_kwargs):
                 exec_args.extend(args)
                 return _DummyProc()
 
             with (
                 patch("spec_runtime.web.bridge_codex.shutil.which", return_value="/usr/bin/codex"),
-                patch("spec_runtime.web.bridge_codex.asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec),
+                patch(
+                    "spec_runtime.web.bridge_codex.ProcessSupervisor.spawn_async",
+                    new=fake_spawn_async,
+                ),
                 patch.object(_CodexSession, "_drain_stderr", new=AsyncMock(return_value=None)),
                 patch.object(_CodexSession, "_send_request", side_effect=fake_send_request),
             ):
@@ -788,14 +791,14 @@ class TestCodexBridge:
         async def _run():
             session = _CodexSession(cwd="/tmp/test")
 
-            async def fake_create_subprocess_exec(*_args, **_kwargs):
+            async def fake_spawn_async(_supervisor, _args, **_kwargs):
                 return _DummyProc()
 
             with (
                 patch("spec_runtime.web.bridge_codex.shutil.which", return_value="/usr/bin/codex"),
                 patch(
-                    "spec_runtime.web.bridge_codex.asyncio.create_subprocess_exec",
-                    side_effect=fake_create_subprocess_exec,
+                    "spec_runtime.web.bridge_codex.ProcessSupervisor.spawn_async",
+                    new=fake_spawn_async,
                 ),
             ):
                 with pytest.raises(RuntimeError, match=r"(?s)exit code 1.*ANTHROPIC_API_KEY"):
@@ -849,7 +852,7 @@ class TestCodexBridge:
             session = _CodexSession(cwd="/tmp/test")
             process = _DummyProc()
 
-            async def fake_create_subprocess_exec(*_args, **_kwargs):
+            async def fake_spawn_async(_supervisor, _args, **_kwargs):
                 return process
 
             # Only raise TimeoutError on the first wait_for call (the
@@ -870,8 +873,8 @@ class TestCodexBridge:
             with (
                 patch("spec_runtime.web.bridge_codex.shutil.which", return_value="/usr/bin/codex"),
                 patch(
-                    "spec_runtime.web.bridge_codex.asyncio.create_subprocess_exec",
-                    side_effect=fake_create_subprocess_exec,
+                    "spec_runtime.web.bridge_codex.ProcessSupervisor.spawn_async",
+                    new=fake_spawn_async,
                 ),
                 patch("spec_runtime.web.bridge_codex.asyncio.wait_for", side_effect=selective_wait_for),
             ):
@@ -2960,7 +2963,7 @@ class TestImplementEndpoint:
         mock_proc.poll.return_value = None  # still running
 
         with patch("spec_runtime.orchestrator.run_subprocess", return_value=mock_diff), \
-             patch("spec_runtime.web.chat_api.subprocess.Popen", return_value=mock_proc):
+             patch("spec_runtime.web.chat_api.ProcessSupervisor.spawn", return_value=mock_proc):
             resp = client.post(
                 f"/api/v1/chat/sessions/{session.session_id}/implement",
                 json={"spec_id": "wrong-spec-from-client"},
@@ -3023,16 +3026,16 @@ class TestImplementEndpoint:
 
         with patch("spec_runtime.orchestrator.run_subprocess", return_value=mock_diff), \
              patch("spec_runtime.web.api._spec_executable", return_value="/venv/bin/spec"), \
-             patch("spec_runtime.web.chat_api.subprocess.Popen", return_value=mock_proc) as popen_mock:
+             patch("spec_runtime.web.chat_api.ProcessSupervisor.spawn", return_value=mock_proc) as spawn_mock:
             resp = client.post(
                 f"/api/v1/chat/sessions/{session.session_id}/implement",
                 json={"agent": "claude"},  # client sends stale value
                 headers=self._auth_headers(),
             )
         assert resp.status_code == 200
-        # The Popen call should use the session's agent ("codex"), not the
+        # The supervised spawn should use the session's agent ("codex"), not the
         # client-supplied "claude".
-        call_args = popen_mock.call_args[0][0]
+        call_args = spawn_mock.call_args[0][0]
         assert call_args[0] == "/venv/bin/spec"
         agent_idx = call_args.index("--agent")
         assert call_args[agent_idx + 1] == "codex"
