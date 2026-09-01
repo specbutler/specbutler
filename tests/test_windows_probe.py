@@ -836,6 +836,8 @@ with patch("spec_runtime.update.resolve_repo_slug", return_value="fixture/spec")
         backend_source="repo-config",
         backend_workspace_root=".worktrees",
     ).save(repo)
+    pinned_spec = repo / ".spec-state" / "runs" / run_id / "spec.md"
+    pinned_spec.write_text(lifecycle_spec.read_text(encoding="utf-8"), encoding="utf-8")
     first_implement = _cli(
         repo,
         "phase",
