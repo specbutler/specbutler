@@ -136,6 +136,7 @@ jobs:
     if: needs.skip-check.outputs.is_version_bump != 'true'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
     steps:

@@ -335,6 +335,12 @@ def test_ci_windows_matrix_covers_supported_python_and_both_distribution_types()
     assert "windows-package" in windows["needs"]
 
 
+def test_ci_linux_matrix_reports_every_supported_version_failure():
+    jobs = _workflow_jobs()
+
+    assert jobs["test"]["strategy"]["fail-fast"] is False
+
+
 def test_ci_windows_tests_cannot_import_checkout_via_pytest_pythonpath():
     jobs = _workflow_jobs()
     steps = [step for step in jobs["windows-probe"]["steps"] if isinstance(step, dict)]
