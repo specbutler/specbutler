@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 _REAL_POPEN_TYPE = subprocess.Popen
+_ADOPTED_TOKENS: set[str] = set()
 
 
 def _kernel32() -> Any:
@@ -49,6 +50,17 @@ def _kernel32() -> Any:
         function.argtypes = argtypes
         function.restype = restype
     return kernel32
+
+
+def _resume_windows_process(process_handle: int) -> None:
+    """Resume every thread in a process created with CREATE_SUSPENDED."""
+    from ctypes import wintypes
+
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+    ntdll.NtResumeProcess.restype = ctypes.c_long
+    if ntdll.NtResumeProcess(process_handle) != 0:
+        raise OSError("NtResumeProcess failed")
 
 
 class LifetimeMode(str, Enum):
@@ -354,6 +366,47 @@ class ManagedProcess:
     def terminate(self, grace_seconds: float = 5.0) -> None:
         terminate(self.token, grace_seconds=grace_seconds, job=self._job)
 
+    def wait(self, timeout: float | None = None) -> int:
+        returncode = int(self.process.wait(timeout=timeout))
+        self.close()
+        return returncode
+
+    def close(self) -> None:
+        if self._job is not None:
+            self._job.close()
+            self._job = None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.process, name)
+
+
+class ManagedAsyncProcess:
+    """Asyncio process facade that retains its run-owned Job handle."""
+
+    def __init__(self, process: asyncio.subprocess.Process, token: SupervisionToken, job: _WindowsJob | None = None):
+        self.process = process
+        self.token = token
+        self._job = job
+
+    def terminate(self) -> None:
+        self.process.terminate()
+
+    def kill(self) -> None:
+        if self._job is not None and identity_matches(self.token.identity):
+            self._job.terminate()
+        else:
+            self.process.kill()
+
+    async def wait(self) -> int:
+        returncode = int(await self.process.wait())
+        self.close()
+        return returncode
+
+    async def communicate(self, input: bytes | None = None) -> tuple[bytes | None, bytes | None]:
+        result = await self.process.communicate(input)
+        self.close()
+        return result
+
     def close(self) -> None:
         if self._job is not None:
             self._job.close()
@@ -368,7 +421,7 @@ class ProcessSupervisor:
 
     def __init__(self, mode: LifetimeMode = LifetimeMode.RUN_OWNED):
         self.mode = LifetimeMode(mode)
-        self._children: list[ManagedProcess] = []
+        self._children: list[ManagedProcess | ManagedAsyncProcess] = []
 
     def spawn(self, argv: Sequence[str], **kwargs: Any) -> ManagedProcess:
         job = None
@@ -397,8 +450,7 @@ class ProcessSupervisor:
         try:
             if job is not None:
                 job.assign(int(process._handle))  # type: ignore[attr-defined]
-                if ctypes.windll.ntdll.NtResumeProcess(int(process._handle)) != 0:  # type: ignore[attr-defined]
-                    raise OSError("NtResumeProcess failed")
+                _resume_windows_process(int(process._handle))  # type: ignore[attr-defined]
             # Minimal Popen doubles used by callers do not represent a live OS
             # process. Keep that compatibility seam out of production paths.
             is_test_double = not isinstance(process, _REAL_POPEN_TYPE)
@@ -422,17 +474,45 @@ class ProcessSupervisor:
                 process.kill()
             raise
 
-    async def spawn_async(self, argv: Sequence[str], **kwargs: Any) -> Any:
+    async def spawn_async(self, argv: Sequence[str], **kwargs: Any) -> ManagedAsyncProcess:
         """Async counterpart with the same platform-owned launch policy."""
+        job = None
         if os.name == "nt":
             flags = int(kwargs.pop("creationflags", 0))
             flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
-            if self.mode is LifetimeMode.DETACHED:
+            if self.mode is LifetimeMode.RUN_OWNED:
+                flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
+                job = _WindowsJob()
+            elif self.mode is LifetimeMode.ADOPTABLE:
+                argv = [sys.executable, "-m", "spec_runtime.process_supervisor", "--adoptable-helper", "--", *argv]
+                flags |= getattr(subprocess, "DETACHED_PROCESS", 0x8)
+            elif self.mode is LifetimeMode.DETACHED:
                 flags |= getattr(subprocess, "DETACHED_PROCESS", 0x8)
             kwargs["creationflags"] = flags
         else:
             kwargs["start_new_session"] = True
-        return await asyncio.create_subprocess_exec(*argv, **kwargs)
+        process = await asyncio.create_subprocess_exec(*argv, **kwargs)
+        try:
+            if job is not None:
+                transport_process = process._transport.get_extra_info("subprocess")  # type: ignore[attr-defined]
+                process_handle = int(transport_process._handle)
+                job.assign(process_handle)
+                _resume_windows_process(process_handle)
+            identity = inspect_process(process.pid)
+            if identity is None:
+                raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
+            owner = inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable")
+            pgid = os.getpgid(process.pid) if os.name == "posix" else 0
+            token = SupervisionToken(self.mode, identity, owner.pid, owner.started_at, uuid.uuid4().hex, pgid)
+            managed = ManagedAsyncProcess(process, token, job)
+            self._children.append(managed)
+            return managed
+        except Exception:
+            if job is not None:
+                job.close()
+            process.kill()
+            await process.wait()
+            raise
 
     def close(self) -> None:
         if self.mode is LifetimeMode.RUN_OWNED:
@@ -482,10 +562,14 @@ def adopt(token: SupervisionToken) -> SupervisionToken:
     """Validate a durable adoptable token and transfer logical ownership once."""
     if token.mode is not LifetimeMode.ADOPTABLE:
         raise ValueError("Only adoptable tokens may be adopted")
+    if token.token in _ADOPTED_TOKENS:
+        raise ValueError("Supervision token was already adopted by this owner")
     if not identity_matches(token.identity):
         raise ProcessLookupError(token.identity.pid)
     owner = inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable")
-    return SupervisionToken(token.mode, token.identity, owner.pid, owner.started_at, token.token, token.pgid)
+    adopted = SupervisionToken(token.mode, token.identity, owner.pid, owner.started_at, token.token, token.pgid)
+    _ADOPTED_TOKENS.add(token.token)
+    return adopted
 
 
 def _adoptable_helper(argv: Sequence[str]) -> int:

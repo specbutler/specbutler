@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ from spec_runtime.process_supervisor import (
     ProcessIdentity,
     ProcessSupervisor,
     SupervisionToken,
+    adopt,
     identity_matches,
     inspect_process,
     terminate,
@@ -34,6 +36,19 @@ def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -
     assert identity_matches(expected) is False
 
 
+def test_adoptable_token_transfers_only_once_per_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    identity = ProcessIdentity(42, "created", "python.exe")
+    token = SupervisionToken(LifetimeMode.ADOPTABLE, identity, 7, "owner", "unique-adoption-token")
+    monkeypatch.setattr("spec_runtime.process_supervisor.identity_matches", lambda _identity: True)
+    monkeypatch.setattr(
+        "spec_runtime.process_supervisor.inspect_process",
+        lambda pid: ProcessIdentity(pid, "new-owner", sys.executable),
+    )
+    assert adopt(token).owner_pid == os.getpid()
+    with pytest.raises(ValueError, match="already adopted"):
+        adopt(token)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")
 @pytest.mark.parametrize("action", ["normal", "timeout", "stop", "owner-close"])
 def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: str) -> None:
@@ -41,39 +56,118 @@ def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: 
     pid_file = tmp_path / "pids.json"
     script = tmp_path / "tree.py"
     script.write_text(
-        "import json,os,subprocess,sys,time\n"
+        "import os,subprocess,sys,time\n"
         "level=int(sys.argv[1]); path=sys.argv[2]\n"
+        "open(path+'-'+str(level),'w').write(str(os.getpid()))\n"
         "child=None if level == 2 else subprocess.Popen([sys.executable,__file__,str(level+1),path])\n"
-        "if level == 0:\n"
-        " time.sleep(.5); json.dump([os.getpid(),child.pid],open(path,'w'))\n"
         "time.sleep(30 if level else 2)\n",
         encoding="utf-8",
     )
     supervisor = ProcessSupervisor(LifetimeMode.RUN_OWNED)
     managed = supervisor.spawn([sys.executable, str(script), "0", str(pid_file)])
+    while not all(Path(f"{pid_file}-{level}").exists() for level in range(3)):
+        time.sleep(0.05)
     if action == "normal":
         managed.wait(timeout=10)
     else:
-        while not pid_file.exists():
-            time.sleep(0.05)
         if action == "owner-close":
             supervisor.close()
         else:
             managed.terminate(grace_seconds=0.1)
         managed.wait(timeout=10)
-    if action != "normal":
-        for pid in json.loads(pid_file.read_text(encoding="utf-8")):
-            assert inspect_process(pid) is None
+    for level in range(3):
+        pid = int(Path(f"{pid_file}-{level}").read_text(encoding="utf-8"))
+        assert inspect_process(pid) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows async Job Object integration")
+def test_windows_async_run_owned_owner_close_kills_complete_tree(tmp_path: Path) -> None:
+    pid_file = tmp_path / "async-pids"
+    script = tmp_path / "async-tree.py"
+    script.write_text(
+        "import os,subprocess,sys,time\n"
+        "level=int(sys.argv[1]); path=sys.argv[2]\n"
+        "open(path+'-'+str(level),'w').write(str(os.getpid()))\n"
+        "child=None if level == 2 else subprocess.Popen([sys.executable,__file__,str(level+1),path])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+
+    async def exercise() -> None:
+        supervisor = ProcessSupervisor(LifetimeMode.RUN_OWNED)
+        managed = await supervisor.spawn_async([sys.executable, str(script), "0", str(pid_file)])
+        while not all(Path(f"{pid_file}-{level}").exists() for level in range(3)):
+            await asyncio.sleep(0.05)
+        supervisor.close()
+        await asyncio.wait_for(managed.wait(), timeout=10)
+
+    asyncio.run(exercise())
+    for level in range(3):
+        pid = int(Path(f"{pid_file}-{level}").read_text(encoding="utf-8"))
+        assert inspect_process(pid) is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows durable helper integration")
 def test_windows_adoptable_helper_survives_launcher_and_stops(tmp_path: Path) -> None:
     marker = tmp_path / "alive"
-    managed = ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
-        [sys.executable, "-c", f"from pathlib import Path; import time; Path({str(marker)!r}).write_text('ok'); time.sleep(30)"]
+    token_file = tmp_path / "adoptable.json"
+    launcher = tmp_path / "adoptable-launcher.py"
+    launcher.write_text(
+        "import json,sys\n"
+        "from spec_runtime.process_supervisor import LifetimeMode,ProcessSupervisor\n"
+        "payload=[sys.executable,'-c',"
+        "'from pathlib import Path; import sys,time; Path(sys.argv[1]).write_text(\"alive\"); time.sleep(30)',sys.argv[2]]\n"
+        "managed=ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(payload)\n"
+        "open(sys.argv[1],'w').write(json.dumps(managed.token.to_dict()))\n",
+        encoding="utf-8",
     )
+    __import__("subprocess").run(
+        [sys.executable, str(launcher), str(token_file), str(marker)],
+        check=True,
+        timeout=10,
+    )
+    token = SupervisionToken.from_dict(json.loads(token_file.read_text(encoding="utf-8")))
     while not marker.exists():
         time.sleep(0.05)
-    assert identity_matches(managed.token.identity)
-    assert terminate(managed.token, grace_seconds=0.1)
-    managed.wait(timeout=10)
+    assert identity_matches(token.identity)
+    adopted = adopt(token)
+    with pytest.raises(ValueError, match="already adopted"):
+        adopt(token)
+    assert terminate(adopted, grace_seconds=0.1)
+    deadline = time.monotonic() + 10
+    while identity_matches(adopted.identity) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not identity_matches(adopted.identity)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows detached launcher integration")
+@pytest.mark.parametrize("workflow", ["update-refresh", "background-web-service"])
+def test_windows_detached_workflows_survive_launcher_and_stop_by_identity(tmp_path: Path, workflow: str) -> None:
+    """Model both short-lived call sites with a real launcher and payload."""
+    token_file = tmp_path / f"{workflow}.json"
+    marker = tmp_path / f"{workflow}.alive"
+    launcher = tmp_path / f"launch-{workflow}.py"
+    launcher.write_text(
+        "import json,sys\n"
+        "from spec_runtime.process_supervisor import LifetimeMode,ProcessSupervisor\n"
+        "payload=[sys.executable,'-c',"
+        "'from pathlib import Path; import sys,time; Path(sys.argv[1]).write_text(\"alive\"); time.sleep(30)',sys.argv[2]]\n"
+        "managed=ProcessSupervisor(LifetimeMode.DETACHED).spawn(payload)\n"
+        "open(sys.argv[1],'w').write(json.dumps(managed.token.to_dict()))\n",
+        encoding="utf-8",
+    )
+    launcher_process = __import__("subprocess").run(
+        [sys.executable, str(launcher), str(token_file), str(marker)],
+        check=True,
+        timeout=10,
+    )
+    assert launcher_process.returncode == 0
+    token = SupervisionToken.from_dict(json.loads(token_file.read_text(encoding="utf-8")))
+    while not marker.exists():
+        time.sleep(0.05)
+    assert identity_matches(token.identity)
+    assert terminate(token, grace_seconds=0.1)
+    deadline = time.monotonic() + 10
+    while identity_matches(token.identity) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not identity_matches(token.identity)
