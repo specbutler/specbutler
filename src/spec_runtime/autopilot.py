@@ -513,6 +513,8 @@ class PidFileRecord:
     pid: int
     started_at: str = ""
     command: str = ""
+    instance_id: str = ""
+    nonce: str = ""
 
 
 @dataclass(frozen=True)
@@ -2254,6 +2256,8 @@ def _read_pid_file(path: Path) -> PidFileRecord | None:
         pid=pid,
         started_at=str(payload.get("started_at", "")).strip(),
         command=str(payload.get("command", "")).strip(),
+        instance_id=str(payload.get("instance_id", "")).strip(),
+        nonce=str(payload.get("nonce", "")).strip(),
     )
 
 
@@ -2343,16 +2347,20 @@ def find_autopilot_processes_for_repo(repo_root: Path) -> list[ProcessIdentity]:
     return matches
 
 
-def _write_pid_file(path: Path, identity: ProcessIdentity) -> None:
+def _write_pid_file(path: Path, identity: ProcessIdentity, *, instance_id: str = "", nonce: str = "") -> None:
     payload = {
         "pid": identity.pid,
         "started_at": identity.started_at,
         "command": identity.command,
     }
+    if instance_id:
+        payload["instance_id"] = instance_id
+    if nonce:
+        payload["nonce"] = nonce
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def ensure_pid_file(repo_root: Path) -> None:
+def ensure_pid_file(repo_root: Path, *, instance_id: str = "", nonce: str = "") -> None:
     path = autopilot_pid_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
@@ -2361,7 +2369,7 @@ def ensure_pid_file(repo_root: Path) -> None:
             live_identity = read_process_identity(record.pid)
             if live_identity is not None and _pid_record_matches_process(record, live_identity):
                 raise RuntimeError(f"Autopilot already running with pid {record.pid}.")
-    _write_pid_file(path, current_process_identity())
+    _write_pid_file(path, current_process_identity(), instance_id=instance_id, nonce=nonce)
 
 
 def remove_pid_file(repo_root: Path) -> None:
@@ -2384,8 +2392,16 @@ def run_loop(args: argparse.Namespace) -> int:
     dispatcher_lock = FileLock(autopilot_state_root(repo_root) / "dispatcher.lock", blocking=False)
     if not dispatcher_lock.acquire():
         raise RuntimeError("Autopilot already running for this repository.")
+    dispatcher_instance_id = uuid.uuid4().hex
+    dispatcher_nonce = uuid.uuid4().hex
+    dispatcher_identity = current_process_identity()
     try:
-        ensure_pid_file(repo_root)
+        try:
+            ensure_pid_file(repo_root, instance_id=dispatcher_instance_id, nonce=dispatcher_nonce)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            ensure_pid_file(repo_root)
     except Exception:
         dispatcher_lock.release()
         raise
@@ -2412,15 +2428,20 @@ def run_loop(args: argparse.Namespace) -> int:
             )
         )
 
-    shutdown_tracker = ShutdownTracker(autopilot_state_root(repo_root))
-    reconciled = shutdown_tracker.reconcile_stale()
-    if reconciled.phase is ShutdownPhase.COMPLETE and reconciled.requested_at:
-        print(
-            format_status_line(
-                "resume",
-                f"reconciled stale shutdown from {reconciled.requested_at}",
-            )
-        )
+    legacy_tracker = ShutdownTracker(autopilot_state_root(repo_root))
+    legacy_state = legacy_tracker.state()
+    if not legacy_state.instance_id and legacy_state.phase in {ShutdownPhase.GRACEFUL, ShutdownPhase.FORCED}:
+        reconciled = legacy_tracker.reconcile_stale()
+        print(format_status_line("resume", f"reconciled stale shutdown from {reconciled.requested_at}"))
+    shutdown_tracker = ShutdownTracker(
+        autopilot_state_root(repo_root),
+        instance_id=dispatcher_instance_id,
+        pid=dispatcher_identity.pid,
+        process_started_at=dispatcher_identity.started_at,
+        nonce=dispatcher_nonce,
+    )
+    if not args.dry_run:
+        shutdown_tracker.initialize()
 
     stop_requested = False
     force_shutdown = False
@@ -2590,7 +2611,7 @@ def run_loop(args: argparse.Namespace) -> int:
             if stop_requested:
                 if not active or force_shutdown:
                     break
-                time.sleep(args.poll_interval)
+                time.sleep(min(args.poll_interval, 0.25))
                 continue
 
             if len(active) < args.concurrency or args.dry_run:
@@ -3496,7 +3517,17 @@ def _signal_autopilot(pid: int, repo_root: Path | None = None) -> int:
     if os.name == "nt":
         if repo_root is None:
             raise ValueError("repo_root is required for portable Windows shutdown")
-        tracker = ShutdownTracker(autopilot_state_root(repo_root))
+        record = _read_pid_file(autopilot_pid_path(repo_root))
+        if record is None or record.pid != pid or not record.instance_id or not record.nonce:
+            print(f"Autopilot pid {pid} has no targetable shutdown identity.", file=sys.stderr)
+            return 1
+        tracker = ShutdownTracker(
+            autopilot_state_root(repo_root),
+            instance_id=record.instance_id,
+            pid=record.pid,
+            process_started_at=record.started_at,
+            nonce=record.nonce,
+        )
         tracker.record_interrupt(reason=f"stop-command:{os.getpid()}")
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:

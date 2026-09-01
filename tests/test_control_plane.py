@@ -734,6 +734,35 @@ def test_shutdown_running_state_when_no_file(tmp_path: Path) -> None:
     assert not tracker.is_graceful_requested()
 
 
+def test_shutdown_tracker_targets_one_dispatcher_generation(tmp_path: Path) -> None:
+    first = ShutdownTracker(
+        tmp_path, instance_id="first", pid=101, process_started_at="one", nonce="nonce-one"
+    )
+    first.initialize()
+    assert first.record_interrupt().phase is ShutdownPhase.GRACEFUL
+
+    second = ShutdownTracker(
+        tmp_path, instance_id="second", pid=202, process_started_at="two", nonce="nonce-two"
+    )
+    second.initialize()
+    assert second.state().phase is ShutdownPhase.RUNNING
+    assert first.is_graceful_requested() is False
+
+    requested = second.record_interrupt()
+    assert requested.phase is ShutdownPhase.GRACEFUL
+    assert requested.instance_id == "second"
+    assert requested.pid == 202
+    assert requested.process_started_at == "two"
+    assert requested.nonce == "nonce-two"
+
+
+def test_shutdown_tracker_second_targeted_request_forces(tmp_path: Path) -> None:
+    tracker = ShutdownTracker(tmp_path, instance_id="dispatcher", pid=303, nonce="secret")
+    tracker.initialize()
+    assert tracker.record_interrupt().phase is ShutdownPhase.GRACEFUL
+    assert tracker.record_interrupt().phase is ShutdownPhase.FORCED
+
+
 # --------------------------------------------------------------------------- #
 # Status projection tests
 # --------------------------------------------------------------------------- #
