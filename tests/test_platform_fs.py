@@ -16,6 +16,8 @@ from spec_runtime.platform import is_unc_path
 from spec_runtime.platform_fs import FileLock, _windows_extended_path, atomic_write_text, remove_tree
 from spec_runtime.spec_identity import SPEC_ID_RE
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 
 def _locked_increment(path_text: str, count: int) -> None:
     from spec_runtime.orchestrator import _locked_state_path, _read_json_dict, _write_json_file_atomically
@@ -75,14 +77,15 @@ def test_atomic_write_text_uses_bounded_temp_basename(
     monkeypatch.setattr(platform_fs.os, "replace", capture_replace)
     path = tmp_path / f"{('long-run-state-' * 10)}.json"
 
-    atomic_write_text(path, '{"ok": true}\n')
+    atomic_write_text(path, '{"version": 1}\n')
+    atomic_write_text(path, '{"version": 2}\n')
 
-    assert json.loads(path.read_text()) == {"ok": True}
-    assert len(replaced_from) == 1
-    temporary = replaced_from[0]
-    assert temporary.parent == path.parent
-    assert path.name not in temporary.name
-    assert len(temporary.name) <= 32
+    assert json.loads(path.read_text()) == {"version": 2}
+    assert len(replaced_from) == 2
+    for temporary in replaced_from:
+        assert temporary.parent == path.parent
+        assert path.name not in temporary.name
+        assert len(temporary.name) <= 32
 
 
 def test_locked_state_updates_survive_multiple_processes(tmp_path: Path) -> None:
@@ -115,12 +118,37 @@ def test_windows_atomic_replace_retries_sharing_violation(monkeypatch: pytest.Mo
         real_replace(source, target)
 
     monkeypatch.setattr(platform_fs, "_WINDOWS", True)
+    monkeypatch.setattr(platform_fs, "_windows_extended_path", lambda path: path)
     monkeypatch.setattr(platform_fs.time, "sleep", lambda _delay: None)
     monkeypatch.setattr(platform_fs.os, "replace", sharing_violation_then_replace)
     path = tmp_path / "state.json"
     atomic_write_text(path, '{"ok": true}\n')
     assert json.loads(path.read_text()) == {"ok": True}
     assert attempts == 3
+
+
+def test_windows_atomic_replace_extends_source_and_destination(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from spec_runtime import platform_fs
+
+    extended: list[Path] = []
+
+    def capture_extended(path: Path) -> Path:
+        extended.append(path)
+        return path
+
+    monkeypatch.setattr(platform_fs, "_WINDOWS", True)
+    monkeypatch.setattr(platform_fs, "_windows_extended_path", capture_extended)
+    path = tmp_path / "state.json"
+
+    atomic_write_text(path, '{"ok": true}\n')
+
+    assert len(extended) == 2
+    assert extended[0].name.startswith(".spec-")
+    assert extended[0].suffix == ".tmp"
+    assert extended[1] == path
 
 
 def test_windows_blocking_lock_waits_until_contention_clears(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -313,7 +341,10 @@ def test_workspace_identity_is_deterministic_under_unicode_root(tmp_path: Path) 
 @pytest.mark.skipif(sys.platform != "win32", reason="installed-wheel smoke test requires native Windows")
 def test_installed_wheel_read_only_cli_smoke(tmp_path: Path) -> None:
     wheel_dir = tmp_path / "wheels"
-    subprocess.run([sys.executable, "-m", "pip", "wheel", ".", "-w", str(wheel_dir)], check=True)
+    subprocess.run(
+        [sys.executable, "-m", "pip", "wheel", str(PROJECT_ROOT), "-w", str(wheel_dir)],
+        check=True,
+    )
     wheel = next(wheel_dir.glob("*.whl"))
     target = tmp_path / "installed"
     subprocess.run([sys.executable, "-m", "pip", "install", "--target", str(target), str(wheel)], check=True)

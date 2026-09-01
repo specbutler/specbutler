@@ -15,6 +15,7 @@ from spec_runtime.config import (
     _discover_repo_root,
     load_spec_runtime_config,
 )
+from spec_runtime.git_common import run_git
 from spec_runtime.init import (
     _ask_agent_for_config,
     _build_agent_merge_command,
@@ -497,6 +498,46 @@ class TestDetectBaseBranch:
         result = _detect_base_branch(tmp_path)
         # No remote — uses local branch name without origin/ prefix
         assert result == "main"
+
+    def test_reads_remote_head_without_contacting_remote(self, tmp_path):
+        _init_git_repo(tmp_path)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        real_run_git = run_git
+
+        def local_git_only(args, **kwargs):  # noqa: ANN001
+            assert list(args[:2]) != ["remote", "show"]
+            return real_run_git(args, **kwargs)
+
+        with patch("spec_runtime.init.run_git", side_effect=local_git_only):
+            assert _detect_base_branch(tmp_path) == "origin/trunk"
+
+    def test_uses_local_remote_tracking_ref_when_remote_head_is_unset(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/main", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        assert _detect_base_branch(tmp_path) == "origin/main"
 
 
 # ---------------------------------------------------------------------------

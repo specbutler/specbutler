@@ -1155,6 +1155,7 @@ class TestCloneBackend:
         assert index[-1]["preserved"] is False
         assert "unpushed commits" in index[-1]["unpreserved"]
 
+    @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows cannot create file symlinks")
     def test_rescue_preserves_untracked_symlink_without_following_it(self, tmp_path: Path):
         # An untracked symlink pointing outside the workspace must be captured
         # as a symlink, never dereferenced — otherwise the rescue artifact would
@@ -3651,6 +3652,7 @@ class TestContainerBackend:
         sync_calls = [call for call in runner.calls if "/workspace/host:ro" in " ".join(call)]
         assert sync_calls == []
 
+    @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows cannot create file symlinks")
     def test_snapshot_restore_and_cleanup_are_idempotent(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)

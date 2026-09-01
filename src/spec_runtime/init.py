@@ -38,25 +38,30 @@ def _has_remote(repo_root: Path, remote: str = "origin") -> bool:
 
 
 def _detect_base_branch(repo_root: Path) -> str:
-    """Detect the default branch name from the remote or local refs."""
+    """Detect the default branch from local Git configuration and refs only.
+
+    ``spec init`` must remain a local operation.  In particular, ``git remote
+    show`` may contact the forge and invoke an interactive credential helper,
+    which can make initialization hang in an otherwise healthy repository.
+    """
     has_origin = _has_remote(repo_root)
 
     if has_origin:
-        # Try remote HEAD
-        try:
-            result = run_git(
-                ["remote", "show", "origin"],
-                timeout=10,
+        remote_head = run_git(
+            ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            cwd=repo_root,
+        )
+        branch = remote_head.stdout.strip()
+        if remote_head.returncode == 0 and branch.startswith("origin/"):
+            return branch
+
+        for name in ("main", "master"):
+            remote_ref = run_git(
+                ["show-ref", "--verify", "--quiet", f"refs/remotes/origin/{name}"],
                 cwd=repo_root,
             )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    if "HEAD branch:" in line:
-                        branch = line.split("HEAD branch:")[-1].strip()
-                        if branch and branch != "(unknown)":
-                            return f"origin/{branch}"
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            if remote_ref.returncode == 0:
+                return f"origin/{name}"
 
     # Fall back to checking local refs — only use origin/ prefix if remote exists
     for name in ("main", "master"):

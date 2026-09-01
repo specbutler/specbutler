@@ -20320,7 +20320,7 @@ class TestValidateCodexExec:
 
 class TestWriteSandboxConfig:
     @pytest.mark.parametrize(("agent", "config_name"), [("claude", ".claude"), ("codex", ".codex")])
-    def test_refuses_agent_config_symlink(
+    def test_refuses_agent_config_link(
         self,
         tmp_path: Path,
         agent: str,
@@ -20330,12 +20330,46 @@ class TestWriteSandboxConfig:
         external = tmp_path / "external"
         worktree.mkdir()
         external.mkdir()
-        (worktree / config_name).symlink_to(external, target_is_directory=True)
+        config_path = worktree / config_name
+        if os.name == "nt":
+            subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(config_path), str(external)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            config_path.symlink_to(external, target_is_directory=True)
 
         with pytest.raises(ValueError, match="non-directory path"):
             orch._write_sandbox_config(agent, worktree)
 
         assert list(external.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        ("agent", "relative_path"),
+        [
+            ("claude", Path(".claude/settings.local.json")),
+            ("claude", Path(".claude/mcp-servers.json")),
+            ("codex", Path(".codex/config.toml")),
+        ],
+    )
+    def test_replaces_agent_config_hardlink(
+        self,
+        tmp_path: Path,
+        agent: str,
+        relative_path: Path,
+    ) -> None:
+        worktree = tmp_path / "worktree"
+        target = worktree / relative_path
+        target.parent.mkdir(parents=True)
+        external = tmp_path / "external-config"
+        external.write_text("do-not-overwrite", encoding="utf-8")
+        os.link(external, target)
+
+        orch._write_sandbox_config(agent, worktree)
+
+        assert external.read_text(encoding="utf-8") == "do-not-overwrite"
+        assert not os.path.samefile(external, target)
 
     def test_claude_writes_default_playwright_mcp_config(self, tmp_path: Path):
         # Create the Playwright cli.js so _default_claude_mcp_servers includes it
@@ -26039,6 +26073,22 @@ class TestCleanupPhase:
 
         assert result == "failed"
         assert "Cleanup left stale worktree metadata" in run.last_error
+
+    def test_phase_cleanup_rejects_mismatched_identity_before_reaping(self, repo: Path):
+        run = self._make_run()
+        mismatched = repo / ".worktrees" / "unrelated-worktree"
+        mismatched.mkdir(parents=True)
+
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=mismatched),
+            patch.object(orch, "_reap_registered_worktree_processes") as reap,
+        ):
+            result = orch.phase_cleanup(run, repo)
+
+        assert result == "failed"
+        assert "does not match expected identity" in run.last_error
+        reap.assert_not_called()
+        assert mismatched.is_dir()
 
     def test_worktree_registration_requires_exact_path_match(self, repo: Path):
         worktree = repo / ".worktrees" / "feature"
@@ -33477,6 +33527,7 @@ class TestClaudeIsolatedHome:
         if os.name == "posix":
             assert credentials_path.stat().st_mode & 0o777 == 0o600
 
+    @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows uses hardlink coverage")
     def test_write_claude_isolated_home_replaces_planted_credentials_symlink(
         self, tmp_path: Path
     ):
@@ -33508,6 +33559,35 @@ class TestClaudeIsolatedHome:
         assert exfil_target.read_text() == "untouched"
         assert "sk-ant-oat01-access" in dst.read_text()
 
+    def test_write_claude_isolated_home_replaces_planted_credentials_hardlink(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_config = tmp_path / ".claude.json"
+        source_config.write_text("{}")
+        source_credentials = tmp_path / ".credentials.json"
+        source_credentials.write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-ant-oat01-access"}
+        }))
+        exfil_target = tmp_path / "exfil.json"
+        exfil_target.write_text("untouched")
+        planted = worktree / ".spec-claude-home" / ".claude" / ".credentials.json"
+        planted.parent.mkdir(parents=True)
+        os.link(exfil_target, planted)
+
+        home = orch._write_claude_isolated_home(
+            worktree,
+            source_config=source_config,
+            source_credentials=source_credentials,
+        )
+
+        dst = home / ".claude" / ".credentials.json"
+        assert exfil_target.read_text() == "untouched"
+        assert not os.path.samefile(exfil_target, dst)
+        assert "sk-ant-oat01-access" in dst.read_text()
+
+    @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows uses junction coverage")
     def test_write_claude_isolated_home_replaces_symlinked_claude_dir(
         self, tmp_path: Path
     ):
@@ -33534,6 +33614,40 @@ class TestClaudeIsolatedHome:
         )
 
         assert not (home / ".claude").is_symlink()
+        assert list(exfil_dir.iterdir()) == []
+        assert "sk-ant-oat01-access" in (
+            home / ".claude" / ".credentials.json"
+        ).read_text()
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+    def test_write_claude_isolated_home_replaces_junctioned_claude_dir(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_config = tmp_path / ".claude.json"
+        source_config.write_text("{}")
+        source_credentials = tmp_path / ".credentials.json"
+        source_credentials.write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-ant-oat01-access"}
+        }))
+        exfil_dir = tmp_path / "exfil"
+        exfil_dir.mkdir()
+        home_root = worktree / ".spec-claude-home"
+        home_root.mkdir()
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(home_root / ".claude"), str(exfil_dir)],
+            check=True,
+            capture_output=True,
+        )
+
+        home = orch._write_claude_isolated_home(
+            worktree,
+            source_config=source_config,
+            source_credentials=source_credentials,
+        )
+
+        assert not orch._is_windows_reparse_point(home / ".claude")
         assert list(exfil_dir.iterdir()) == []
         assert "sk-ant-oat01-access" in (
             home / ".claude" / ".credentials.json"
@@ -34225,7 +34339,7 @@ class TestMakeTreeReadonlyExclude:
         finally:
             orch._restore_tree_writable(root)
 
-    def test_readonly_and_restore_never_chmod_external_symlink_targets(self, tmp_path: Path):
+    def test_readonly_and_restore_never_chmod_external_link_targets(self, tmp_path: Path):
         root = tmp_path / "root"
         root.mkdir()
         locked = root / "locked.txt"
@@ -34236,8 +34350,15 @@ class TestMakeTreeReadonlyExclude:
         external_dir.mkdir()
         external_nested = external_dir / "nested.txt"
         external_nested.write_text("nested")
-        (root / "file-link").symlink_to(external_file)
-        (root / "dir-link").symlink_to(external_dir, target_is_directory=True)
+        if os.name == "nt":
+            subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(root / "dir-link"), str(external_dir)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            (root / "file-link").symlink_to(external_file)
+            (root / "dir-link").symlink_to(external_dir, target_is_directory=True)
 
         external_modes = {
             path: stat.S_IMODE(os.stat(path).st_mode)

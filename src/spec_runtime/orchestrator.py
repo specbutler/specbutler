@@ -4796,7 +4796,6 @@ def _worktree_venv_python(
     return _worktree_venv_executable_dir(worktree_path, windows=windows) / executable
 
 
-@contextmanager
 def _inject_worktree_venv_into_env(env: dict[str, str], worktree_path: Path) -> None:
     """Prefer the worktree virtualenv for implement-agent subprocesses."""
     venv_dir = worktree_path / ".venv"
@@ -5001,6 +5000,12 @@ def _write_claude_mcp_config(
     host paths or the agent will try to execute non-existent paths.
     """
     config_dir = worktree_path / ".claude"
+    if config_dir.is_symlink() or _is_windows_reparse_point(config_dir) or (
+        config_dir.exists() and not config_dir.is_dir()
+    ):
+        raise ValueError(
+            f"Refusing to write Claude config through non-directory path {config_dir}"
+        )
     config_dir.mkdir(parents=True, exist_ok=True)
     mcp_servers = _default_claude_mcp_servers(worktree_path)
     if extra_mcp_servers:
@@ -5014,15 +5019,17 @@ def _write_claude_mcp_config(
     if not host_subprocess:
         mcp_servers = _worker_mcp_servers_for_container(mcp_servers, worktree_path)
     mcp_servers = _enforce_playwright_browser_pin(mcp_servers)
-    _mcp_config_path(worktree_path).write_text(
-        json.dumps(
+    _replace_with_exclusive_file(
+        _mcp_config_path(worktree_path),
+        (
+            json.dumps(
             {
                 "mcpServers": mcp_servers,
             },
             indent=2,
         )
-        + "\n",
-        encoding="utf-8",
+            + "\n"
+        ).encode("utf-8"),
     )
 
 
@@ -5091,10 +5098,20 @@ def _is_windows_reparse_point(path: Path) -> bool:
     return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)))
 
 
+def _remove_path_entry_without_following(path: Path) -> None:
+    """Remove one untrusted path entry without traversing a Windows junction."""
+    if _is_windows_reparse_point(path):
+        attributes = int(getattr(os.lstat(path), "st_file_attributes", 0))
+        if attributes & int(getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0)):
+            os.rmdir(path)
+            return
+    path.unlink()
+
+
 def _replace_with_exclusive_file(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
     """Replace an agent-controlled path without following links or hardlinks."""
-    if path.is_symlink() or path.exists():
-        path.unlink()
+    if path.is_symlink() or _is_windows_reparse_point(path) or path.exists():
+        _remove_path_entry_without_following(path)
     descriptor = os.open(
         str(path),
         os.O_WRONLY
@@ -5208,12 +5225,10 @@ def _write_codex_isolated_home(
     # link-like or non-directory home before writing any config or auth data.
     # Staging happens while no agent for this worktree is running, so there is
     # no legitimate concurrent writer to preserve here.
-    if home.is_symlink():
-        home.unlink()
-    elif _is_windows_reparse_point(home):
-        os.rmdir(home)
+    if home.is_symlink() or _is_windows_reparse_point(home):
+        _remove_path_entry_without_following(home)
     elif home.exists() and not home.is_dir():
-        home.unlink()
+        _remove_path_entry_without_following(home)
     home.mkdir(parents=True, exist_ok=True)
 
     # Make the directory self-ignoring so a copied auth.json (or any other
@@ -5251,8 +5266,12 @@ def _write_codex_isolated_home(
                 payload = src_auth.read_bytes()
                 _replace_with_exclusive_file(dst_auth, payload)
             else:
-                if dst_auth.is_symlink() or dst_auth.exists():
-                    dst_auth.unlink()
+                if (
+                    dst_auth.is_symlink()
+                    or _is_windows_reparse_point(dst_auth)
+                    or dst_auth.exists()
+                ):
+                    _remove_path_entry_without_following(dst_auth)
                 dst_auth.symlink_to(src_auth)
         except OSError as exc:
             raise RuntimeError(
@@ -5277,7 +5296,9 @@ def _remove_codex_isolated_auth(worktree_path: Path) -> None:
     """
     home = codex_isolated_home(worktree_path)
     try:
-        (home / "auth.json").unlink(missing_ok=True)
+        auth_path = home / "auth.json"
+        if auth_path.is_symlink() or _is_windows_reparse_point(auth_path) or auth_path.exists():
+            _remove_path_entry_without_following(auth_path)
     except OSError as exc:
         logger.error(
             "Could not remove transient Codex auth.json from isolated home %s: %s",
@@ -5328,18 +5349,20 @@ def _write_claude_isolated_home(
     # Staging always runs before the agent launches, so there is no live
     # writer to race with.
     for directory in (home, home / ".claude"):
-        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
-            directory.unlink()
+        if (
+            directory.is_symlink()
+            or _is_windows_reparse_point(directory)
+            or (directory.exists() and not directory.is_dir())
+        ):
+            _remove_path_entry_without_following(directory)
         directory.mkdir(parents=True, exist_ok=True)
-    (home / ".gitignore").write_text("*\n", encoding="utf-8")
+    _replace_with_exclusive_file(home / ".gitignore", b"*\n")
 
     src_config = source_config if source_config is not None else Path.home() / ".claude.json"
     dst_config = home / ".claude.json"
     if src_config.exists():
         try:
-            if dst_config.is_symlink() or dst_config.exists():
-                dst_config.unlink()
-            shutil.copy2(src_config, dst_config)
+            _replace_with_exclusive_file(dst_config, src_config.read_bytes())
         except OSError as exc:
             logger.warning(
                 "Could not materialize Claude .claude.json in isolated home %s: %s",
@@ -5366,20 +5389,10 @@ def _write_claude_isolated_home(
                 oauth = payload.get("claudeAiOauth")
                 if isinstance(oauth, dict):
                     oauth.pop("refreshToken", None)
-            # The destination lives inside the (agent-writable) worktree, so a
-            # prior attempt could have left a symlink here to exfiltrate the
-            # token. Unlink whatever exists, then create exclusively without
-            # following symlinks so a race re-planting one fails the open
-            # instead of redirecting the write.
-            if dst_creds.is_symlink() or dst_creds.exists():
-                dst_creds.unlink()
-            fd = os.open(
-                str(dst_creds),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
+            _replace_with_exclusive_file(
+                dst_creds,
+                json.dumps(payload).encode("utf-8"),
             )
-            with os.fdopen(fd, "w") as handle:
-                handle.write(json.dumps(payload))
         except (OSError, ValueError) as exc:
             logger.warning(
                 "Could not materialize Claude credentials in isolated home %s: %s",
@@ -12875,7 +12888,9 @@ def _make_tree_readonly(root: Path, *, exclude: Path | None = None) -> None:
     """
     root_str = os.path.abspath(os.fspath(root))
     try:
-        if stat.S_ISLNK(os.lstat(root_str).st_mode):
+        if stat.S_ISLNK(os.lstat(root_str).st_mode) or _is_windows_reparse_point(
+            Path(root_str)
+        ):
             return
     except OSError:
         return
@@ -12901,26 +12916,32 @@ def _make_tree_readonly(root: Path, *, exclude: Path | None = None) -> None:
     def _remove_write_bits(path: str) -> None:
         try:
             mode = os.lstat(path).st_mode
-            if stat.S_ISLNK(mode):
+            if stat.S_ISLNK(mode) or _is_windows_reparse_point(Path(path)):
                 return
             os.chmod(path, mode & ~_write_bits)
         except OSError:
             pass
 
     _write_bits = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
-    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+    directories: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
         if _excluded(dirpath):
+            dirnames[:] = []
             continue
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not _is_windows_reparse_point(Path(dirpath) / name)
+        ]
+        directories.extend(os.path.join(dirpath, name) for name in dirnames)
         for name in filenames:
             p = os.path.join(dirpath, name)
             if _excluded(p):
                 continue
             _remove_write_bits(p)
-        for name in dirnames:
-            p = os.path.join(dirpath, name)
-            if _excluded(p):
-                continue
-            _remove_write_bits(p)
+    for directory in reversed(directories):
+        if not _excluded(directory):
+            _remove_write_bits(directory)
     if not _excluded(str(root)):
         _remove_write_bits(str(root))
 
@@ -12929,7 +12950,9 @@ def _restore_tree_writable(root: Path) -> None:
     """Restore owner-write permission so the tree can be removed."""
     root_str = os.path.abspath(os.fspath(root))
     try:
-        if stat.S_ISLNK(os.lstat(root_str).st_mode):
+        if stat.S_ISLNK(os.lstat(root_str).st_mode) or _is_windows_reparse_point(
+            Path(root_str)
+        ):
             return
     except OSError:
         return
@@ -12937,13 +12960,18 @@ def _restore_tree_writable(root: Path) -> None:
     def _restore_owner_write(path: str) -> None:
         try:
             mode = os.lstat(path).st_mode
-            if stat.S_ISLNK(mode):
+            if stat.S_ISLNK(mode) or _is_windows_reparse_point(Path(path)):
                 return
             os.chmod(path, mode | stat.S_IWUSR)
         except OSError:
             pass
 
     for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not _is_windows_reparse_point(Path(dirpath) / name)
+        ]
         _restore_owner_write(dirpath)
         for name in filenames:
             _restore_owner_write(os.path.join(dirpath, name))
@@ -14002,7 +14030,7 @@ def _write_sandbox_config(
     """Write agent-specific sandbox configuration."""
     if agent == "claude":
         config_dir = worktree_path / ".claude"
-        if config_dir.is_symlink() or (
+        if config_dir.is_symlink() or _is_windows_reparse_point(config_dir) or (
             config_dir.exists() and not config_dir.is_dir()
         ):
             raise ValueError(
@@ -14042,8 +14070,9 @@ def _write_sandbox_config(
                 ],
             },
         }
-        (config_dir / "settings.local.json").write_text(
-            json.dumps(config, indent=2) + "\n", encoding="utf-8"
+        _replace_with_exclusive_file(
+            config_dir / "settings.local.json",
+            (json.dumps(config, indent=2) + "\n").encode("utf-8"),
         )
         _write_claude_mcp_config(
             worktree_path,
@@ -14055,19 +14084,21 @@ def _write_sandbox_config(
         # written here. Codex does not read this .codex/config.toml file for
         # MCP configuration, so ``extra_mcp_servers`` is intentionally ignored.
         config_dir = worktree_path / ".codex"
-        if config_dir.is_symlink() or (
+        if config_dir.is_symlink() or _is_windows_reparse_point(config_dir) or (
             config_dir.exists() and not config_dir.is_dir()
         ):
             raise ValueError(
                 f"Refusing to write Codex config through non-directory path {config_dir}"
             )
         config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "config.toml").write_text(
-            'sandbox_mode = "workspace-write"\n'
-            'approval_policy = "never"\n\n'
-            "[sandbox_workspace_write]\n"
-            "network_access = true\n",
-            encoding="utf-8",
+        _replace_with_exclusive_file(
+            config_dir / "config.toml",
+            (
+                'sandbox_mode = "workspace-write"\n'
+                'approval_policy = "never"\n\n'
+                "[sandbox_workspace_write]\n"
+                "network_access = true\n"
+            ).encode("utf-8"),
         )
 
 

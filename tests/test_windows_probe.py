@@ -568,7 +568,7 @@ def test_cleanup_reaps_registered_helper_and_preserves_unrelated_process(tmp_pat
         capture_output=True,
     )
     branch = "code/windows-cleanup--native"
-    worktree = repo / ".worktrees" / "cleanup space-雪"
+    worktree = repo / ".worktrees" / "code-windows-cleanup--native"
     worktree.parent.mkdir()
     subprocess.run(
         ["git", "worktree", "add", "-b", branch, str(worktree), "HEAD"],

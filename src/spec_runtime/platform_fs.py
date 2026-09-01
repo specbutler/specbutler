@@ -65,7 +65,9 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        _retry(lambda: os.replace(temporary, path))
+        replace_source = _windows_extended_path(temporary) if _WINDOWS else temporary
+        replace_target = _windows_extended_path(path) if _WINDOWS else path
+        _retry(lambda: os.replace(replace_source, replace_target))
     finally:
         temporary.unlink(missing_ok=True)
 

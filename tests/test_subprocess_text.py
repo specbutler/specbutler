@@ -8,7 +8,16 @@ import locale
 import subprocess
 from pathlib import Path
 
-from spec_runtime import autopilot, backfill_merge_tags, doctor, forge, orchestrator, review_feedback, update
+from spec_runtime import (
+    autopilot,
+    backfill_merge_tags,
+    doctor,
+    forge,
+    git_common,
+    orchestrator,
+    review_feedback,
+    update,
+)
 from spec_runtime.git_common import (
     is_git_command,
     is_github_cli_command,
@@ -70,6 +79,40 @@ def test_non_utf8_cli_retains_locale_text_mode() -> None:
         "text": True,
         "errors": "replace",
     }
+
+
+def test_timed_git_commands_use_tree_safe_runner(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(command, **kwargs):  # noqa: ANN001
+        calls.append((list(command), dict(kwargs)))
+        return subprocess.CompletedProcess(command, 0, "ok\n", "")
+
+    monkeypatch.setattr(git_common, "run_supervised", fake_run)
+
+    result = git_common.run_git(
+        ["fetch", "origin"],
+        cwd=tmp_path,
+        timeout=2.5,
+        env={"GIT_TERMINAL_PROMPT": "0"},
+    )
+
+    assert result.stdout == "ok\n"
+    assert calls == [
+        (
+            ["git", "fetch", "origin"],
+            {
+                "cwd": tmp_path,
+                "check": False,
+                "timeout": 2.5,
+                "env": {"GIT_TERMINAL_PROMPT": "0"},
+                "capture_output": True,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+            },
+        )
+    ]
 
 
 def test_runtime_github_cli_subprocess_seams_request_utf8(

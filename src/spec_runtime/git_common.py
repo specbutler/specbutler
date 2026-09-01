@@ -14,6 +14,8 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from .process_supervisor import run as run_supervised
+
 
 def _command_executable(command: Sequence[str]) -> str:
     """Return a case-normalized executable basename for *command*."""
@@ -69,7 +71,8 @@ def run_git(
 ) -> subprocess.CompletedProcess[str]:
     """Run Git through the shared UTF-8 stdout/stderr decoding boundary."""
     command = ["git", *args]
-    return subprocess.run(
+    runner = run_supervised if timeout is not None else subprocess.run
+    return runner(
         command,
         cwd=cwd,
         check=check,

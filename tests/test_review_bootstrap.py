@@ -188,13 +188,12 @@ def test_native_sandbox_denies_operator_secret_and_sibling_write(tmp_path: Path)
     secret = operator_home / "credential.txt"
     secret.write_text("operator-secret")
     escaped = sibling_worktree / "escaped.txt"
-    result_path = review_worktree / "result.json"
     script = """
 import json
 import pathlib
 import sys
 
-secret, escaped, result = map(pathlib.Path, sys.argv[1:])
+secret, escaped = map(pathlib.Path, sys.argv[1:])
 outcome = {}
 try:
     outcome["credential"] = secret.read_text()
@@ -205,13 +204,16 @@ try:
     outcome["sibling_write"] = "allowed"
 except OSError:
     outcome["sibling_write"] = "denied"
-result.write_text(json.dumps(outcome))
+marker = pathlib.Path("workspace-marker.txt")
+marker.write_text("sandbox-write")
+outcome["workspace_round_trip"] = marker.read_text()
+print(json.dumps(outcome))
 """
     # Resolve virtual-environment launcher symlinks: the native sandbox must
     # read the interpreter itself, but should not need access to the outer
     # repository that owns this test process's venv.
     interpreter = str(Path(sys.executable).resolve())
-    command = [interpreter, "-c", script, str(secret), str(escaped), str(result_path)]
+    command = [interpreter, "-c", script, str(secret), str(escaped)]
     inherited = dict(os.environ)
     inherited["HOME"] = str(operator_home)
     inherited["USERPROFILE"] = str(operator_home)
@@ -232,9 +234,10 @@ result.write_text(json.dumps(outcome))
         stdout, stderr = process.communicate(timeout=30)
 
     assert process.returncode == 0, stderr or stdout
-    assert json.loads(result_path.read_text()) == {
+    assert json.loads(stdout) == {
         "credential": "denied",
         "sibling_write": "denied",
+        "workspace_round_trip": "sandbox-write",
     }
     assert secret.read_text() == "operator-secret"
     assert not escaped.exists()
