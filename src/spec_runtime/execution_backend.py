@@ -1713,7 +1713,14 @@ def _replace_host_path_reference(value: str, *, host_path: str, container_path: 
     # the end of that path reference; replacing every backslash in ``value``
     # would also rewrite unrelated regexes, JSON escapes, or later values.
     reference_terminators = "\"'`,;{}[]\r\n"
-    suffix_pattern = rf"(?P<suffix>(?:[\\/][^{re.escape(reference_terminators)}]*)?)"
+    # Whitespace can be part of a Windows path, so it is not an unconditional
+    # terminator.  It does end the reference when the next token is visibly a
+    # command option or environment-style assignment.  Without this boundary,
+    # a composite value such as ``C:\repo\a.txt --regex=\d+`` treats the
+    # regex as part of the path and rewrites its backslash.
+    token_start = r"(?:-{1,2}[A-Za-z0-9]|[A-Za-z_][A-Za-z0-9_]*=)"
+    suffix_stop = rf"(?:[{re.escape(reference_terminators)}]|\s+(?={token_start}))"
+    suffix_pattern = rf"(?P<suffix>(?:[\\/](?:(?!{suffix_stop}).)*)?)"
     variants = sorted(
         {
             host_path,

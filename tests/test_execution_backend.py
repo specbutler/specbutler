@@ -68,6 +68,24 @@ def test_container_path_translation_preserves_unrelated_composite_backslashes() 
     )
 
 
+def test_container_path_translation_stops_before_following_option() -> None:
+    translated = eb.ContainerExecutionBackend._translate_container_paths(
+        r"--config=C:\repo\a.txt --regex=\d+",
+        [(r"C:\repo", "/workspace")],
+    )
+
+    assert translated == r"--config=/workspace/a.txt --regex=\d+"
+
+
+def test_container_path_translation_preserves_spaces_inside_path() -> None:
+    translated = eb.ContainerExecutionBackend._translate_container_paths(
+        r"C:\repo\folder with spaces\tool.exe",
+        [(r"C:\repo", "/workspace")],
+    )
+
+    assert translated == "/workspace/folder with spaces/tool.exe"
+
+
 class TestExecutionConfigDefaults:
     def test_default_when_section_missing(self, tmp_path: Path):
         (tmp_path / ".git").mkdir()
