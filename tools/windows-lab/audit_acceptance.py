@@ -261,7 +261,15 @@ def _source_checkout_checks(
     contract_paths = [manifest_relative, *[Path(spec["path"]) for spec in manifest["specs"]]]
     try:
         revision_run = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
+            [
+                "git",
+                "--no-replace-objects",
+                "-C",
+                str(root),
+                "rev-parse",
+                "--verify",
+                "HEAD^{commit}",
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -290,61 +298,81 @@ def _source_checkout_checks(
 
     path_args = [path.as_posix() for path in contract_paths]
     tracked_run = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", *path_args],
+        [
+            "git",
+            "--no-replace-objects",
+            "-C",
+            str(root),
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            *path_args,
+        ],
         check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
     )
-    diff_run = subprocess.run(
-        ["git", "-C", str(root), "diff", "--quiet", "HEAD", "--", *path_args],
-        check=False,
-    )
-    manifest_blob_run = subprocess.run(
+    staged_diff_run = subprocess.run(
         [
             "git",
+            "--no-replace-objects",
             "-C",
             str(root),
-            "show",
-            f"{source_revision}:{manifest_relative.as_posix()}",
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            source_revision,
+            "--",
+            *path_args,
         ],
         check=False,
         capture_output=True,
     )
-    manifest_clean_hash_run = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "hash-object",
-            "--stdin",
-            f"--path={manifest_relative.as_posix()}",
-        ],
-        input=manifest_bytes,
-        check=False,
-        capture_output=True,
-    )
-    committed_manifest_hash_run = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "hash-object",
-            "--stdin",
-            "--no-filters",
-        ],
-        input=manifest_blob_run.stdout,
-        check=False,
-        capture_output=True,
-    )
+
+    def committed_payload(relative: Path) -> bytes | None:
+        committed_run = subprocess.run(
+            [
+                "git",
+                "--no-replace-objects",
+                "-C",
+                str(root),
+                "show",
+                f"{source_revision}:{relative.as_posix()}",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        return committed_run.stdout if committed_run.returncode == 0 else None
+
+    def checkout_payload_matches(relative: Path, payload: bytes) -> bool:
+        committed = committed_payload(relative)
+        if committed is None:
+            return False
+        if payload == committed:
+            return True
+        # Accept only a complete LF-to-CRLF checkout transform. Mutable Git
+        # attributes and clean-filter commands are outside the trust boundary.
+        return b"\r" not in committed and payload == committed.replace(b"\n", b"\r\n")
+
+    worktree_contracts_match = True
+    for relative in contract_paths:
+        try:
+            payload = (root / relative).read_bytes()
+        except OSError:
+            worktree_contracts_match = False
+            break
+        if not checkout_payload_matches(relative, payload):
+            worktree_contracts_match = False
+            break
+    manifest_snapshot_matches = checkout_payload_matches(manifest_relative, manifest_bytes)
     clean = (
         tracked_run.returncode == 0
-        and diff_run.returncode == 0
-        and manifest_blob_run.returncode == 0
-        and manifest_clean_hash_run.returncode == 0
-        and committed_manifest_hash_run.returncode == 0
-        and manifest_clean_hash_run.stdout == committed_manifest_hash_run.stdout
+        and staged_diff_run.returncode == 0
+        and worktree_contracts_match
+        and manifest_snapshot_matches
     )
     contract_result = CheckResult(
         "global.source-contract-at-revision",

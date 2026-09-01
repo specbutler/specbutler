@@ -26323,6 +26323,34 @@ class TestCleanupPhase:
         assert error == ""
         assert process_registry.list_registered_worktrees(state_root) == []
 
+    def test_cleanup_preserves_worktree_when_registered_helper_survives(self, repo: Path):
+        worktree = repo / ".worktrees" / "feature"
+        worktree.mkdir(parents=True)
+        report = process_registry.ReapReport(
+            surviving=("dev-server pid=4242 survived reap",),
+        )
+
+        with (
+            patch.object(orch, "_stop_worktree_postgres_if_present") as stop_postgres,
+            patch.object(orch, "_reap_registered_worktree_processes", return_value=report),
+            patch.object(
+                orch,
+                "run_subprocess",
+                side_effect=AssertionError("worktree removal must not start"),
+            ),
+        ):
+            error = orch._cleanup_worktree_checkout(
+                repo,
+                worktree,
+                branch=None,
+                delete_branch=False,
+            )
+
+        assert "registered processes survived cleanup" in error
+        assert "dev-server pid=4242" in error
+        assert worktree.is_dir()
+        stop_postgres.assert_called_once_with(worktree)
+
     def test_cleanup_falls_back_when_git_cannot_delete_registered_worktree(self, repo: Path):
         worktree = repo / ".worktrees" / "feature"
         worktree.mkdir(parents=True)
@@ -26404,6 +26432,29 @@ class TestCleanupPhase:
         assert "Reaped registered helper for" in caplog.text
         assert "reason=orchestrator SIGTERM" in caplog.text
         assert "Registered helper survived cleanup" in caplog.text
+
+    def test_reap_registered_worktree_processes_exception_fails_closed(
+        self,
+        repo: Path,
+    ):
+        worktree = repo / ".worktrees" / "my-feature"
+        worktree.mkdir(parents=True)
+
+        with patch.object(
+            orch.worktree_process_registry,
+            "reap_registered_processes",
+            side_effect=PermissionError("registry denied"),
+        ):
+            report = orch._reap_registered_worktree_processes(
+                repo,
+                worktree,
+                reason="worktree cleanup",
+            )
+
+        assert report.terminated == ()
+        assert report.surviving == (
+            f"process reaper failed for {worktree}; refusing cleanup: registry denied",
+        )
 
 
 class TestRetryCap:

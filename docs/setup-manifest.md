@@ -66,7 +66,10 @@ The orchestrator applies the manifest like this:
 - `managed_processes`: registered for identity-checked teardown. Each entry
   requires a positive `pid` and the process start identity reported by the
   operating system. `termination_scope` may be `pid` or `pgid`; a `pgid` scope
-  may also supply the process-group ID.
+  may also supply the process-group ID. Tokenless `pid` teardown requires a
+  stable kernel process handle (currently Linux pidfd); other platforms fail
+  closed and preserve the worktree. Use a teardown command or a dedicated
+  `pgid` on those platforms rather than relying on a raw PID.
 
 ## Examples
 

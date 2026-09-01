@@ -78,7 +78,7 @@ This command:
 
 | Setting | Detection logic |
 |---------|----------------|
-| `base_ref` | Queries `git remote show origin` for the HEAD branch; falls back to `origin/main` |
+| `base_ref` | Uses local `origin/HEAD`, a conventional ref, or the only remote-tracking ref without contacting the remote; use `spec init --base REF` if ambiguous |
 | `agents.default` | First of `claude`, `codex` found on `PATH` |
 | `agents.allowed` | All of `claude`, `codex` found on `PATH` |
 | Bootstrap | Prefers `make install`; otherwise detects Python or Node package setup |

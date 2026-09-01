@@ -16,6 +16,7 @@ from .process_supervisor import (
     SupervisionToken,
     inspect_process,
     terminate,
+    terminate_exact_process,
 )
 
 PROCESS_TERMINATION_TIMEOUT_SECONDS = 5.0
@@ -252,7 +253,35 @@ def reap_registered_processes(
     del reason
     normalized_worktree = _normalize_worktree_path(worktree_path)
     path = _registry_path(state_root, normalized_worktree)
+    if not path.exists():
+        return ReapReport()
+    payload = _read_json_dict(path)
+    items = payload.get("processes") if payload is not None else None
+    recorded_worktree = str(payload.get("worktree_path", "")).strip() if payload else ""
+    if (
+        payload is None
+        or not isinstance(items, list)
+        or not recorded_worktree
+        or _normalize_worktree_path(Path(recorded_worktree)) != normalized_worktree
+    ):
+        return ReapReport(
+            surviving=(f"process registry for {normalized_worktree} is malformed; refusing cleanup",)
+        )
+    malformed_supervision_token = any(
+        isinstance(item, dict)
+        and "supervision_token" in item
+        and item["supervision_token"] is not None
+        and not isinstance(item["supervision_token"], dict)
+        for item in items
+    )
     entries = load_registered_processes(state_root, normalized_worktree)
+    if len(entries) != len(items) or malformed_supervision_token:
+        return ReapReport(
+            surviving=(
+                f"process registry for {normalized_worktree} contains malformed entries; "
+                "refusing cleanup",
+            )
+        )
     if not entries:
         path.unlink(missing_ok=True)
         return ReapReport()
@@ -267,9 +296,29 @@ def reap_registered_processes(
             stale.append(f"{entry.name} pid={entry.pid} already exited")
             continue
 
+        stopped = False
         if entry.supervision_token is not None:
-            token = SupervisionToken.from_dict(entry.supervision_token)
-        elif os.name == "posix":
+            try:
+                token = SupervisionToken.from_dict(entry.supervision_token)
+            except (KeyError, TypeError, ValueError):
+                surviving.append(f"{entry.name} pid={entry.pid} has an invalid supervision token")
+                still_alive.append(entry)
+                continue
+            if (
+                token.payload.pid != entry.pid
+                or token.payload.started_at != entry.started_at
+            ):
+                surviving.append(
+                    f"{entry.name} pid={entry.pid} supervision token does not match "
+                    "the registered process"
+                )
+                still_alive.append(entry)
+                continue
+            stopped = terminate(token, grace_seconds=timeout_seconds)
+        elif os.name == "posix" and entry.termination_scope == "pid":
+            identity = ProcessIdentity(entry.pid, entry.started_at, command=entry.command)
+            stopped = terminate_exact_process(identity, grace_seconds=timeout_seconds)
+        elif os.name == "posix" and entry.termination_scope == "pgid":
             identity = ProcessIdentity(entry.pid, entry.started_at, command=entry.command)
             token = SupervisionToken(
                 LifetimeMode.RUN_OWNED,
@@ -277,13 +326,21 @@ def reap_registered_processes(
                 os.getpid(),
                 "registry-reaper",
                 f"registry-{entry.pid}-{entry.started_at}",
-                entry.pgid if entry.termination_scope == "pgid" else 0,
+                entry.pgid,
             )
+            stopped = terminate(token, grace_seconds=timeout_seconds)
+        elif os.name == "posix":
+            surviving.append(
+                f"{entry.name} pid={entry.pid} has unknown termination scope "
+                f"{entry.termination_scope!r}"
+            )
+            still_alive.append(entry)
+            continue
         else:
             surviving.append(f"{entry.name} pid={entry.pid} has no Windows supervision token")
             still_alive.append(entry)
             continue
-        if terminate(token, grace_seconds=timeout_seconds) and _wait_for_exit(entry, 1.0):
+        if stopped and _wait_for_exit(entry, 1.0):
             terminated.append(f"{entry.name} pid={entry.pid} terminated")
             continue
 

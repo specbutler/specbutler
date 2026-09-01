@@ -124,6 +124,9 @@ from .process_supervisor import (
     terminate_legacy_popen_tree,
     terminate_legacy_process_group,
 )
+from .process_supervisor import (
+    is_process_group_alive as _supervised_process_group_is_alive,
+)
 from .process_supervisor import run as run_supervised
 from .review_bootstrap import (
     ReviewBootstrapSandboxUnavailable,
@@ -1059,12 +1062,17 @@ def _cleanup_worktree_checkout(
     except UnsafeWorktreePathError as exc:
         return f"Refusing unsafe worktree cleanup for {worktree_path}: {exc}"
 
-    _reap_registered_worktree_processes(
+    _stop_worktree_postgres_if_present(worktree_path)
+    reap_report = _reap_registered_worktree_processes(
         repo_root,
         worktree_path,
         reason="worktree cleanup",
     )
-    _stop_worktree_postgres_if_present(worktree_path)
+    if reap_report.surviving:
+        return (
+            f"Refusing to remove worktree {worktree_path}: registered processes survived "
+            f"cleanup ({'; '.join(reap_report.surviving)})."
+        )
 
     registered, error = _worktree_is_registered(repo_root, worktree_path)
     if error:
@@ -6527,7 +6535,11 @@ def _reap_registered_worktree_processes(
             worktree_path,
             exc,
         )
-        return worktree_process_registry.ReapReport()
+        return worktree_process_registry.ReapReport(
+            surviving=(
+                f"process reaper failed for {worktree_path}; refusing cleanup: {exc}",
+            )
+        )
     for entry in report.terminated:
         logger.info("Reaped registered helper for %s (reason=%s): %s", worktree_path, reason, entry)
     for entry in report.stale:
@@ -6578,6 +6590,11 @@ def read_process_identity(pid: int) -> ProcessIdentity | None:
         started_at=identity.started_at,
         command=identity.command,
     )
+
+
+def is_process_group_alive(pgid: int) -> bool:
+    """Expose portable group liveness to the lazy CLI orchestration boundary."""
+    return _supervised_process_group_is_alive(pgid)
 
 
 def is_pid_alive(pid: int, expected_started_at: str = "") -> bool:

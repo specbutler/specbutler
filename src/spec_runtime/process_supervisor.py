@@ -2268,7 +2268,7 @@ def _terminate_verified_posix_group(
 
 def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _WindowsJob | None = None) -> bool:
     """Revalidate identity, request cancellation, then kill the owned tree."""
-    if os.name == "nt":
+    if _platform_is_windows():
         held_job = job or _LIVE_WINDOWS_JOBS.get((token.identity.pid, token.identity.started_at))
         if held_job is not None:
             return _terminate_held_windows_job(token, held_job, grace_seconds)
@@ -2325,13 +2325,34 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(min(0.05, remaining))
+            try:
+                if not reopened_job.active_process_ids():
+                    return True
+            except OSError:
+                # A query failure is not an empty-Job proof. A still-live
+                # keeper below permits bounded hard cleanup through the same
+                # already-authenticated handle; a dead keeper must fail closed.
+                pass
             if not identity_matches(token.identity):
                 # The open Job handle preserves the owned tree if the keeper
                 # vanished, but a changed keeper identity invalidates the
-                # persisted authorization rather than broadening it.
+                # persisted authorization rather than broadening it. Close
+                # the final observation race only when the same handle now
+                # proves that no members remain.
+                try:
+                    return not reopened_job.active_process_ids()
+                except OSError:
+                    return False
+            if authenticated_payload is None:
                 return False
-            if authenticated_payload is None or not reopened_job.contains(authenticated_payload):
-                return False
+            # The exact payload membership was authenticated while the
+            # control record was locked above. Keep using the same open Job
+            # handle as the ownership capability: the payload can exit at the
+            # shared grace deadline just before the keeper acknowledges and
+            # retires state. Requiring it to remain a member here turns that
+            # successful exit into a false failure and strands the durable
+            # record. Every remaining member is still confined to this
+            # already-authenticated kernel Job.
             identities = reopened_job.active_identities()
             reopened_job.terminate()
             return _wait_for_identities_exit(identities) if identities else True
@@ -2423,6 +2444,76 @@ def request_legacy_process_shutdown(identity: ProcessIdentity) -> bool:
             f"Failed to request shutdown from legacy process {identity.pid}: {exc}"
         ) from exc
     return True
+
+
+def _wait_for_process_identity_exit(identity: ProcessIdentity, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if not identity_matches(identity):
+            return True
+        time.sleep(0.05)
+    return not identity_matches(identity)
+
+
+def _open_verified_posix_process_handle(identity: ProcessIdentity) -> int | None:
+    """Open a stable kernel handle and then bind it to the recorded identity."""
+    pidfd_open = getattr(os, "pidfd_open", None)
+    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
+    if not callable(pidfd_open) or not callable(pidfd_send_signal):
+        return None
+    try:
+        handle = pidfd_open(identity.pid, 0)
+    except (OSError, ValueError):
+        return None
+    if identity_matches(identity):
+        return handle
+    os.close(handle)
+    return None
+
+
+def _signal_posix_process_handle(handle: int, signal_number: int) -> bool:
+    send_signal = getattr(signal, "pidfd_send_signal", None)
+    if not callable(send_signal):
+        return False
+    try:
+        send_signal(handle, signal_number, None, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def terminate_exact_process(
+    identity: ProcessIdentity,
+    *,
+    grace_seconds: float = 5.0,
+    hard_grace_seconds: float = 1.0,
+) -> bool:
+    """Stop one exact POSIX process without signaling its process group.
+
+    Setup manifests may intentionally register a helper with ``pid`` scope
+    when that helper shares a process group with the setup shell or another
+    service. A numeric PID plus a prior identity check is vulnerable to reuse
+    before ``kill`` executes, so this path requires a stable kernel process
+    handle (currently Linux pidfd). Other platforms fail closed, as Windows
+    raw PIDs and portable POSIX PIDs are not ownership capabilities.
+    """
+    if os.name != "posix" or identity.pid <= 0 or not identity.started_at:
+        return False
+    handle = _open_verified_posix_process_handle(identity)
+    if handle is None:
+        return False
+    try:
+        if not _signal_posix_process_handle(handle, signal.SIGTERM):
+            return False
+        if _wait_for_process_identity_exit(identity, grace_seconds):
+            return True
+        if not _signal_posix_process_handle(handle, signal.SIGKILL):
+            return False
+        return _wait_for_process_identity_exit(identity, hard_grace_seconds)
+    finally:
+        os.close(handle)
 
 
 def stop_supervised_process(

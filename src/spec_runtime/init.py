@@ -40,6 +40,10 @@ def _has_remote(repo_root: Path, remote: str = "origin") -> bool:
     return result.returncode == 0
 
 
+class BaseBranchDetectionError(RuntimeError):
+    """The local repository does not identify one safe default branch."""
+
+
 def _detect_base_branch(repo_root: Path) -> str:
     """Detect the default branch from local Git configuration and refs only.
 
@@ -48,6 +52,13 @@ def _detect_base_branch(repo_root: Path) -> str:
     which can make initialization hang in an otherwise healthy repository.
     """
     has_origin = _has_remote(repo_root)
+    current_branch_result = run_git(
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=repo_root,
+    )
+    current_branch = (
+        current_branch_result.stdout.strip() if current_branch_result.returncode == 0 else ""
+    )
 
     if has_origin:
         remote_head = run_git(
@@ -66,6 +77,23 @@ def _detect_base_branch(repo_root: Path) -> str:
             if remote_ref.returncode == 0:
                 return f"origin/{name}"
 
+        remote_refs = run_git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"],
+            cwd=repo_root,
+        )
+        candidates = [
+            ref.strip()
+            for ref in remote_refs.stdout.splitlines()
+            if ref.strip() and ref.strip() != "origin/HEAD"
+        ]
+        if remote_refs.returncode == 0 and len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            raise BaseBranchDetectionError(
+                "Cannot determine the default branch from local origin refs "
+                f"({', '.join(candidates)}). Run spec init --base origin/<branch>."
+            )
+
     # Fall back to checking local refs — only use origin/ prefix if remote exists
     for name in ("main", "master"):
         check = run_git(
@@ -77,6 +105,8 @@ def _detect_base_branch(repo_root: Path) -> str:
                 return f"origin/{name}"
             return name
 
+    if current_branch:
+        return f"origin/{current_branch}" if has_origin else current_branch
     return "origin/main" if has_origin else "main"
 
 
@@ -738,7 +768,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         return 1
 
     # Detect settings
-    base_ref = _detect_base_branch(repo_root)
+    requested_base = str(vars(args).get("base", "") or "").strip()
+    try:
+        base_ref = requested_base or _detect_base_branch(repo_root)
+    except BaseBranchDetectionError as exc:
+        print(f"Error: {exc}", flush=True)
+        return 1
     default_agent, allowed_agents = _detect_agents()
     review_default = "codex" if "codex" in allowed_agents else default_agent
 

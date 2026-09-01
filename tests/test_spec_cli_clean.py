@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spec_runtime import cli
+from spec_runtime import cli, orchestrator
 from spec_runtime.config import ExecutionConfig, SpecPathConfig, SpecRuntimeConfig
 
 
@@ -60,7 +60,7 @@ def _orch(
         SpecLock=_SpecLock,
         _resolve_recorded_process_group=MagicMock(return_value=process_group),
         read_process_identity=MagicMock(return_value=identity),
-        _is_process_group_alive=MagicMock(return_value=group_alive),
+        is_process_group_alive=MagicMock(return_value=group_alive),
     )
 
 
@@ -72,6 +72,21 @@ def _git_read_only(cmd: list[str], **_kwargs: object) -> subprocess.CompletedPro
     if cmd[:2] == ["git", "show-ref"]:
         return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
     raise AssertionError(f"unexpected subprocess: {cmd}")
+
+
+def test_recorded_group_liveness_uses_current_orchestrator_surface() -> None:
+    started_at = "Fri Aug 14 12:00:00 2026"
+    with (
+        patch.object(
+            orchestrator,
+            "read_process_identity",
+            return_value=SimpleNamespace(started_at=started_at),
+        ),
+        patch.object(orchestrator, "is_process_group_alive", return_value=True) as group_alive,
+    ):
+        assert cli._recorded_group_is_live(orchestrator, 4321, started_at)
+
+    group_alive.assert_called_once_with(4321)
 
 
 @pytest.mark.parametrize("spec_id", ["*", "[x]", "../other", "x/y", "UPPER"])
@@ -302,7 +317,7 @@ def test_clean_treats_reused_pid_with_different_start_time_as_stale(
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
 
     assert result == 0
-    orch._is_process_group_alive.assert_not_called()
+    orch.is_process_group_alive.assert_not_called()
     backend.cleanup.assert_called_once()
     assert backend.cleanup.call_args.kwargs["allow_unpushed_work"] is True
 

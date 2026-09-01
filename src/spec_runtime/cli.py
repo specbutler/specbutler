@@ -306,7 +306,7 @@ def _recorded_group_is_live(orch: object, pgid: int, started_at: str) -> bool:
     identity = orch.read_process_identity(pgid)
     if identity is not None and started_at and identity.started_at != started_at:
         return False
-    return bool(orch._is_process_group_alive(pgid, pgid, started_at))
+    return bool(orch.is_process_group_alive(pgid))
 
 
 def _live_clean_blockers(
@@ -941,6 +941,11 @@ def _configure_init_parser(parser: argparse.ArgumentParser) -> None:
         "--yolo",
         action="store_true",
         help="Use agent-assisted detection for build/test config",
+    )
+    parser.add_argument(
+        "--base",
+        default="",
+        help="Explicit base ref when the repository default cannot be inferred locally",
     )
 
 

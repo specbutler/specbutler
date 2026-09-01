@@ -180,11 +180,6 @@ def test_audit_passes_only_with_exact_revision_and_satisfied_artifact(tmp_path: 
     source, manifest, revision = _write_minimal_contract(tmp_path)
     manifest.write_bytes(manifest.read_bytes().replace(b"\n", b"\r\n"))
     assert b"\r\n" in manifest.read_bytes()
-    assert subprocess.run(
-        ["git", "diff", "--quiet", "HEAD", "--", "manifest.json"],
-        cwd=source,
-        check=False,
-    ).returncode == 0
     evidence = tmp_path / "evidence"
     _write_provenance(evidence, configured=revision, staged=revision)
     (evidence / "evidence.json").write_text(
@@ -244,6 +239,129 @@ def test_immutable_manifest_snapshot_is_bound_to_canonical_repository_path(
     )
 
     assert result.returncode == 1
+    contract = next(
+        check
+        for check in audit["global_checks"]
+        if check["check_id"] == "global.source-contract-at-revision"
+    )
+    assert contract["status"] == "failed"
+
+
+def test_dirty_spec_contract_blocks_release_even_when_manifest_is_clean(tmp_path: Path) -> None:
+    source, manifest, revision = _write_minimal_contract(tmp_path)
+    spec_path = source / "specs" / "proof.md"
+    spec_path.write_bytes(spec_path.read_bytes() + b"\n")
+    evidence = tmp_path / "evidence"
+    _write_provenance(evidence, configured=revision, staged=revision)
+    (evidence / "evidence.json").write_text(
+        json.dumps({"status": "passed", "source_revision": revision}) + "\n",
+        encoding="utf-8",
+    )
+
+    result, audit = _run_audit(
+        tmp_path,
+        manifest=manifest,
+        source_root=source,
+        evidence_root=evidence,
+        revision=revision,
+    )
+
+    assert result.returncode == 1
+    contract = next(
+        check
+        for check in audit["global_checks"]
+        if check["check_id"] == "global.source-contract-at-revision"
+    )
+    assert contract["status"] == "failed"
+
+
+def test_mutable_clean_filter_cannot_authenticate_dirty_manifest(tmp_path: Path) -> None:
+    source, manifest, revision = _write_minimal_contract(tmp_path)
+    manifest.write_bytes(
+        manifest.read_bytes().replace(b'"expected": "passed"', b'"expected": "failed"')
+    )
+    with (source / ".gitattributes").open("a", encoding="ascii") as attributes:
+        attributes.write("manifest.json filter=mask\n")
+    subprocess.run(
+        ["git", "config", "filter.mask.clean", "git show HEAD:manifest.json"],
+        cwd=source,
+        check=True,
+    )
+    evidence = tmp_path / "evidence"
+    _write_provenance(evidence, configured=revision, staged=revision)
+    (evidence / "evidence.json").write_text(
+        json.dumps({"status": "failed", "source_revision": revision}) + "\n",
+        encoding="utf-8",
+    )
+
+    result, audit = _run_audit(
+        tmp_path,
+        manifest=manifest,
+        source_root=source,
+        evidence_root=evidence,
+        revision=revision,
+    )
+
+    assert result.returncode == 1
+    assert audit["counts"] == {"failed": 0, "passed": 1, "unproven": 0}
+    contract = next(
+        check
+        for check in audit["global_checks"]
+        if check["check_id"] == "global.source-contract-at-revision"
+    )
+    assert contract["status"] == "failed"
+
+
+def test_git_replacement_object_cannot_spoof_exact_contract_revision(tmp_path: Path) -> None:
+    source, manifest, good_revision = _write_minimal_contract(tmp_path)
+    manifest.write_bytes(
+        manifest.read_bytes().replace(b'"expected": "passed"', b'"expected": "failed"')
+    )
+    subprocess.run(["git", "add", "manifest.json"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "alter contract"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    altered_revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source, text=True, encoding="ascii"
+    ).strip()
+    subprocess.run(
+        ["git", "checkout", "--detach", good_revision],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "replace", good_revision, altered_revision],
+        cwd=source,
+        check=True,
+    )
+    manifest.write_bytes(
+        subprocess.check_output(
+            ["git", "--no-replace-objects", "show", f"{altered_revision}:manifest.json"],
+            cwd=source,
+        )
+    )
+    subprocess.run(["git", "add", "manifest.json"], cwd=source, check=True)
+    evidence = tmp_path / "evidence"
+    _write_provenance(evidence, configured=good_revision, staged=good_revision)
+    (evidence / "evidence.json").write_text(
+        json.dumps({"status": "failed", "source_revision": good_revision}) + "\n",
+        encoding="utf-8",
+    )
+
+    result, audit = _run_audit(
+        tmp_path,
+        manifest=manifest,
+        source_root=source,
+        evidence_root=evidence,
+        revision=good_revision,
+    )
+
+    assert result.returncode == 1
+    assert audit["counts"] == {"failed": 0, "passed": 1, "unproven": 0}
     contract = next(
         check
         for check in audit["global_checks"]

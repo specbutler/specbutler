@@ -15,7 +15,7 @@ class HarnessMismatch(RuntimeError):
 
 def _git(repo_root: Path, *arguments: str, text: bool = False) -> bytes | str:
     completed = subprocess.run(
-        ["git", "-C", str(repo_root), *arguments],
+        ["git", "--no-replace-objects", "-C", str(repo_root), *arguments],
         check=False,
         capture_output=True,
         text=text,
@@ -26,31 +26,13 @@ def _git(repo_root: Path, *arguments: str, text: bool = False) -> bytes | str:
     return completed.stdout
 
 
-def _git_clean_object_id(repo_root: Path, relative: str, payload: bytes) -> str:
-    """Hash worktree bytes through the clean filters for *relative*."""
-    completed = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "hash-object",
-            "--stdin",
-            f"--path={relative}",
-        ],
-        input=payload,
-        check=False,
-        capture_output=True,
-    )
-    if completed.returncode != 0:
-        stderr = completed.stderr.decode(errors="replace").strip()
-        raise HarnessMismatch(f"git hash-object failed for {relative}: {stderr}")
-    try:
-        object_id = completed.stdout.decode("ascii").strip().lower()
-    except UnicodeDecodeError as exc:
-        raise HarnessMismatch(f"git hash-object returned invalid output for {relative}") from exc
-    if not object_id or any(character not in "0123456789abcdef" for character in object_id):
-        raise HarnessMismatch(f"git hash-object returned invalid output for {relative}")
-    return object_id
+def _matches_exact_or_full_crlf_checkout(committed: bytes, worktree: bytes) -> bool:
+    """Accept exact bytes or one deterministic whole-file LF-to-CRLF smudge."""
+    if worktree == committed:
+        return True
+    # A committed CR byte is intentional content, not a portable line-ending
+    # candidate. Requiring every LF to be expanded also rejects mixed endings.
+    return b"\r" not in committed and worktree == committed.replace(b"\n", b"\r\n")
 
 
 def verify_exact_harness(
@@ -75,6 +57,7 @@ def verify_exact_harness(
     staged_diff = subprocess.run(
         [
             "git",
+            "--no-replace-objects",
             "-C",
             str(repo_root),
             "diff",
@@ -88,28 +71,10 @@ def verify_exact_harness(
         check=False,
         capture_output=True,
     )
-    worktree_diff = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_root),
-            "diff",
-            "--quiet",
-            "--no-ext-diff",
-            "--",
-            "tools/windows-lab",
-        ],
-        check=False,
-        capture_output=True,
-    )
-    for label, completed in (
-        ("staged", staged_diff),
-        ("worktree", worktree_diff),
-    ):
-        if completed.returncode not in {0, 1}:
-            stderr = completed.stderr.decode(errors="replace").strip()
-            raise HarnessMismatch(f"git {label} diff failed: {stderr}")
-    if staged_diff.returncode == 1 or worktree_diff.returncode == 1:
+    if staged_diff.returncode not in {0, 1}:
+        stderr = staged_diff.stderr.decode(errors="replace").strip()
+        raise HarnessMismatch(f"git staged diff failed: {stderr}")
+    if staged_diff.returncode == 1:
         raise HarnessMismatch(
             "tools/windows-lab differs from the exact proof revision"
         )
@@ -174,10 +139,12 @@ def verify_exact_harness(
             worktree = worktree_path.read_bytes()
         except OSError as exc:
             raise HarnessMismatch(f"harness file is unavailable: {relative}: {exc}") from exc
-        # Git may legitimately smudge a clean checkout (most notably LF blobs
-        # to CRLF on Windows). Compare the worktree through the path's clean
-        # filters, while continuing to materialize the raw committed blob below.
-        if _git_clean_object_id(repo_root, relative, worktree) != object_id:
+        if os.name == "posix" and os.access(worktree_path, os.X_OK) != (mode == "100755"):
+            raise HarnessMismatch(f"harness file mode differs from exact revision: {relative}")
+        # A Windows checkout can legitimately contain CRLF for an LF blob.
+        # Never invoke mutable clean filters here: raw equality or one narrow,
+        # deterministic whole-file line-ending transform is the full policy.
+        if not _matches_exact_or_full_crlf_checkout(committed, worktree):
             raise HarnessMismatch(
                 f"harness file differs from exact revision: {relative}"
             )

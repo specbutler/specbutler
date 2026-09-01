@@ -1418,11 +1418,6 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
     labctl.write_bytes(labctl.read_bytes().replace(b"\n", b"\r\n"))
     verifier.write_bytes(verifier.read_bytes().replace(b"\n", b"\r\n"))
     assert b"\r\n" in labctl.read_bytes()
-    assert subprocess.run(
-        ["git", "diff", "--quiet", "HEAD", "--", "tools/windows-lab"],
-        cwd=repo,
-        check=False,
-    ).returncode == 0
 
     output = tmp_path / "exact.json"
     snapshot = tmp_path / "snapshot"
@@ -1445,6 +1440,23 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
     assert b"\r\n" not in committed_labctl
     assert os.access(snapshot_labctl, os.X_OK)
 
+    # Local attributes and filter commands are mutable and therefore cannot
+    # authenticate the controller that is about to drive native evidence.
+    (repo / ".gitattributes").write_text(
+        "tools/windows-lab/* text eol=lf\n"
+        "tools/windows-lab/labctl filter=mask\n",
+        encoding="ascii",
+    )
+    subprocess.run(
+        [
+            "git",
+            "config",
+            "filter.mask.clean",
+            "git show HEAD:tools/windows-lab/labctl",
+        ],
+        cwd=repo,
+        check=True,
+    )
     labctl.write_text("#!/usr/bin/env bash\nexit 23\n", encoding="utf-8")
     assert snapshot_labctl.read_bytes() == committed_labctl
     dirty_snapshot = tmp_path / "dirty-snapshot"
@@ -1456,6 +1468,15 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
             tmp_path / "dirty.json",
             dirty_snapshot,
         )
+    (repo / ".gitattributes").write_text(
+        "tools/windows-lab/* text eol=lf\n",
+        encoding="ascii",
+    )
+    subprocess.run(
+        ["git", "config", "--unset", "filter.mask.clean"],
+        cwd=repo,
+        check=True,
+    )
     subprocess.run(["git", "add", "tools/windows-lab/labctl"], cwd=repo, check=True)
     staged_snapshot = tmp_path / "staged-snapshot"
     staged_snapshot.mkdir()
@@ -1489,6 +1510,58 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
             revision,
             tmp_path / "nonempty.json",
             nonempty,
+        )
+
+
+def test_windows_lab_exact_harness_ignores_git_replacement_objects(tmp_path: Path) -> None:
+    module = _load_exact_harness_module()
+    repo = tmp_path / "repo"
+    harness = repo / "tools" / "windows-lab"
+    harness.mkdir(parents=True)
+    labctl = harness / "labctl"
+    labctl.write_text("#!/usr/bin/env bash\necho GOOD\n", encoding="utf-8")
+    labctl.chmod(0o755)
+    (harness / "exact_harness.py").write_bytes((LAB_ROOT / "exact_harness.py").read_bytes())
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Spec Test"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "spec-test@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "good"], cwd=repo, check=True, capture_output=True)
+    good_revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, encoding="ascii"
+    ).strip()
+    labctl.write_text("#!/usr/bin/env bash\necho EVIL\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tools/windows-lab/labctl"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "evil"], cwd=repo, check=True, capture_output=True)
+    evil_revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True, encoding="ascii"
+    ).strip()
+    subprocess.run(
+        ["git", "checkout", "--detach", good_revision],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(["git", "replace", good_revision, evil_revision], cwd=repo, check=True)
+    labctl.write_bytes(
+        subprocess.check_output(
+            ["git", "--no-replace-objects", "show", f"{evil_revision}:tools/windows-lab/labctl"],
+            cwd=repo,
+        )
+    )
+
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    with pytest.raises(module.HarnessMismatch, match="differs"):
+        module.verify_exact_harness(
+            repo,
+            good_revision,
+            tmp_path / "exact.json",
+            snapshot,
         )
 
 

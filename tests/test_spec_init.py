@@ -17,6 +17,7 @@ from spec_runtime.config import (
 )
 from spec_runtime.git_common import run_git
 from spec_runtime.init import (
+    BaseBranchDetectionError,
     _agent_detection_failure_message,
     _ask_agent_for_config,
     _build_agent_merge_command,
@@ -575,6 +576,195 @@ class TestDetectBaseBranch:
         )
 
         assert _detect_base_branch(tmp_path) == "origin/main"
+
+    def test_uses_custom_remote_tracking_ref_when_remote_head_is_unset(self, tmp_path):
+        subprocess.run(
+            ["git", "init", "-b", "trunk"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=tmp_path,
+            check=True,
+        )
+        (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/trunk", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        assert _detect_base_branch(tmp_path) == "origin/trunk"
+
+    def test_falls_back_to_custom_current_branch_without_remote(self, tmp_path):
+        subprocess.run(
+            ["git", "init", "-b", "trunk"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+
+        assert _detect_base_branch(tmp_path) == "trunk"
+
+    def test_custom_remote_default_and_feature_require_explicit_base(self, tmp_path):
+        subprocess.run(
+            ["git", "init", "-b", "trunk"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+        (tmp_path / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"], cwd=tmp_path, check=True, capture_output=True
+        )
+        trunk_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "switch", "-c", "feature"], cwd=tmp_path, check=True)
+        (tmp_path / "feature.txt").write_text("feature\n", encoding="utf-8")
+        subprocess.run(["git", "add", "feature.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "feature"], cwd=tmp_path, check=True, capture_output=True
+        )
+        feature_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/trunk", trunk_sha],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/feature", feature_sha],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        with pytest.raises(BaseBranchDetectionError, match="spec init --base"):
+            _detect_base_branch(tmp_path)
+
+    def test_does_not_mistake_stale_ancestor_for_custom_default(self, tmp_path):
+        subprocess.run(
+            ["git", "init", "-b", "legacy"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+        (tmp_path / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+        subprocess.run(["git", "add", "legacy.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "legacy"], cwd=tmp_path, check=True, capture_output=True
+        )
+        legacy_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "switch", "-c", "trunk"], cwd=tmp_path, check=True)
+        (tmp_path / "trunk.txt").write_text("trunk\n", encoding="utf-8")
+        subprocess.run(["git", "add", "trunk.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "trunk"], cwd=tmp_path, check=True, capture_output=True
+        )
+        trunk_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/legacy", legacy_sha],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/trunk", trunk_sha],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        with pytest.raises(BaseBranchDetectionError, match="spec init --base"):
+            _detect_base_branch(tmp_path)
+
+    def test_ambiguous_custom_remote_branches_require_explicit_base(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"], cwd=tmp_path, check=True, capture_output=True
+        )
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        for branch, filename in (("alpha", "alpha.txt"), ("beta", "beta.txt")):
+            subprocess.run(["git", "switch", "--detach", base_sha], cwd=tmp_path, check=True)
+            (tmp_path / filename).write_text(f"{branch}\n", encoding="utf-8")
+            subprocess.run(["git", "add", filename], cwd=tmp_path, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", branch], cwd=tmp_path, check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "update-ref", f"refs/remotes/origin/{branch}", "HEAD"],
+                cwd=tmp_path,
+                check=True,
+            )
+
+        with pytest.raises(BaseBranchDetectionError, match="spec init --base"):
+            _detect_base_branch(tmp_path)
 
 
 # ---------------------------------------------------------------------------

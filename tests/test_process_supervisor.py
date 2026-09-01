@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
@@ -1056,6 +1056,64 @@ def test_legacy_single_process_shutdown_revalidates_identity(
     signal_process.assert_not_called()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="exact PID termination is POSIX-only")
+def test_exact_process_termination_revalidates_before_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = ProcessIdentity(4242, "created")
+    send_signal = MagicMock()
+    close_handle = MagicMock()
+    monkeypatch.setattr(process_supervisor, "_open_verified_posix_process_handle", lambda _identity: 17)
+    monkeypatch.setattr(process_supervisor, "_signal_posix_process_handle", send_signal)
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _candidate: False)
+    monkeypatch.setattr(process_supervisor.os, "close", close_handle)
+
+    assert process_supervisor.terminate_exact_process(identity, grace_seconds=0)
+    send_signal.assert_called_once_with(17, signal.SIGTERM)
+    close_handle.assert_called_once_with(17)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exact PID termination is POSIX-only")
+def test_exact_process_termination_escalates_only_same_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = ProcessIdentity(4242, "created")
+    send_signal = MagicMock(return_value=True)
+    close_handle = MagicMock()
+    monkeypatch.setattr(process_supervisor, "_open_verified_posix_process_handle", lambda _identity: 17)
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda candidate: candidate == identity)
+    monkeypatch.setattr(process_supervisor, "_signal_posix_process_handle", send_signal)
+    monkeypatch.setattr(process_supervisor.os, "close", close_handle)
+
+    assert not process_supervisor.terminate_exact_process(
+        identity,
+        grace_seconds=0,
+        hard_grace_seconds=0,
+    )
+    assert send_signal.call_args_list == [
+        call(17, signal.SIGTERM),
+        call(17, signal.SIGKILL),
+    ]
+    close_handle.assert_called_once_with(17)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="exact PID termination is POSIX-only")
+def test_exact_process_termination_without_stable_handle_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = ProcessIdentity(4242, "created")
+    signal_process = MagicMock()
+    monkeypatch.setattr(
+        process_supervisor,
+        "_open_verified_posix_process_handle",
+        lambda _identity: None,
+    )
+    monkeypatch.setattr(process_supervisor.os, "kill", signal_process)
+
+    assert not process_supervisor.terminate_exact_process(identity)
+    signal_process.assert_not_called()
+
+
 def test_adoptable_token_records_new_logical_owner(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1351,6 +1409,172 @@ def test_payload_promotion_rejects_candidate_from_another_job(
 
     control = json.loads((tmp_path / token.control_relpath).read_text(encoding="utf-8"))
     assert control["payload_identity"] == shim.to_dict()
+
+
+def test_persisted_windows_termination_keeps_authenticated_job_when_payload_exits_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    keeper = ProcessIdentity(41, "keeper", "python.exe")
+    payload = ProcessIdentity(42, "payload", "python.exe")
+    token = SupervisionToken(
+        LifetimeMode.DETACHED,
+        keeper,
+        7,
+        "owner",
+        "payload-exit-at-deadline",
+        payload_identity=payload,
+    )
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path))
+    _write_promotion_state(tmp_path, token)
+    events: list[object] = []
+
+    class Job:
+        def contains(self, identity: ProcessIdentity) -> bool:
+            events.append(("contains", identity))
+            # Initial authentication succeeds. A second membership check
+            # would model the racy, already-exited payload and must not occur.
+            return len([event for event in events if isinstance(event, tuple)]) == 1
+
+        def active_process_ids(self) -> tuple[int, ...]:
+            return (99,)
+
+        def active_identities(self) -> list[ProcessIdentity]:
+            return [ProcessIdentity(99, "remaining-job-member")]
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def close(self) -> None:
+            events.append("close")
+
+    job = Job()
+    monkeypatch.setattr(process_supervisor, "_platform_is_windows", lambda: True)
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: True)
+    monkeypatch.setattr(
+        process_supervisor._WindowsJob,
+        "open",
+        classmethod(lambda _cls, _name: job),
+    )
+    monkeypatch.setattr(process_supervisor, "_wait_for_identities_exit", lambda _items: True)
+
+    assert process_supervisor.terminate(token, grace_seconds=0)
+    assert events == [("contains", payload), "terminate", "close"]
+
+
+def test_persisted_windows_termination_accepts_empty_job_after_keeper_exits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    keeper = ProcessIdentity(41, "keeper", "python.exe")
+    payload = ProcessIdentity(42, "payload", "python.exe")
+    token = SupervisionToken(
+        LifetimeMode.DETACHED,
+        keeper,
+        7,
+        "owner",
+        "empty-job-after-keeper-exit",
+        payload_identity=payload,
+    )
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path))
+    _write_promotion_state(tmp_path, token)
+    events: list[object] = []
+    identity_checks = 0
+
+    class Job:
+        def contains(self, identity: ProcessIdentity) -> bool:
+            events.append(("contains", identity))
+            return True
+
+        def active_process_ids(self) -> tuple[int, ...]:
+            events.append("empty")
+            return ()
+
+        def active_identities(self) -> list[ProcessIdentity]:
+            raise AssertionError("an empty Job must not be escalated")
+
+        def terminate(self) -> None:
+            raise AssertionError("an empty Job must not be terminated")
+
+        def close(self) -> None:
+            events.append("close")
+
+    def identity_matches_then_exits(_identity: ProcessIdentity) -> bool:
+        nonlocal identity_checks
+        identity_checks += 1
+        return identity_checks == 1
+
+    monkeypatch.setattr(process_supervisor, "_platform_is_windows", lambda: True)
+    monkeypatch.setattr(process_supervisor, "identity_matches", identity_matches_then_exits)
+    monkeypatch.setattr(
+        process_supervisor._WindowsJob,
+        "open",
+        classmethod(lambda _cls, _name: Job()),
+    )
+
+    assert process_supervisor.terminate(token, grace_seconds=0)
+    assert identity_checks == 1
+    assert events == [("contains", payload), "empty", "close"]
+
+
+def test_persisted_windows_termination_rejects_nonempty_job_after_keeper_exits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    keeper = ProcessIdentity(41, "keeper", "python.exe")
+    payload = ProcessIdentity(42, "payload", "python.exe")
+    token = SupervisionToken(
+        LifetimeMode.DETACHED,
+        keeper,
+        7,
+        "owner",
+        "nonempty-job-after-keeper-exit",
+        payload_identity=payload,
+    )
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path))
+    _write_promotion_state(tmp_path, token)
+    events: list[object] = []
+    identity_checks = 0
+
+    class Job:
+        def contains(self, identity: ProcessIdentity) -> bool:
+            events.append(("contains", identity))
+            return True
+
+        def active_process_ids(self) -> tuple[int, ...]:
+            events.append("nonempty")
+            return (99,)
+
+        def active_identities(self) -> list[ProcessIdentity]:
+            raise AssertionError("lost keeper identity must prevent escalation")
+
+        def terminate(self) -> None:
+            raise AssertionError("lost keeper identity must prevent termination")
+
+        def close(self) -> None:
+            events.append("close")
+
+    def keeper_exits_after_authentication(_identity: ProcessIdentity) -> bool:
+        nonlocal identity_checks
+        identity_checks += 1
+        return identity_checks == 1
+
+    monkeypatch.setattr(process_supervisor, "_platform_is_windows", lambda: True)
+    monkeypatch.setattr(process_supervisor, "identity_matches", keeper_exits_after_authentication)
+    monkeypatch.setattr(
+        process_supervisor._WindowsJob,
+        "open",
+        classmethod(lambda _cls, _name: Job()),
+    )
+
+    assert not process_supervisor.terminate(token, grace_seconds=0)
+    assert identity_checks == 2
+    assert events == [
+        ("contains", payload),
+        "nonempty",
+        "nonempty",
+        "close",
+    ]
 
 
 def test_payload_promotion_converges_after_death_between_atomic_writes(
