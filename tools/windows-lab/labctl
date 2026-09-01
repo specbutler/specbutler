@@ -73,6 +73,13 @@ docker_query_timeout_seconds() {
     printf '%s\n' "$timeout"
 }
 
+bounded_host_command() {
+    local timeout="$1"
+    shift
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "host command timeout must be a positive integer"
+    python3 "$HARNESS_ROOT/run_with_timeout.py" "$timeout" -- "$@"
+}
+
 load_config() {
     test -f "$CONFIG_FILE" || die "copy lab.env.example to lab.env and fill every placeholder"
     set -a
@@ -111,12 +118,10 @@ bounded_compose_down() {
     local container_grace="${1:-30}" host_timeout
     [[ "$container_grace" =~ ^[1-9][0-9]*$ ]] || die "container shutdown grace must be a positive integer"
     host_timeout="$(compose_down_timeout_seconds)"
-    require_command timeout
     load_config
     load_identity
     SPEC_WINDOWS_LAB_STATE_ROOT="$STATE_ROOT" \
-        timeout --foreground --kill-after=5s "${host_timeout}s" \
-        docker compose \
+        bounded_host_command "$host_timeout" docker compose \
             --project-name windows-lab \
             --project-directory "$HARNESS_ROOT" \
             -f "$HARNESS_ROOT/compose.yaml" \
@@ -127,10 +132,8 @@ try_refresh_vm_state() {
     local output state query_timeout query_status=0
     VM_STATE_ERROR=
     query_timeout="$(docker_query_timeout_seconds)"
-    require_command timeout
     output="$(
-        timeout --foreground --kill-after=5s "${query_timeout}s" \
-            docker ps -a \
+        bounded_host_command "$query_timeout" docker ps -a \
             --filter "name=^/${CONTAINER_NAME}$" \
             --format '{{.Names}}|{{.State}}' \
             2>/dev/null
@@ -217,11 +220,10 @@ guest_ssh_timeout() {
     local timeout="$1"
     shift
     [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "SSH timeout must be a positive integer"
-    require_command timeout
     prepare_ssh_options
     # The caller intentionally supplies the PowerShell command evaluated by the guest.
     # shellcheck disable=SC2029
-    timeout --foreground --kill-after=5s "${timeout}s" \
+    bounded_host_command "$timeout" \
         ssh "${SSH_OPTIONS[@]}" specadmin@127.0.0.1 "$@"
 }
 
@@ -247,11 +249,9 @@ guest_scp_timeout() {
     local timeout="$1"
     shift
     [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "SCP timeout must be a positive integer"
-    require_command timeout
     load_config
     load_identity
-    timeout --foreground --kill-after=5s "${timeout}s" \
-        scp -q \
+    bounded_host_command "$timeout" scp -q \
             -P "${LAB_SSH_PORT:-12222}" \
             -o "UserKnownHostsFile=$STATE_ROOT/ssh/known_hosts" \
             -i "$STATE_ROOT/ssh/id_ed25519" \
@@ -300,7 +300,7 @@ PY
 
 init_lab() {
     load_config
-    for command in awk df docker git python3 sha256sum ssh ssh-keygen scp timeout; do
+    for command in awk df docker git python3 sha256sum ssh ssh-keygen scp; do
         require_command "$command"
     done
     require_free_space

@@ -45,6 +45,7 @@ REQUIRED_FILES = {
     "provision.ps1",
     "redact.py",
     "register-job.ps1",
+    "run_with_timeout.py",
     "runtime_proof.py",
     "toolchain.json.example",
     "trash_retention.py",
@@ -87,8 +88,8 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert 'local timeout="${LAB_SHUTDOWN_TIMEOUT_SECONDS:-600}"' in controller
     assert 'local timeout="${LAB_COMPOSE_DOWN_TIMEOUT_SECONDS:-180}"' in controller
     assert 'local timeout="${LAB_DOCKER_QUERY_TIMEOUT_SECONDS:-30}"' in controller
-    assert 'timeout --foreground --kill-after=5s "${host_timeout}s"' in controller
-    assert 'timeout --foreground --kill-after=5s "${query_timeout}s"' in controller
+    assert 'bounded_host_command "$host_timeout" docker compose' in controller
+    assert 'bounded_host_command "$query_timeout" docker ps -a' in controller
     assert "graceful shutdown timed out; forcing the VM down" in controller
     assert "VM remained active after forced shutdown" in controller
     assert 'local keep="${LAB_PROOF_TRASH_KEEP:-1}"' in controller
@@ -1258,6 +1259,72 @@ def _load_exact_harness_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_windows_lab_portable_timeout_terminates_the_command_group(
+    tmp_path: Path,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("the host timeout helper is for POSIX lab controllers")
+    child = tmp_path / "child.py"
+    parent = tmp_path / "parent.py"
+    child.write_text(
+        "import os\n"
+        "import signal\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "root = Path(sys.argv[1])\n"
+        "def stopped(_signum, _frame):\n"
+        "    (root / 'child-stopped').write_text('yes', encoding='ascii')\n"
+        "    os._exit(0)\n"
+        "signal.signal(signal.SIGTERM, stopped)\n"
+        "(root / 'child-ready').write_text('yes', encoding='ascii')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    parent.write_text(
+        "import os\n"
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "root = Path(sys.argv[1])\n"
+        "def stopped(_signum, _frame):\n"
+        "    (root / 'parent-stopped').write_text('yes', encoding='ascii')\n"
+        "    os._exit(0)\n"
+        "signal.signal(signal.SIGTERM, stopped)\n"
+        "subprocess.Popen([sys.executable, str(root / 'child.py'), str(root)])\n"
+        "deadline = time.monotonic() + 5\n"
+        "while not (root / 'child-ready').exists():\n"
+        "    if time.monotonic() >= deadline:\n"
+        "        raise SystemExit('child did not become ready')\n"
+        "    time.sleep(0.01)\n"
+        "(root / 'parent-ready').write_text('yes', encoding='ascii')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LAB_ROOT / "run_with_timeout.py"),
+            "1",
+            "--",
+            sys.executable,
+            str(parent),
+            str(tmp_path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 124
+    assert (tmp_path / "parent-ready").is_file()
+    assert (tmp_path / "child-ready").is_file()
+    assert (tmp_path / "parent-stopped").read_text(encoding="ascii") == "yes"
+    assert (tmp_path / "child-stopped").read_text(encoding="ascii") == "yes"
 
 
 def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
