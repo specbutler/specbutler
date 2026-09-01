@@ -21,10 +21,39 @@ function Invoke-LoggedNative {
         [Parameter(Mandatory = $true)] [string[]] $Arguments,
         [Parameter(Mandatory = $true)] [string] $LogName
     )
-    & $FilePath @Arguments 2>&1 | Tee-Object -LiteralPath (Join-Path $evidenceRoot $LogName)
-    if ($LASTEXITCODE -ne 0) {
-        throw "$FilePath failed with exit code $LASTEXITCODE"
+    # Windows PowerShell 5 promotes native stderr to NativeCommandError when
+    # ErrorActionPreference is Stop. Healthy tools such as git emit progress on
+    # stderr, so judge native commands by their exit code instead.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $FilePath @Arguments 2>&1 | Tee-Object -LiteralPath (Join-Path $evidenceRoot $LogName)
+        $nativeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
     }
+    if ($nativeExitCode -ne 0) {
+        throw "$FilePath failed with exit code $nativeExitCode"
+    }
+}
+
+function Invoke-NativeOutput {
+    param(
+        [Parameter(Mandatory = $true)] [string] $FilePath,
+        [Parameter(Mandatory = $true)] [string[]] $Arguments
+    )
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $FilePath @Arguments)
+        $nativeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($nativeExitCode -ne 0) {
+        throw "$FilePath failed with exit code $nativeExitCode"
+    }
+    return $output
 }
 
 function Write-Utf8NoBom {
@@ -36,30 +65,49 @@ function Write-Utf8NoBom {
     [System.IO.File]::WriteAllText($LiteralPath, $Value, $encoding)
 }
 
-function Wait-ChatTurn {
-    param([string] $SessionId, [hashtable] $Headers, [int] $TimeoutSeconds = 600)
+function Wait-Condition {
+    param(
+        [Parameter(Mandatory = $true)] [scriptblock] $Condition,
+        [Parameter(Mandatory = $true)] [string] $Description,
+        [int] $TimeoutSeconds = 60
+    )
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
-        $history = Invoke-RestMethod `
-            -Uri "http://127.0.0.1:17702/api/v1/chat/sessions/$SessionId/history" `
-            -Headers $Headers
-        if (-not $history.turn_active) { return $history }
-        Start-Sleep -Milliseconds 500
+        if (& $Condition) { return }
+        Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "Chat turn timed out for session $SessionId"
+    throw "Timed out waiting for $Description"
 }
 
-function Get-LatestAssistantText {
-    param($History)
-    $assistantEntries = @($History.history | Where-Object { $_.role -eq 'assistant' })
-    if ($assistantEntries.Count -eq 0) { return '' }
-    $parts = [System.Collections.Generic.List[string]]::new()
-    foreach ($entry in @($assistantEntries[-1])) {
-        foreach ($event in $entry.events) {
-            if ($event.kind -eq 'text' -and $event.text) { $parts.Add([string] $event.text) }
-        }
+function Wait-ProcessExit {
+    param(
+        [Parameter(Mandatory = $true)] [System.Diagnostics.Process] $Process,
+        [Parameter(Mandatory = $true)] [string] $Description,
+        [int] $TimeoutSeconds = 60
+    )
+    $exited = $Process.WaitForExit($TimeoutSeconds * 1000)
+    if (-not $exited) { throw "$Description did not exit within $TimeoutSeconds seconds" }
+    # Start-Process uses asynchronous readers for redirected streams. The
+    # parameterless wait drains those readers and makes ExitCode available.
+    $Process.WaitForExit()
+    $Process.Refresh()
+}
+
+$criteria = [ordered]@{}
+function Set-Criterion {
+    param(
+        [Parameter(Mandatory = $true)] [string] $Id,
+        [Parameter(Mandatory = $true)] [string[]] $Evidence,
+        [Parameter(Mandatory = $true)] [string] $Detail
+    )
+    $script:criteria[$Id] = [ordered]@{
+        status = 'passed'
+        evidence = $Evidence
+        detail = $Detail
     }
-    return ($parts -join '')
+    Write-Utf8NoBom `
+        -LiteralPath (Join-Path $script:evidenceRoot 'criteria.json') `
+        -Value ($script:criteria | ConvertTo-Json -Depth 8)
 }
 
 $recordedRevision = (Get-Content -LiteralPath (Join-Path $sourceRoot '.lab-source-revision') -Raw).Trim()
@@ -106,6 +154,10 @@ Invoke-LoggedNative -FilePath $spec -Arguments @('--version') -LogName 'spec-ver
 Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
     '-m', 'pytest', (Join-Path $sourceRoot 'tests'), '-v'
 ) -LogName 'native-tests.log'
+Set-Criterion `
+    -Id 'windows-ci-e2e-release.1' `
+    -Evidence @('native-tests.log', 'wheel-install.log', 'spec-version.log') `
+    -Detail 'The release-candidate wheel and complete candidate test tree ran under native Windows Python 3.12.'
 
 $repositoryName = "specbutler-windows-$($runName.Replace('proof-', ''))"
 $repositorySlug = "$githubOwner/$repositoryName"
@@ -142,13 +194,16 @@ pythonpath = ["."]
 
 Set-Location $fixtureRoot
 Invoke-LoggedNative -FilePath 'git.exe' -Arguments @('init', '-b', 'main') -LogName 'fixture-git-init.log'
-$githubLogin = (& gh.exe api user --jq .login).Trim()
-if ($LASTEXITCODE -ne 0 -or -not $githubLogin) { throw 'Unable to resolve authenticated GitHub login' }
-& git.exe config user.name $githubLogin
-& git.exe config user.email "$githubLogin@users.noreply.github.com"
-& git.exe add .
-& git.exe commit -m 'Create Windows lifecycle proof fixture'
-if ($LASTEXITCODE -ne 0) { throw 'Initial fixture commit failed' }
+$githubLogin = (@(Invoke-NativeOutput -FilePath 'gh.exe' -Arguments @('api', 'user', '--jq', '.login')) -join "`n").Trim()
+if (-not $githubLogin) { throw 'Unable to resolve authenticated GitHub login' }
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @('config', 'user.name', $githubLogin) -LogName 'fixture-git-user-name.log'
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'config', 'user.email', "$githubLogin@users.noreply.github.com"
+) -LogName 'fixture-git-user-email.log'
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @('add', '.') -LogName 'fixture-git-add.log'
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'commit', '-m', 'Create Windows lifecycle proof fixture'
+) -LogName 'fixture-git-commit.log'
 Invoke-LoggedNative -FilePath 'gh.exe' -Arguments @(
     'repo', 'create', $repositorySlug, '--private', '--source', $fixtureRoot, '--remote', 'origin', '--push'
 ) -LogName 'github-repository-create.log'
@@ -207,11 +262,11 @@ Make `calculator.add(left, right)` return the arithmetic sum of its two integer 
 
 - Additional calculator operations.
 '@
-& git.exe add .
-& git.exe commit -m 'Configure Spec Butler proof lifecycle'
-if ($LASTEXITCODE -ne 0) { throw 'Spec fixture commit failed' }
-& git.exe push origin main
-if ($LASTEXITCODE -ne 0) { throw 'Spec fixture push failed' }
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @('add', '.') -LogName 'lifecycle-git-add.log'
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'commit', '-m', 'Configure Spec Butler proof lifecycle'
+) -LogName 'lifecycle-git-commit.log'
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @('push', 'origin', 'main') -LogName 'lifecycle-git-push.log'
 
 Invoke-LoggedNative -FilePath $spec -Arguments @('doctor') -LogName 'spec-doctor.log'
 Invoke-LoggedNative -FilePath $spec -Arguments @(
@@ -221,77 +276,435 @@ Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
     '-m', 'pytest', 'tests\test_calculator.py', '-q'
 ) -LogName 'fixture-final-test.log'
 
-$mergedPulls = & gh.exe pr list --repo $repositorySlug --state merged --json number,url,mergedAt
-if ($LASTEXITCODE -ne 0) { throw 'Unable to query merged proof pull request' }
+$mergedPulls = @(Invoke-NativeOutput -FilePath 'gh.exe' -Arguments @(
+    'pr', 'list', '--repo', $repositorySlug, '--state', 'merged', '--json', 'number,url,mergedAt'
+)) -join "`n"
 $merged = @($mergedPulls | ConvertFrom-Json)
 if ($merged.Count -lt 1) { throw 'Real Codex lifecycle did not leave a merged pull request' }
-$worktreeBranches = @(& git.exe branch --list 'code/add-numbers--*')
+$worktreeBranches = @(Invoke-NativeOutput -FilePath 'git.exe' -Arguments @(
+    'branch', '--list', 'code/add-numbers--*'
+))
 if ($worktreeBranches.Count -ne 0) { throw 'Implementation branches remain after lifecycle cleanup' }
+Set-Criterion `
+    -Id 'windows-ci-e2e-release.4.lifecycle' `
+    -Evidence @('real-codex-lifecycle.log', 'fixture-final-test.log', 'result.json') `
+    -Detail 'A real Codex implementation, review, disposable GitHub pull request, merge, and cleanup completed.'
+
+$foregroundWeb = $null
+try {
+    $foregroundOut = Join-Path $evidenceRoot 'web-foreground.log'
+    $foregroundErr = Join-Path $evidenceRoot 'web-foreground-error.log'
+    $foregroundWeb = Start-Process `
+        -FilePath $spec `
+        -ArgumentList @('web', 'start', '--host', '127.0.0.1', '--port', '17701') `
+        -WorkingDirectory $fixtureRoot `
+        -RedirectStandardOutput $foregroundOut `
+        -RedirectStandardError $foregroundErr `
+        -PassThru
+    Wait-Condition -Description 'foreground web readiness' -TimeoutSeconds 90 -Condition {
+        try {
+            $tokenPath = Join-Path $fixtureRoot '.spec-state\web\auth-token'
+            if (-not (Test-Path -LiteralPath $tokenPath)) { return $false }
+            $foregroundToken = (Get-Content -LiteralPath $tokenPath -Raw).Trim()
+            Invoke-RestMethod `
+                -Uri 'http://127.0.0.1:17701/api/v1/chat/backends' `
+                -Headers @{ Authorization = "Bearer $foregroundToken" } | Out-Null
+            return $true
+        } catch { return $false }
+    }
+    Invoke-LoggedNative -FilePath $spec -Arguments @('web', 'stop') -LogName 'web-foreground-stop.log'
+    Wait-ProcessExit `
+        -Process $foregroundWeb `
+        -Description 'Foreground web process after spec web stop' `
+        -TimeoutSeconds 30
+} finally {
+    if ($foregroundWeb -and -not $foregroundWeb.HasExited) {
+        Stop-Process -Id $foregroundWeb.Id -Force -ErrorAction SilentlyContinue
+    }
+}
 
 $webStarted = $false
-$sessionIds = [System.Collections.Generic.List[string]]::new()
+$backgroundServerPid = 0
 try {
     Invoke-LoggedNative -FilePath $spec -Arguments @(
         'web', 'start', '--background', '--host', '127.0.0.1', '--port', '17702'
     ) -LogName 'web-start.log'
     $webStarted = $true
-    $token = (Get-Content -LiteralPath (Join-Path $fixtureRoot '.spec-state\web\auth-token') -Raw).Trim()
-    if (-not $token) { throw 'Web authentication token was not created' }
-    $headers = @{ Authorization = "Bearer $token" }
-    $backends = Invoke-RestMethod -Uri 'http://127.0.0.1:17702/api/v1/chat/backends' -Headers $headers
-    if (-not $backends.backends.codex) { throw 'Codex web chat backend is unavailable' }
-    if ($backends.backends.claude) { throw 'Native Claude web chat must fail closed' }
-
-    $marker = "WINDOWS-CONTEXT-$([Random]::new().Next(100000, 999999))"
-    $createBody = @{
-        mode = 'create'
-        agent = 'codex'
-        prompt = "Do not edit files. Remember the exact marker $marker. Reply ACK only."
-    } | ConvertTo-Json -Compress
-    $created = Invoke-RestMethod `
-        -Method Post `
-        -Uri 'http://127.0.0.1:17702/api/v1/chat/sessions' `
-        -Headers $headers `
-        -ContentType 'application/json' `
-        -Body $createBody
-    $sessionId = [string] $created.session_id
-    $sessionIds.Add($sessionId)
-    $first = Wait-ChatTurn $sessionId $headers
-    if (-not (Get-LatestAssistantText $first)) { throw 'Initial Codex web chat turn returned no text' }
-
-    $message = @{ text = 'What exact marker did I ask you to remember? Reply with the marker only.' } |
-        ConvertTo-Json -Compress
-    Invoke-WebRequest `
-        -UseBasicParsing `
-        -Method Post `
-        -Uri "http://127.0.0.1:17702/api/v1/chat/sessions/$sessionId/messages" `
-        -Headers $headers `
-        -ContentType 'application/json' `
-        -Body $message | Out-Null
-    $second = Wait-ChatTurn $sessionId $headers
-    $secondText = Get-LatestAssistantText $second
-    if ($secondText -notmatch [regex]::Escape($marker)) {
-        throw "Second Codex web chat turn lost context: $secondText"
-    }
-    $chatResult = [ordered]@{
-        backend = 'codex'
-        native_claude_available = $false
-        retained_second_turn_context = $true
-    } | ConvertTo-Json
-    Write-Utf8NoBom -LiteralPath (Join-Path $evidenceRoot 'web-chat-result.json') -Value $chatResult
+    $tokenPath = Join-Path $fixtureRoot '.spec-state\web\auth-token'
+    $supervisionPath = Join-Path $fixtureRoot '.spec-state\web\server.supervision.json'
+    if (-not (Test-Path -LiteralPath $tokenPath)) { throw 'Web authentication token was not created' }
+    if (-not (Test-Path -LiteralPath $supervisionPath)) { throw 'Web supervision token was not created' }
+    $supervision = Get-Content -LiteralPath $supervisionPath -Raw | ConvertFrom-Json
+    $backgroundServerPid = [int] $supervision.payload_identity.pid
+    if ($backgroundServerPid -le 0) { throw 'Web supervision token has no payload process id' }
+    Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
+        (Join-Path $sourceRoot 'tools\windows-lab\runtime_proof.py'),
+        'chat',
+        '--base-url', 'http://127.0.0.1:17702',
+        '--token-file', $tokenPath,
+        '--evidence-root', $evidenceRoot,
+        '--server-pid', [string] $backgroundServerPid
+    ) -LogName 'web-chat-proof.log'
+    $chatResult = Get-Content -LiteralPath (Join-Path $evidenceRoot 'web-chat-result.json') -Raw |
+        ConvertFrom-Json
+    if ($chatResult.status -ne 'passed') { throw 'Comprehensive real web chat proof did not pass' }
 } finally {
     if ($webStarted) {
-        foreach ($sessionId in $sessionIds) {
-            try {
-                Invoke-RestMethod `
-                    -Method Post `
-                    -Uri "http://127.0.0.1:17702/api/v1/chat/sessions/$sessionId/stop" `
-                    -Headers $headers | Out-Null
-            } catch {}
+        try {
+            Invoke-LoggedNative -FilePath $spec -Arguments @('web', 'stop') -LogName 'web-stop.log'
+        } catch {
+            $_ | Out-String | Add-Content -LiteralPath (Join-Path $evidenceRoot 'web-stop.log')
         }
-        & $spec web stop 2>&1 | Add-Content -LiteralPath (Join-Path $evidenceRoot 'web-stop.log')
     }
 }
+if ($backgroundServerPid -gt 0 -and (Get-Process -Id $backgroundServerPid -ErrorAction SilentlyContinue)) {
+    throw "Background web process $backgroundServerPid survived spec web stop"
+}
+Set-Criterion `
+    -Id 'windows-web-autopilot.1' `
+    -Evidence @('web-foreground.log', 'web-foreground-stop.log', 'web-start.log', 'web-stop.log') `
+    -Detail 'Foreground and durable background web services reached authenticated readiness and stopped with their owned processes gone.'
+Set-Criterion `
+    -Id 'windows-web-autopilot.2' `
+    -Evidence @('web-chat-result.json', 'web-chat-events.json', 'web-chat-proof.log') `
+    -Detail 'Real Codex used three context-dependent turns over HTTP/SSE, reconnect/history, concurrent isolated sessions, and live cancellation without descendants.'
+Set-Criterion `
+    -Id 'windows-web-autopilot.3.native' `
+    -Evidence @('web-chat-result.json') `
+    -Detail 'The native backend inventory offered Codex and failed closed for Claude.'
+Set-Criterion `
+    -Id 'windows-web-autopilot.7.chat' `
+    -Evidence @('web-chat-result.json', 'web-chat-events.json') `
+    -Detail 'The proof used a real loopback listener, authenticated API requests, streaming reconnect, concurrent provider processes, and cancellation.'
+
+Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
+    (Join-Path $sourceRoot 'tools\windows-lab\runtime_proof.py'),
+    'timeout-tree',
+    '--work-root', (Join-Path $runRoot 'timeout-tree'),
+    '--evidence-root', $evidenceRoot
+) -LogName 'timeout-tree.log'
+Set-Criterion `
+    -Id 'windows-ci-e2e-release.4.timeout-cleanup' `
+    -Evidence @('timeout-tree-result.json', 'timeout-tree.log') `
+    -Detail 'A native parent-child-grandchild process tree exceeded a bounded timeout and every exact process identity was gone afterward.'
+
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'pull', '--ff-only', 'origin', 'main'
+) -LogName 'autopilot-git-pull.log'
+Write-Utf8NoBom -LiteralPath (Join-Path $fixtureRoot '.spec.toml') -Value @'
+base_ref = "origin/main"
+
+[paths]
+specs_dir = "specs"
+task_specs_dir = "specs/tasks"
+state_dir = ".spec-state"
+worktrees_dir = ".worktrees"
+
+[retry]
+cap = 2
+no_progress_retry_threshold = 2
+
+[agents]
+default = "codex"
+review_default = "codex"
+allowed = ["codex"]
+
+[bootstrap]
+argv_windows = ["C:\\Windows\\System32\\cmd.exe", "/d", "/c", "exit 0"]
+
+[verify]
+'@
+Write-Utf8NoBom -LiteralPath (Join-Path $fixtureRoot 'specs\auto-root-a.md') -Value @'
+---
+id: auto-root-a
+area: proof
+priority: 1
+depends_on: []
+description: First ready autopilot proof root
+---
+
+# First ready autopilot proof root
+
+## Goal
+
+Exercise native autopilot supervision for one dependency-ready root.
+
+## Acceptance Criteria
+
+1. The proof agent starts and waits for the release marker.
+'@
+Write-Utf8NoBom -LiteralPath (Join-Path $fixtureRoot 'specs\auto-root-b.md') -Value @'
+---
+id: auto-root-b
+area: proof
+priority: 2
+depends_on: []
+description: Second ready autopilot proof root
+---
+
+# Second ready autopilot proof root
+
+## Goal
+
+Exercise native autopilot concurrency for a second ready root.
+
+## Acceptance Criteria
+
+1. The proof agent starts concurrently and waits for the release marker.
+'@
+Write-Utf8NoBom -LiteralPath (Join-Path $fixtureRoot 'specs\auto-dependent.md') -Value @'
+---
+id: auto-dependent
+area: proof
+priority: 3
+depends_on:
+  - auto-root-a
+description: Autopilot proof dependent that must remain blocked
+---
+
+# Blocked autopilot proof dependent
+
+## Goal
+
+Remain undispatched until the parent spec is merged.
+
+## Acceptance Criteria
+
+1. Autopilot does not dispatch this spec while `auto-root-a` is unresolved.
+'@
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'add', '.spec.toml', 'specs'
+) -LogName 'autopilot-git-add.log'
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'commit', '-m', 'Add native autopilot proof graph'
+) -LogName 'autopilot-git-commit.log'
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'push', 'origin', 'main'
+) -LogName 'autopilot-git-push.log'
+
+$shimRoot = Join-Path $runRoot 'autopilot-shim'
+$agentEvents = Join-Path $runRoot 'autopilot-agent-events'
+$releaseMarker = Join-Path $runRoot 'autopilot-release'
+New-Item -ItemType Directory -Force -Path $shimRoot, $agentEvents | Out-Null
+Remove-Item -LiteralPath $releaseMarker -Force -ErrorAction SilentlyContinue
+$csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+if (-not (Test-Path -LiteralPath $csc)) {
+    $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+}
+if (-not (Test-Path -LiteralPath $csc)) { throw 'Windows C# compiler is unavailable for autopilot proof agent' }
+Invoke-LoggedNative -FilePath $csc -Arguments @(
+    '/nologo',
+    '/target:exe',
+    "/out:$(Join-Path $shimRoot 'codex.exe')",
+    (Join-Path $sourceRoot 'tools\windows-lab\autopilot-agent.cs')
+) -LogName 'autopilot-agent-build.log'
+
+$oldPath = $env:Path
+$oldProofEvents = $env:SPEC_AUTOPILOT_PROOF_EVENTS
+$oldProofRelease = $env:SPEC_AUTOPILOT_PROOF_RELEASE
+$oldProofSpec = $env:SPEC_AUTOPILOT_SPEC_EXE
+$firstDispatcher = $null
+$secondDispatcher = $null
+$firstPids = [ordered]@{}
+$activePath = Join-Path $fixtureRoot '.spec-state\autopilot\active.json'
+$shutdownPath = Join-Path $fixtureRoot '.spec-state\autopilot\shutdown.json'
+try {
+    $env:Path = "$shimRoot;$(Join-Path $wheelVenv 'Scripts');$oldPath"
+    $env:SPEC_AUTOPILOT_PROOF_EVENTS = $agentEvents
+    $env:SPEC_AUTOPILOT_PROOF_RELEASE = $releaseMarker
+    $env:SPEC_AUTOPILOT_SPEC_EXE = $spec
+
+    $firstDispatcher = Start-Process `
+        -FilePath $spec `
+        -ArgumentList @('auto', 'run', '--concurrency', '2', '--poll-interval', '1') `
+        -WorkingDirectory $fixtureRoot `
+        -RedirectStandardOutput (Join-Path $evidenceRoot 'autopilot-first.log') `
+        -RedirectStandardError (Join-Path $evidenceRoot 'autopilot-first-error.log') `
+        -PassThru
+    Wait-Condition -Description 'two autopilot implementation children' -TimeoutSeconds 120 -Condition {
+        if (-not (Test-Path -LiteralPath $activePath)) { return $false }
+        try {
+            $active = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
+            $properties = @($active.PSObject.Properties)
+            if ($properties.Count -ne 2) { return $false }
+            return @($properties | Where-Object { [int] $_.Value.pid -gt 0 }).Count -eq 2
+        } catch { return $false }
+    }
+    Wait-Condition -Description 'two deterministic autopilot agents' -TimeoutSeconds 120 -Condition {
+        return @(Get-ChildItem -LiteralPath $agentEvents -Filter 'started-*.json' -ErrorAction SilentlyContinue).Count -eq 2
+    }
+    $firstActive = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
+    foreach ($id in @('auto-root-a', 'auto-root-b')) {
+        $entry = $firstActive.PSObject.Properties[$id].Value
+        if (-not $entry) { throw "Expected active autopilot root is missing: $id" }
+        $firstPids[$id] = [int] $entry.pid
+    }
+    if ($firstActive.PSObject.Properties['auto-dependent']) {
+        throw 'Dependency-blocked autopilot spec was dispatched'
+    }
+
+    Stop-Process -Id $firstDispatcher.Id -Force
+    Wait-ProcessExit `
+        -Process $firstDispatcher `
+        -Description 'Forced dispatcher' `
+        -TimeoutSeconds 30
+    foreach ($id in $firstPids.Keys) {
+        if (-not (Get-Process -Id $firstPids[$id] -ErrorAction SilentlyContinue)) {
+            throw "Adoptable implementation child for $id died with its dispatcher"
+        }
+    }
+
+    $secondDispatcher = Start-Process `
+        -FilePath $spec `
+        -ArgumentList @('auto', 'run', '--concurrency', '2', '--poll-interval', '1') `
+        -WorkingDirectory $fixtureRoot `
+        -RedirectStandardOutput (Join-Path $evidenceRoot 'autopilot-second.log') `
+        -RedirectStandardError (Join-Path $evidenceRoot 'autopilot-second-error.log') `
+        -PassThru
+    Wait-Condition -Description 'dispatcher adoption of both exact children' -TimeoutSeconds 60 -Condition {
+        try {
+            $active = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
+            foreach ($id in @('auto-root-a', 'auto-root-b')) {
+                $entry = $active.PSObject.Properties[$id].Value
+                if (-not $entry) { return $false }
+                if ([int] $entry.pid -ne [int] $firstPids[$id]) { return $false }
+                if ([int] $entry.adoption_generation -ne 1) { return $false }
+            }
+            return $true
+        } catch { return $false }
+    }
+    $adoptedActive = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
+    Write-Utf8NoBom `
+        -LiteralPath (Join-Path $evidenceRoot 'autopilot-adopted-state.json') `
+        -Value ($adoptedActive | ConvertTo-Json -Depth 12)
+
+    $stopper = Start-Process `
+        -FilePath $spec `
+        -ArgumentList @('auto', 'stop') `
+        -WorkingDirectory $fixtureRoot `
+        -RedirectStandardOutput (Join-Path $evidenceRoot 'autopilot-stop.log') `
+        -RedirectStandardError (Join-Path $evidenceRoot 'autopilot-stop-error.log') `
+        -PassThru
+    Wait-Condition -Description 'recorded graceful autopilot shutdown request' -TimeoutSeconds 15 -Condition {
+        if (-not (Test-Path -LiteralPath $shutdownPath)) { return $false }
+        try {
+            $shutdownState = Get-Content -LiteralPath $shutdownPath -Raw | ConvertFrom-Json
+            return $shutdownState.phase -in @('graceful', 'forced', 'complete')
+        } catch { return $false }
+    }
+    $requestedShutdown = Get-Content -LiteralPath $shutdownPath -Raw | ConvertFrom-Json
+    Write-Utf8NoBom `
+        -LiteralPath (Join-Path $evidenceRoot 'autopilot-shutdown-requested-state.json') `
+        -Value ($requestedShutdown | ConvertTo-Json -Depth 8)
+    Write-Utf8NoBom -LiteralPath $releaseMarker -Value 'release'
+    try {
+        Wait-ProcessExit `
+            -Process $stopper `
+            -Description 'spec auto stop' `
+            -TimeoutSeconds 60
+    } catch {
+        Stop-Process -Id $stopper.Id -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    Wait-ProcessExit `
+        -Process $secondDispatcher `
+        -Description 'Adopting dispatcher graceful shutdown' `
+        -TimeoutSeconds 60
+    $stopText = Get-Content -LiteralPath (Join-Path $evidenceRoot 'autopilot-stop.log') -Raw
+    if ($stopText -notmatch 'acknowledged shutdown request') {
+        throw 'spec auto stop did not record an acknowledged graceful shutdown'
+    }
+    $finalActive = Get-Content -LiteralPath $activePath -Raw | ConvertFrom-Json
+    if (@($finalActive.PSObject.Properties).Count -ne 0) {
+        throw 'Autopilot active state was not empty after graceful shutdown'
+    }
+    foreach ($id in $firstPids.Keys) {
+        if (Get-Process -Id $firstPids[$id] -ErrorAction SilentlyContinue) {
+            throw "Implementation child for $id survived graceful auto stop"
+        }
+    }
+
+    $startedEvents = @(
+        Get-ChildItem -LiteralPath $agentEvents -Filter 'started-*.json' |
+            ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json }
+    )
+    $finishedEvents = @(
+        Get-ChildItem -LiteralPath $agentEvents -Filter 'finished-*.json' |
+            ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json }
+    )
+    $startedIds = @($startedEvents | ForEach-Object { [string] $_.spec_id } | Sort-Object)
+    if (($startedIds -join ',') -ne 'auto-root-a,auto-root-b') {
+        throw "Autopilot launched an unexpected agent set: $($startedIds -join ',')"
+    }
+    if ($finishedEvents.Count -ne 2 -or @($finishedEvents | Where-Object { $_.report_exit_code -ne 0 }).Count) {
+        throw 'Autopilot proof agents did not finish cleanly'
+    }
+    $adoptionLines = @(
+        Select-String `
+            -LiteralPath (Join-Path $evidenceRoot 'autopilot-second.log') `
+            -Pattern 'adopt: auto-root-(a|b) '
+    )
+    if ($adoptionLines.Count -ne 2) {
+        throw "Replacement dispatcher logged $($adoptionLines.Count) adoptions instead of exactly two"
+    }
+    $autoResult = [ordered]@{
+        status = 'passed'
+        concurrency = 2
+        dispatched_specs = $startedIds
+        blocked_dependent = 'auto-dependent'
+        blocked_dependent_dispatch_count = 0
+        forced_dispatcher_pid = $firstDispatcher.Id
+        replacement_dispatcher_pid = $secondDispatcher.Id
+        child_pids_before_restart = $firstPids
+        child_pids_after_restart = [ordered]@{
+            'auto-root-a' = [int] $adoptedActive.'auto-root-a'.pid
+            'auto-root-b' = [int] $adoptedActive.'auto-root-b'.pid
+        }
+        adoption_generation = [ordered]@{
+            'auto-root-a' = [int] $adoptedActive.'auto-root-a'.adoption_generation
+            'auto-root-b' = [int] $adoptedActive.'auto-root-b'.adoption_generation
+        }
+        launches_per_spec = 1
+        shutdown_phase_before_agent_release = [string] $requestedShutdown.phase
+        graceful_auto_stop = $true
+        remaining_agent_processes = 0
+    }
+    Write-Utf8NoBom `
+        -LiteralPath (Join-Path $evidenceRoot 'autopilot-result.json') `
+        -Value ($autoResult | ConvertTo-Json -Depth 10)
+} finally {
+    Write-Utf8NoBom -LiteralPath $releaseMarker -Value 'release'
+    if ($secondDispatcher -and -not $secondDispatcher.HasExited) {
+        try {
+            Invoke-LoggedNative -FilePath $spec -Arguments @('auto', 'stop') -LogName 'autopilot-cleanup.log'
+        } catch {
+            $_ | Out-String | Add-Content -LiteralPath (Join-Path $evidenceRoot 'autopilot-cleanup.log')
+        }
+        try {
+            Wait-ProcessExit `
+                -Process $secondDispatcher `
+                -Description 'Autopilot cleanup dispatcher' `
+                -TimeoutSeconds 30
+        } catch {
+            Stop-Process -Id $secondDispatcher.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    if ($firstDispatcher -and -not $firstDispatcher.HasExited) {
+        Stop-Process -Id $firstDispatcher.Id -Force -ErrorAction SilentlyContinue
+    }
+    $env:Path = $oldPath
+    $env:SPEC_AUTOPILOT_PROOF_EVENTS = $oldProofEvents
+    $env:SPEC_AUTOPILOT_PROOF_RELEASE = $oldProofRelease
+    $env:SPEC_AUTOPILOT_SPEC_EXE = $oldProofSpec
+}
+Set-Criterion `
+    -Id 'windows-web-autopilot.5' `
+    -Evidence @('autopilot-result.json', 'autopilot-adopted-state.json', 'autopilot-shutdown-requested-state.json', 'autopilot-first.log', 'autopilot-second.log', 'autopilot-stop.log') `
+    -Detail 'Two dependency-ready specs ran concurrently, the blocked dependent never launched, a replacement dispatcher adopted both exact children once, and auto stop drained them.'
+Set-Criterion `
+    -Id 'windows-ci-e2e-release.4.autopilot' `
+    -Evidence @('autopilot-result.json', 'autopilot-adopted-state.json') `
+    -Detail 'The reusable Windows 11 lab forced dispatcher death and proved durable native adoption and graceful stop with real subprocesses.'
 
 $result = [ordered]@{
     status = 'passed'
@@ -307,8 +720,17 @@ $result = [ordered]@{
     native_suite = 'passed'
     real_codex_lifecycle = 'passed'
     real_web_chat_context = 'passed'
+    real_web_chat_dependent_turns = 3
+    web_chat_reconnect = 'passed'
+    web_chat_concurrent_isolation = 'passed'
+    web_chat_cancellation_cleanup = 'passed'
+    timeout_tree_cleanup = 'passed'
+    autopilot_dependency_dispatch = 'passed'
+    autopilot_restart_adoption = 'passed'
+    autopilot_stop = 'passed'
+    criteria = $criteria
 }
-$resultJson = $result | ConvertTo-Json
+$resultJson = $result | ConvertTo-Json -Depth 12
 Write-Utf8NoBom -LiteralPath (Join-Path $evidenceRoot 'result.json') -Value $resultJson
 $result | ConvertTo-Json
 exit 0

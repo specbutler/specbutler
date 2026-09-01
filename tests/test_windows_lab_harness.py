@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -18,6 +19,7 @@ WINDOWS_DOC = REPO_ROOT / "docs" / "windows.md"
 REQUIRED_FILES = {
     ".gitignore",
     "Autounattend.xml.template",
+    "autopilot-agent.cs",
     "Dockerfile",
     "README.md",
     "bootstrap.ps1.template",
@@ -30,6 +32,7 @@ REQUIRED_FILES = {
     "provision.ps1",
     "redact.py",
     "register-job.ps1",
+    "runtime_proof.py",
     "toolchain.json.example",
 }
 
@@ -74,9 +77,13 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "-m', 'pytest'" in proof
     assert "'repo', 'create'" in proof
     assert "'implement', '--spec', 'add-numbers'" in proof
-    assert "Get-LatestAssistantText" in proof
     assert "Write-Utf8NoBom" in proof
-    assert "retained_second_turn_context = $true" in proof
+    assert "runtime_proof.py" in proof
+    assert "dependent_turns" in (LAB_ROOT / "runtime_proof.py").read_text(encoding="utf-8")
+    assert "autopilot-adopted-state.json" in proof
+    assert "adoption_generation -ne 1" in proof
+    assert "blocked_dependent_dispatch_count = 0" in proof
+    assert "Set-Criterion" in proof
 
 
 def test_windows_lab_inputs_are_placeholder_only_and_private_state_is_ignored() -> None:
@@ -145,7 +152,11 @@ def test_windows_lab_redactor_removes_supported_secret_shapes(tmp_path: Path) ->
     destination = tmp_path / "sanitized"
     source.mkdir()
     token = "ghp_" + "A" * 36
-    (source / "proof.log").write_text(f"Authorization: Bearer {token}\ntoken={token}\n")
+    web_token = "web-auth-token-" + "Z" * 32
+    (source / "proof.log").write_text(
+        f"Authorization: Bearer {token}\n"
+        f"Authenticated URL: http://127.0.0.1:17702/?token={web_token}\n"
+    )
 
     subprocess.run(
         [sys.executable, str(LAB_ROOT / "redact.py"), str(source), str(destination)],
@@ -154,6 +165,7 @@ def test_windows_lab_redactor_removes_supported_secret_shapes(tmp_path: Path) ->
 
     redacted = (destination / "proof.log").read_text()
     assert token not in redacted
+    assert web_token not in redacted
     assert "[REDACTED]" in redacted
 
     utf16_token = "sk-" + "B" * 24
@@ -167,6 +179,96 @@ def test_windows_lab_redactor_removes_supported_secret_shapes(tmp_path: Path) ->
     utf16_redacted = (destination / "powershell.log").read_text(encoding="utf-16")
     assert utf16_token not in utf16_redacted
     assert "[REDACTED]" in utf16_redacted
+    report = json.loads((destination / "_redaction-report.json").read_text())
+    assert report["status"] == "passed"
+    assert report["files_processed"] == 2
+    assert report["files_with_replacements"] == 2
+    assert report["recognized_secret_shapes_remaining"] == []
+
+
+def test_windows_runtime_proof_sse_parser_is_hermetic() -> None:
+    path = LAB_ROOT / "runtime_proof.py"
+    spec = importlib.util.spec_from_file_location("windows_runtime_proof", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    events = module.parse_sse(
+        [
+            b": keepalive\r\n",
+            b"\r\n",
+            b"event: agent_event\r\n",
+            b'data: {"kind":"text","text":"first"}\r\n',
+            b"\r\n",
+            b"event: agent_event\n",
+            b'data: {"kind":"done"}\n',
+            b"\n",
+        ]
+    )
+
+    assert events == [
+        {"kind": "text", "text": "first"},
+        {"kind": "done"},
+    ]
+
+
+def test_windows_runtime_proof_declares_real_runtime_invariants() -> None:
+    runtime = (LAB_ROOT / "runtime_proof.py").read_text(encoding="utf-8")
+    proof = (LAB_ROOT / "proof.ps1").read_text(encoding="utf-8")
+    agent = (LAB_ROOT / "autopilot-agent.cs").read_text(encoding="utf-8")
+    runner = (LAB_ROOT / "job-runner.ps1").read_text(encoding="utf-8")
+
+    for statement in (
+        "dependent_turns",
+        "reconnect_endpoint_exercised",
+        "reconnect_replayed_event_count",
+        "concurrent_sessions_isolated",
+        "cancelled_descendants_remaining",
+        "native_claude_failed_closed",
+        "_sse_reconnect",
+        "_tree_identities",
+    ):
+        assert statement in runtime
+    for statement in (
+        "windows-web-autopilot.2",
+        "windows-web-autopilot.5",
+        "windows-ci-e2e-release.4.timeout-cleanup",
+        "Stop-Process -Id $firstDispatcher.Id -Force",
+        "spec auto stop",
+        "autopilot-result.json",
+    ):
+        assert statement in proof
+    assert "SPEC_AUTOPILOT_PROOF_RELEASE" in agent
+    assert "report --status needs-input" in agent
+    assert "$ErrorActionPreference = 'Continue'" in runner
+    assert "$exitCode = if ($null -eq $LASTEXITCODE)" in runner
+
+
+def test_windows_runtime_timeout_probe_kills_a_real_tree(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence"
+    subprocess.run(
+        [
+            sys.executable,
+            str(LAB_ROOT / "runtime_proof.py"),
+            "timeout-tree",
+            "--work-root",
+            str(tmp_path / "work"),
+            "--evidence-root",
+            str(evidence),
+        ],
+        cwd=REPO_ROOT,
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")},
+        check=True,
+        timeout=20,
+    )
+
+    result = json.loads((evidence / "timeout-tree-result.json").read_text())
+    assert result == {
+        "processes_remaining": [],
+        "status": "passed",
+        "timeout_observed": True,
+        "tree_depth": 3,
+    }
 
 
 def test_windows_lab_scripts_parse_and_compose_is_loopback_only() -> None:

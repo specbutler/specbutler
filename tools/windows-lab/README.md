@@ -79,10 +79,25 @@ The proof:
 3. creates a uniquely named private repository under `LAB_GITHUB_OWNER`;
 4. runs a real Codex worktree lifecycle through implementation, local review,
    pull-request merge, and cleanup;
-5. starts the native web service and proves that a second real Codex chat turn
-   retains the first turn's marker while native Claude remains unavailable;
-6. writes a machine-readable result and sanitized logs under
+5. starts the native web service in foreground and background modes, then uses
+   its authenticated HTTP/SSE API for three context-dependent real Codex turns,
+   stream reconnect/history, two concurrent isolated chats, and live
+   cancellation with exact descendant-process checks; native Claude remains
+   explicitly unavailable;
+6. runs a real native three-level timeout tree and proves every process identity
+   is gone after bounded cleanup;
+7. launches two dependency-ready specs under autopilot with a deterministic
+   provider double, crashes the dispatcher while both implementation processes
+   are live, proves a replacement adopts each exact child once without launching
+   the blocked dependent, then exercises `spec auto stop` graceful draining;
+8. writes per-criterion machine-readable results and sanitized logs under
    `tools/windows-lab/artifacts/<run-name>/`.
+
+The deterministic autopilot provider is intentionally distinct from the real
+Codex evidence: adoption must hold children at a reproducible boundary across a
+forced dispatcher crash, while the lifecycle and chat portions independently
+prove the candidate against the authenticated provider. The proof records this
+distinction in `autopilot-result.json` and `web-chat-result.json`.
 
 The disposable GitHub repository is retained so its merged PR is auditable;
 delete it manually after retaining the release evidence. `proof` is intentionally
@@ -90,7 +105,10 @@ opt-in because it creates that external repository and consumes real provider
 capacity. Microsoft and provider authentication may need renewal between runs.
 
 Raw artifacts remain under ignored `state/raw/`; the publishable copy passes
-through `redact.py`. Redaction is a backstop, not permission to print secrets.
+through `redact.py`. The sanitized directory contains
+`_redaction-report.json`, including the replacement count and a post-redaction
+scan for every recognized credential shape. Redaction is a backstop, not
+permission to print secrets.
 
 ## Controller commands
 

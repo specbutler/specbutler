@@ -20,9 +20,18 @@ $result = [ordered]@{
 }
 
 try {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script *>&1 |
-        Tee-Object -LiteralPath $log
-    $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+    # Windows PowerShell 5 wraps a child process's stderr as NativeCommandError.
+    # Git, pytest, and providers legitimately use stderr on successful runs, so
+    # preserve the merged live log but determine success from the exit code.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script *>&1 |
+            Tee-Object -LiteralPath $log
+        $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     if ($exitCode -ne 0) { throw "Job exited with code $exitCode" }
     $result.status = 'ok'
     $result.exit_code = 0
