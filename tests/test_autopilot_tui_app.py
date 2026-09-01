@@ -126,7 +126,9 @@ def test_chat_provider_silent_hang_times_out_and_reaps_process(
 
     def recording_popen(*args, **kwargs):
         proc = real_popen(*args, **kwargs)
-        started.append(proc)
+        command = args[0] if args else kwargs.get("args", ())
+        if command and command[0] == sys.executable:
+            started.append(proc)
         return proc
 
     monkeypatch.setattr(tui_app.subprocess, "Popen", recording_popen)
@@ -156,7 +158,9 @@ def test_chat_provider_generator_cancel_terminates_and_reaps_process(
 
     def recording_popen(*args, **kwargs):
         proc = real_popen(*args, **kwargs)
-        started.append(proc)
+        command = args[0] if args else kwargs.get("args", ())
+        if command and command[0] == sys.executable:
+            started.append(proc)
         return proc
 
     monkeypatch.setattr(tui_app.subprocess, "Popen", recording_popen)

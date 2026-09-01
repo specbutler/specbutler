@@ -180,6 +180,8 @@ class TestServerLifecycle:
     def test_windows_background_persists_token_and_cleans_failed_start(self, tmp_path, capsys):
         from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
 
+        windows_os = MagicMock(wraps=os)
+        windows_os.name = "nt"
         token = SupervisionToken(
             LifetimeMode.DETACHED, ProcessIdentity(123, "created"), 1, "owner", "web-token"
         )
@@ -189,7 +191,7 @@ class TestServerLifecycle:
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="auth"),
-            patch("spec_runtime.web.server.os.name", "nt"),
+            patch("spec_runtime.web.server.os", windows_os),
             patch("socket.create_connection", side_effect=OSError("free")),
             patch("spec_runtime.process_supervisor.ProcessSupervisor", return_value=supervisor),
             patch("spec_runtime.web.server.write_supervision_token") as write_token,
@@ -1363,15 +1365,13 @@ class TestAPIRoutes:
                 "spec_runtime.autopilot_tui.dashboard._resolve_live_process_group",
                 return_value=None,
             ),
-            patch("spec_runtime.web.api.os.getpgid", create=True) as getpgid,
-            patch("spec_runtime.web.api.os.kill") as kill,
+            patch("spec_runtime.orchestrator.stop_run") as stop_run,
         ):
             client = self._make_client(tmp_path)
             resp = client.post("/api/v1/specs/my-spec/stop", headers=self._auth_headers())
 
         assert resp.status_code == 404
-        getpgid.assert_not_called()
-        kill.assert_not_called()
+        stop_run.assert_not_called()
 
     def test_stop_spec_uses_managed_process_when_run_metadata_exists(self, tmp_path):
         """A web-started run retains its portable tree-termination boundary."""
@@ -1391,8 +1391,6 @@ class TestAPIRoutes:
             ),
             patch("spec_runtime.autopilot.load_run_record_index", return_value=run_index),
             patch("spec_runtime.config.load_repo_spec_runtime_config") as mock_config,
-            patch("spec_runtime.web.api.os.getpgid", create=True) as getpgid,
-            patch("spec_runtime.web.api.os.killpg", create=True) as killpg,
         ):
             mock_config.return_value = MagicMock(paths=MagicMock(specs_dir="specs"))
             client = self._make_client(tmp_path)
@@ -1405,8 +1403,6 @@ class TestAPIRoutes:
         assert resp.status_code == 200
         proc.terminate.assert_called_once_with(grace_seconds=3)
         proc.wait.assert_called_once_with(timeout=3)
-        getpgid.assert_not_called()
-        killpg.assert_not_called()
         assert "my-spec" not in client.app.state.web_started_procs
 
     def test_process_registry_is_scoped_to_app_and_cleared_on_shutdown(self, tmp_path):
