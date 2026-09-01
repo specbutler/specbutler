@@ -187,6 +187,56 @@ teardown_shell_windows = "pwsh"
     assert "pwsh" in by_name["implement teardown command"].detail
 
 
+@pytest.mark.parametrize(
+    ("drive_type", "filesystem", "expected_detail"),
+    [
+        (4, "NTFS", "network NTFS"),
+        (2, "NTFS", "removable NTFS"),
+        (3, "ReFS", "fixed ReFS"),
+        (3, "exFAT", "fixed exFAT"),
+    ],
+)
+def test_doctor_rejects_unsupported_windows_volume_before_git(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    drive_type: int,
+    filesystem: str,
+    expected_detail: str,
+) -> None:
+    monkeypatch.setattr(doctor, "is_windows", lambda: True)
+    runner = _Runner()
+
+    report = doctor.run_doctor_checks(
+        tmp_path,
+        runner=runner,
+        windows_volume_probe=lambda _path: doctor.WindowsVolumeProfile(
+            root="Z:\\",
+            drive_type=drive_type,
+            filesystem=filesystem,
+        ),
+    )
+
+    assert report.exit_code == 1
+    assert report.checks == (
+        doctor.DoctorCheck(
+            "local filesystem",
+            "error",
+            f"unsupported repository volume: Z:\\ is a {expected_detail} volume",
+            ("Move the checkout to a fixed local NTFS volume and rerun `spec doctor`.",),
+        ),
+    )
+    assert runner.calls == []
+
+
+def test_supported_windows_volume_is_reported() -> None:
+    check = doctor._windows_volume_check(
+        doctor.WindowsVolumeProfile(root="C:\\", drive_type=3, filesystem="NTFS")
+    )
+
+    assert check.status == "ok"
+    assert check.detail == "C:\\ is a fixed NTFS volume"
+
+
 def test_windows_command_checks_target_posix_hook_migration(tmp_path: Path) -> None:
     config_text = _config_text().replace(
         "[execution]",

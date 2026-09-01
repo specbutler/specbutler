@@ -25,6 +25,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_native_windows_volume_probe_reports_fixed_ntfs_checkout() -> None:
+    from spec_runtime.doctor import _probe_windows_volume
+
+    profile = _probe_windows_volume(Path.cwd())
+
+    assert profile.drive_type == 3
+    assert profile.filesystem.casefold() == "ntfs"
+    assert profile.root
+
+
 def _clean_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("SPEC_CONFIG", None)
