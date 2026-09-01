@@ -33019,6 +33019,24 @@ class TestCodexIsolatedHome:
         assert auth_path.is_file()
         assert not auth_path.is_symlink()
         assert auth_path.read_text() == '{"token":"x"}'
+        assert (home / "config.toml").read_text().startswith(
+            '[windows]\nsandbox = "unelevated"\n'
+        )
+
+    def test_non_windows_isolated_home_does_not_override_windows_sandbox(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+
+        with patch.object(orch.sys, "platform", "linux"):
+            home = orch._write_codex_isolated_home(
+                worktree,
+                mcp_servers={},
+                source_home=tmp_path / "missing-source",
+            )
+
+        assert "[windows]" not in (home / "config.toml").read_text()
 
     def test_write_codex_isolated_home_replaces_hardlinked_config(
         self, tmp_path: Path

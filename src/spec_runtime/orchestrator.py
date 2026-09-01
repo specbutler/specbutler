@@ -5078,12 +5078,13 @@ def _write_codex_isolated_home(
 ) -> Path:
     """Materialize the per-worktree isolated ``CODEX_HOME``.
 
-    Writes ``config.toml`` containing only the supplied MCP servers and makes
-    ``auth.json`` available from ``source_home`` (defaulting to the operator's
-    effective ``CODEX_HOME``). The directory is created if missing and the
-    config file is rewritten on every call so it never goes stale. A missing
-    source ``auth.json`` is logged as a warning but does not raise — Codex will
-    surface the auth issue itself if it tries to use the network.
+    Writes ``config.toml`` containing only the supplied MCP servers and the
+    native-Windows sandbox fallback, then makes ``auth.json`` available from
+    ``source_home`` (defaulting to the operator's effective ``CODEX_HOME``).
+    The directory is created if missing and the config file is rewritten on
+    every call so it never goes stale. A missing source ``auth.json`` is logged
+    as a warning but does not raise — Codex will surface the auth issue itself
+    if it tries to use the network.
 
     When *copy_auth* is true, copy the auth file instead of symlinking. This is
     required for container backends and native Windows, where creating a
@@ -5115,6 +5116,15 @@ def _write_codex_isolated_home(
     _replace_with_exclusive_file(gitignore_path, b"*\n")
 
     config_body = _render_codex_mcp_toml(mcp_servers or {})
+    if sys.platform == "win32":
+        # Codex's preferred elevated Windows sandbox needs administrator-
+        # approved, machine-local setup. Non-interactive Spec Butler sessions
+        # use an isolated CODEX_HOME and cannot complete or approve that setup;
+        # with `-a never`, a missing setup rejects every child process before
+        # it starts. The documented unelevated implementation remains a real
+        # restricted-token/ACL sandbox and works without an interactive UAC
+        # bootstrap, so select it explicitly for native Windows automation.
+        config_body = f'[windows]\nsandbox = "unelevated"\n\n{config_body}'
     config_path = home / "config.toml"
     _replace_with_exclusive_file(config_path, config_body.encode("utf-8"))
 
