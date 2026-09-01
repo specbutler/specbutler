@@ -1,0 +1,137 @@
+# Windows 11 release lab
+
+This directory is a secret-free controller for a disposable, KVM-backed
+Windows 11 VM. It exists to reproduce the native Spec Butler release proof; it
+is not part of the installed `specbutler` package and it does not distribute
+Windows or third-party tools.
+
+The controller keeps all mutable or machine-specific material outside Git:
+the Windows ISO, qcow2 disks, VM identity, unattended-install output, generated
+password, SSH keys, downloaded installers, provider login, raw logs, and proof
+artifacts. The adjacent `.gitignore` is defense in depth; never force-add those
+paths.
+
+## Host requirements
+
+- A Linux x86-64 host with hardware virtualization enabled and `/dev/kvm`
+  readable and writable by the operator.
+- Docker Engine with Compose v2, SSH/SCP, Git, Python 3, `sha256sum`, and at
+  least 40 GiB of free disk space (80 GiB is a practical minimum).
+- A properly licensed or time-limited Windows 11 x64 ISO obtained from
+  Microsoft. This repository does not supply an ISO or a license.
+- Current Windows x64 artifacts for Git, GitHub CLI, uv, and Codex. Populate
+  the manifest from the publishers' release pages, including independently
+  verified SHA-256 hashes. For Codex installation and authentication options,
+  use the [official Codex CLI documentation](https://developers.openai.com/codex/cli).
+
+## First-time setup
+
+```bash
+cd tools/windows-lab
+cp lab.env.example lab.env
+cp toolchain.json.example toolchain.json
+# Replace every angle-bracket placeholder in both local files.
+
+./labctl init
+./labctl up
+./labctl wait                 # first Windows installation can take 15–45 minutes
+./labctl provision
+```
+
+`init` verifies the ISO hash before creating an 80 GiB qcow2 disk, generates a
+fresh local VM identity/password/SSH key, renders the unattended templates into
+ignored state, builds the QEMU container, and creates the unattended media.
+`provision` downloads only the HTTPS artifacts named in `toolchain.json`, checks
+their pinned hashes on both host and guest, then installs the Windows toolchain.
+
+Provider and forge authentication are deliberately manual and remain inside
+the VM. Use the loopback-only noVNC console or SSH:
+
+```bash
+./labctl ssh
+gh auth login
+codex                         # complete the normal interactive sign-in
+exit
+./labctl shutdown
+./labctl snapshot provisioned
+```
+
+The unattended lab user automatically logs into the loopback-only console so
+interactive scheduled jobs can use provider login. Treat the VM as sensitive
+local test infrastructure: do not expose the SSH, RDP, or noVNC ports, reuse
+its generated password, or run untrusted source inside it.
+
+## One-command release proof
+
+After the baseline and provider/forge sign-in exist, one command resets the VM,
+stages the configured tracked source revision, reprovisions idempotently, runs
+the proof in the console session, and retrieves redacted evidence:
+
+```bash
+./labctl proof
+```
+
+The proof:
+
+1. builds and installs the candidate wheel with the `dev`, `tui`, and `web`
+   surfaces;
+2. runs the full native test suite on Windows;
+3. creates a uniquely named private repository under `LAB_GITHUB_OWNER`;
+4. runs a real Codex worktree lifecycle through implementation, local review,
+   pull-request merge, and cleanup;
+5. starts the native web service and proves that a second real Codex chat turn
+   retains the first turn's marker while native Claude remains unavailable;
+6. writes a machine-readable result and sanitized logs under
+   `tools/windows-lab/artifacts/<run-name>/`.
+
+The disposable GitHub repository is retained so its merged PR is auditable;
+delete it manually after retaining the release evidence. `proof` is intentionally
+opt-in because it creates that external repository and consumes real provider
+capacity. Microsoft and provider authentication may need renewal between runs.
+
+Raw artifacts remain under ignored `state/raw/`; the publishable copy passes
+through `redact.py`. Redaction is a backstop, not permission to print secrets.
+
+## Controller commands
+
+| Command | Purpose |
+|---|---|
+| `labctl init` | Validate inputs, render private state, and create the VM disk |
+| `labctl up`, `down`, `shutdown`, `wait` | Start the VM, perform an emergency container stop, cleanly shut Windows down, or wait for SSH |
+| `labctl provision` | Download, verify, and install the pinned guest toolchain |
+| `labctl snapshot NAME` | Turn the stopped run disk into a read-only cold baseline and create a new overlay |
+| `labctl reset NAME` | Replace the stopped run overlay; retain the prior overlay under ignored trash |
+| `labctl stage [REF]` | Export tracked files from an exact Git commit into `C:\SpecHarness\source` |
+| `labctl exec -- 'COMMAND'` | Run a foreground PowerShell command over SSH |
+| `labctl job submit NAME FILE` | Run a PowerShell script in the logged-on console session |
+| `labctl job wait NAME`, `job logs NAME` | Wait for or inspect a named job |
+| `labctl collect NAME [DEST]` | Retrieve job/evidence files and apply redaction |
+| `labctl proof` | Execute the complete reset-to-evidence release proof |
+| `labctl logs`, `status`, `ssh` | Inspect the QEMU container or guest |
+
+Snapshots are cold: shut Windows down before creating or resetting one. The
+controller moves replaced overlays into ignored `state/trash/` instead of
+deleting them. Remove old trash manually only after confirming it is not needed.
+
+## Development checks
+
+The normal test suite statically verifies required commands, placeholders,
+ignored state, executable bits, documentation claims, and common credential
+patterns. When available, also run:
+
+```bash
+shellcheck tools/windows-lab/labctl tools/windows-lab/entrypoint.sh
+bash -n tools/windows-lab/labctl
+sh -n tools/windows-lab/entrypoint.sh
+pytest tests/test_windows_lab_harness.py
+```
+
+The real-provider pytest entrypoint is separately marked and skipped unless
+both `SPEC_WINDOWS_REAL_PROVIDER=1` and an explicit
+`SPEC_WINDOWS_LAB_CONFIG=/absolute/path/to/lab.env` are present:
+
+```bash
+SPEC_WINDOWS_REAL_PROVIDER=1 \
+SPEC_WINDOWS_LAB_CONFIG="$PWD/tools/windows-lab/lab.env" \
+pytest -m windows_real_provider tests/test_windows_real_provider.py
+```

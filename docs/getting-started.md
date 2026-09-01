@@ -6,8 +6,9 @@ the full implementation lifecycle.
 
 ## Prerequisites
 
-- **Linux or macOS** -- native Windows is not supported; WSL provides a Linux
-  environment but is not currently covered by the project's CI matrix
+- **Linux, macOS, or the documented native Windows tier** -- Windows support is
+  Windows 11, local fixed NTFS, the worktree backend, Codex, and PowerShell;
+  review the [support matrix and limitations](windows.md) before setup
 - **Python 3.11+**
 - **pipx** -- installs the CLI in an isolated environment
 - **git** (with a remote named `origin`)
@@ -42,8 +43,14 @@ Verify the install:
 ```bash
 spec --version
 gh auth status
-claude --version  # or: codex --version
+claude --version  # or: codex --version; use Codex for native Windows
 ```
+
+On native Windows, use the PowerShell installation commands in
+[INSTALL.md](../INSTALL.md), keep the clone on a local NTFS drive, and run
+`git config --system core.longpaths true` once from an elevated shell. Native
+Claude is unavailable and fails closed; WSL2/Linux is the alternative when
+Claude is required.
 
 ## 2. Initialize
 
@@ -281,12 +288,19 @@ backends](execution-backends.md) before switching from the default; the
 container guide includes image setup, workspace modes, diagnostics, and a
 smoke test.
 
+Native Windows support currently covers only the worktree backend. Docker
+Desktop container execution and UNC/network workspaces are not claimed. See
+[Native Windows support](windows.md) for the exact tier and troubleshooting.
+
 ## Browser dashboard
 
 Install the `web` extra to monitor runs and chat with Claude or Codex from a
 browser. The server binds to loopback by default and requires its generated
 token. See [Web dashboard and chat](web.md) for startup, authentication, remote
 access, and lifecycle commands.
+
+On native Windows, web chat supports Codex only. Claude fails closed there;
+use WSL2 or a supported Linux/macOS container when Claude is required.
 
 ## 6. Monitor
 

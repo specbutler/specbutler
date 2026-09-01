@@ -4,6 +4,11 @@ The optional web interface provides a local dashboard, run controls, server-sent
 event updates, and isolated Claude or Codex chat sessions for creating specs
 and scoping tasks.
 
+On the supported native Windows tier, chat uses Codex only. Native Claude is
+unavailable and fails closed; run Spec Butler in WSL2 or a supported Linux/macOS
+container when Claude is required. See [Native Windows support](windows.md) for
+the exact support matrix.
+
 ## Install and start
 
 ```bash
@@ -92,10 +97,10 @@ spec web start --verbose
   or restart with `--open`.
 - **A provider is unavailable:** verify `claude --version` or `codex --version`
   in the same environment that launches `spec web` and complete the provider's
-  login flow. On Linux, Claude web chat also requires `bubblewrap` and `socat`;
-  install both and rerun `spec doctor`. Spec configures Claude to fail closed
-  when its sandbox cannot start instead of silently running commands without
-  isolation.
+  login flow. Native Windows supports Codex only. On Linux, Claude web chat
+  also requires `bubblewrap` and `socat`; install both and rerun `spec doctor`.
+  Spec configures Claude to fail closed when its sandbox cannot start instead
+  of silently running commands without isolation.
 - **Codex reports that `.codex/config.toml` is not a directory:** an older tool
   left a project-root `.codex` file. Inspect and rename or remove that file so
   current Codex can use `.codex/` as a directory, then rerun `spec doctor`.

@@ -1,0 +1,32 @@
+{
+  "git": {
+    "url": "<https-url-for-git-for-windows-installer>",
+    "sha256": "<git-installer-sha256>",
+    "filename": "git-installer.exe"
+  },
+  "gh": {
+    "url": "<https-url-for-github-cli-msi>",
+    "sha256": "<github-cli-msi-sha256>",
+    "filename": "github-cli.msi"
+  },
+  "uv": {
+    "url": "<https-url-for-uv-windows-archive>",
+    "sha256": "<uv-archive-sha256>",
+    "filename": "uv.zip"
+  },
+  "codex": {
+    "url": "<https-url-for-codex-windows-archive>",
+    "sha256": "<codex-archive-sha256>",
+    "filename": "codex.zip"
+  },
+  "codex_code_mode_host": {
+    "url": "<https-url-for-codex-code-mode-host-windows-archive>",
+    "sha256": "<codex-code-mode-host-archive-sha256>",
+    "filename": "codex-code-mode-host.zip"
+  },
+  "codex_sandbox_setup": {
+    "url": "<https-url-for-codex-windows-sandbox-setup>",
+    "sha256": "<codex-windows-sandbox-setup-sha256>",
+    "filename": "codex-windows-sandbox-setup.exe"
+  }
+}

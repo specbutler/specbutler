@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LAB_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$LAB_ROOT/../.." && pwd)"
+STATE_ROOT="$LAB_ROOT/state"
+CONFIG_FILE="${SPEC_WINDOWS_LAB_CONFIG:-$LAB_ROOT/lab.env}"
+TOOLCHAIN_FILE="${SPEC_WINDOWS_TOOLCHAIN_CONFIG:-$LAB_ROOT/toolchain.json}"
+IDENTITY_FILE="$STATE_ROOT/identity.env"
+CONTAINER_NAME=specbutler-windows-lab
+SSH_OPTIONS=()
+
+die() {
+    printf '%s\n' "windows-lab: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+usage: labctl COMMAND [ARGS]
+
+  init                         validate inputs and create the Windows VM
+  up | down | shutdown | wait  control the VM and wait for SSH
+  provision                   install the pinned guest toolchain
+  snapshot NAME               create a cold qcow2 baseline
+  reset NAME                  replace the run overlay from a baseline
+  stage [REF]                 stage a tracked source revision in the guest
+  exec -- POWERSHELL          run a foreground guest command
+  job submit NAME FILE        submit an interactive-session PowerShell job
+  job wait NAME [SECONDS]     wait for a job completion record
+  job logs NAME               stream the current job log
+  collect NAME [DESTINATION]  retrieve and redact job/evidence artifacts
+  proof                       reset, stage, and run the real-provider proof
+  logs | status | ssh         inspect the VM
+EOF
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command is unavailable: $1"
+}
+
+require_free_space() {
+    local available minimum=$((40 * 1024 * 1024 * 1024))
+    available="$(df --output=avail -B1 "$LAB_ROOT" | awk 'NR == 2 { print $1 }')"
+    [[ "$available" =~ ^[0-9]+$ ]] || die "could not determine available lab disk space"
+    if (( available < minimum )); then
+        die "less than 40 GiB is free; refusing to initialize the Windows VM"
+    fi
+}
+
+load_config() {
+    test -f "$CONFIG_FILE" || die "copy lab.env.example to lab.env and fill every placeholder"
+    set -a
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    set +a
+    : "${WINDOWS_ISO:?WINDOWS_ISO is required in lab.env}"
+    : "${WINDOWS_ISO_SHA256:?WINDOWS_ISO_SHA256 is required in lab.env}"
+    : "${WINDOWS_IMAGE_INDEX:?WINDOWS_IMAGE_INDEX is required in lab.env}"
+    [[ "$WINDOWS_ISO" = /* ]] || die "WINDOWS_ISO must be an absolute path"
+    [[ "$WINDOWS_ISO_SHA256" =~ ^[[:xdigit:]]{64}$ ]] || die "WINDOWS_ISO_SHA256 must contain 64 hexadecimal characters"
+    [[ "$WINDOWS_IMAGE_INDEX" =~ ^[1-9][0-9]*$ ]] || die "WINDOWS_IMAGE_INDEX must be a positive integer"
+    [[ "$WINDOWS_ISO" != *'<'* && "$WINDOWS_ISO_SHA256" != *'<'* ]] || die "lab.env still contains placeholders"
+}
+
+load_identity() {
+    test -f "$IDENTITY_FILE" || die "lab is not initialized; run: $0 init"
+    set -a
+    # shellcheck disable=SC1090
+    source "$IDENTITY_FILE"
+    set +a
+}
+
+compose() {
+    load_config
+    load_identity
+    docker compose --project-directory "$LAB_ROOT" -f "$LAB_ROOT/compose.yaml" "$@"
+}
+
+vm_running() {
+    docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -qx true
+}
+
+require_stopped() {
+    if vm_running; then
+        die "the VM must be stopped for this operation"
+    fi
+}
+
+prepare_ssh_options() {
+    load_config
+    load_identity
+    SSH_OPTIONS=(
+        -o BatchMode=yes
+        -o ConnectTimeout=10
+        -o "UserKnownHostsFile=$STATE_ROOT/ssh/known_hosts"
+        -i "$STATE_ROOT/ssh/id_ed25519"
+        -p "${LAB_SSH_PORT:-12222}"
+    )
+}
+
+guest_ssh() {
+    prepare_ssh_options
+    # The caller intentionally supplies the PowerShell command evaluated by the guest.
+    # shellcheck disable=SC2029
+    ssh "${SSH_OPTIONS[@]}" specadmin@127.0.0.1 "$@"
+}
+
+guest_scp() {
+    load_config
+    load_identity
+    scp -q \
+        -P "${LAB_SSH_PORT:-12222}" \
+        -o "UserKnownHostsFile=$STATE_ROOT/ssh/known_hosts" \
+        -i "$STATE_ROOT/ssh/id_ed25519" \
+        "$@"
+}
+
+validate_name() {
+    [[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] || die "name must match [a-z0-9][a-z0-9-]{0,47}"
+}
+
+qemu_img() {
+    compose run --rm --no-deps windows qemu-img "$@"
+}
+
+render_unattend() {
+    local password public_key
+    password="$(<"$STATE_ROOT/secrets/admin-password")"
+    public_key="$(<"$STATE_ROOT/ssh/id_ed25519.pub")"
+    python3 - \
+        "$LAB_ROOT/Autounattend.xml.template" \
+        "$STATE_ROOT/unattend/Autounattend.xml" \
+        "$LAB_ROOT/bootstrap.ps1.template" \
+        "$STATE_ROOT/unattend/bootstrap.ps1" \
+        "$password" \
+        "$public_key" \
+        "$WINDOWS_IMAGE_INDEX" <<'PY'
+import sys
+from pathlib import Path
+
+xml_source, xml_dest, ps_source, ps_dest, password, public_key, image_index = sys.argv[1:]
+xml = Path(xml_source).read_text(encoding="utf-8")
+ps = Path(ps_source).read_text(encoding="utf-8")
+for placeholder in ("__ADMIN_PASSWORD__", "__WINDOWS_IMAGE_INDEX__"):
+    if placeholder not in xml:
+        raise SystemExit(f"missing template placeholder: {placeholder}")
+if "__SSH_PUBLIC_KEY__" not in ps:
+    raise SystemExit("missing template placeholder: __SSH_PUBLIC_KEY__")
+Path(xml_dest).write_text(
+    xml.replace("__ADMIN_PASSWORD__", password).replace("__WINDOWS_IMAGE_INDEX__", image_index),
+    encoding="utf-8",
+)
+Path(ps_dest).write_text(ps.replace("__SSH_PUBLIC_KEY__", public_key), encoding="utf-8")
+PY
+    chmod 0600 "$STATE_ROOT/unattend/Autounattend.xml" "$STATE_ROOT/unattend/bootstrap.ps1"
+}
+
+init_lab() {
+    load_config
+    for command in awk df docker git python3 sha256sum ssh ssh-keygen scp; do
+        require_command "$command"
+    done
+    require_free_space
+    if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+        die "/dev/kvm must be readable and writable"
+    fi
+    test -f "$WINDOWS_ISO" || die "Windows ISO not found: $WINDOWS_ISO"
+    printf '%s  %s\n' "${WINDOWS_ISO_SHA256,,}" "$WINDOWS_ISO" | sha256sum --check --strict
+
+    mkdir -p "$STATE_ROOT"/{baselines,disk,downloads,incoming,raw,run,secrets,ssh,trash,unattend}
+    chmod 0700 "$STATE_ROOT" "$STATE_ROOT/secrets" "$STATE_ROOT/ssh" "$STATE_ROOT/unattend"
+    if [ ! -f "$IDENTITY_FILE" ]; then
+        python3 - "$(id -u)" "$(id -g)" "$(stat -c %g /dev/kvm)" > "$IDENTITY_FILE" <<'PY'
+import secrets
+import sys
+import uuid
+
+uid, gid, kvm_gid = sys.argv[1:]
+identity = uuid.uuid4()
+mac = "52:54:00:" + ":".join(f"{byte:02x}" for byte in secrets.token_bytes(3))
+print(f"LAB_UID={uid}")
+print(f"LAB_GID={gid}")
+print(f"LAB_KVM_GID={kvm_gid}")
+print(f"LAB_VM_UUID={identity}")
+print(f"LAB_VM_MAC={mac}")
+print(f"LAB_DISK_SERIAL=SPECBUTLER{identity.hex[:10]}")
+print("LAB_ATTACH_UNATTEND=1")
+PY
+        chmod 0600 "$IDENTITY_FILE"
+    fi
+    if [ ! -f "$STATE_ROOT/secrets/admin-password" ]; then
+        python3 - <<'PY' > "$STATE_ROOT/secrets/admin-password"
+import secrets
+
+print("Sb1!" + secrets.token_hex(16))
+PY
+        chmod 0600 "$STATE_ROOT/secrets/admin-password"
+    fi
+    if [ ! -f "$STATE_ROOT/ssh/id_ed25519" ]; then
+        ssh-keygen -q -t ed25519 -N '' -C specbutler-windows-lab -f "$STATE_ROOT/ssh/id_ed25519"
+    fi
+    load_identity
+    render_unattend
+    compose build
+    compose run --rm --no-deps windows \
+        xorriso -as mkisofs -quiet -V SPECBUTLER -o /state/unattend.iso /state/unattend
+    chmod 0600 "$STATE_ROOT/unattend.iso"
+    if [ ! -f "$STATE_ROOT/disk/run.qcow2" ]; then
+        qemu_img create -f qcow2 /state/disk/run.qcow2 "${LAB_DISK_SIZE:-80G}"
+    fi
+    printf '%s\n' "Initialized the lab. Start it with: $0 up"
+    printf '%s\n' "Console: http://127.0.0.1:${LAB_VNC_PORT:-16080}/vnc.html?autoconnect=1&resize=scale"
+}
+
+up_lab() {
+    compose up -d
+    printf '%s\n' "Console: http://127.0.0.1:${LAB_VNC_PORT:-16080}/vnc.html?autoconnect=1&resize=scale"
+}
+
+wait_ssh() {
+    load_config
+    load_identity
+    local deadline=$((SECONDS + 2700))
+    prepare_ssh_options
+    until ssh "${SSH_OPTIONS[@]}" -o StrictHostKeyChecking=accept-new specadmin@127.0.0.1 'exit 0' 2>/dev/null; do
+        (( SECONDS < deadline )) || die "SSH did not become ready within 45 minutes"
+        sleep 5
+    done
+}
+
+shutdown_lab() {
+    vm_running || return 0
+    guest_ssh 'Stop-Computer -Force' || true
+    local deadline=$((SECONDS + 180))
+    while vm_running; do
+        (( SECONDS < deadline )) || die "the guest did not power off within three minutes"
+        sleep 3
+    done
+    compose down --timeout 30
+}
+
+set_unattend_attached() {
+    local value="$1"
+    python3 - "$IDENTITY_FILE" "$value" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+value = sys.argv[2]
+lines = path.read_text(encoding="utf-8").splitlines()
+lines = [line for line in lines if not line.startswith("LAB_ATTACH_UNATTEND=")]
+lines.append(f"LAB_ATTACH_UNATTEND={value}")
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+    chmod 0600 "$IDENTITY_FILE"
+}
+
+fetch_toolchain() {
+    test -f "$TOOLCHAIN_FILE" || die "copy toolchain.json.example to toolchain.json and pin each URL and SHA-256"
+    python3 - "$TOOLCHAIN_FILE" "$STATE_ROOT/downloads" <<'PY'
+import hashlib
+import json
+import re
+import sys
+import urllib.request
+from pathlib import Path
+
+manifest_path, cache_path = map(Path, sys.argv[1:])
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+required = {"git", "gh", "uv", "codex", "codex_code_mode_host", "codex_sandbox_setup"}
+if set(manifest) != required:
+    raise SystemExit(f"toolchain keys must be exactly: {', '.join(sorted(required))}")
+cache_path.mkdir(parents=True, exist_ok=True)
+for name, item in manifest.items():
+    url = str(item.get("url", ""))
+    digest = str(item.get("sha256", "")).lower()
+    filename = str(item.get("filename", ""))
+    if "<" in url or "<" in digest:
+        raise SystemExit(f"toolchain entry {name} still contains a placeholder")
+    if not url.startswith("https://"):
+        raise SystemExit(f"toolchain entry {name} must use HTTPS")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SystemExit(f"toolchain entry {name} has an invalid SHA-256")
+    if not filename or Path(filename).name != filename:
+        raise SystemExit(f"toolchain entry {name} has an unsafe filename")
+    destination = cache_path / filename
+    if not destination.exists() or hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+        partial = destination.with_suffix(destination.suffix + ".partial")
+        urllib.request.urlretrieve(url, partial)
+        if hashlib.sha256(partial.read_bytes()).hexdigest() != digest:
+            partial.unlink(missing_ok=True)
+            raise SystemExit(f"SHA-256 mismatch for {name}")
+        partial.replace(destination)
+PY
+}
+
+provision_guest() {
+    wait_ssh
+    fetch_toolchain
+    guest_ssh 'New-Item -ItemType Directory -Force C:\SpecHarness\toolchain | Out-Null'
+    guest_scp "$TOOLCHAIN_FILE" "specadmin@127.0.0.1:C:/SpecHarness/toolchain/toolchain.json"
+    while IFS= read -r filename; do
+        guest_scp "$STATE_ROOT/downloads/$filename" "specadmin@127.0.0.1:C:/SpecHarness/toolchain/$filename"
+    done < <(python3 - "$TOOLCHAIN_FILE" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+for entry in manifest.values():
+    print(entry["filename"])
+PY
+)
+    guest_scp "$LAB_ROOT/provision.ps1" "specadmin@127.0.0.1:C:/SpecHarness/provision.ps1"
+    guest_ssh '& C:\SpecHarness\provision.ps1'
+    set_unattend_attached 0
+}
+
+snapshot_lab() {
+    load_config
+    load_identity
+    local name="${1:-}"
+    validate_name "$name"
+    require_stopped
+    local destination="$STATE_ROOT/baselines/$name"
+    test ! -e "$destination" || die "baseline already exists: $name"
+    if [ ! -f "$STATE_ROOT/run/nvram.fd" ] || [ ! -d "$STATE_ROOT/run/tpm" ]; then
+        die "boot the VM before creating a baseline"
+    fi
+    qemu_img check /state/disk/run.qcow2
+    mkdir -p "$destination"
+    mv "$STATE_ROOT/disk/run.qcow2" "$destination/disk.qcow2"
+    cp "$STATE_ROOT/run/nvram.fd" "$destination/nvram.fd"
+    cp -a "$STATE_ROOT/run/tpm" "$destination/tpm"
+    chmod 0444 "$destination/disk.qcow2"
+    qemu_img create -f qcow2 -F qcow2 -b "/state/baselines/$name/disk.qcow2" /state/disk/run.qcow2
+    printf 'name=%s\ncreated_at=%s\n' "$name" "$(date --iso-8601=seconds)" > "$destination/manifest"
+    printf '%s\n' "Created cold baseline: $name"
+}
+
+reset_lab() {
+    load_config
+    load_identity
+    local name="${1:-}"
+    validate_name "$name"
+    require_stopped
+    local source="$STATE_ROOT/baselines/$name"
+    test -f "$source/disk.qcow2" || die "baseline not found: $name"
+    local trash
+    trash="$STATE_ROOT/trash/$(date +%Y%m%dT%H%M%S)-$$"
+    mkdir -p "$trash"
+    test ! -f "$STATE_ROOT/disk/run.qcow2" || mv "$STATE_ROOT/disk/run.qcow2" "$trash/run.qcow2"
+    test ! -f "$STATE_ROOT/run/nvram.fd" || mv "$STATE_ROOT/run/nvram.fd" "$trash/nvram.fd"
+    test ! -d "$STATE_ROOT/run/tpm" || mv "$STATE_ROOT/run/tpm" "$trash/tpm"
+    cp "$source/nvram.fd" "$STATE_ROOT/run/nvram.fd"
+    cp -a "$source/tpm" "$STATE_ROOT/run/tpm"
+    qemu_img create -f qcow2 -F qcow2 -b "/state/baselines/$name/disk.qcow2" /state/disk/run.qcow2
+    qemu_img check /state/disk/run.qcow2
+    printf '%s\n' "Reset run overlay to baseline $name; prior overlay retained at $trash"
+}
+
+stage_source() {
+    wait_ssh
+    local ref="${1:-${LAB_SOURCE_REF:-HEAD}}"
+    local commit archive
+    commit="$(git -C "$REPO_ROOT" rev-parse --verify "$ref^{commit}")" || die "source ref does not resolve: $ref"
+    archive="$STATE_ROOT/incoming/source.zip"
+    git -C "$REPO_ROOT" archive --format=zip --output "$archive" "$commit"
+    guest_scp "$archive" "specadmin@127.0.0.1:C:/SpecHarness/source.zip"
+    guest_ssh "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue C:\\SpecHarness\\source; Expand-Archive -LiteralPath C:\\SpecHarness\\source.zip -DestinationPath C:\\SpecHarness\\source; Set-Content -LiteralPath C:\\SpecHarness\\source\\.lab-source-revision -Encoding ascii -Value '$commit'"
+    printf '%s\n' "$commit"
+}
+
+job_submit() {
+    local name="${1:-}" script="${2:-}"
+    validate_name "$name"
+    test -f "$script" || die "job script not found: $script"
+    wait_ssh
+    guest_ssh 'New-Item -ItemType Directory -Force C:\SpecHarness\jobs | Out-Null'
+    guest_scp \
+        "$LAB_ROOT/job-runner.ps1" \
+        "$LAB_ROOT/register-job.ps1" \
+        "specadmin@127.0.0.1:C:/SpecHarness/"
+    guest_scp "$script" "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.ps1"
+    guest_ssh "& C:\\SpecHarness\\register-job.ps1 -JobName '$name'"
+}
+
+job_wait() {
+    local name="${1:-}" timeout="${2:-7200}"
+    validate_name "$name"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "timeout must be a positive integer"
+    local deadline=$((SECONDS + timeout))
+    until guest_ssh "Test-Path C:\\SpecHarness\\jobs\\$name.done.json" 2>/dev/null | tr -d '\r' | grep -qx True; do
+        if (( SECONDS >= deadline )); then
+            printf '%s\n' "windows-lab: job $name did not finish within $timeout seconds" >&2
+            return 124
+        fi
+        sleep 3
+    done
+    guest_ssh "Get-Content C:\\SpecHarness\\jobs\\$name.done.json"
+    local result=0
+    if guest_ssh "if ((Get-Content C:\\SpecHarness\\jobs\\$name.done.json -Raw | ConvertFrom-Json).status -ne 'ok') { exit 1 }"; then
+        result=0
+    else
+        result=$?
+    fi
+    guest_ssh "Unregister-ScheduledTask -TaskName 'SpecButlerLab-$name' -Confirm:\$false -ErrorAction SilentlyContinue" || true
+    return "$result"
+}
+
+job_logs() {
+    local name="${1:-}"
+    validate_name "$name"
+    guest_ssh "if (Test-Path C:\\SpecHarness\\jobs\\$name.log) { Get-Content C:\\SpecHarness\\jobs\\$name.log }"
+}
+
+collect_artifacts() {
+    local name="${1:-}"
+    local destination="${2:-$LAB_ROOT/artifacts/$name}"
+    validate_name "$name"
+    require_command unzip
+    local raw="$STATE_ROOT/raw/$name"
+    mkdir -p "$raw" "$destination"
+    guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.log" "$raw/job.log" 2>/dev/null || true
+    guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.done.json" "$raw/job.done.json" 2>/dev/null || true
+    guest_ssh "if (Test-Path C:\\SpecHarness\\evidence\\$name) { Compress-Archive -Force -Path C:\\SpecHarness\\evidence\\$name\\* -DestinationPath C:\\SpecHarness\\$name-evidence.zip }"
+    if guest_scp "specadmin@127.0.0.1:C:/SpecHarness/$name-evidence.zip" "$raw/evidence.zip" 2>/dev/null; then
+        unzip -q "$raw/evidence.zip" -d "$raw/evidence"
+        rm -f -- "$raw/evidence.zip"
+    fi
+    find "$raw" -type f -print -quit | grep -q . || die "no artifacts were available for job $name"
+    python3 "$LAB_ROOT/redact.py" "$raw" "$destination"
+    printf '%s\n' "$destination"
+}
+
+run_proof() {
+    load_config
+    : "${LAB_BASELINE:?LAB_BASELINE is required for a repeatable proof}"
+    : "${LAB_GITHUB_OWNER:?LAB_GITHUB_OWNER is required for the real-provider proof}"
+    [[ "$LAB_GITHUB_OWNER" != *'<'* ]] || die "LAB_GITHUB_OWNER still contains a placeholder"
+    validate_name "$LAB_BASELINE"
+    if vm_running; then
+        shutdown_lab
+    fi
+    reset_lab "$LAB_BASELINE"
+    up_lab
+    wait_ssh
+    provision_guest
+    local revision name config
+    revision="$(stage_source "${LAB_SOURCE_REF:-HEAD}")"
+    name="proof-$(date -u +%Y%m%dt%H%M%Sz | tr '[:upper:]' '[:lower:]')"
+    config="$STATE_ROOT/incoming/proof-config.json"
+    python3 - "$config" "$name" "$revision" "$LAB_GITHUB_OWNER" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, run_name, revision, github_owner = sys.argv[1:]
+Path(path).write_text(
+    json.dumps({"run_name": run_name, "source_revision": revision, "github_owner": github_owner}, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+    guest_scp "$config" "specadmin@127.0.0.1:C:/SpecHarness/proof-config.json"
+    job_submit "$name" "$LAB_ROOT/proof.ps1"
+    local proof_status=0
+    if job_wait "$name" 14400; then
+        proof_status=0
+    else
+        proof_status=$?
+    fi
+    collect_artifacts "$name"
+    return "$proof_status"
+}
+
+command="${1:-help}"
+case "$command" in
+    init) init_lab ;;
+    up) up_lab ;;
+    down) compose down --timeout 120 ;;
+    shutdown) shutdown_lab ;;
+    wait) wait_ssh ;;
+    provision) provision_guest ;;
+    snapshot) snapshot_lab "${2:-}" ;;
+    reset) reset_lab "${2:-}" ;;
+    stage) stage_source "${2:-${LAB_SOURCE_REF:-HEAD}}" ;;
+    exec)
+        shift
+        test "${1:-}" != -- || shift
+        (( $# > 0 )) || die "exec requires a PowerShell command"
+        guest_ssh "$@"
+        ;;
+    job)
+        case "${2:-}" in
+            submit) job_submit "${3:-}" "${4:-}" ;;
+            wait) job_wait "${3:-}" "${4:-7200}" ;;
+            logs) job_logs "${3:-}" ;;
+            *) die "job requires submit, wait, or logs" ;;
+        esac
+        ;;
+    collect) collect_artifacts "${2:-}" "${3:-$LAB_ROOT/artifacts/${2:-}}" ;;
+    proof) run_proof ;;
+    logs) compose logs "${@:2}" ;;
+    status) compose ps ;;
+    ssh)
+        shift
+        prepare_ssh_options
+        exec ssh "${SSH_OPTIONS[@]}" specadmin@127.0.0.1 "$@"
+        ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command: $command" ;;
+esac

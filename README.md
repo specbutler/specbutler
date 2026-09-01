@@ -23,12 +23,16 @@ SPEC_RELEASE="$(gh release view --repo specbutler/specbutler --json tagName --jq
 pipx install "specbutler @ git+https://github.com/specbutler/specbutler.git@${SPEC_RELEASE}"
 ```
 
-Requires Linux or macOS, Python 3.11+, [pipx](https://pipx.pypa.io/), at least
-one AI agent CLI (`claude` or `codex`) on PATH, and an authenticated `gh`
-(GitHub CLI). Native Windows is not supported; WSL provides a Linux environment
-but is not currently covered by this project's CI matrix. The command resolves
-the latest tagged GitHub Release; `spec update` advances a tagged install to
-newer non-prerelease GitHub Releases.
+Requires Python 3.11+, [pipx](https://pipx.pypa.io/), an authenticated `gh`
+(GitHub CLI), and at least one supported agent CLI on PATH. Linux and macOS
+support Claude and Codex. The first native Windows tier is intentionally exact:
+Windows 11, a repository on a local fixed NTFS volume, the `worktree` backend,
+Codex, and PowerShell. Native Claude fails closed; UNC/network workspaces and
+Docker Desktop container mode are not claimed. See the [Windows support matrix
+and setup guide](docs/windows.md).
+
+The command resolves the latest tagged GitHub Release; `spec update` advances a
+tagged install to newer non-prerelease GitHub Releases.
 
 Install optional interfaces when you need them:
 
@@ -339,8 +343,8 @@ setup required.
 For non-spec PRs, a repository can enforce the same three-way merge gate used
 by the orchestrator:
 
-- `ci` aggregates lint, test, package, and security jobs into one required
-  status check.
+- `ci` aggregates lint, test, package, security, and native Windows jobs into
+  one required status check.
 - `review-decision-gate` runs blocking cloud Codex review unless the PR body
   declares `Review-Owner: local`.
 - `spec-pr-policy` validates spec/task PR structure while passing

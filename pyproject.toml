@@ -77,6 +77,7 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
   "host_agent_preflight: exercise the real host provider availability policy",
+  "windows_real_provider: opt-in Windows 11 lab proof using real Codex and a disposable GitHub repository",
 ]
 
 [tool.ruff]

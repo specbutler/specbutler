@@ -1,0 +1,33 @@
+services:
+  windows:
+    build:
+      context: .
+    image: specbutler/windows-lab:ubuntu24.04
+    container_name: specbutler-windows-lab
+    user: "${LAB_UID}:${LAB_GID}"
+    group_add:
+      - "${LAB_KVM_GID}"
+    devices:
+      - /dev/kvm:/dev/kvm
+    environment:
+      LAB_VM_UUID: "${LAB_VM_UUID}"
+      LAB_VM_MAC: "${LAB_VM_MAC}"
+      LAB_DISK_SERIAL: "${LAB_DISK_SERIAL}"
+      LAB_ATTACH_UNATTEND: "${LAB_ATTACH_UNATTEND:-1}"
+      LAB_CPUS: "${LAB_CPUS:-8}"
+      LAB_MEMORY: "${LAB_MEMORY:-16G}"
+    volumes:
+      - "${WINDOWS_ISO}:/iso/windows.iso:ro"
+      - ./state:/state
+    tmpfs:
+      - /run:size=64m,mode=0700,uid=${LAB_UID},gid=${LAB_GID}
+    ports:
+      - "127.0.0.1:${LAB_SSH_PORT:-12222}:2222"
+      - "127.0.0.1:${LAB_RDP_PORT:-13390}:3389"
+      - "127.0.0.1:${LAB_VNC_PORT:-16080}:6080"
+    cpus: "${LAB_CPUS:-8}"
+    mem_limit: "${LAB_MEMORY:-16G}"
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 2m
+    restart: "no"
