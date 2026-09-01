@@ -8493,6 +8493,49 @@ class TestSpecAutopilot:
             "started_at": current.started_at,
         }
 
+    def test_windows_v2_pid_record_uses_targeted_generation_without_argv(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        record = autopilot.PidFileRecord(
+            pid=4242,
+            started_at="2026-09-01T03:00:00+00:00",
+            command=r"C:\old-venv\Scripts\spec.exe auto run",
+            instance_id="dispatcher-generation",
+            nonce="secret-nonce",
+        )
+        tracker = autopilot.ShutdownTracker(
+            autopilot.autopilot_state_root(repo),
+            instance_id=record.instance_id,
+            pid=record.pid,
+            process_started_at=record.started_at,
+            nonce=record.nonce,
+        )
+        tracker.initialize()
+        executable_only = autopilot.ProcessIdentity(
+            pid=record.pid,
+            started_at=record.started_at,
+            command=r"C:\Python\python.exe",
+        )
+        assert autopilot._pid_record_has_live_dispatcher_generation(repo, record)
+        tracker.mark_complete()
+        assert not autopilot._pid_record_has_live_dispatcher_generation(repo, record)
+        tracker.initialize()
+
+        monkeypatch.setattr(
+            autopilot,
+            "_pid_record_has_live_dispatcher_generation",
+            lambda _repo, _record: True,
+        )
+        monkeypatch.setattr(autopilot.os, "name", "nt")
+
+        assert autopilot._pid_record_matches_process(
+            record,
+            executable_only,
+            repo_root=repo,
+        )
+
     def test_stop_command_refuses_to_signal_stale_recycled_pid(
         self,
         repo: Path,

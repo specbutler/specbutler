@@ -2261,14 +2261,50 @@ def _read_pid_file(path: Path) -> PidFileRecord | None:
     )
 
 
-def _pid_record_matches_process(record: PidFileRecord, identity: ProcessIdentity) -> bool:
+def _pid_record_has_live_dispatcher_generation(repo_root: Path, record: PidFileRecord) -> bool:
+    """Validate a V2 pid record against its exact control-plane generation.
+
+    Native Windows process inspection intentionally exposes the executable, not
+    the full argv.  The unforgeable per-launch nonce and the shutdown state are
+    therefore the authoritative ownership proof there.  COMPLETE is excluded
+    so a delayed stop request cannot target a later process through stale state.
+    """
+    if not record.instance_id or not record.nonce or not record.started_at:
+        return False
+    state = ShutdownTracker(
+        autopilot_state_root(repo_root),
+        instance_id=record.instance_id,
+        pid=record.pid,
+        process_started_at=record.started_at,
+        nonce=record.nonce,
+    ).state()
+    return (
+        state.phase is not ShutdownPhase.COMPLETE
+        and state.instance_id == record.instance_id
+        and state.pid == record.pid
+        and state.process_started_at == record.started_at
+        and state.nonce == record.nonce
+    )
+
+
+def _pid_record_matches_process(
+    record: PidFileRecord,
+    identity: ProcessIdentity,
+    *,
+    repo_root: Path | None = None,
+) -> bool:
     if record.pid != identity.pid:
         return False
-    if not _is_autopilot_run_command(identity.command):
+    native_v2 = (
+        os.name == "nt"
+        and repo_root is not None
+        and _pid_record_has_live_dispatcher_generation(repo_root, record)
+    )
+    if not native_v2 and not _is_autopilot_run_command(identity.command):
         return False
     if record.started_at and record.started_at != identity.started_at:
         return False
-    if record.command and record.command != identity.command:
+    if not native_v2 and record.command and record.command != identity.command:
         return False
     return True
 
@@ -2367,7 +2403,11 @@ def ensure_pid_file(repo_root: Path, *, instance_id: str = "", nonce: str = "") 
         record = _read_pid_file(path)
         if record is not None and record.pid != os.getpid():
             live_identity = read_process_identity(record.pid)
-            if live_identity is not None and _pid_record_matches_process(record, live_identity):
+            if live_identity is not None and _pid_record_matches_process(
+                record,
+                live_identity,
+                repo_root=repo_root,
+            ):
                 raise RuntimeError(f"Autopilot already running with pid {record.pid}.")
     _write_pid_file(path, current_process_identity(), instance_id=instance_id, nonce=nonce)
 
@@ -3611,6 +3651,9 @@ def stop_command(args: argparse.Namespace) -> int:
             repo_root,
             why=f"Autopilot pid {record.pid} (recorded start {record.started_at or 'unknown'}) is no longer running.",
         )
+    native_v2 = os.name == "nt" and _pid_record_has_live_dispatcher_generation(repo_root, record)
+    if native_v2:
+        return _signal_autopilot(record.pid, repo_root)
     if not _is_autopilot_run_command(live_identity.command):
         # Live, but it is not an autopilot at all — almost certainly a recycled
         # pid. Refuse to signal it, and keep the pid file: deleting it could
