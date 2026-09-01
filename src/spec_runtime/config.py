@@ -575,8 +575,15 @@ def load_spec_runtime_config(
         except CommandConfigurationError as exc:
             raise SpecConfigError(str(exc)) from exc
         command = variants.command
-        if not name or not variants.select(windows=False) and not variants.select(windows=True):
+        portable_command = variants.select(windows=False)
+        windows_command = variants.select(windows=True)
+        if not name or portable_command is None and windows_command is None:
             continue
+        if portable_command is None:
+            raise SpecConfigError(
+                f"[[verify.gates]] name={name!r} requires command or argv; "
+                "command_windows and argv_windows are additive overrides"
+            )
         gates.append(
             VerifyGateConfig(
                 name=name,

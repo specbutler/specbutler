@@ -122,6 +122,31 @@ allow_from_user = "render"
             with pytest.raises(SpecConfigError, match="allow_from_user must be a list of strings"):
                 load_spec_runtime_config(require=True)
 
+    @pytest.mark.parametrize(
+        "windows_variant",
+        [
+            'command_windows = "Write-Output ok"\nshell_windows = "powershell"',
+            'argv_windows = ["py", "-m", "pytest"]',
+        ],
+    )
+    def test_load_rejects_windows_only_verify_gate_on_posix(
+        self, tmp_path: Path, windows_variant: str
+    ) -> None:
+        (tmp_path / ".spec.toml").write_text(
+            f"""
+[verify]
+[[verify.gates]]
+name = "test"
+{windows_variant}
+"""
+        )
+
+        with pytest.raises(
+            SpecConfigError,
+            match=r"verify\.gates.*requires command or argv.*additive overrides",
+        ):
+            load_spec_runtime_config(config_path=tmp_path / ".spec.toml")
+
     def test_discover_repo_root_prefers_current_repo_markers(self, tmp_path, monkeypatch):
         repo_root = tmp_path / "repo"
         nested = repo_root / "pkg" / "feature"
