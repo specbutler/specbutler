@@ -72,6 +72,7 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "reset_lab \"$LAB_BASELINE\"" in controller
     assert "provision_guest" in controller
     assert "stage_source" in controller
+    assert 'mkdir -p "$STATE_ROOT/incoming"' in controller
     assert "job_submit" in controller
     assert "job_wait" in controller
     assert "collect_artifacts" in controller

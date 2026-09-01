@@ -365,6 +365,7 @@ stage_source() {
     local ref="${1:-${LAB_SOURCE_REF:-HEAD}}"
     local commit archive
     commit="$(git -C "$REPO_ROOT" rev-parse --verify "$ref^{commit}")" || die "source ref does not resolve: $ref"
+    mkdir -p "$STATE_ROOT/incoming"
     archive="$STATE_ROOT/incoming/source.zip"
     git -C "$REPO_ROOT" archive --format=zip --output "$archive" "$commit"
     guest_scp "$archive" "specadmin@127.0.0.1:C:/SpecHarness/source.zip"
