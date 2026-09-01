@@ -123,7 +123,7 @@ jobs:
             --kind lint \
             --output artifacts/ci-evidence/lint.json
       - name: Upload lint evidence fragment
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-evidence-lint
           path: artifacts/ci-evidence/lint.json
@@ -159,7 +159,7 @@ jobs:
             --junit 'artifacts/ci-evidence/linux-${{ matrix.python-version }}.xml' \
             --output 'artifacts/ci-evidence/linux-${{ matrix.python-version }}.json'
       - name: Upload Linux evidence fragment
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-evidence-linux-${{ matrix.python-version }}
           path: artifacts/ci-evidence/
@@ -193,7 +193,7 @@ jobs:
             --junit artifacts/ci-evidence/macos-3.12.xml \
             --output artifacts/ci-evidence/macos-3.12.json
       - name: Upload macOS evidence fragment
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-evidence-macos-3.12
           path: artifacts/ci-evidence/
@@ -294,14 +294,14 @@ jobs:
             --output artifacts/ci-evidence/windows-package.json
           exit $LASTEXITCODE
       - name: Upload Windows package evidence fragment
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-evidence-windows-package
           path: artifacts/ci-evidence/windows-package.json
           if-no-files-found: error
           retention-days: 14
       - name: Upload Windows-built release distributions
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-release-distributions
           path: dist/*
@@ -309,7 +309,7 @@ jobs:
           retention-days: 14
       - name: Upload Windows package logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-package-logs
           path: artifacts/
@@ -489,7 +489,7 @@ jobs:
           python @arguments
           exit $LASTEXITCODE
       - name: Upload Windows probe evidence fragment
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ci-evidence-windows-${{ matrix.python-version }}-${{ matrix.distribution }}
           path: artifacts/ci-evidence/
@@ -509,7 +509,7 @@ jobs:
           "@ >> $env:GITHUB_STEP_SUMMARY
       - name: Upload Windows probe logs
         if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-probe-${{ matrix.python-version }}-${{ matrix.distribution }}-logs
           path: artifacts/
@@ -556,7 +556,7 @@ jobs:
             --output artifacts/acceptance-evidence \
             --expected-revision "$revision"
       - name: Upload hosted acceptance evidence
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hosted-ci-acceptance-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/acceptance-evidence/
