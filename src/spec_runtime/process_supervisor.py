@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -56,6 +57,7 @@ def _kernel32() -> Any:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     declarations = {
         "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "GetCurrentProcess": ([], wintypes.HANDLE),
         "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
         "GetProcessTimes": ([wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], wintypes.BOOL),
         "GetExitCodeProcess": ([wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
@@ -131,6 +133,10 @@ class SupervisionToken:
     def __post_init__(self) -> None:
         if self.payload_identity is None:
             object.__setattr__(self, "payload_identity", self.identity)
+        # Programmatic token creation is the trusted minting boundary. Parsing
+        # below is intentionally strict and never repairs persisted V2 data.
+        if self.version >= 2 and not self.job_name:
+            object.__setattr__(self, "job_name", _windows_job_name(self.token))
         if self.version >= 2 and not self.control_relpath:
             object.__setattr__(self, "control_relpath", f"controls/{self.token}/control.json")
         if self.version >= 2 and not self.control_nonce:
@@ -154,6 +160,19 @@ class SupervisionToken:
         version = int(value.get("version", 1))
         if os.name == "nt" and version < 2:
             raise ValueError("legacy Windows supervision tokens are not safe to use")
+        if version >= 2:
+            required = (
+                "supervision_id",
+                "job_name",
+                "keeper_identity",
+                "payload_identity",
+                "control_relpath",
+                "control_nonce",
+            )
+            missing = [key for key in required if not value.get(key)]
+            if missing:
+                raise ValueError(f"V2 supervision token is missing {', '.join(missing)}")
+            _control_path(str(value["control_relpath"]))
         keeper_value = value.get("keeper_identity") or value.get("supervisor_identity") or value.get("identity")
         if not isinstance(keeper_value, dict):
             raise ValueError("supervision token has no keeper identity")
@@ -495,10 +514,80 @@ class _WindowsJob:
 
 
 _LIVE_WINDOWS_JOBS: dict[tuple[int, str], _WindowsJob] = {}
+_CURRENT_WINDOWS_JOBS: dict[str, _WindowsJob] = {}
 
 
 def _windows_job_name(token: str) -> str:
     return f"Local\\SpecButler-{token}"
+
+
+def claim_current_process(supervision_id: str) -> SupervisionToken:
+    """Put the current Windows orchestrator in a retained kill-on-close Job."""
+    if os.name != "nt":
+        raise RuntimeError("current-process Job ownership is Windows-only")
+    if not supervision_id:
+        raise ValueError("supervision_id is required")
+    identity = inspect_process(os.getpid())
+    if identity is None:
+        raise RuntimeError("Could not inspect current process")
+    existing = _CURRENT_WINDOWS_JOBS.get(supervision_id)
+    if existing is None:
+        job = _WindowsJob(_windows_job_name(supervision_id))
+        try:
+            job.assign(int(_kernel32().GetCurrentProcess()))
+        except Exception:
+            job.close()
+            raise
+        _CURRENT_WINDOWS_JOBS[supervision_id] = job
+    nonce = uuid.uuid4().hex
+    relpath = f"controls/{supervision_id}/control.json"
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        identity,
+        identity.pid,
+        identity.started_at,
+        supervision_id,
+        payload_identity=identity,
+        job_name=_windows_job_name(supervision_id),
+        control_relpath=relpath,
+        control_nonce=nonce,
+    )
+    control_path = _control_path(relpath)
+    state = {
+        "schema": 2,
+        "supervision_id": supervision_id,
+        "nonce": nonce,
+        "keeper_identity": identity.to_dict(),
+        "payload_identity": identity.to_dict(),
+        "request": None,
+        "ack": None,
+    }
+    with FileLock(control_path.with_suffix(".lock")):
+        atomic_write_text(control_path, json.dumps(state, sort_keys=True))
+
+    def monitor() -> None:
+        while identity_matches(identity):
+            try:
+                current = json.loads(control_path.read_text(encoding="utf-8"))
+                request = current.get("request")
+                if (
+                    isinstance(request, dict)
+                    and request.get("operation") == "stop"
+                    and request.get("nonce") == nonce
+                ):
+                    # The orchestrator owns its normal cleanup semantics. Give
+                    # it the bounded grace interval, then enforce tree exit.
+                    time.sleep(5.0)
+                    retained = _CURRENT_WINDOWS_JOBS.get(supervision_id)
+                    if retained is not None:
+                        retained.terminate()
+                    return
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+            time.sleep(0.05)
+
+    threading.Thread(target=monitor, name=f"spec-stop-{supervision_id}", daemon=True).start()
+    return token
 
 
 class ManagedProcess:
@@ -526,6 +615,10 @@ class ManagedProcess:
         try:
             result = self.process.communicate(input=input, timeout=timeout)
         except subprocess.TimeoutExpired:
+            raise
+        except BaseException:
+            self.kill()
+            self.close()
             raise
         self.close()
         return result
@@ -593,13 +686,13 @@ class ManagedAsyncProcess:
         self._job = job
 
     def terminate(self) -> None:
-        self.process.terminate()
+        terminate(self.token, job=self._job)
 
     def kill(self) -> None:
         if self._job is not None and identity_matches(self.token.identity):
             self._job.terminate()
         else:
-            self.process.kill()
+            terminate(self.token, grace_seconds=0, job=self._job)
 
     async def wait(self) -> int:
         tree = _windows_tree_identities(self.token.identity.pid)
@@ -610,7 +703,13 @@ class ManagedAsyncProcess:
         return returncode
 
     async def communicate(self, input: bytes | None = None) -> tuple[bytes | None, bytes | None]:
-        result = await self.process.communicate(input)
+        try:
+            result = await self.process.communicate(input)
+        except BaseException:
+            self.kill()
+            await self.process.wait()
+            self.close()
+            raise
         self.close()
         return result
 
@@ -638,6 +737,8 @@ class ProcessSupervisor:
         job = None
         metadata_path: Path | None = None
         supervision_id = self._supervision_id or uuid.uuid4().hex
+        control_relpath = f"controls/{supervision_id}/control.json"
+        control_nonce = uuid.uuid4().hex
         if os.name == "nt":
             flags = int(kwargs.pop("creationflags", 0))
             if self.mode is LifetimeMode.RUN_OWNED:
@@ -656,6 +757,9 @@ class ProcessSupervisor:
                     "--durable-helper",
                     str(metadata_path),
                     supervision_id,
+                    self.mode.value,
+                    control_relpath,
+                    control_nonce,
                     "--",
                     *argv,
                 ]
@@ -713,8 +817,8 @@ class ProcessSupervisor:
                 pgid,
                 payload_identity,
                 job_name=job_name,
-                control_relpath=helper_token.control_relpath if helper_token is not None else "",
-                control_nonce=helper_token.control_nonce if helper_token is not None else "",
+                control_relpath=helper_token.control_relpath if helper_token is not None else control_relpath,
+                control_nonce=helper_token.control_nonce if helper_token is not None else control_nonce,
             )
             if is_test_double:
                 setattr(process, "token", token)
@@ -736,6 +840,8 @@ class ProcessSupervisor:
         job = None
         metadata_path: Path | None = None
         supervision_id = self._supervision_id or uuid.uuid4().hex
+        control_relpath = f"controls/{supervision_id}/control.json"
+        control_nonce = uuid.uuid4().hex
         if os.name == "nt":
             flags = int(kwargs.pop("creationflags", 0))
             flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
@@ -751,6 +857,9 @@ class ProcessSupervisor:
                     "--durable-helper",
                     str(metadata_path),
                     supervision_id,
+                    self.mode.value,
+                    control_relpath,
+                    control_nonce,
                     "--",
                     *argv,
                 ]
@@ -807,8 +916,8 @@ class ProcessSupervisor:
                 pgid,
                 payload_identity,
                 job_name=job_name,
-                control_relpath=helper_token.control_relpath if helper_token is not None else "",
-                control_nonce=helper_token.control_nonce if helper_token is not None else "",
+                control_relpath=helper_token.control_relpath if helper_token is not None else control_relpath,
+                control_nonce=helper_token.control_nonce if helper_token is not None else control_nonce,
             )
             managed = ManagedAsyncProcess(process, token, job)
             if job is not None:
@@ -841,17 +950,40 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
     if job is None and os.name == "nt":
         job = _LIVE_WINDOWS_JOBS.get((token.identity.pid, token.identity.started_at))
     tree = _windows_tree_identities(token.payload.pid)
-    try:
-        if os.name == "posix":
+    request_id = ""
+    control_path: Path | None = None
+    if os.name == "posix":
+        try:
             os.killpg(token.pgid or token.identity.pid, signal.SIGTERM)
-        else:
-            os.kill(token.identity.pid, signal.CTRL_BREAK_EVENT)
-    except (OSError, ValueError):
-        pass
+        except (OSError, ValueError):
+            pass
+    elif token.control_relpath and token.control_nonce:
+        request_id = uuid.uuid4().hex
+        control_path = _control_path(token.control_relpath)
+        with FileLock(control_path.with_suffix(".lock")):
+            try:
+                state = json.loads(control_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError, TypeError):
+                state = {}
+            if (
+                state.get("supervision_id") == token.token
+                and state.get("nonce") == token.control_nonce
+                and state.get("keeper_identity") == token.identity.to_dict()
+                and state.get("payload_identity") == token.payload.to_dict()
+            ):
+                state["request"] = {"id": request_id, "operation": "stop", "nonce": token.control_nonce}
+                atomic_write_text(control_path, json.dumps(state, sort_keys=True))
     deadline = time.monotonic() + max(0.0, grace_seconds)
     while time.monotonic() < deadline:
         if not identity_matches(token.identity):
             return _wait_for_identities_exit(tree) if tree else True
+        if control_path is not None and request_id:
+            try:
+                state = json.loads(control_path.read_text(encoding="utf-8"))
+                if state.get("ack") == request_id and not identity_matches(token.payload):
+                    return True
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
         time.sleep(0.05)
     if not identity_matches(token.identity):
         return _wait_for_identities_exit(tree) if tree else True
@@ -921,7 +1053,14 @@ def adopt(token: SupervisionToken) -> SupervisionToken:
     return adopted
 
 
-def _durable_helper(metadata_path: Path, supervision_id: str, argv: Sequence[str]) -> int:
+def _durable_helper(
+    metadata_path: Path,
+    supervision_id: str,
+    mode: LifetimeMode,
+    control_relpath: str,
+    control_nonce: str,
+    argv: Sequence[str],
+) -> int:
     """Own one Windows Job for the full lifetime of a durable payload."""
     with ProcessSupervisor(LifetimeMode.RUN_OWNED, supervision_id=supervision_id) as supervisor:
         child = supervisor.spawn(argv)
@@ -929,13 +1068,15 @@ def _durable_helper(metadata_path: Path, supervision_id: str, argv: Sequence[str
         if keeper is None:
             raise RuntimeError("Could not inspect durable supervisor identity")
         token = SupervisionToken(
-            LifetimeMode.ADOPTABLE,
+            mode,
             keeper,
             0,
             "",
             supervision_id,
             payload_identity=child.token.identity,
             job_name=child.token.job_name,
+            control_relpath=control_relpath,
+            control_nonce=control_nonce,
         )
         control_path = _control_path(token.control_relpath)
         state = {
@@ -949,6 +1090,31 @@ def _durable_helper(metadata_path: Path, supervision_id: str, argv: Sequence[str
         with FileLock(control_path.with_suffix(".lock")):
             atomic_write_text(control_path, json.dumps(state, sort_keys=True))
         atomic_write_text(metadata_path, json.dumps(token.to_dict()))
+        while child.poll() is None:
+            request_id = ""
+            with FileLock(control_path.with_suffix(".lock")):
+                try:
+                    current = json.loads(control_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError, TypeError):
+                    current = {}
+                request = current.get("request")
+                if (
+                    isinstance(request, dict)
+                    and request.get("operation") == "stop"
+                    and request.get("nonce") == control_nonce
+                    and isinstance(request.get("id"), str)
+                    and request.get("id")
+                ):
+                    request_id = str(request["id"])
+            if request_id:
+                child.kill()
+                child.wait()
+                with FileLock(control_path.with_suffix(".lock")):
+                    current["ack"] = request_id
+                    current["request"] = None
+                    atomic_write_text(control_path, json.dumps(current, sort_keys=True))
+                return int(child.returncode)
+            time.sleep(0.05)
         return int(child.wait())
 
 
@@ -958,5 +1124,12 @@ if __name__ == "__main__":  # pragma: no cover - exercised by native Windows tes
         separator = sys.argv.index("--")
         marker_index = sys.argv.index(marker)
         raise SystemExit(
-            _durable_helper(Path(sys.argv[marker_index + 1]), sys.argv[marker_index + 2], sys.argv[separator + 1 :])
+            _durable_helper(
+                Path(sys.argv[marker_index + 1]),
+                sys.argv[marker_index + 2],
+                LifetimeMode(sys.argv[marker_index + 3]),
+                sys.argv[marker_index + 4],
+                sys.argv[marker_index + 5],
+                sys.argv[separator + 1 :],
+            )
         )

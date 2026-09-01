@@ -33,6 +33,19 @@ def test_token_round_trip_preserves_reopenable_identity() -> None:
     assert token.control_nonce
 
 
+@pytest.mark.parametrize(
+    "missing",
+    ["supervision_id", "job_name", "keeper_identity", "payload_identity", "control_relpath", "control_nonce"],
+)
+def test_v2_token_parser_does_not_mint_missing_security_fields(missing: str) -> None:
+    identity = ProcessIdentity(42, "created", "python.exe", "python child.py")
+    payload = SupervisionToken(LifetimeMode.DETACHED, identity, 7, "owner", "strict-token").to_dict()
+    payload.pop(missing)
+
+    with pytest.raises(ValueError, match="V2 supervision token is missing"):
+        SupervisionToken.from_dict(payload)
+
+
 def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -> None:
     expected = ProcessIdentity(os.getpid(), "old", sys.executable)
     monkeypatch.setattr(

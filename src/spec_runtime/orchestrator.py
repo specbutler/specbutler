@@ -109,7 +109,12 @@ from .execution_backend import get_execution_backend as _factory_get_execution_b
 from .forge import GitHubForge, PushResult
 from .git_common import resolve_common_root
 from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
-from .process_supervisor import LifetimeMode, ProcessSupervisor, SupervisionToken, inspect_process
+from .process_supervisor import (
+    LifetimeMode,
+    ProcessSupervisor,
+    SupervisionToken,
+    claim_current_process,
+)
 from .process_supervisor import run as run_supervised
 from .process_supervisor import terminate as terminate_supervised
 from .spec_identity import (
@@ -6413,13 +6418,9 @@ def _orchestrator_sigterm_guard(
 def _ensure_orchestrator_process_group(run: RunState, repo_root: Path) -> None:
     if os.name != "posix":
         run.pgid = None
-        identity = inspect_process(os.getpid())
-        if identity is None:
-            raise RuntimeError("Could not record orchestrator process identity")
-        run.process_started_at = identity.started_at
-        run.supervision_token = SupervisionToken(
-            LifetimeMode.DETACHED, identity, identity.pid, identity.started_at, f"orchestrator-{run.run_id}"
-        ).to_dict()
+        token = claim_current_process(f"orchestrator-{run.run_id}")
+        run.process_started_at = token.identity.started_at
+        run.supervision_token = token.to_dict()
         run.save(repo_root)
         return
 
