@@ -470,8 +470,23 @@ PY
     else
         proof_status=$?
     fi
-    collect_artifacts "$name"
-    return "$proof_status"
+    local destination="$LAB_ROOT/artifacts/$name"
+    collect_artifacts "$name" "$destination"
+    local audit_status=0
+    if python3 "$LAB_ROOT/audit_acceptance.py" \
+        --manifest "$LAB_ROOT/acceptance-manifest.json" \
+        --source-root "$REPO_ROOT" \
+        --evidence-root "$destination" \
+        --expected-revision "$revision" \
+        --output "$destination/acceptance-audit.json"; then
+        audit_status=0
+    else
+        audit_status=$?
+    fi
+    if (( proof_status != 0 )); then
+        return "$proof_status"
+    fi
+    return "$audit_status"
 }
 
 command="${1:-help}"
