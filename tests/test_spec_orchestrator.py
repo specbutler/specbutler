@@ -8635,6 +8635,116 @@ class TestSpecAutopilot:
             repo_root=repo,
         )
 
+    def test_stop_command_uses_targeted_generation_on_every_platform(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        identity = autopilot.ProcessIdentity(
+            pid=4242,
+            started_at="2026-09-01T03:00:00+00:00",
+            command="spec auto run",
+        )
+        record = autopilot.PidFileRecord(
+            pid=identity.pid,
+            started_at=identity.started_at,
+            command=identity.command,
+            instance_id="dispatcher-generation",
+            nonce="secret-nonce",
+        )
+        autopilot._write_pid_file(
+            autopilot.autopilot_pid_path(repo),
+            identity,
+            instance_id=record.instance_id,
+            nonce=record.nonce,
+        )
+        tracker = autopilot.ShutdownTracker(
+            autopilot.autopilot_state_root(repo),
+            instance_id=record.instance_id,
+            pid=record.pid,
+            process_started_at=record.started_at,
+            nonce=record.nonce,
+        )
+        tracker.initialize()
+        legacy_shutdown = MagicMock(
+            side_effect=AssertionError("targeted generations must not use legacy signals")
+        )
+        monkeypatch.setattr(
+            autopilot,
+            "read_process_identity",
+            lambda pid: identity if pid == identity.pid else None,
+        )
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", legacy_shutdown)
+        monkeypatch.setattr(autopilot.ShutdownTracker, "is_complete", lambda self: True)
+
+        assert autopilot.stop_command(argparse.Namespace(repo_root=str(repo))) == 0
+
+        state = tracker.state()
+        assert state.phase is autopilot.ShutdownPhase.GRACEFUL
+        assert state.instance_id == record.instance_id
+        assert state.pid == record.pid
+        assert state.nonce == record.nonce
+        legacy_shutdown.assert_not_called()
+
+    def test_stop_command_round_trips_targeted_shutdown_across_processes(
+        self,
+        repo: Path,
+    ):
+        child_code = textwrap.dedent(
+            """
+            import sys
+            import time
+            from pathlib import Path
+            from spec_runtime import autopilot
+            from spec_runtime.control_plane import ShutdownPhase, ShutdownTracker
+
+            repo = Path(sys.argv[1])
+            identity = autopilot.current_process_identity()
+            instance_id = "real-dispatcher-generation"
+            nonce = "real-dispatcher-nonce"
+            autopilot._write_pid_file(
+                autopilot.autopilot_pid_path(repo),
+                identity,
+                instance_id=instance_id,
+                nonce=nonce,
+            )
+            tracker = ShutdownTracker(
+                autopilot.autopilot_state_root(repo),
+                instance_id=instance_id,
+                pid=identity.pid,
+                process_started_at=identity.started_at,
+                nonce=nonce,
+            )
+            tracker.initialize()
+            print("ready", flush=True)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if tracker.state().phase in {ShutdownPhase.GRACEFUL, ShutdownPhase.FORCED}:
+                    tracker.mark_complete()
+                    raise SystemExit(0)
+                time.sleep(0.02)
+            raise SystemExit(3)
+            """
+        )
+        child = process_supervisor.ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+            [sys.executable, "-c", child_code, str(repo)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert child.stdout is not None
+            ready = child.stdout.readline().strip()
+            if ready != "ready":
+                assert child.stderr is not None
+                pytest.fail(f"dispatcher helper did not start: {child.stderr.read()}")
+            assert autopilot.stop_command(argparse.Namespace(repo_root=str(repo))) == 0
+            assert child.wait(timeout=5) == 0
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
     def test_stop_command_refuses_to_signal_stale_recycled_pid(
         self,
         repo: Path,
@@ -8653,7 +8763,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock(side_effect=AssertionError("should not signal stale pid"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("should not signal stale pid"))
 
         monkeypatch.setattr(
             autopilot,
@@ -8668,7 +8778,7 @@ class TestSpecAutopilot:
                 else None
             ),
         )
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
@@ -8678,7 +8788,7 @@ class TestSpecAutopilot:
         # say which fields disagree rather than printing the bare word "stale".
         assert "not an autopilot process" in captured.err
         assert "some_other_script.py" in captured.err
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
         # The pid file must survive. Deleting it on a
         # rejected record is what left a repo with a live, unstoppable daemon and
         # no handle to it. A leftover record blocks nothing — ensure_pid_file
@@ -8710,7 +8820,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock()
+        shutdown_mock = MagicMock(return_value=True)
         monkeypatch.setattr(
             autopilot,
             "read_process_identity",
@@ -8727,13 +8837,14 @@ class TestSpecAutopilot:
         # Drift is only forgiven once the process is confirmed to be running in
         # this repo.
         monkeypatch.setattr(autopilot, "read_process_cwd", lambda pid: repo.resolve())
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         captured = capsys.readouterr()
         assert code == 0
-        kill_mock.assert_called_once_with(4242, signal.SIGTERM)
+        shutdown_mock.assert_called_once()
+        assert shutdown_mock.call_args.args[0].pid == 4242
         assert pid_path.exists()
         # The drift is reported, not silently swallowed.
         assert "started_at" in captured.err
@@ -8767,7 +8878,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock(side_effect=AssertionError("must not signal another repo's autopilot"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("must not signal another repo's autopilot"))
         monkeypatch.setattr(
             autopilot,
             "read_process_identity",
@@ -8783,13 +8894,13 @@ class TestSpecAutopilot:
         )
         monkeypatch.setattr(autopilot, "read_process_cwd", lambda pid: other_repo.resolve())
         monkeypatch.setattr(autopilot, "find_autopilot_processes_for_repo", lambda root: [])
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         captured = capsys.readouterr()
         assert code == 1
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
         assert "different repository" in captured.err
         assert str(other_repo.resolve()) in captured.err
         # Never hand the operator a command that kills someone else's dispatcher.
@@ -8814,7 +8925,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock(side_effect=AssertionError("must not signal an unconfirmed process"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("must not signal an unconfirmed process"))
         monkeypatch.setattr(
             autopilot,
             "read_process_identity",
@@ -8829,13 +8940,13 @@ class TestSpecAutopilot:
             ),
         )
         monkeypatch.setattr(autopilot, "read_process_cwd", lambda pid: None)
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         captured = capsys.readouterr()
         assert code == 1
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
         assert "could not be read" in captured.err
         assert "kill -TERM 4242" in captured.err
         assert pid_path.exists()
@@ -8868,7 +8979,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock()
+        shutdown_mock = MagicMock(return_value=True)
         monkeypatch.setattr(
             autopilot,
             "read_process_identity",
@@ -8879,12 +8990,12 @@ class TestSpecAutopilot:
             "read_process_cwd",
             MagicMock(side_effect=AssertionError("cwd must not be consulted on an exact match")),
         )
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         assert code == 0
-        kill_mock.assert_called_once_with(4242, signal.SIGTERM)
+        shutdown_mock.assert_called_once_with(identity)
 
     def test_cwd_belongs_to_repo_accepts_linked_worktree_of_same_repo(
         self,
@@ -8956,10 +9067,10 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock(side_effect=AssertionError("should not signal a dead pid"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("should not signal a dead pid"))
         monkeypatch.setattr(autopilot, "read_process_identity", lambda pid: None)
         monkeypatch.setattr(autopilot, "find_autopilot_processes_for_repo", lambda root: [])
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
@@ -8969,7 +9080,7 @@ class TestSpecAutopilot:
         # `spec web`'s dispatch/stop endpoint classifies a no-op by this phrase.
         assert "not running" in captured.err
         assert not pid_path.exists()
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
 
     def test_stop_command_scans_for_repo_autopilot_when_pid_file_missing(
         self,
@@ -8978,7 +9089,7 @@ class TestSpecAutopilot:
         capsys: pytest.CaptureFixture[str],
     ):
         """Recovery path for a repo already bitten by the destructive unlink."""
-        kill_mock = MagicMock()
+        shutdown_mock = MagicMock(return_value=True)
         monkeypatch.setattr(
             autopilot,
             "find_autopilot_processes_for_repo",
@@ -8990,13 +9101,14 @@ class TestSpecAutopilot:
                 )
             ],
         )
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         captured = capsys.readouterr()
         assert code == 0
-        kill_mock.assert_called_once_with(9001, signal.SIGTERM)
+        shutdown_mock.assert_called_once()
+        assert shutdown_mock.call_args.args[0].pid == 9001
         assert "9001" in captured.out + captured.err
 
     def test_stop_command_refuses_to_guess_between_multiple_scan_matches(
@@ -9005,7 +9117,7 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
-        kill_mock = MagicMock(side_effect=AssertionError("must not guess"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("must not guess"))
         monkeypatch.setattr(
             autopilot,
             "find_autopilot_processes_for_repo",
@@ -9014,7 +9126,7 @@ class TestSpecAutopilot:
                 autopilot.ProcessIdentity(pid=9002, started_at="b", command="spec auto run"),
             ],
         )
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
@@ -9022,7 +9134,7 @@ class TestSpecAutopilot:
         assert code == 1
         assert "9001" in captured.err and "9002" in captured.err
         assert "kill -TERM" in captured.err
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
 
     def test_find_autopilot_processes_for_repo_excludes_other_repos(
         self,
@@ -9033,16 +9145,15 @@ class TestSpecAutopilot:
         """This host runs one autopilot per repo; a scan must never cross repos."""
         other_repo = tmp_path / "other-repo"
         other_repo.mkdir()
-        ps_output = (
-            "  111 Fri Aug  7 09:00:00 2026 /venv/bin/python /bin/spec auto run --concurrency 4\n"
-            "  222 Fri Aug  7 09:00:00 2026 /venv/bin/python /bin/spec auto run --concurrency 2\n"
-            "  333 Fri Aug  7 09:00:00 2026 /venv/bin/python /bin/spec auto run\n"
-            "  444 Fri Aug  7 09:00:00 2026 /venv/bin/python /bin/spec implement --spec foo\n"
-        )
         monkeypatch.setattr(
-            autopilot.subprocess,
-            "run",
-            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, ps_output, ""),
+            autopilot,
+            "iter_processes",
+            lambda: [
+                autopilot.ProcessIdentity(111, "a", command="/venv/bin/python /bin/spec auto run --concurrency 4"),
+                autopilot.ProcessIdentity(222, "b", command="/venv/bin/python /bin/spec auto run --concurrency 2"),
+                autopilot.ProcessIdentity(333, "c", command="/venv/bin/python /bin/spec auto run"),
+                autopilot.ProcessIdentity(444, "d", command="/venv/bin/python /bin/spec implement --spec foo"),
+            ],
         )
         cwds = {
             111: repo.resolve() / "subdir",

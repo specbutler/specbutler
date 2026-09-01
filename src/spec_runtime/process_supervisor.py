@@ -1721,6 +1721,32 @@ def terminate_legacy_process_group(
     return True
 
 
+def request_legacy_process_shutdown(identity: ProcessIdentity) -> bool:
+    """Send SIGTERM to one exactly revalidated legacy POSIX process.
+
+    Modern long-lived processes use a persisted supervision token or their
+    control-plane shutdown tracker.  This compatibility seam exists for old
+    pid files and discovery records that predate either capability.  Keeping
+    the signal here prevents workflow code from reimplementing platform and
+    PID-reuse policy.
+    """
+    if os.name != "posix":
+        raise ProcessGroupOwnershipError(
+            "legacy single-process shutdown is unavailable on this platform"
+        )
+    if identity.pid <= 0 or not identity.started_at or not identity_matches(identity):
+        return False
+    try:
+        os.kill(identity.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except (OSError, ValueError) as exc:
+        raise ProcessGroupTerminationError(
+            f"Failed to request shutdown from legacy process {identity.pid}: {exc}"
+        ) from exc
+    return True
+
+
 def stop_supervised_process(
     token: SupervisionToken,
     *,

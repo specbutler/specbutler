@@ -10,6 +10,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -224,6 +225,24 @@ def test_legacy_reused_leader_identity_fails_closed(monkeypatch: pytest.MonkeyPa
 
     with pytest.raises(process_supervisor.ProcessGroupOwnershipError, match="orphaned or reused"):
         process_supervisor.terminate_legacy_process_group(42, 42, "recorded-start")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="legacy SIGTERM compatibility is POSIX-only")
+def test_legacy_single_process_shutdown_revalidates_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = ProcessIdentity(4242, "created")
+    signal_process = MagicMock()
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda candidate: candidate == identity)
+    monkeypatch.setattr(process_supervisor.os, "kill", signal_process)
+
+    assert process_supervisor.request_legacy_process_shutdown(identity)
+    signal_process.assert_called_once_with(identity.pid, signal.SIGTERM)
+
+    signal_process.reset_mock()
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _candidate: False)
+    assert not process_supervisor.request_legacy_process_shutdown(identity)
+    signal_process.assert_not_called()
 
 
 def test_adoptable_token_records_new_logical_owner(

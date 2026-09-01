@@ -72,6 +72,8 @@ from spec_runtime.orchestrator import (
 from spec_runtime.platform_fs import FileLock, atomic_write_text
 from spec_runtime.process_supervisor import (
     LifetimeMode,
+    ProcessGroupOwnershipError,
+    ProcessGroupTerminationError,
     ProcessSupervisor,
     SupervisionToken,
     adopt,
@@ -79,6 +81,7 @@ from spec_runtime.process_supervisor import (
     inspect_process,
     iter_processes,
     process_cwd,
+    request_legacy_process_shutdown,
 )
 from spec_runtime.spec_merge_tags import (
     MergeTagProvenance,
@@ -3507,35 +3510,55 @@ def watch_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _signal_autopilot(pid: int, repo_root: Path | None = None) -> int:
-    if os.name == "nt":
-        if repo_root is None:
-            raise ValueError("repo_root is required for portable Windows shutdown")
+def _signal_autopilot(
+    pid: int,
+    repo_root: Path | None = None,
+    *,
+    legacy_identity: ProcessIdentity | None = None,
+) -> int:
+    if repo_root is not None:
         record = _read_pid_file(autopilot_pid_path(repo_root))
-        if record is None or record.pid != pid or not record.instance_id or not record.nonce:
-            print(f"Autopilot pid {pid} has no targetable shutdown identity.", file=sys.stderr)
+        if (
+            record is not None
+            and record.pid == pid
+            and _pid_record_has_live_dispatcher_generation(repo_root, record)
+        ):
+            tracker = ShutdownTracker(
+                autopilot_state_root(repo_root),
+                instance_id=record.instance_id,
+                pid=record.pid,
+                process_started_at=record.started_at,
+                nonce=record.nonce,
+            )
+            tracker.record_interrupt(reason=f"stop-command:{os.getpid()}")
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if tracker.is_complete() or read_process_identity(pid) is None:
+                    print(f"Autopilot pid {pid} acknowledged shutdown request.")
+                    return 0
+                time.sleep(0.05)
+            print(f"Autopilot pid {pid} did not acknowledge shutdown request.", file=sys.stderr)
             return 1
-        tracker = ShutdownTracker(
-            autopilot_state_root(repo_root),
-            instance_id=record.instance_id,
-            pid=record.pid,
-            process_started_at=record.started_at,
-            nonce=record.nonce,
-        )
-        tracker.record_interrupt(reason=f"stop-command:{os.getpid()}")
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            if tracker.is_complete() or read_process_identity(pid) is None:
-                print(f"Autopilot pid {pid} acknowledged shutdown request.")
-                return 0
-            time.sleep(0.05)
-        print(f"Autopilot pid {pid} did not acknowledge shutdown request.", file=sys.stderr)
+
+    # Compatibility for pid files and repo scans written before dispatcher
+    # generations existed. The process boundary revalidates the exact creation
+    # identity immediately before the signal and refuses this path on Windows.
+    target = legacy_identity or read_process_identity(pid)
+    if target is None or target.pid != pid:
+        print(f"Autopilot pid {pid} has no targetable shutdown identity.", file=sys.stderr)
         return 1
     try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as exc:
+        requested = request_legacy_process_shutdown(target)
+    except (ProcessGroupOwnershipError, ProcessGroupTerminationError) as exc:
         print(f"Failed to stop autopilot pid {pid}: {exc}", file=sys.stderr)
-        print(f"Stop it manually with: kill -TERM {pid}", file=sys.stderr)
+        if os.name == "posix":
+            print(f"Stop it manually with: kill -TERM {pid}", file=sys.stderr)
+        return 1
+    if not requested:
+        print(
+            f"Autopilot pid {pid} changed identity before shutdown; refusing to signal it.",
+            file=sys.stderr,
+        )
         return 1
     print(f"Sent SIGTERM to autopilot pid {pid}.")
     return 0
@@ -3569,7 +3592,7 @@ def _stop_via_repo_scan(repo_root: Path, *, why: str) -> int:
         f"is running in {repo_root}: {found.command}",
         file=sys.stderr,
     )
-    return _signal_autopilot(found.pid, repo_root)
+    return _signal_autopilot(found.pid, repo_root, legacy_identity=found)
 
 
 def stop_command(args: argparse.Namespace) -> int:
@@ -3588,8 +3611,8 @@ def stop_command(args: argparse.Namespace) -> int:
             repo_root,
             why=f"Autopilot pid {record.pid} (recorded start {record.started_at or 'unknown'}) is no longer running.",
         )
-    native_v2 = os.name == "nt" and _pid_record_has_live_dispatcher_generation(repo_root, record)
-    if native_v2:
+    targeted_generation = _pid_record_has_live_dispatcher_generation(repo_root, record)
+    if targeted_generation:
         return _signal_autopilot(record.pid, repo_root)
     if not _is_autopilot_run_command(live_identity.command):
         # Live, but it is not an autopilot at all — almost certainly a recycled
@@ -3614,7 +3637,7 @@ def stop_command(args: argparse.Namespace) -> int:
         # runs with a working directory outside the repo, and demanding a cwd
         # match would reintroduce the very "cannot stop my own daemon" failure
         # this path exists to fix.
-        return _signal_autopilot(record.pid, repo_root)
+        return _signal_autopilot(record.pid, repo_root, legacy_identity=live_identity)
 
     # Relaxed path. `started_at`/`command` equality is a nice-to-have, not a
     # gate: the pid file is written once at launch, while `spec auto stop` runs
@@ -3660,7 +3683,7 @@ def stop_command(args: argparse.Namespace) -> int:
     )
     for reason in reasons:
         print(f"  {reason}", file=sys.stderr)
-    return _signal_autopilot(record.pid, repo_root)
+    return _signal_autopilot(record.pid, repo_root, legacy_identity=live_identity)
 
 
 def gc_command(args: argparse.Namespace) -> int:
