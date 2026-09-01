@@ -201,6 +201,46 @@ def test_contradictory_evidence_and_revision_mismatch_fail(tmp_path: Path) -> No
     assert any(check["status"] == "failed" for check in audit["global_checks"])
 
 
+def test_every_manifest_json_artifact_is_bound_to_exact_revision(tmp_path: Path) -> None:
+    source, manifest, _ = _write_minimal_contract(tmp_path)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["criteria"][0]["checks"] = payload["criteria"][0]["checks"][:1]
+    manifest.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=source, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "Make artifact revision implicit"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    revision = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source, text=True, encoding="utf-8"
+    ).strip()
+    evidence = tmp_path / "evidence"
+    _write_provenance(evidence, configured=revision, staged=revision)
+    (evidence / "evidence.json").write_text(
+        json.dumps({"status": "passed", "source_revision": "2" * 40}) + "\n",
+        encoding="utf-8",
+    )
+
+    result, audit = _run_audit(
+        tmp_path,
+        manifest=manifest,
+        source_root=source,
+        evidence_root=evidence,
+        revision=revision,
+    )
+
+    assert result.returncode == 1
+    assert audit["criteria"][0]["status"] == "passed"
+    revision_check = next(
+        check
+        for check in audit["global_checks"]
+        if check["check_id"] == "global.artifact-revision.evidence.json"
+    )
+    assert revision_check["status"] == "failed"
+
+
 def test_manifest_drift_and_unsafe_artifact_paths_are_schema_errors(tmp_path: Path) -> None:
     source, manifest, revision = _write_minimal_contract(tmp_path, artifact="../outside.json")
 

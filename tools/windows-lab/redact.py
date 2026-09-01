@@ -13,6 +13,13 @@ PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s\"']+"),
     re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s\"']+"),
     re.compile(r"(?i)(\btoken\s*[:=]\s*[\"']?)[A-Za-z0-9._~-]{16,}"),
+    # JSON and PowerShell commonly quote credential field names.  Match the
+    # complete key (including prefixes such as OPENAI_) so the closing quote
+    # cannot sit between the older key pattern and its colon.
+    re.compile(
+        r"(?i)((?:[\"']?[A-Za-z0-9_-]*(?:api[_-]?key|token|secret)"
+        r"[A-Za-z0-9_-]*[\"']?)\s*[:=]\s*[\"']?)[A-Za-z0-9._~+/=-]{16,}"
+    ),
 )
 
 
@@ -41,10 +48,16 @@ def redact(payload: bytes) -> bytes:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: redact.py SOURCE DESTINATION")
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit("usage: redact.py SOURCE DESTINATION [SOURCE_REVISION]")
     source = Path(sys.argv[1]).resolve()
     destination = Path(sys.argv[2]).resolve()
+    source_revision = sys.argv[3].strip().lower() if len(sys.argv) == 4 else None
+    if source_revision is not None and (
+        len(source_revision) != 40
+        or any(character not in "0123456789abcdef" for character in source_revision)
+    ):
+        raise SystemExit("source revision must be an exact 40-character Git SHA")
     if source == destination or source in destination.parents:
         raise SystemExit("destination must be outside the raw source tree")
     destination.mkdir(parents=True, exist_ok=True)
@@ -82,6 +95,8 @@ def main() -> int:
         "files_with_replacements": changed_files,
         "recognized_secret_shapes_remaining": residual_matches,
     }
+    if source_revision is not None:
+        report["source_revision"] = source_revision
     (destination / "_redaction-report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

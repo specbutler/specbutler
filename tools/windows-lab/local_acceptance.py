@@ -253,9 +253,16 @@ def _count_secret_occurrences(root: Path, secrets: set[str]) -> int:
         if not path.is_file():
             continue
         try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise EvidenceError(f"cannot scan evidence file for secrets: {path}: {exc}") from exc
+        if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = payload.decode("utf-16", errors="replace")
+        else:
+            try:
+                text = payload.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = payload.decode("cp1252", errors="replace")
         count += sum(text.count(secret) for secret in secrets)
     return count
 
@@ -337,6 +344,7 @@ def produce(args: argparse.Namespace) -> None:
         evidence_root / "web-chat-result.json",
         {
             "status": "passed",
+            "source_revision": revision,
             "backend": "codex",
             "dependent_turns": 3,
             "turn_2_retained_turn_1": True,

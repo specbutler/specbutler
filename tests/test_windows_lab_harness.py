@@ -28,6 +28,7 @@ REQUIRED_FILES = {
     "bootstrap.ps1.template",
     "compose.yaml",
     "entrypoint.sh",
+    "import_external_evidence.py",
     "job-runner.ps1",
     "lab.env.example",
     "labctl",
@@ -188,12 +189,19 @@ def test_windows_lab_redactor_removes_supported_secret_shapes(tmp_path: Path) ->
     assert web_token not in redacted
     assert "[REDACTED]" in redacted
 
-    utf16_token = "sk-" + "B" * 24
+    utf16_token = "eyJ" + "B" * 32
     (source / "powershell.log").write_text(
-        f"api_key={utf16_token}\n", encoding="utf-16"
+        json.dumps({"access_token": utf16_token}) + "\n", encoding="utf-16"
     )
+    revision = "a" * 40
     subprocess.run(
-        [sys.executable, str(LAB_ROOT / "redact.py"), str(source), str(destination)],
+        [
+            sys.executable,
+            str(LAB_ROOT / "redact.py"),
+            str(source),
+            str(destination),
+            revision,
+        ],
         check=True,
     )
     utf16_redacted = (destination / "powershell.log").read_text(encoding="utf-16")
@@ -201,6 +209,7 @@ def test_windows_lab_redactor_removes_supported_secret_shapes(tmp_path: Path) ->
     assert "[REDACTED]" in utf16_redacted
     report = json.loads((destination / "_redaction-report.json").read_text())
     assert report["status"] == "passed"
+    assert report["source_revision"] == revision
     assert report["files_processed"] == 2
     assert report["files_with_replacements"] == 2
     assert report["recognized_secret_shapes_remaining"] == []
@@ -299,6 +308,11 @@ def test_windows_local_acceptance_requires_executed_unskipped_tests(tmp_path: Pa
     with pytest.raises(module.EvidenceError, match="not green"):
         module.passed_tests(failed_report)
 
+    secret = "utf16-secret-value-1234567890"
+    secret_log = tmp_path / "powershell.log"
+    secret_log.write_text(f"token={secret}\n", encoding="utf-16")
+    assert module._count_secret_occurrences(tmp_path, {secret}) == 1
+
 
 def test_windows_local_acceptance_covers_every_local_manifest_result() -> None:
     path = LAB_ROOT / "local_acceptance.py"
@@ -330,6 +344,174 @@ def test_windows_local_acceptance_covers_every_local_manifest_result() -> None:
     assert "lab-controller-static-result.json" in controller
     assert "lab-controller-result.json" in controller
     assert "clean_snapshot_reset" in controller
+    assert "if (( proof_status != 0 ))" in controller
+    assert "controller success evidence will not be produced" in controller
+
+
+def test_external_evidence_import_requires_one_exact_revision_bundle(tmp_path: Path) -> None:
+    source = tmp_path / "external"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    revision = "a" * 40
+    (destination / "_redaction-report.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "source_revision": revision,
+                "files_processed": 10,
+                "text_files_scanned": 10,
+                "files_with_replacements": 0,
+                "recognized_secret_shapes_remaining": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    github_run = {
+        "repository": "specbutler/specbutler",
+        "workflow": "ci",
+        "run_id": 123,
+        "run_attempt": 1,
+        "event_name": "push",
+        "github_sha": revision,
+    }
+    hosted = (
+        "cross-platform-lifecycle-result.json",
+        "cross-platform-web-result.json",
+        "hosted-windows-ci-result.json",
+        "hosted-windows-smoke-result.json",
+    )
+    (source / "hosted-ci-evidence-index.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "source_revision": revision,
+                "github_run": github_run,
+                "reports": list(hosted),
+            }
+        ),
+        encoding="utf-8",
+    )
+    for name in hosted:
+        (source / name).write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "source_revision": revision,
+                    "github_run": github_run,
+                }
+            ),
+            encoding="utf-8",
+        )
+    (source / "linux-claude-web-result.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "source_revision": revision,
+                "backend": "claude",
+                "dependent_turns": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(LAB_ROOT / "import_external_evidence.py"),
+            "--source",
+            str(source),
+            "--destination",
+            str(destination),
+            "--expected-revision",
+            revision,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert {path.name for path in destination.iterdir()} == {
+        *hosted,
+        "linux-claude-web-result.json",
+        "external-evidence-import.json",
+        "_redaction-report.json",
+    }
+    report = json.loads((destination / "external-evidence-import.json").read_text())
+    assert report["source_revision"] == revision
+    assert set(report["imported_sha256"]) == {*hosted, "linux-claude-web-result.json"}
+    redaction = json.loads((destination / "_redaction-report.json").read_text())
+    assert redaction["files_processed"] == 15
+    assert redaction["external_results_scanned"] == [*hosted, "linux-claude-web-result.json"]
+
+    stale_destination = tmp_path / "stale-destination"
+    stale_destination.mkdir()
+    (stale_destination / "_redaction-report.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "source_revision": "b" * 40,
+                "recognized_secret_shapes_remaining": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_result = subprocess.run(
+        [
+            sys.executable,
+            str(LAB_ROOT / "import_external_evidence.py"),
+            "--source",
+            str(source),
+            "--destination",
+            str(stale_destination),
+            "--expected-revision",
+            "b" * 40,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert stale_result.returncode == 1
+    assert {path.name for path in stale_destination.glob("*.json")} == {
+        "_redaction-report.json"
+    }
+
+    secret_payload = json.loads((source / "linux-claude-web-result.json").read_text())
+    secret_payload["access_token"] = "credential-value-that-must-not-be-imported"
+    (source / "linux-claude-web-result.json").write_text(
+        json.dumps(secret_payload), encoding="utf-8"
+    )
+    secret_destination = tmp_path / "secret-destination"
+    secret_destination.mkdir()
+    (secret_destination / "_redaction-report.json").write_text(
+        json.dumps(
+            {
+                "status": "passed",
+                "source_revision": revision,
+                "recognized_secret_shapes_remaining": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    secret_result = subprocess.run(
+        [
+            sys.executable,
+            str(LAB_ROOT / "import_external_evidence.py"),
+            "--source",
+            str(source),
+            "--destination",
+            str(secret_destination),
+            "--expected-revision",
+            revision,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert secret_result.returncode == 1
+    assert "credential shape" in secret_result.stdout
+    assert not (secret_destination / "linux-claude-web-result.json").exists()
 
 
 def test_windows_runtime_timeout_probe_kills_a_real_tree(tmp_path: Path) -> None:

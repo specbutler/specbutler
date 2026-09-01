@@ -13,7 +13,14 @@ $sourceRoot = Join-Path $harnessRoot 'source'
 $evidenceRoot = Join-Path $harnessRoot "evidence\$runName"
 $runRoot = Join-Path $harnessRoot "runs\$runName"
 $venvRoot = Join-Path $harnessRoot 'venvs'
-New-Item -ItemType Directory -Force -Path $evidenceRoot, $runRoot, $venvRoot | Out-Null
+New-Item -ItemType Directory -Force -Path (Split-Path $evidenceRoot), (Split-Path $runRoot) | Out-Null
+foreach ($freshRoot in @($evidenceRoot, $runRoot)) {
+    if (Test-Path -LiteralPath $freshRoot) {
+        throw "Proof run path already exists; refusing to mix evidence: $freshRoot"
+    }
+}
+New-Item -ItemType Directory -Path $evidenceRoot, $runRoot | Out-Null
+New-Item -ItemType Directory -Force -Path $venvRoot | Out-Null
 
 function Invoke-LoggedNative {
     param(
@@ -21,6 +28,7 @@ function Invoke-LoggedNative {
         [Parameter(Mandatory = $true)] [string[]] $Arguments,
         [Parameter(Mandatory = $true)] [string] $LogName
     )
+    Get-Command -Name $FilePath -ErrorAction Stop | Out-Null
     # Windows PowerShell 5 promotes native stderr to NativeCommandError when
     # ErrorActionPreference is Stop. Healthy tools such as git emit progress on
     # stderr, so judge native commands by their exit code instead.
@@ -42,6 +50,7 @@ function Invoke-NativeOutput {
         [Parameter(Mandatory = $true)] [string] $FilePath,
         [Parameter(Mandatory = $true)] [string[]] $Arguments
     )
+    Get-Command -Name $FilePath -ErrorAction Stop | Out-Null
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
@@ -120,6 +129,7 @@ if ($isElevated) { throw 'Proof must run with a non-elevated user token' }
 if ($sessionId -le 0) { throw 'Proof must run in an interactive Windows session' }
 $userContext = [ordered]@{
     status = 'passed'
+    source_revision = $sourceRevision
     non_elevated = $true
     interactive_session = $true
     session_id = $sessionId
@@ -380,9 +390,14 @@ $reviewDecision = Get-Content -LiteralPath $reviewDecisions[0].FullName -Raw | C
 if ($reviewDecision.status -ne 'approved' -and $reviewDecision.decision -ne 'approved') {
     throw 'Retained local review decision was not approved'
 }
-Copy-Item `
-    -LiteralPath $reviewDecisions[0].FullName `
-    -Destination (Join-Path $evidenceRoot 'review-decision.json')
+$reviewEvidence = [ordered]@{
+    status = 'approved'
+    source_revision = $sourceRevision
+    product_artifact = $reviewDecision
+}
+Write-Utf8NoBom `
+    -LiteralPath (Join-Path $evidenceRoot 'review-decision.json') `
+    -Value ($reviewEvidence | ConvertTo-Json -Depth 20)
 $lifecycleResult = [ordered]@{
     status = 'passed'
     source_revision = $sourceRevision
@@ -457,7 +472,8 @@ try {
         '--base-url', 'http://127.0.0.1:17702',
         '--token-file', $tokenPath,
         '--evidence-root', $evidenceRoot,
-        '--server-pid', [string] $backgroundServerPid
+        '--server-pid', [string] $backgroundServerPid,
+        '--source-revision', $sourceRevision
     ) -LogName 'web-chat-proof.log'
     $chatResult = Get-Content -LiteralPath (Join-Path $evidenceRoot 'web-chat-result.json') -Raw |
         ConvertFrom-Json
@@ -506,7 +522,8 @@ Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
     (Join-Path $sourceRoot 'tools\windows-lab\runtime_proof.py'),
     'timeout-tree',
     '--work-root', (Join-Path $runRoot 'timeout-tree'),
-    '--evidence-root', $evidenceRoot
+    '--evidence-root', $evidenceRoot,
+    '--source-revision', $sourceRevision
 ) -LogName 'timeout-tree.log'
 Set-EvidenceClaim `
     -Id 'runtime.timeout-cleanup' `
@@ -774,6 +791,7 @@ try {
     }
     $autoResult = [ordered]@{
         status = 'passed'
+        source_revision = $sourceRevision
         concurrency = 2
         dispatched_specs = $startedIds
         blocked_dependent = 'auto-dependent'

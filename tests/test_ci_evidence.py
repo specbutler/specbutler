@@ -127,17 +127,31 @@ def _complete_fragments(
         junit,
         names=portable_names
         or (
-            "test_lifecycle",
-            "test_web",
-            "test_autopilot",
-            "test_tui",
+            "test_save_and_load_from_explicit_state_root",
+            "test_implement_command_dispatches_to_orchestrator",
+            "test_bearer_auth_allows_access",
+            "test_codex_session_resumes_thread_before_follow_up_turn",
+            "test_chat_provider_generator_cancel_terminates_and_reaps_process",
+            "test_autopilot_acquires_candidate_lease_before_launch",
+            "test_watch_command_non_tty_prints_once",
             "test_windows_docs_state_exact_supported_tier_and_exclusions",
             "test_windows_real_provider_proof_is_separately_marked_and_one_command",
         ),
     )
     _junit(
         focused,
-        names=("test_native_process", "test_installed_artifact_cli_matrix"),
+        names=(
+            "test_native_windows_volume_probe_reports_fixed_ntfs_checkout",
+            "test_repository_text_survives_utf8_mode_off",
+            "test_cross_process_spec_lock_contention",
+            "test_parent_child_grandchild_termination",
+            "test_spec_stop_terminates_owned_tree_without_touching_unrelated_process",
+            "test_local_review_timeout_reaps_tree_without_touching_unrelated_process",
+            "test_cleanup_reaps_registered_helper_and_preserves_unrelated_process",
+            "test_spec_init_output_is_accepted_by_doctor",
+            "test_foreground_web_bind_and_authenticated_request",
+            "test_installed_artifact_cli_matrix",
+        ),
         skipped_reason="run once in the Python 3.12 wheel job",
     )
     _junit(cli, names=("test_installed_artifact_cli_matrix",))
@@ -303,22 +317,19 @@ def test_incomplete_matrix_fails_without_partial_reports(tmp_path: Path) -> None
 
 def test_missing_required_coverage_test_fails_without_reports(tmp_path: Path) -> None:
     source, revision = _source_repo(tmp_path)
-    fragments = _complete_fragments(
-        tmp_path,
-        source,
-        revision,
-        portable_names=(
-            "test_lifecycle",
-            "test_windows_real_provider_proof_is_separately_marked_and_one_command",
-        ),
+    fragments = _complete_fragments(tmp_path, source, revision)
+    fragment_path = fragments / "linux-3.11.json"
+    fragment = json.loads(fragment_path.read_text(encoding="utf-8"))
+    fragment["details"]["portable_suite"]["passed_test_names"].remove(
+        "test_windows_docs_state_exact_supported_tier_and_exclusions"
     )
+    fragment_path.write_text(json.dumps(fragment), encoding="utf-8")
     output = tmp_path / "evidence"
 
     result = _aggregate(source, revision, fragments, output)
 
     assert result.returncode == 1
-    assert "lacks required tests" in result.stderr
-    assert "test_windows_docs_state_exact_supported_tier_and_exclusions" in result.stderr
+    assert "summary does not match its retained JUnit artifact" in result.stderr
     assert not output.exists()
 
 
@@ -358,7 +369,20 @@ def test_windows_server_skip_reason_blocks_probe_fragment(tmp_path: Path) -> Non
     source, revision = _source_repo(tmp_path)
     suite = tmp_path / "suite.xml"
     focused = tmp_path / "focused.xml"
-    _junit(suite)
+    _junit(
+        suite,
+        names=(
+            "test_save_and_load_from_explicit_state_root",
+            "test_implement_command_dispatches_to_orchestrator",
+            "test_bearer_auth_allows_access",
+            "test_codex_session_resumes_thread_before_follow_up_turn",
+            "test_chat_provider_generator_cancel_terminates_and_reaps_process",
+            "test_autopilot_acquires_candidate_lease_before_launch",
+            "test_watch_command_non_tty_prints_once",
+            "test_windows_docs_state_exact_supported_tier_and_exclusions",
+            "test_windows_real_provider_proof_is_separately_marked_and_one_command",
+        ),
+    )
     _junit(focused, skipped_reason="native Windows probe; skipped on Windows Server")
     output = tmp_path / "fragment.json"
 
@@ -384,6 +408,59 @@ def test_windows_server_skip_reason_blocks_probe_fragment(tmp_path: Path) -> Non
 
     assert result.returncode == 1
     assert "skipped for its platform" in result.stderr
+    assert not output.exists()
+
+
+def test_neutral_skip_reason_cannot_hide_required_windows_probe(tmp_path: Path) -> None:
+    source, revision = _source_repo(tmp_path)
+    suite = tmp_path / "suite.xml"
+    focused = tmp_path / "focused.xml"
+    _junit(
+        suite,
+        names=(
+            "test_save_and_load_from_explicit_state_root",
+            "test_implement_command_dispatches_to_orchestrator",
+            "test_bearer_auth_allows_access",
+            "test_codex_session_resumes_thread_before_follow_up_turn",
+            "test_chat_provider_generator_cancel_terminates_and_reaps_process",
+            "test_autopilot_acquires_candidate_lease_before_launch",
+            "test_watch_command_non_tty_prints_once",
+            "test_windows_docs_state_exact_supported_tier_and_exclusions",
+            "test_windows_real_provider_proof_is_separately_marked_and_one_command",
+        ),
+    )
+    _junit(
+        focused,
+        names=(
+            "test_native_windows_volume_probe_reports_fixed_ntfs_checkout",
+            "test_repository_text_survives_utf8_mode_off",
+        ),
+        skipped_reason="temporary infrastructure condition",
+    )
+    output = tmp_path / "fragment.json"
+
+    result = _record(
+        source,
+        revision,
+        output,
+        kind="windows-probe",
+        job="windows-probe",
+        runner_os="Windows",
+        extra=[
+            "--python-version",
+            "3.11",
+            "--distribution",
+            "wheel",
+            "--full-suite",
+            "--junit",
+            str(suite),
+            "--focused-junit",
+            str(focused),
+        ],
+    )
+
+    assert result.returncode == 1
+    assert "was skipped" in result.stderr
     assert not output.exists()
 
 

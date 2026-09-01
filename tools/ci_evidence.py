@@ -44,6 +44,29 @@ SMOKE_COMMANDS = [
 DOCUMENTATION_TEST = "test_windows_docs_state_exact_supported_tier_and_exclusions"
 REAL_PROVIDER_MARKER_TEST = "test_windows_real_provider_proof_is_separately_marked_and_one_command"
 HERMETIC_LIFECYCLE_TEST = "test_installed_artifact_cli_matrix"
+CROSS_PLATFORM_REQUIRED_TESTS = {
+    "test_save_and_load_from_explicit_state_root",
+    "test_implement_command_dispatches_to_orchestrator",
+    "test_bearer_auth_allows_access",
+    "test_codex_session_resumes_thread_before_follow_up_turn",
+    "test_chat_provider_generator_cancel_terminates_and_reaps_process",
+    "test_autopilot_acquires_candidate_lease_before_launch",
+    "test_watch_command_non_tty_prints_once",
+    DOCUMENTATION_TEST,
+    REAL_PROVIDER_MARKER_TEST,
+}
+WINDOWS_FOCUSED_REQUIRED_TESTS = {
+    "test_native_windows_volume_probe_reports_fixed_ntfs_checkout",
+    "test_repository_text_survives_utf8_mode_off",
+    "test_cross_process_spec_lock_contention",
+    "test_parent_child_grandchild_termination",
+    "test_spec_stop_terminates_owned_tree_without_touching_unrelated_process",
+    "test_local_review_timeout_reaps_tree_without_touching_unrelated_process",
+    "test_cleanup_reaps_registered_helper_and_preserves_unrelated_process",
+    "test_spec_init_output_is_accepted_by_doctor",
+    "test_foreground_web_bind_and_authenticated_request",
+}
+WINDOWS_FOCUSED_ALLOWED_SKIPS = {HERMETIC_LIFECYCLE_TEST}
 
 
 class EvidenceError(ValueError):
@@ -116,6 +139,16 @@ def _junit_summary(path: Path) -> dict[str, Any]:
     failures = sum(1 for case in cases if case.find("failure") is not None)
     errors = sum(1 for case in cases if case.find("error") is not None)
     skipped_nodes = [case.find("skipped") for case in cases if case.find("skipped") is not None]
+    passed_names = sorted(
+        str(case.get("name", ""))
+        for case in cases
+        if not any(case.find(kind) is not None for kind in ("failure", "error", "skipped"))
+    )
+    skipped_names = sorted(
+        str(case.get("name", ""))
+        for case in cases
+        if case.find("skipped") is not None
+    )
     if failures or errors:
         raise EvidenceError(f"JUnit evidence contains failures/errors: {path} ({failures}/{errors})")
     skipped_reasons = sorted(
@@ -134,6 +167,8 @@ def _junit_summary(path: Path) -> dict[str, Any]:
         "skipped": len(skipped_nodes),
         "skipped_reasons": skipped_reasons,
         "test_names": names,
+        "passed_test_names": passed_names,
+        "skipped_test_names": skipped_names,
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
 
@@ -172,9 +207,15 @@ def _record(args: argparse.Namespace) -> int:
             raise EvidenceError(f"{args.kind} evidence must come from a {expected_os} runner")
         if not args.python_version or not args.junit:
             raise EvidenceError(f"{args.kind} requires --python-version and --junit")
+        portable = _junit_summary(args.junit)
+        _require_passed_test_names(
+            portable,
+            CROSS_PLATFORM_REQUIRED_TESTS,
+            label=f"{args.kind} portable suite",
+        )
         details = {
             "python_version": args.python_version,
-            "portable_suite": _junit_summary(args.junit),
+            "portable_suite": portable,
         }
     elif args.kind == "windows-package":
         if github["runner_os"] != "Windows" or not args.dist_dir:
@@ -212,13 +253,24 @@ def _record(args: argparse.Namespace) -> int:
                 raise EvidenceError("full Windows probes require portable and focused JUnit")
             portable = _junit_summary(args.junit)
             focused = _junit_summary(args.focused_junit)
-            disallowed_skips = [
-                reason
-                for reason in focused["skipped_reasons"]
-                if "native windows probe" in reason.casefold() or "windows server" in reason.casefold()
-            ]
-            if disallowed_skips:
-                raise EvidenceError("Windows integration was skipped for its platform: " + ", ".join(disallowed_skips))
+            _require_passed_test_names(
+                portable,
+                CROSS_PLATFORM_REQUIRED_TESTS,
+                label="Windows portable suite",
+            )
+            unexpected_skips = sorted(
+                set(focused["skipped_test_names"]) - WINDOWS_FOCUSED_ALLOWED_SKIPS
+            )
+            if unexpected_skips:
+                raise EvidenceError(
+                    "Windows integration was skipped for its platform or another unsupported reason: "
+                    + ", ".join(unexpected_skips)
+                )
+            _require_passed_test_names(
+                focused,
+                WINDOWS_FOCUSED_REQUIRED_TESTS,
+                label="Windows focused integration suite",
+            )
             details.update(
                 {
                     "lint": "passed",
@@ -231,8 +283,13 @@ def _record(args: argparse.Namespace) -> int:
             if not args.cli_junit:
                 raise EvidenceError("CLI matrix probe requires --cli-junit")
             cli = _junit_summary(args.cli_junit)
-            if cli["skipped"] or "test_installed_artifact_cli_matrix" not in cli["test_names"]:
+            if cli["skipped"]:
                 raise EvidenceError("installed-artifact CLI matrix did not execute")
+            _require_passed_test_names(
+                cli,
+                {HERMETIC_LIFECYCLE_TEST},
+                label="installed-artifact CLI matrix",
+            )
             details["installed_cli_matrix_result"] = cli
     else:  # pragma: no cover - argparse enforces choices
         raise EvidenceError(f"unsupported fragment kind: {args.kind}")
@@ -319,6 +376,9 @@ def _require_passing_junit(summary: Any, *, label: str, fragment: dict[str, Any]
         raise EvidenceError(f"{label} ran no tests")
     if summary.get("failures") != 0 or summary.get("errors") != 0:
         raise EvidenceError(f"{label} contains failures or errors")
+    passed_names = summary.get("passed_test_names")
+    if not isinstance(passed_names, list) or not passed_names:
+        raise EvidenceError(f"{label} contains no passed tests")
     digest = summary.get("sha256")
     if not isinstance(digest, str) or len(digest) != 64:
         raise EvidenceError(f"{label} has no exact JUnit digest")
@@ -328,12 +388,15 @@ def _require_passing_junit(summary: Any, *, label: str, fragment: dict[str, Any]
     artifact = fragment["_fragment_path"].parent / artifact_name
     if not artifact.is_file() or hashlib.sha256(artifact.read_bytes()).hexdigest() != digest:
         raise EvidenceError(f"{label} retained JUnit artifact is missing or has changed")
+    retained = _junit_summary(artifact)
+    if retained != summary:
+        raise EvidenceError(f"{label} summary does not match its retained JUnit artifact")
 
 
-def _require_test_names(summary: Any, required: set[str], *, label: str) -> None:
-    if not isinstance(summary, dict) or not isinstance(summary.get("test_names"), list):
-        raise EvidenceError(f"{label} has no machine-readable test inventory")
-    names = {name for name in summary["test_names"] if isinstance(name, str)}
+def _require_passed_test_names(summary: Any, required: set[str], *, label: str) -> None:
+    if not isinstance(summary, dict) or not isinstance(summary.get("passed_test_names"), list):
+        raise EvidenceError(f"{label} has no machine-readable passed-test inventory")
+    names = {name for name in summary["passed_test_names"] if isinstance(name, str)}
     missing = sorted(required - names)
     if missing:
         raise EvidenceError(f"{label} lacks required tests: {', '.join(missing)}")
@@ -380,11 +443,21 @@ def _aggregate(args: argparse.Namespace) -> int:
             label=f"Linux {fragment['details'].get('python_version')} suite",
             fragment=fragment,
         )
+        _require_passed_test_names(
+            fragment["details"].get("portable_suite"),
+            CROSS_PLATFORM_REQUIRED_TESTS,
+            label=f"Linux {fragment['details'].get('python_version')} suite",
+        )
     _require_runner(macos[0], os_name="macOS", job="macos-test")
     _require_passing_junit(
         macos[0]["details"].get("portable_suite"),
         label="macOS suite",
         fragment=macos[0],
+    )
+    _require_passed_test_names(
+        macos[0]["details"].get("portable_suite"),
+        CROSS_PLATFORM_REQUIRED_TESTS,
+        label="macOS suite",
     )
     _require_runner(windows_package, os_name="Windows", job="windows-package")
     package_details = windows_package["details"]
@@ -420,11 +493,24 @@ def _aggregate(args: argparse.Namespace) -> int:
             label=f"Windows {details['python_version']} portable suite",
             fragment=fragment,
         )
+        _require_passed_test_names(
+            details.get("portable_suite_result"),
+            CROSS_PLATFORM_REQUIRED_TESTS,
+            label=f"Windows {details['python_version']} portable suite",
+        )
         _require_passing_junit(
             details.get("windows_integration_result"),
             label=f"Windows {details['python_version']} integration suite",
             fragment=fragment,
         )
+        _require_passed_test_names(
+            details.get("windows_integration_result"),
+            WINDOWS_FOCUSED_REQUIRED_TESTS,
+            label=f"Windows {details['python_version']} integration suite",
+        )
+        skipped_names = details["windows_integration_result"].get("skipped_test_names")
+        if not isinstance(skipped_names, list) or set(skipped_names) - WINDOWS_FOCUSED_ALLOWED_SKIPS:
+            raise EvidenceError("Windows focused integration contains unexpected skipped tests")
     cli_probe = next(item for item in wheel_probes if item["details"]["python_version"] == "3.12")
     if "installed_cli_matrix_result" not in cli_probe["details"]:
         raise EvidenceError("Python 3.12 wheel probe lacks installed CLI evidence")
@@ -433,14 +519,14 @@ def _aggregate(args: argparse.Namespace) -> int:
         label="Windows installed CLI matrix",
         fragment=cli_probe,
     )
-    _require_test_names(
+    _require_passed_test_names(
         cli_probe["details"]["installed_cli_matrix_result"],
         {HERMETIC_LIFECYCLE_TEST},
         label="Windows installed CLI matrix",
     )
-    _require_test_names(
+    _require_passed_test_names(
         cli_probe["details"]["portable_suite_result"],
-        {DOCUMENTATION_TEST, REAL_PROVIDER_MARKER_TEST},
+        CROSS_PLATFORM_REQUIRED_TESTS,
         label="Windows portable suite",
     )
 

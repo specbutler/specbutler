@@ -378,6 +378,32 @@ def audit(
         },
     ]
     global_results = [_evaluate_check(check, evidence_root, source_revision) for check in provenance_checks]
+    # Every machine-readable result named by the evidence contract must attest
+    # the exact source revision.  Keeping this invariant here (instead of relying
+    # on each criterion author to remember an extra check) prevents a current
+    # provenance file from being combined with stale passing result JSON.
+    result_artifacts = sorted(
+        {
+            str(check["artifact"])
+            for entry in entries
+            for check in entry["checks"]
+            if str(check.get("artifact", "")).endswith(".json")
+        }
+    )
+    global_results.extend(
+        _evaluate_check(
+            {
+                "id": f"global.artifact-revision.{artifact}",
+                "op": "json_equals",
+                "artifact": artifact,
+                "pointer": "/source_revision",
+                "expected": "${SOURCE_REVISION}",
+            },
+            evidence_root,
+            source_revision,
+        )
+        for artifact in result_artifacts
+    )
     global_results.extend(
         _source_checkout_checks(
             source_root=source_root,

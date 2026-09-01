@@ -36,6 +36,15 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
+def _source_revision(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if len(normalized) != 40 or any(character not in "0123456789abcdef" for character in normalized):
+        raise ProofFailure("source revision must be an exact 40-character Git SHA")
+    return normalized
+
+
 def _request(
     base_url: str,
     path: str,
@@ -250,6 +259,9 @@ def prove_chat(args: argparse.Namespace) -> int:
         "status": "failed",
         "transport": "authenticated HTTP with server-sent event streaming",
     }
+    revision = _source_revision(args.source_revision)
+    if revision is not None:
+        result["source_revision"] = revision
     try:
         try:
             _json_request(base_url, "/api/v1/chat/backends")
@@ -498,6 +510,9 @@ def prove_timeout_tree(args: argparse.Namespace) -> int:
         "tree_depth": 3,
         "processes_remaining": remaining,
     }
+    revision = _source_revision(args.source_revision)
+    if revision is not None:
+        result["source_revision"] = revision
     _write_json(evidence_root / "timeout-tree-result.json", result)
     if result["status"] != "passed":
         raise ProofFailure(f"timeout cleanup failed: {result}")
@@ -512,10 +527,12 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--token-file", required=True)
     chat.add_argument("--evidence-root", required=True)
     chat.add_argument("--server-pid", required=True, type=int)
+    chat.add_argument("--source-revision")
     chat.set_defaults(function=prove_chat)
     timeout_tree = subparsers.add_parser("timeout-tree")
     timeout_tree.add_argument("--work-root", required=True)
     timeout_tree.add_argument("--evidence-root", required=True)
+    timeout_tree.add_argument("--source-revision")
     timeout_tree.set_defaults(function=prove_timeout_tree)
     return parser
 

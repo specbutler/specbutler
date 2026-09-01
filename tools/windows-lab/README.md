@@ -63,9 +63,10 @@ its generated password, or run untrusted source inside it.
 
 ## One-command release proof
 
-After the baseline and provider/forge sign-in exist, one command resets the VM,
-stages the configured tracked source revision, reprovisions idempotently, runs
-the proof in the console session, and retrieves redacted evidence:
+After the baseline, provider/forge sign-in, and independently produced external
+evidence for the same revision exist, one command resets the VM, stages the
+configured tracked source revision, reprovisions idempotently, runs the proof in
+the console session, imports that evidence, and performs the final audit:
 
 ```bash
 ./labctl proof
@@ -94,7 +95,9 @@ The proof:
 8. retains the exact staged Git revision and sanitized logs under
    `tools/windows-lab/artifacts/<run-name>/`, then evaluates every one of the
    26 acceptance criteria in the three Windows specs against the checked-in
-   evidence contract.
+   evidence contract. The command fails before claiming completion if the
+   external bundle is missing, belongs to another revision/run, or would
+   overwrite a local result.
 
 Before the controller audit, `local_acceptance.py` parses the two JUnit reports
 and requires exact, unskipped test names for each local claim. It also validates
@@ -134,6 +137,7 @@ at its absolute state directory instead of copying the VM disks:
 SPEC_WINDOWS_LAB_STATE_ROOT=/absolute/path/to/windows-lab/state \
 SPEC_WINDOWS_LAB_CONFIG=/absolute/path/to/lab.env \
 SPEC_WINDOWS_TOOLCHAIN_CONFIG=/absolute/path/to/toolchain.json \
+SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT=/absolute/path/to/exact-revision-evidence \
 ./labctl proof
 ```
 
@@ -183,8 +187,9 @@ Windows wheel, Windows source-distribution, native integration, lint, and
 installed-CLI matrices pass and a fail-closed aggregation job confirms every
 fragment belongs to one workflow run and one exact checkout SHA. This includes
 the static documentation and hermetic-test coverage reports; it does not claim
-that the separately marked real-provider test passed. Download the combined
-artifact and copy it into the sanitized VM evidence directory:
+that the separately marked real-provider test passed. Assemble the hosted
+artifact and independently produced Linux Claude result in one external
+directory before invoking the proof:
 
 ```bash
 run_id=<github-actions-run-id>
@@ -202,9 +207,16 @@ payload = json.load(open(sys.argv[1], encoding="utf-8"))
 if payload.get("status") != "passed" or payload.get("source_revision") != sys.argv[2]:
     raise SystemExit("hosted CI evidence does not match this checkout")
 PY
-find "$ci_evidence" -maxdepth 2 -type f -name '*-result.json' \
-  -exec cp {} "tools/windows-lab/artifacts/<run-name>/" \;
+cp /path/to/linux-claude-web-result.json "$ci_evidence/"
+export SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT="$ci_evidence"
+./labctl proof
 ```
+
+`labctl proof` locates exactly one required result and one hosted evidence index
+under that root, verifies every result's exact source revision and the common
+hosted workflow identity, and imports only the five non-local result files. It
+never overwrites locally produced evidence. This removes the prior manual
+copy-and-re-audit step while preserving independent evidence provenance.
 
 GitHub pull-request workflows normally test GitHub's synthetic merge commit;
 that exact revision is recorded in every report. It cannot be combined with VM
@@ -224,13 +236,13 @@ python3 tools/ci_evidence.py aggregate \
   --expected-revision "$(git rev-parse HEAD)"
 ```
 
-The local proof deliberately does not create
+The local VM job deliberately does not create
 `hosted-windows-ci-result.json`, `hosted-windows-smoke-result.json`,
 `cross-platform-lifecycle-result.json`, `cross-platform-web-result.json`, or
 `linux-claude-web-result.json`. Those claims require their named hosted,
-macOS/Linux, or real-Claude runs. Until independently produced artifacts for
-the exact staged revision are retained beside the VM evidence, the fail-closed
-audit reports those criteria as `unproven`.
+macOS/Linux, or real-Claude runs. The host-side `labctl proof` therefore requires
+them as its external evidence input and imports them only after the local run is
+collected and redacted.
 
 Produce the real-Claude artifact on an authenticated Linux host from the same
 clean revision, then retain it beside the collected VM evidence:

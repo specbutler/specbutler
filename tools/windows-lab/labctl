@@ -419,9 +419,16 @@ job_logs() {
 collect_artifacts() {
     local name="${1:-}"
     local destination="${2:-$LAB_ROOT/artifacts/$name}"
+    local revision="${3:-}"
     validate_name "$name"
     require_command unzip
     local raw="$STATE_ROOT/raw/$name"
+    if [ -e "$raw" ] && find "$raw" -type f -print -quit | grep -q .; then
+        die "raw artifact directory is not empty; refusing to mix runs: $raw"
+    fi
+    if [ -e "$destination" ] && find "$destination" -type f -print -quit | grep -q .; then
+        die "artifact destination is not empty; refusing to mix runs: $destination"
+    fi
     mkdir -p "$raw" "$destination"
     guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.log" "$raw/job.log" 2>/dev/null || true
     guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.done.json" "$raw/job.done.json" 2>/dev/null || true
@@ -431,7 +438,11 @@ collect_artifacts() {
         rm -f -- "$raw/evidence.zip"
     fi
     find "$raw" -type f -print -quit | grep -q . || die "no artifacts were available for job $name"
-    python3 "$LAB_ROOT/redact.py" "$raw" "$destination"
+    if [ -n "$revision" ]; then
+        python3 "$LAB_ROOT/redact.py" "$raw" "$destination" "$revision"
+    else
+        python3 "$LAB_ROOT/redact.py" "$raw" "$destination"
+    fi
     printf '%s\n' "$destination"
 }
 
@@ -439,7 +450,10 @@ run_proof() {
     load_config
     : "${LAB_BASELINE:?LAB_BASELINE is required for a repeatable proof}"
     : "${LAB_GITHUB_OWNER:?LAB_GITHUB_OWNER is required for the real-provider proof}"
+    : "${SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT:?SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT is required for the complete release audit}"
     [[ "$LAB_GITHUB_OWNER" != *'<'* ]] || die "LAB_GITHUB_OWNER still contains a placeholder"
+    [[ "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" = /* ]] || die "SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT must be an absolute path"
+    test -d "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" || die "external acceptance evidence root does not exist: $SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT"
     validate_name "$LAB_BASELINE"
     if vm_running; then
         shutdown_lab
@@ -472,9 +486,20 @@ PY
         proof_status=$?
     fi
     local destination="$LAB_ROOT/artifacts/$name"
-    collect_artifacts "$name" "$destination"
+    collect_artifacts "$name" "$destination" "$revision"
+    local external_status=0
+    if python3 "$LAB_ROOT/import_external_evidence.py" \
+        --source "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" \
+        --destination "$destination" \
+        --expected-revision "$revision"; then
+        external_status=0
+    else
+        external_status=$?
+    fi
     rm -f -- "$destination/lab-controller-result.json"
-    if ! python3 - "$destination/lab-controller-static-result.json" "$destination/lab-controller-result.json" "$revision" <<'PY'
+    if (( proof_status != 0 )); then
+        printf '%s\n' "windows-lab: guest proof failed; controller success evidence will not be produced" >&2
+    elif ! python3 - "$destination/lab-controller-static-result.json" "$destination/lab-controller-result.json" "$revision" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -534,6 +559,9 @@ PY
     fi
     if (( proof_status != 0 )); then
         return "$proof_status"
+    fi
+    if (( external_status != 0 )); then
+        return "$external_status"
     fi
     return "$audit_status"
 }
