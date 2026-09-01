@@ -88,6 +88,12 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "adoption_generation -ne 1" in proof
     assert "blocked_dependent_dispatch_count = 0" in proof
     assert "Set-EvidenceClaim" in proof
+    assert "Proof must run with a non-elevated user token" in proof
+    register_job = (LAB_ROOT / "register-job.ps1").read_text(encoding="utf-8")
+    assert "-RunLevel Limited" in register_job
+    assert "-RunLevel Highest" not in register_job
+    provision = (LAB_ROOT / "provision.ps1").read_text(encoding="utf-8")
+    assert 'icacls.exe $harnessRoot /grant:r "${account}:(OI)(CI)M" /T /C' in provision
 
 
 def test_windows_lab_inputs_are_placeholder_only_and_private_state_is_ignored() -> None:
@@ -306,6 +312,7 @@ def test_windows_docs_state_exact_supported_tier_and_exclusions() -> None:
         "UNC/network",
         "Microsoft Excel",
         "outside Spec Butler's support scope",
+        "non-elevated PowerShell",
     ):
         assert statement in docs
 
@@ -316,6 +323,9 @@ def test_windows_docs_state_exact_supported_tier_and_exclusions() -> None:
     assert "Native Windows is not supported" not in release_surfaces
     assert "docs/windows.md" in (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     assert "docs/windows.md" in (REPO_ROOT / "INSTALL.md").read_text(encoding="utf-8")
+    assert "install_command_windows = '" in docs
+    assert 'install_shell_windows = "powershell"' in docs
+    assert 'argv_windows = [".venv/Scripts/python.exe", "-m", "pytest"]' in docs
 
 
 def test_windows_real_provider_proof_is_separately_marked_and_one_command() -> None:

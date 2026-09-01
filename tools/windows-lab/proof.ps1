@@ -110,6 +110,24 @@ function Set-EvidenceClaim {
         -Value ($script:evidenceClaims | ConvertTo-Json -Depth 8)
 }
 
+$windowsIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$windowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($windowsIdentity)
+$isElevated = $windowsPrincipal.IsInRole(
+    [System.Security.Principal.WindowsBuiltInRole]::Administrator
+)
+$sessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+if ($isElevated) { throw 'Proof must run with a non-elevated user token' }
+if ($sessionId -le 0) { throw 'Proof must run in an interactive Windows session' }
+$userContext = [ordered]@{
+    status = 'passed'
+    non_elevated = $true
+    interactive_session = $true
+    session_id = $sessionId
+}
+Write-Utf8NoBom `
+    -LiteralPath (Join-Path $evidenceRoot 'user-context.json') `
+    -Value ($userContext | ConvertTo-Json -Depth 4)
+
 $recordedRevision = (Get-Content -LiteralPath (Join-Path $sourceRoot '.lab-source-revision') -Raw).Trim()
 if ($recordedRevision -ne $sourceRevision) { throw 'Staged source revision does not match proof configuration' }
 if ($sourceRevision -notmatch '^[0-9a-f]{40}$') { throw 'Proof source revision must be an exact Git commit SHA' }
@@ -237,13 +255,16 @@ review_default = "codex"
 allowed = ["codex"]
 
 [bootstrap]
-install_command = '$wheelPython -m venv --system-site-packages .venv; C:\Windows\System32\cmd.exe /d /c "echo $wheelVenv\Lib\site-packages>.venv\Lib\site-packages\spec-proof-parent.pth"; .venv\Scripts\python.exe -m pip install --no-build-isolation --no-deps -e .'
+install_command = 'python -m venv .venv && .venv/bin/python -m pip install --no-build-isolation --no-deps -e .'
+install_command_windows = '$wheelPython -m venv --system-site-packages .venv; C:\Windows\System32\cmd.exe /d /c "echo $wheelVenv\Lib\site-packages>.venv\Lib\site-packages\spec-proof-parent.pth"; .venv\Scripts\python.exe -m pip install --no-build-isolation --no-deps -e .'
+install_shell_windows = "powershell"
 
 [verify]
 
 [[verify.gates]]
 name = "test"
-command = '.venv\Scripts\python.exe -m pytest -q'
+command = '.venv/bin/python -m pytest -q'
+argv_windows = [".venv/Scripts/python.exe", "-m", "pytest", "-q"]
 parallel = true
 "@
 Write-Utf8NoBom -LiteralPath (Join-Path $fixtureRoot 'specs\add-numbers.md') -Value @'
@@ -336,6 +357,7 @@ $lifecycleResult = [ordered]@{
     status = 'passed'
     source_revision = $sourceRevision
     provider = 'codex'
+    non_elevated = $true
     pull_request_merged = $true
     merged_pull_request = $merged[0].url
     provenance_tag_present = $true

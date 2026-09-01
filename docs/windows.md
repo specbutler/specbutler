@@ -51,6 +51,9 @@ Configure Git's long-path support from an elevated PowerShell once:
 git config --system core.longpaths true
 ```
 
+Run the remaining setup and all Spec Butler commands from an ordinary,
+non-elevated PowerShell session.
+
 Keep the repository on a local NTFS drive (for example `C:\src\project`), then
 authenticate and initialize it:
 
@@ -75,18 +78,23 @@ review_default = "codex"
 allowed = ["codex"]
 
 [bootstrap]
-install_command = 'python -m venv .venv; .venv\Scripts\python.exe -m pip install -e ".[dev]"'
+install_command = 'python -m venv .venv && .venv/bin/python -m pip install -e ".[dev]"'
+install_command_windows = 'python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -e ".[dev]"'
+install_shell_windows = "powershell"
 
 [verify]
 
 [[verify.gates]]
 name = "test"
-command = '.venv\Scripts\python.exe -m pytest'
+command = '.venv/bin/python -m pytest'
+argv_windows = [".venv/Scripts/python.exe", "-m", "pytest"]
 parallel = true
 ```
 
-The implementation bootstrap may download dependencies. The same command is
-also attempted before local review inside Codex's model-free sandbox, where
+The Windows-specific command and shell are required for a PowerShell script;
+the portable `install_command` remains the POSIX fallback. The implementation
+bootstrap may download dependencies. The same selected command is also
+attempted before local review inside Codex's model-free sandbox, where
 network access and operator-profile reads are deliberately denied. If the
 command requires a package download, Spec Butler records a review-environment
 warning and continues with a diff-only review. To let the reviewer run tests,

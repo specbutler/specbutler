@@ -1,5 +1,10 @@
 $ErrorActionPreference = 'Stop'
-$root = 'C:\SpecHarness\toolchain'
+$harnessRoot = 'C:\SpecHarness'
+$account = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+& icacls.exe $harnessRoot /grant:r "${account}:(OI)(CI)M" /T /C | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Failed to grant the lab user modify access to the harness workspace' }
+
+$root = Join-Path $harnessRoot 'toolchain'
 $manifest = Get-Content -LiteralPath (Join-Path $root 'toolchain.json') -Raw | ConvertFrom-Json
 
 function Get-VerifiedArtifact {

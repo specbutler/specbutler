@@ -106,6 +106,10 @@ delete it manually after retaining the release evidence. `proof` is intentionall
 opt-in because it creates that external repository and consumes real provider
 capacity. Microsoft and provider authentication may need renewal between runs.
 
+Provisioning uses the administrative SSH control plane. Interactive proof jobs
+use the logged-on account's filtered, non-elevated token and fail unless they are
+in a real desktop session; this matches the documented day-to-day Windows tier.
+
 Raw artifacts remain under ignored `state/raw/`; the publishable copy passes
 through `redact.py`. The sanitized directory contains
 `_redaction-report.json`, including the replacement count and a post-redaction

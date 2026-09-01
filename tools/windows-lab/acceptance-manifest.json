@@ -304,6 +304,9 @@
       "text": "The local Windows 11 proof run installs the release candidate wheel and executes a real Codex lifecycle, real multi-turn web chat, cancellation/timeout tree cleanup, autopilot dependency dispatch, restart recovery, and a real disposable GitHub PR/merge. Logs and machine-readable results are retained as release evidence with secrets redacted.",
       "checks": [
         {"id": "release.4.lifecycle", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.4.user-context", "op": "json_equals", "artifact": "user-context.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.4.non-elevated", "op": "json_equals", "artifact": "user-context.json", "pointer": "/non_elevated", "expected": true},
+        {"id": "release.4.interactive", "op": "json_equals", "artifact": "user-context.json", "pointer": "/interactive_session", "expected": true},
         {"id": "release.4.chat", "op": "json_equals", "artifact": "web-chat-result.json", "pointer": "/status", "expected": "passed"},
         {"id": "release.4.timeout", "op": "json_equals", "artifact": "timeout-tree-result.json", "pointer": "/status", "expected": "passed"},
         {"id": "release.4.timeout-clean", "op": "json_equals", "artifact": "timeout-tree-result.json", "pointer": "/processes_remaining", "expected": []},
