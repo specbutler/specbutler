@@ -18,7 +18,7 @@ services:
       LAB_MEMORY: "${LAB_MEMORY:-16G}"
     volumes:
       - "${WINDOWS_ISO}:/iso/windows.iso:ro"
-      - ./state:/state
+      - "${SPEC_WINDOWS_LAB_STATE_ROOT:-./state}:/state"
     tmpfs:
       - /run:size=64m,mode=0700,uid=${LAB_UID},gid=${LAB_GID}
     ports:

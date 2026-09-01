@@ -73,6 +73,8 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "job_submit" in controller
     assert "job_wait" in controller
     assert "collect_artifacts" in controller
+    assert 'STATE_ROOT="${SPEC_WINDOWS_LAB_STATE_ROOT:-$LAB_ROOT/state}"' in controller
+    assert 'SPEC_WINDOWS_LAB_STATE_ROOT="$STATE_ROOT"' in controller
     proof = (LAB_ROOT / "proof.ps1").read_text(encoding="utf-8")
     assert "-m', 'pytest'" in proof
     assert "'repo', 'create'" in proof
@@ -286,6 +288,7 @@ def test_windows_lab_scripts_parse_and_compose_is_loopback_only() -> None:
     assert service["devices"] == ["/dev/kvm:/dev/kvm"]
     assert service["restart"] == "no"
     assert all(str(port).startswith("127.0.0.1:") for port in service["ports"])
+    assert "${SPEC_WINDOWS_LAB_STATE_ROOT:-./state}:/state" in service["volumes"]
 
 
 def test_windows_docs_state_exact_supported_tier_and_exclusions() -> None:

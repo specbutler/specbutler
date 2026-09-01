@@ -3,7 +3,7 @@ set -euo pipefail
 
 LAB_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$LAB_ROOT/../.." && pwd)"
-STATE_ROOT="$LAB_ROOT/state"
+STATE_ROOT="${SPEC_WINDOWS_LAB_STATE_ROOT:-$LAB_ROOT/state}"
 CONFIG_FILE="${SPEC_WINDOWS_LAB_CONFIG:-$LAB_ROOT/lab.env}"
 TOOLCHAIN_FILE="${SPEC_WINDOWS_TOOLCHAIN_CONFIG:-$LAB_ROOT/toolchain.json}"
 IDENTITY_FILE="$STATE_ROOT/identity.env"
@@ -74,7 +74,8 @@ load_identity() {
 compose() {
     load_config
     load_identity
-    docker compose --project-directory "$LAB_ROOT" -f "$LAB_ROOT/compose.yaml" "$@"
+    SPEC_WINDOWS_LAB_STATE_ROOT="$STATE_ROOT" \
+        docker compose --project-directory "$LAB_ROOT" -f "$LAB_ROOT/compose.yaml" "$@"
 }
 
 vm_running() {

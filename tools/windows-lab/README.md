@@ -110,6 +110,20 @@ through `redact.py`. The sanitized directory contains
 scan for every recognized credential shape. Redaction is a backstop, not
 permission to print secrets.
 
+To reuse one provisioned lab from multiple source worktrees, point the controller
+at its absolute state directory instead of copying the VM disks:
+
+```bash
+SPEC_WINDOWS_LAB_STATE_ROOT=/absolute/path/to/windows-lab/state \
+SPEC_WINDOWS_LAB_CONFIG=/absolute/path/to/lab.env \
+SPEC_WINDOWS_TOOLCHAIN_CONFIG=/absolute/path/to/toolchain.json \
+./labctl proof
+```
+
+The override is intentionally environment-only: it keeps the reusable disk,
+identity, SSH key, and authentication state outside every source checkout while
+each agent stages the exact commit from its own worktree.
+
 ## Controller commands
 
 | Command | Purpose |
