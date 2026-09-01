@@ -238,20 +238,25 @@ class TestGitHubForgeProtocol:
         assert captured["cwd"] == tmp_path
 
     def test_merge_pr_can_match_expected_head(self, tmp_path):
-        captured = {}
+        calls = []
 
         def run_fn(cmd, cwd=None, **kw):
-            captured["cmd"] = cmd
-            captured["cwd"] = cwd
-            captured["timeout"] = kw.get("timeout")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            calls.append((cmd, cwd, kw))
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"state":"MERGED","headRefOid":"abc123","autoMergeRequest":null}',
+                stderr="",
+            )
 
         forge = GitHubForge(run_fn=run_fn)
 
         result = forge.merge_pr(12, method="squash", auto=True, expected_head_sha="abc123", cwd=tmp_path)
 
         assert result.ok is True
-        assert captured["cmd"] == [
+        assert calls[0][0] == [
             "gh",
             "pr",
             "merge",
@@ -261,8 +266,38 @@ class TestGitHubForgeProtocol:
             "--match-head-commit",
             "abc123",
         ]
-        assert captured["cwd"] == tmp_path
-        assert captured["timeout"] == AUTO_MERGE_ARM_TIMEOUT_SECONDS
+        assert calls[0][1] == tmp_path
+        assert calls[0][2]["timeout"] == AUTO_MERGE_ARM_TIMEOUT_SECONDS
+        assert calls[1][0] == [
+            "gh",
+            "pr",
+            "view",
+            "12",
+            "--json",
+            "state,autoMergeRequest,headRefOid",
+        ]
+
+    def test_merge_pr_auto_success_without_recorded_request_falls_back(self, tmp_path):
+        def run_fn(cmd, cwd=None, **kw):  # noqa: ARG001
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"state":"OPEN","headRefOid":"abc123","autoMergeRequest":null}',
+                stderr="",
+            )
+
+        result = GitHubForge(run_fn=run_fn).merge_pr(
+            12,
+            auto=True,
+            expected_head_sha="abc123",
+            cwd=tmp_path,
+        )
+
+        assert result.ok is False
+        assert "auto-merge is not enabled" in result.message
+        assert "no auto-merge request" in result.message
 
     def test_merge_pr_auto_timeout_returns_after_confirming_auto_merge_is_armed(self, tmp_path):
         calls = []

@@ -477,6 +477,38 @@ class GitHubForge:
             args.append("--auto")
         if expected_head_sha:
             args.extend(["--match-head-commit", expected_head_sha])
+        def confirm_auto_merge() -> tuple[bool, str]:
+            confirmation = self._gh(
+                [
+                    "pr",
+                    "view",
+                    str(pr_number),
+                    "--json",
+                    "state,autoMergeRequest,headRefOid",
+                ],
+                cwd=cwd,
+            )
+            if confirmation.returncode != 0:
+                detail = (confirmation.stderr or confirmation.stdout or "").strip()
+                return False, detail or "GitHub CLI could not query the resulting PR state"
+            try:
+                payload = json.loads(confirmation.stdout or "{}")
+            except (json.JSONDecodeError, TypeError):
+                return False, "GitHub CLI returned an invalid PR state response"
+            head_matches = not expected_head_sha or (
+                isinstance(payload, dict)
+                and str(payload.get("headRefOid", "")).lower() == expected_head_sha.lower()
+            )
+            if not head_matches:
+                return False, "the PR head changed while enabling auto-merge"
+            merge_confirmed = isinstance(payload, dict) and (
+                str(payload.get("state", "")).upper() == "MERGED"
+                or payload.get("autoMergeRequest") is not None
+            )
+            if merge_confirmed:
+                return True, ""
+            return False, "the PR is still open and has no auto-merge request"
+
         try:
             result = self._gh(
                 args,
@@ -490,32 +522,9 @@ class GitHubForge:
             # status reset by draft-to-ready workflows). Confirm the mutation
             # took effect, then return control to the orchestrator's bounded
             # merge poll loop.
-            confirmation = self._gh(
-                [
-                    "pr",
-                    "view",
-                    str(pr_number),
-                    "--json",
-                    "state,autoMergeRequest,headRefOid",
-                ],
-                cwd=cwd,
-            )
-            if confirmation.returncode == 0:
-                try:
-                    payload = json.loads(confirmation.stdout or "{}")
-                except (json.JSONDecodeError, TypeError):
-                    payload = {}
-                head_matches = not expected_head_sha or (
-                    isinstance(payload, dict)
-                    and str(payload.get("headRefOid", "")).lower()
-                    == expected_head_sha.lower()
-                )
-                merge_confirmed = isinstance(payload, dict) and (
-                    str(payload.get("state", "")).upper() == "MERGED"
-                    or payload.get("autoMergeRequest") is not None
-                )
-                if head_matches and merge_confirmed:
-                    return MergeResult(ok=True, message="auto-merge armed; gh wait detached")
+            confirmed, _detail = confirm_auto_merge()
+            if confirmed:
+                return MergeResult(ok=True, message="auto-merge armed; gh wait detached")
             return MergeResult(
                 ok=False,
                 message=(
@@ -525,6 +534,16 @@ class GitHubForge:
             )
         if result.returncode != 0:
             return MergeResult(ok=False, message=result.stderr.strip())
+        if auto:
+            confirmed, detail = confirm_auto_merge()
+            if not confirmed:
+                return MergeResult(
+                    ok=False,
+                    message=(
+                        "auto-merge is not enabled: GitHub CLI exited successfully, but "
+                        f"{detail}"
+                    ),
+                )
         return MergeResult(ok=True)
 
     def set_commit_status(
