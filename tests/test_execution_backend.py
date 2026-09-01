@@ -4358,6 +4358,9 @@ class TestOrchestratorBackendSeam:
             run_id="my-feature-20260101T000000",
             spec_id="my-feature",
             branch="spec/my-feature",
+            # Keep this backend-seam test independent of the intentional
+            # native-Windows Claude fail-closed boundary.
+            agent="codex",
         )
         worktree = tmp_path / ".worktrees" / "spec-my-feature"
         worktree.mkdir(parents=True)
