@@ -28,11 +28,14 @@ REQUIRED_FILES = {
     "README.md",
     "bootstrap.ps1.template",
     "compose.yaml",
+    "disarm-autologon.ps1",
     "entrypoint.sh",
+    "ensure-console-session.ps1",
     "import_external_evidence.py",
     "job-runner.ps1",
     "lab.env.example",
     "labctl",
+    "launch_attestation.py",
     "local_acceptance.py",
     "proof.ps1",
     "provision.ps1",
@@ -87,6 +90,9 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert 'mkdir -p "$STATE_ROOT/incoming"' in controller
     assert "job_submit" in controller
     assert "job_wait" in controller
+    assert "ensure_console_session" in controller
+    assert "guest_ssh_stdin" in controller
+    assert "cleanup_job_task" in controller
     assert "collect_artifacts" in controller
     assert 'STATE_ROOT="${SPEC_WINDOWS_LAB_STATE_ROOT:-$LAB_ROOT/state}"' in controller
     assert 'SPEC_WINDOWS_LAB_STATE_ROOT="$STATE_ROOT"' in controller
@@ -153,13 +159,46 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     register_job = (LAB_ROOT / "register-job.ps1").read_text(encoding="utf-8")
     assert "-RunLevel Limited" in register_job
     assert "-RunLevel Highest" not in register_job
+    assert register_job.index("$desktopSessions") < register_job.index("Register-ScheduledTask")
+    assert register_job.index("Start-ScheduledTask") < register_job.index("$receipt")
+    assert "launch_nonce" in register_job
+    assert "Unregister-ScheduledTask" in register_job
+    runner = (LAB_ROOT / "job-runner.ps1").read_text(encoding="utf-8")
+    assert "LaunchNonce" in runner
+    assert "started.json.tmp" in runner
+    assert runner.index("Move-Item -LiteralPath $startedTemp") < runner.index("& powershell.exe")
+    assert runner.index("Move-Item -LiteralPath $startedTemp") < runner.index("$releaseDeadline")
+    assert runner.index("$releasedNonce -cne $LaunchNonce") < runner.index("& powershell.exe")
+    console_session = (LAB_ROOT / "ensure-console-session.ps1").read_text(encoding="utf-8")
+    assert "[Console]::In.ReadToEnd()" in console_session
+    assert "DefaultPassword" in console_session
+    assert "Remove-ItemProperty" in console_session
+    assert "AutoLogonCount" in console_session
+    assert console_session.index("Register-ScheduledTask") < console_session.index("DefaultPassword")
+    assert "-Value 1 -PropertyType DWord" in console_session
+    assert "disarm-autologon.ps1" in console_session
+    assert controller.index("ensure_console_session()") < controller.index("job_submit()")
+    assert '"$STATE_ROOT/secrets/admin-password"' in controller
+    assert "-Mode Arm' >/dev/null" in controller
+    assert "-Mode Disarm' >/dev/null" in controller
+    assert "interactive job $name returned to Ready" in controller
+    assert "capture_launch_attestation" in controller
+    launch_attestation = (LAB_ROOT / "launch_attestation.py").read_text(encoding="utf-8")
+    assert "captured-before-release" in launch_attestation
+    assert "receipt_sha256" in launch_attestation
+    assert controller.index('capture_launch_attestation "$name" "$nonce"') < controller.index("$name.release")
+    release_command = controller[controller.index("$name.release") :]
+    assert release_command.index("WriteAllText") < release_command.index("Move-Item")
+    arm_call = controller[controller.index("guest_ssh_stdin") : controller.index("Restart-Computer")]
+    assert "if ! guest_ssh_stdin" in arm_call
+    assert "shutdown_lab" in arm_call
+    assert 'guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.started.json"' in controller
     provision = (LAB_ROOT / "provision.ps1").read_text(encoding="utf-8")
     assert 'icacls.exe $harnessRoot /grant:r "${account}:(OI)(CI)M" /T /C' in provision
     assert "-Filter 'codex-code-mode-host-*.exe'" in provision
     assert "$codexHostAlias = Join-Path $codexRoot 'codex-code-mode-host.exe'" in provision
     assert "$codexHostSourceHash -ne $codexHostAliasHash" in provision
     assert "Codex code-mode host is missing from its required canonical path" in proof
-    runner = (LAB_ROOT / "job-runner.ps1").read_text(encoding="utf-8")
     assert '$env:TEMP = $temp' in runner
     assert '$env:TMP = $temp' in runner
     assert 'python3 "$LAB_ROOT/audit_acceptance.py"' in controller
@@ -177,6 +216,8 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "require_stopped" in retention
     env_example = (LAB_ROOT / "lab.env.example").read_text(encoding="utf-8")
     assert "LAB_SHUTDOWN_TIMEOUT_SECONDS=600" in env_example
+    assert "LAB_INTERACTIVE_SESSION_GRACE_SECONDS=30" in env_example
+    assert "LAB_INTERACTIVE_SESSION_REPAIR=1" in env_example
     assert "LAB_PROOF_TRASH_KEEP=1" in env_example
     proof_run = controller[
         controller.index("run_proof() {") : controller.index('command="${1:-help}"')
@@ -188,6 +229,18 @@ def test_windows_lab_has_complete_controller_surface() -> None:
         < proof_run.index('proof_trash_retention "$trash_keep" apply')
         < proof_run.index('require_free_space "$STATE_ROOT"')
         < proof_run.index("up_lab")
+    )
+    manifest = json.loads(
+        (LAB_ROOT / "acceptance-manifest.json").read_text(encoding="utf-8")
+    )
+    release_five = next(
+        item
+        for item in manifest["criteria"]
+        if item["id"] == "windows-ci-e2e-release.5"
+    )
+    assert any(
+        check["id"] == "release.5.interactive-launch"
+        for check in release_five["checks"]
     )
 
 
@@ -755,6 +808,302 @@ def test_windows_lab_scripts_parse_and_compose_is_loopback_only() -> None:
     assert service["restart"] == "no"
     assert all(str(port).startswith("127.0.0.1:") for port in service["ports"])
     assert "${SPEC_WINDOWS_LAB_STATE_ROOT:-./state}:/state" in service["volumes"]
+
+
+@pytest.mark.parametrize(
+    ("task_state", "cleanup_fails"),
+    [("Ready", False), ("Missing", False), ("Ready", True)],
+)
+def test_windows_lab_job_wait_fails_fast_and_unregisters_stale_task(
+    tmp_path: Path, task_state: str, cleanup_fails: bool
+) -> None:
+    if os.name == "nt":
+        pytest.skip("the host controller is a Bash program")
+    bash = shutil.which("bash")
+    assert bash
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    state.mkdir()
+    fake_bin.mkdir()
+    (state / "identity.env").write_text("LAB_UID=1\n", encoding="utf-8")
+    config = tmp_path / "lab.env"
+    config.write_text(
+        "WINDOWS_ISO=/tmp/fake.iso\n"
+        f"WINDOWS_ISO_SHA256={'0' * 64}\n"
+        "WINDOWS_IMAGE_INDEX=1\n",
+        encoding="utf-8",
+    )
+    cleanup_log = tmp_path / "cleanup.log"
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "command = sys.argv[-1]\n"
+        "if 'Test-Path C:\\\\SpecHarness\\\\jobs\\\\demo.done.json' in command:\n"
+        "    print('False')\n"
+        "elif 'Stop-ScheduledTask' in command:\n"
+        "    Path(os.environ['FAKE_CLEANUP_LOG']).write_text(command, encoding='utf-8')\n"
+        "    if os.environ['FAKE_CLEANUP_FAIL'] == '1':\n"
+        "        raise SystemExit(23)\n"
+        "elif 'Get-ScheduledTask' in command:\n"
+        "    print(os.environ['FAKE_TASK_STATE'])\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected fake SSH command: {command}')\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "if sys.argv[1:3] == ['ps', '-a']:\n"
+        "    print('specbutler-windows-lab|exited')\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected fake Docker command: {sys.argv[1:]}')\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    result = subprocess.run(
+        [bash, str(LAB_ROOT / "labctl"), "job", "wait", "demo", "10"],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "SPEC_WINDOWS_LAB_STATE_ROOT": str(state),
+            "SPEC_WINDOWS_LAB_CONFIG": str(config),
+            "SPEC_WINDOWS_TOOLCHAIN_CONFIG": str(tmp_path / "toolchain.json"),
+            "FAKE_TASK_STATE": task_state,
+            "FAKE_CLEANUP_LOG": str(cleanup_log),
+            "FAKE_CLEANUP_FAIL": "1" if cleanup_fails else "0",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 1
+    expected = (
+        "returned to Ready without a completion record"
+        if task_state == "Ready"
+        else "entered unexpected task state: Missing"
+    )
+    assert expected in result.stderr
+    cleanup = cleanup_log.read_text(encoding="utf-8")
+    assert "Stop-ScheduledTask" in cleanup
+    assert "Unregister-ScheduledTask" in cleanup
+    if cleanup_fails:
+        assert "could not verify scheduled-task cleanup" in result.stderr
+        assert "authoritative guest shutdown confirmed" in result.stderr
+
+
+@pytest.mark.parametrize("failure_mode", ["arm", "register"])
+def test_windows_lab_submit_failure_cleans_up_without_exposing_password(
+    tmp_path: Path, failure_mode: str
+) -> None:
+    if os.name == "nt":
+        pytest.skip("the host controller is a Bash program")
+    bash = shutil.which("bash")
+    assert bash
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    (state / "secrets").mkdir(parents=True)
+    fake_bin.mkdir()
+    (state / "identity.env").write_text("LAB_UID=1\n", encoding="utf-8")
+    password = "Sb1!transport-failure-secret"
+    (state / "secrets" / "admin-password").write_text(
+        password + "\n", encoding="ascii"
+    )
+    config = tmp_path / "lab.env"
+    config.write_text(
+        "WINDOWS_ISO=/tmp/fake.iso\n"
+        f"WINDOWS_ISO_SHA256={'0' * 64}\n"
+        "WINDOWS_IMAGE_INDEX=1\n"
+        "LAB_INTERACTIVE_SESSION_GRACE_SECONDS=0\n"
+        "LAB_INTERACTIVE_SESSION_REPAIR=1\n",
+        encoding="utf-8",
+    )
+    ssh_log = tmp_path / "ssh.log"
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "command = sys.argv[-1]\n"
+        "with Path(os.environ['FAKE_SSH_LOG']).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(command + '\\n')\n"
+        "mode = os.environ['FAKE_FAILURE_MODE']\n"
+        "if '-Mode Check' in command:\n"
+        "    raise SystemExit(2 if mode == 'arm' else 0)\n"
+        "if '-Mode Arm' in command:\n"
+        "    sys.stdin.read()\n"
+        "    raise SystemExit(23 if mode == 'arm' else 0)\n"
+        "if 'register-job.ps1' in command:\n"
+        "    raise SystemExit(23 if mode == 'register' else 0)\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    for command in ("scp", "docker"):
+        executable = fake_bin / command
+        if command == "scp":
+            body = "raise SystemExit(0)"
+        else:
+            body = (
+                "print('specbutler-windows-lab|exited') "
+                "if sys.argv[1:3] == ['ps', '-a'] else (_ for _ in ()).throw(SystemExit(2))"
+            )
+        executable.write_text(
+            f"#!{sys.executable}\nimport sys\n{body}\n", encoding="utf-8"
+        )
+        executable.chmod(0o755)
+    job_script = tmp_path / "job.ps1"
+    job_script.write_text("exit 0\n", encoding="ascii")
+    result = subprocess.run(
+        [bash, str(LAB_ROOT / "labctl"), "job", "submit", "demo", str(job_script)],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "SPEC_WINDOWS_LAB_STATE_ROOT": str(state),
+            "SPEC_WINDOWS_LAB_CONFIG": str(config),
+            "SPEC_WINDOWS_TOOLCHAIN_CONFIG": str(tmp_path / "toolchain.json"),
+            "FAKE_FAILURE_MODE": failure_mode,
+            "FAKE_SSH_LOG": str(ssh_log),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 1
+    commands = ssh_log.read_text(encoding="utf-8")
+    assert password not in commands
+    assert password not in result.stdout
+    assert password not in result.stderr
+    if failure_mode == "arm":
+        assert "-Mode Arm" in commands
+        assert "-Mode Disarm" in commands
+        assert "authoritative guest shutdown was confirmed" in result.stderr
+    else:
+        assert "register-job.ps1" in commands
+        assert "Stop-ScheduledTask" in commands
+        assert "registration or launch acknowledgement failed" in result.stderr
+
+
+def _load_launch_attestation_module():
+    path = LAB_ROOT / "launch_attestation.py"
+    spec = importlib.util.spec_from_file_location("windows_launch_attestation", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_launch_receipt(path: Path, *, nonce: str) -> dict[str, object]:
+    receipt: dict[str, object] = {
+        "job": "proof-test",
+        "launch_nonce": nonce,
+        "user_name": "LAB\\specadmin",
+        "user_sid": "S-1-5-21-1-2-3-1001",
+        "session_id": 1,
+        "started_at": "2026-09-01T00:00:00Z",
+    }
+    path.write_text(json.dumps(receipt), encoding="ascii")
+    return receipt
+
+
+def test_windows_lab_launch_attestation_binds_exact_nonce_before_release(
+    tmp_path: Path,
+) -> None:
+    module = _load_launch_attestation_module()
+    nonce = "ab" * 16
+    receipt_path = tmp_path / "started.json"
+    receipt = _write_launch_receipt(receipt_path, nonce=nonce)
+    output = tmp_path / "attestation.json"
+    payload = module.capture_attestation(
+        receipt_path,
+        output,
+        expected_job="proof-test",
+        expected_nonce=nonce,
+    )
+    assert payload["status"] == "captured-before-release"
+    assert payload["expected_nonce"] == nonce
+    assert payload["receipt"] == receipt
+    assert output.stat().st_mode & 0o777 == 0o600
+    context = tmp_path / "user-context.json"
+    context.write_text(
+        json.dumps(
+            {
+                "user_name": receipt["user_name"],
+                "user_sid": receipt["user_sid"],
+                "session_id": receipt["session_id"],
+            }
+        ),
+        encoding="ascii",
+    )
+    assert (
+        module.validate_attestation(
+            output, receipt_path, context, expected_job="proof-test"
+        )["expected_nonce"]
+        == nonce
+    )
+
+
+def test_windows_lab_launch_attestation_rejects_wrong_or_mutated_receipt(
+    tmp_path: Path,
+) -> None:
+    module = _load_launch_attestation_module()
+    nonce = "cd" * 16
+    receipt_path = tmp_path / "started.json"
+    receipt = _write_launch_receipt(receipt_path, nonce=nonce)
+    with pytest.raises(module.AttestationError, match="exact host nonce"):
+        module.capture_attestation(
+            receipt_path,
+            tmp_path / "wrong.json",
+            expected_job="proof-test",
+            expected_nonce="ef" * 16,
+        )
+    output = tmp_path / "attestation.json"
+    module.capture_attestation(
+        receipt_path,
+        output,
+        expected_job="proof-test",
+        expected_nonce=nonce,
+    )
+    context = tmp_path / "user-context.json"
+    context.write_text(json.dumps(receipt), encoding="ascii")
+    receipt["session_id"] = 2
+    receipt_path.write_text(json.dumps(receipt), encoding="ascii")
+    with pytest.raises(module.AttestationError, match="host and guest"):
+        module.validate_attestation(
+            output, receipt_path, context, expected_job="proof-test"
+        )
+
+
+def test_windows_lab_launch_attestation_rejects_wrong_proof_context(
+    tmp_path: Path,
+) -> None:
+    module = _load_launch_attestation_module()
+    nonce = "12" * 16
+    receipt_path = tmp_path / "started.json"
+    receipt = _write_launch_receipt(receipt_path, nonce=nonce)
+    output = tmp_path / "attestation.json"
+    module.capture_attestation(
+        receipt_path,
+        output,
+        expected_job="proof-test",
+        expected_nonce=nonce,
+    )
+    receipt["user_sid"] = "S-1-5-21-wrong"
+    context = tmp_path / "user-context.json"
+    context.write_text(json.dumps(receipt), encoding="ascii")
+    with pytest.raises(module.AttestationError, match="proof context"):
+        module.validate_attestation(
+            output, receipt_path, context, expected_job="proof-test"
+        )
 
 
 def test_windows_docs_state_exact_supported_tier_and_exclusions() -> None:

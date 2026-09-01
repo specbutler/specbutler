@@ -343,7 +343,8 @@
         {"id": "release.5.status", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/status", "expected": "passed"},
         {"id": "release.5.clean", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/clean_snapshot_reset", "expected": true},
         {"id": "release.5.command", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/proof_command", "expected": "./labctl proof"},
-        {"id": "release.5.manual-edits", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/manual_guest_edits", "expected": false}
+        {"id": "release.5.manual-edits", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/manual_guest_edits", "expected": false},
+        {"id": "release.5.interactive-launch", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/interactive_launch_confirmed", "expected": true}
       ]
     },
     {

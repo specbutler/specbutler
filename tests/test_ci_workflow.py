@@ -251,6 +251,14 @@ def test_ci_windows_job_is_a_required_product_gate_with_diagnostics():
     jobs = _workflow_jobs()
     package = jobs["windows-package"]
     windows = jobs["windows-probe"]
+    package_steps = {
+        step.get("name"): step
+        for step in package["steps"]
+        if isinstance(step, dict) and step.get("name")
+    }
+    parse_step = package_steps["Parse Windows lab PowerShell"]
+    assert "Language.Parser]::ParseFile" in parse_step["run"]
+    assert "*.ps1.template" in parse_step["run"]
     package_steps = [step for step in package["steps"] if isinstance(step, dict)]
     steps = [step for step in windows["steps"] if isinstance(step, dict)]
 

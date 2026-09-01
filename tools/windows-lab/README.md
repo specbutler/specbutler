@@ -56,10 +56,22 @@ exit
 ./labctl snapshot provisioned
 ```
 
-The unattended lab user automatically logs into the loopback-only console so
-interactive scheduled jobs can use provider login. Treat the VM as sensitive
-local test infrastructure: do not expose the SSH, RDP, or noVNC ports, reuse
-its generated password, or run untrusted source inside it.
+The unattended lab user logs into the loopback-only console so interactive
+scheduled jobs can use provider login. Before each job, the controller verifies
+an exact-user Explorer desktop session. If an older baseline's finite unattend
+logon count has expired, the controller passes the generated password only over
+SSH standard input. Before arming a single finite autologon, it installs a
+SYSTEM logon-triggered cleanup from an administrator-only directory, so cleanup
+does not depend on the host controller surviving the reboot. The controller
+then verifies the recovered session, independently removes the temporary
+Winlogon password and cleanup task, and disables autologon before launching
+source.
+Set `LAB_INTERACTIVE_SESSION_REPAIR=0` to require a manual noVNC sign-in instead.
+Treat the VM as sensitive local test infrastructure: during the bounded recovery
+window Windows necessarily holds an autologon credential, and anyone with
+administrative or console access can reach the provider/forge login. Do not
+expose the SSH, RDP, or noVNC ports, reuse its generated password, or run
+untrusted source inside it.
 
 ## One-command release proof
 
@@ -117,8 +129,16 @@ wheel/sdist imports,
 `pip check`, warning-free `spec doctor`, documentation, and credential cleanup.
 It writes each machine-readable local result only after that result's complete
 prerequisite set passes. The host controller adds its own result only after the
-clean-snapshot reset, staging, job execution, collection, and guest-side static
-harness audit have all completed.
+clean-snapshot reset, staging, nonce-bound interactive launch receipt, job
+execution, collection, and guest-side static harness audit have all completed.
+A Task Scheduler start request is not treated as execution: the runner must
+atomically acknowledge the exact nonce, user SID, and preflight desktop session
+within 30 seconds, then pause. The host captures that receipt in private state
+and only then releases candidate source. Final evidence verifies the exact host
+nonce, receipt hash, guest receipt, and proof user/session. Ready or missing
+tasks without completion records fail immediately and are unregistered; if
+teardown cannot be verified, the controller performs an authoritative guest
+shutdown and fails the run.
 
 If the interactive harness fails, it terminates the Job/root while its output
 reader is still draining, closes ConPTY only afterward, and retains
@@ -160,6 +180,8 @@ the controller never resets or prunes after an unconfirmed shutdown.
 Provisioning uses the administrative SSH control plane. Interactive proof jobs
 use the logged-on account's filtered, non-elevated token and fail unless they are
 in a real desktop session; this matches the documented day-to-day Windows tier.
+`LAB_INTERACTIVE_SESSION_GRACE_SECONDS` controls the initial bounded wait before
+automatic recovery (30 seconds by default).
 
 Raw artifacts remain under ignored `state/raw/`; the publishable copy passes
 through `redact.py`. The sanitized directory contains

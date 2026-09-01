@@ -270,6 +270,27 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      - name: Parse Windows lab PowerShell
+        shell: pwsh
+        run: |
+          $parseErrors = @()
+          Get-ChildItem tools/windows-lab -File | Where-Object {
+            $_.Name -like '*.ps1' -or $_.Name -like '*.ps1.template'
+          } | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            $parseErrors += @($errors | ForEach-Object {
+              "$($_.Extent.File):$($_.Extent.StartLineNumber): $($_.Message)"
+            })
+          }
+          if ($parseErrors.Count -gt 0) {
+            throw ($parseErrors -join [Environment]::NewLine)
+          }
       - name: Build wheel and source distribution
         shell: pwsh
         run: |

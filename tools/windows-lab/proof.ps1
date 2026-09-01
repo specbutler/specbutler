@@ -130,6 +130,8 @@ if ($sessionId -le 0) { throw 'Proof must run in an interactive Windows session'
 $userContext = [ordered]@{
     status = 'passed'
     source_revision = $sourceRevision
+    user_name = $windowsIdentity.Name
+    user_sid = $windowsIdentity.User.Value
     non_elevated = $true
     interactive_session = $true
     session_id = $sessionId

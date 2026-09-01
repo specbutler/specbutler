@@ -153,6 +153,14 @@ guest_ssh() {
     ssh "${SSH_OPTIONS[@]}" specadmin@127.0.0.1 "$@"
 }
 
+guest_ssh_stdin() {
+    local input="$1"
+    shift
+    test -f "$input" || die "SSH input file does not exist: $input"
+    prepare_ssh_options
+    ssh "${SSH_OPTIONS[@]}" specadmin@127.0.0.1 "$@" < "$input"
+}
+
 guest_scp() {
     load_config
     load_identity
@@ -449,18 +457,169 @@ stage_source() {
     printf '%s\n' "$commit"
 }
 
+interactive_session_grace_seconds() {
+    local timeout="${LAB_INTERACTIVE_SESSION_GRACE_SECONDS:-30}"
+    [[ "$timeout" =~ ^[0-9]+$ ]] || die "LAB_INTERACTIVE_SESSION_GRACE_SECONDS must be a non-negative integer"
+    printf '%s\n' "$timeout"
+}
+
+interactive_session_repair_enabled() {
+    local enabled="${LAB_INTERACTIVE_SESSION_REPAIR:-1}"
+    [[ "$enabled" = 0 || "$enabled" = 1 ]] || die "LAB_INTERACTIVE_SESSION_REPAIR must be 0 or 1"
+    printf '%s\n' "$enabled"
+}
+
+console_session_ready() {
+    guest_ssh '& C:\SpecHarness\ensure-console-session.ps1 -Mode Check' >/dev/null 2>&1
+}
+
+wait_console_session() {
+    local timeout="$1"
+    local deadline=$((SECONDS + timeout))
+    while ! console_session_ready; do
+        (( SECONDS < deadline )) || return 1
+        sleep 2
+    done
+}
+
+disarm_console_session() {
+    if guest_ssh '& C:\SpecHarness\ensure-console-session.ps1 -Mode Disarm' >/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "windows-lab: could not remove the temporary Windows console recovery credential" >&2
+    shutdown_lab
+    die "console recovery cleanup failed; authoritative guest shutdown was confirmed"
+}
+
+wait_guest_disconnect() {
+    local deadline=$((SECONDS + 120))
+    while guest_ssh 'exit 0' >/dev/null 2>&1; do
+        (( SECONDS < deadline )) || return 1
+        sleep 2
+    done
+}
+
+ensure_console_session() {
+    wait_ssh
+    guest_ssh 'New-Item -ItemType Directory -Force C:\SpecHarness | Out-Null'
+    guest_scp \
+        "$LAB_ROOT/ensure-console-session.ps1" \
+        "$LAB_ROOT/disarm-autologon.ps1" \
+        "specadmin@127.0.0.1:C:/SpecHarness/"
+    local grace repair_enabled
+    grace="$(interactive_session_grace_seconds)"
+    repair_enabled="$(interactive_session_repair_enabled)"
+    if wait_console_session "$grace"; then
+        disarm_console_session
+        printf '%s\n' "Confirmed the logged-on Windows desktop session and disabled autologon."
+        return 0
+    fi
+    if [ "$repair_enabled" != 1 ]; then
+        die "no logged-on Windows desktop session appeared; sign in at http://127.0.0.1:${LAB_VNC_PORT:-16080}/vnc.html and retry"
+    fi
+
+    # The generated password travels only on SSH stdin. The guest script never
+    # writes or emits it, and disarms Winlogon immediately after the reboot.
+    if ! guest_ssh_stdin \
+        "$STATE_ROOT/secrets/admin-password" \
+        '& C:\SpecHarness\ensure-console-session.ps1 -Mode Arm' >/dev/null; then
+        printf '%s\n' "windows-lab: console recovery arming failed; cleaning up and stopping the guest" >&2
+        guest_ssh '& C:\SpecHarness\ensure-console-session.ps1 -Mode Disarm' >/dev/null 2>&1 || true
+        shutdown_lab
+        die "console recovery arming failed; authoritative guest shutdown was confirmed"
+    fi
+    guest_ssh 'Restart-Computer -Force' >/dev/null 2>&1 || true
+    if ! wait_guest_disconnect; then
+        disarm_console_session
+        shutdown_lab
+        die "Windows did not begin the requested console-recovery reboot; authoritative guest shutdown was confirmed"
+    fi
+    wait_ssh
+    if ! wait_console_session 120; then
+        guest_ssh '& C:\SpecHarness\ensure-console-session.ps1 -Mode Disarm' >/dev/null 2>&1 || true
+        shutdown_lab
+        die "Windows console recovery did not establish the expected Explorer session; authoritative guest shutdown was confirmed"
+    fi
+    disarm_console_session
+    console_session_ready || die "the recovered Windows desktop session disappeared before job launch"
+    printf '%s\n' "Recovered the Windows desktop session and removed the temporary autologon credential."
+}
+
+cleanup_job_task() {
+    local name="$1"
+    guest_ssh "\$task = Get-ScheduledTask -TaskName 'SpecButlerLab-$name' -ErrorAction SilentlyContinue; if (\$null -ne \$task) { Stop-ScheduledTask -TaskName 'SpecButlerLab-$name' -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName 'SpecButlerLab-$name' -Confirm:\$false -ErrorAction Stop }; if (\$null -ne (Get-ScheduledTask -TaskName 'SpecButlerLab-$name' -ErrorAction SilentlyContinue)) { throw 'scheduled task cleanup was not observable' }" >/dev/null 2>&1
+}
+
+cleanup_job_task_or_stop() {
+    local name="$1"
+    if cleanup_job_task "$name"; then
+        return 0
+    fi
+    printf '%s\n' "windows-lab: could not verify scheduled-task cleanup for $name; stopping the guest" >&2
+    shutdown_lab
+    printf '%s\n' "windows-lab: authoritative guest shutdown confirmed after cleanup failure" >&2
+    return 1
+}
+
+capture_launch_attestation() {
+    local name="$1" nonce="$2"
+    local launch_root="$STATE_ROOT/launch-attestations"
+    local captured="$launch_root/$name.started.json"
+    local attestation="$launch_root/$name.json"
+    mkdir -p "$launch_root"
+    chmod 0700 "$launch_root"
+    if [ -e "$captured" ] || [ -e "$attestation" ]; then
+        printf '%s\n' "windows-lab: launch attestation already exists for $name" >&2
+        return 1
+    fi
+    if ! guest_scp \
+        "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.started.json" \
+        "$captured"; then
+        printf '%s\n' "windows-lab: could not capture the acknowledged launch receipt for $name" >&2
+        return 1
+    fi
+    chmod 0600 "$captured"
+    if ! python3 "$LAB_ROOT/launch_attestation.py" capture \
+        --receipt "$captured" \
+        --output "$attestation" \
+        --expected-job "$name" \
+        --expected-nonce "$nonce"; then
+        return 1
+    fi
+}
+
 job_submit() {
     local name="${1:-}" script="${2:-}"
     validate_name "$name"
     test -f "$script" || die "job script not found: $script"
-    wait_ssh
+    ensure_console_session
     guest_ssh 'New-Item -ItemType Directory -Force C:\SpecHarness\jobs | Out-Null'
     guest_scp \
         "$LAB_ROOT/job-runner.ps1" \
         "$LAB_ROOT/register-job.ps1" \
         "specadmin@127.0.0.1:C:/SpecHarness/"
     guest_scp "$script" "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.ps1"
-    guest_ssh "& C:\\SpecHarness\\register-job.ps1 -JobName '$name'"
+    local nonce
+    nonce="$(python3 - <<'PY'
+import secrets
+
+print(secrets.token_hex(16))
+PY
+)"
+    if ! guest_ssh "& C:\\SpecHarness\\register-job.ps1 -JobName '$name' -LaunchNonce '$nonce'" >/dev/null; then
+        printf '%s\n' "windows-lab: interactive task registration or launch acknowledgement failed for $name" >&2
+        cleanup_job_task_or_stop "$name" || true
+        return 1
+    fi
+    if ! capture_launch_attestation "$name" "$nonce"; then
+        cleanup_job_task_or_stop "$name" || true
+        return 1
+    fi
+    if ! guest_ssh "\$release = 'C:\\SpecHarness\\jobs\\$name.release'; \$temporary = \"\$release.tmp\"; [System.IO.File]::WriteAllText(\$temporary, '$nonce', [System.Text.Encoding]::ASCII); Move-Item -LiteralPath \$temporary -Destination \$release -Force"; then
+        printf '%s\n' "windows-lab: could not release acknowledged interactive job $name" >&2
+        cleanup_job_task_or_stop "$name" || true
+        return 1
+    fi
 }
 
 job_wait() {
@@ -471,18 +630,48 @@ job_wait() {
     until guest_ssh "Test-Path C:\\SpecHarness\\jobs\\$name.done.json" 2>/dev/null | tr -d '\r' | grep -qx True; do
         if (( SECONDS >= deadline )); then
             printf '%s\n' "windows-lab: job $name did not finish within $timeout seconds" >&2
+            cleanup_job_task_or_stop "$name" || true
             return 124
         fi
+        local task_state
+        if ! task_state="$(guest_ssh "\$task = Get-ScheduledTask -TaskName 'SpecButlerLab-$name' -ErrorAction SilentlyContinue; if (\$null -eq \$task) { 'Missing' } else { \$task.State }" 2>/dev/null | tr -d '\r')"; then
+            printf '%s\n' "windows-lab: could not inspect interactive job $name" >&2
+            cleanup_job_task_or_stop "$name" || true
+            return 1
+        fi
+        case "$task_state" in
+            Running|Queued) ;;
+            Ready)
+                if ! guest_ssh "Test-Path C:\\SpecHarness\\jobs\\$name.done.json" 2>/dev/null | tr -d '\r' | grep -qx True; then
+                    printf '%s\n' "windows-lab: interactive job $name returned to Ready without a completion record" >&2
+                    cleanup_job_task_or_stop "$name" || true
+                    return 1
+                fi
+                ;;
+            *)
+                printf '%s\n' "windows-lab: interactive job $name entered unexpected task state: ${task_state:-<empty>}" >&2
+                cleanup_job_task_or_stop "$name" || true
+                return 1
+                ;;
+        esac
         sleep 3
     done
-    guest_ssh "Get-Content C:\\SpecHarness\\jobs\\$name.done.json"
+    local done_payload
+    if ! done_payload="$(guest_ssh "Get-Content C:\\SpecHarness\\jobs\\$name.done.json" 2>/dev/null)"; then
+        printf '%s\n' "windows-lab: could not read completion record for $name" >&2
+        cleanup_job_task_or_stop "$name" || true
+        return 1
+    fi
+    printf '%s\n' "$done_payload"
     local result=0
     if guest_ssh "if ((Get-Content C:\\SpecHarness\\jobs\\$name.done.json -Raw | ConvertFrom-Json).status -ne 'ok') { exit 1 }"; then
         result=0
     else
         result=$?
     fi
-    guest_ssh "Unregister-ScheduledTask -TaskName 'SpecButlerLab-$name' -Confirm:\$false -ErrorAction SilentlyContinue" || true
+    if ! cleanup_job_task_or_stop "$name"; then
+        return 1
+    fi
     return "$result"
 }
 
@@ -508,6 +697,10 @@ collect_artifacts() {
     mkdir -p "$raw" "$destination"
     guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.log" "$raw/job.log" 2>/dev/null || true
     guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.done.json" "$raw/job.done.json" 2>/dev/null || true
+    guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.started.json" "$raw/job.started.json" 2>/dev/null || true
+    local launch_attestation="$STATE_ROOT/launch-attestations/$name.json"
+    test -f "$launch_attestation" || die "host launch attestation is missing: $launch_attestation"
+    cp -- "$launch_attestation" "$raw/job.launch-attestation.json"
     guest_ssh "if (Test-Path C:\\SpecHarness\\evidence\\$name) { Compress-Archive -Force -Path C:\\SpecHarness\\evidence\\$name\\* -DestinationPath C:\\SpecHarness\\$name-evidence.zip }"
     if guest_scp "specadmin@127.0.0.1:C:/SpecHarness/$name-evidence.zip" "$raw/evidence.zip" 2>/dev/null; then
         unzip -q "$raw/evidence.zip" -d "$raw/evidence"
@@ -583,15 +776,44 @@ PY
     rm -f -- "$destination/lab-controller-result.json"
     if (( proof_status != 0 )); then
         printf '%s\n' "windows-lab: guest proof failed; controller success evidence will not be produced" >&2
-    elif ! python3 - "$destination/lab-controller-static-result.json" "$destination/lab-controller-result.json" "$revision" <<'PY'
+    elif ! python3 - \
+        "$destination/lab-controller-static-result.json" \
+        "$destination/lab-controller-result.json" \
+        "$revision" \
+        "$destination/job.launch-attestation.json" \
+        "$destination/job.started.json" \
+        "$destination/user-context.json" \
+        "$LAB_ROOT/launch_attestation.py" \
+        "$name" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-static_arg, output_arg, revision = sys.argv[1:]
+(
+    static_arg,
+    output_arg,
+    revision,
+    attestation_arg,
+    started_arg,
+    user_context_arg,
+    launch_helper_arg,
+    run_name,
+) = sys.argv[1:]
+sys.path.insert(0, str(Path(launch_helper_arg).resolve().parent))
+from launch_attestation import validate_attestation
+
 static_path = Path(static_arg)
 output_path = Path(output_arg)
 payload = json.loads(static_path.read_text(encoding="utf-8"))
+attestation_path = Path(attestation_arg)
+started_path = Path(started_arg)
+user_context_path = Path(user_context_arg)
+validate_attestation(
+    attestation_path,
+    started_path,
+    user_context_path,
+    expected_job=run_name,
+)
 expected_operations = ["create", "reset", "source-sync", "exec", "collect", "snapshot"]
 if payload.get("status") != "passed":
     raise SystemExit("guest controller audit did not pass")
@@ -613,14 +835,17 @@ result = {
     "clean_snapshot_reset": True,
     "proof_command": "./labctl proof",
     "manual_guest_edits": False,
+    "interactive_launch_confirmed": True,
     "evidence": {
         "guest_static_audit": static_path.name,
+        "interactive_launch_attestation": attestation_path.name,
+        "interactive_launch_receipt": started_path.name,
         "observed_controller_path": [
             "reset provisioned snapshot",
             "start and wait for guest",
             "idempotent provision",
             "stage exact revision",
-            "submit and wait for interactive job",
+            "confirm nonce-bound interactive launch and wait for completion",
             "collect and redact evidence",
         ],
     },
