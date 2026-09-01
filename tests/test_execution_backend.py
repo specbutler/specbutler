@@ -4380,10 +4380,6 @@ class TestOrchestratorBackendSeam:
             run_id="my-feature-20260101T000000",
             spec_id="my-feature",
             branch="spec/my-feature",
-            # This test exercises workspace routing, not Claude host-sandbox
-            # preflight. Keep it independent of whether bwrap/socat happen to
-            # be installed on the test runner.
-            agent="codex",
         )
         with patch("spec_runtime.orchestrator.resolve_worktree_path", return_value=tmp_path / "wt"):
             handle = orch._resolve_workspace_handle(run, tmp_path)
@@ -4443,6 +4439,10 @@ class TestOrchestratorBackendSeam:
             run_id="my-feature-20260101T000000",
             spec_id="my-feature",
             branch="spec/my-feature",
+            # This test exercises workspace routing, not Claude host-sandbox
+            # preflight. Keep it independent of whether bwrap/socat happen to
+            # be installed on the test runner.
+            agent="codex",
         )
         run.save(tmp_path)
         with patch(
