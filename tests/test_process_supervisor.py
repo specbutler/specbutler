@@ -42,15 +42,35 @@ def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -
     assert identity_matches(expected) is False
 
 
-def test_adoptable_token_records_new_logical_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_adoptable_token_records_new_logical_owner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     identity = ProcessIdentity(42, "created", "python.exe")
     token = SupervisionToken(LifetimeMode.ADOPTABLE, identity, 7, "owner", "unique-adoption-token")
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path))
+    control_path = tmp_path / token.control_relpath
+    control_path.parent.mkdir(parents=True)
+    control_path.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "supervision_id": token.token,
+                "nonce": token.control_nonce,
+                "keeper_identity": token.identity.to_dict(),
+                "payload_identity": token.payload.to_dict(),
+                "adopted_by": None,
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr("spec_runtime.process_supervisor.identity_matches", lambda _identity: True)
     monkeypatch.setattr(
         "spec_runtime.process_supervisor.inspect_process",
         lambda pid: ProcessIdentity(pid, "new-owner", sys.executable),
     )
     assert adopt(token).owner_pid == os.getpid()
+    with pytest.raises(ValueError, match="already adopted"):
+        adopt(token)
 
 
 def test_token_distinguishes_supervisor_and_payload_identity() -> None:

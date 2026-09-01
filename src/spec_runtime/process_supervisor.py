@@ -15,6 +15,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -22,7 +23,31 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
 
+from spec_runtime.platform_fs import FileLock, atomic_write_text
+
 _REAL_POPEN_TYPE = subprocess.Popen
+
+
+def _control_root() -> Path:
+    """Return per-user common state shared by launcher, helper, and adopter."""
+    configured = os.environ.get("SPEC_PROCESS_CONTROL_ROOT")
+    if configured:
+        return Path(configured)
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "SpecButler" / "process-controls"
+    user_key = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+    return Path(tempfile.gettempdir()) / f"specbutler-process-controls-{user_key}"
+
+
+def _control_path(relpath: str) -> Path:
+    relative = Path(relpath)
+    if not relpath or relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("invalid supervision control path")
+    root = _control_root().resolve()
+    resolved = (root / relative).resolve()
+    if root not in resolved.parents:
+        raise ValueError("invalid supervision control path")
+    return resolved
 
 def _kernel32() -> Any:
     """Return kernel32 with pointer-width-safe declarations."""
@@ -604,14 +629,15 @@ class ManagedAsyncProcess:
 class ProcessSupervisor:
     """Launch children with an explicit ownership lifetime."""
 
-    def __init__(self, mode: LifetimeMode = LifetimeMode.RUN_OWNED):
+    def __init__(self, mode: LifetimeMode = LifetimeMode.RUN_OWNED, *, supervision_id: str | None = None):
         self.mode = LifetimeMode(mode)
+        self._supervision_id = supervision_id
         self._children: list[ManagedProcess | ManagedAsyncProcess] = []
 
     def spawn(self, argv: Sequence[str], **kwargs: Any) -> ManagedProcess:
         job = None
         metadata_path: Path | None = None
-        supervision_id = uuid.uuid4().hex
+        supervision_id = self._supervision_id or uuid.uuid4().hex
         if os.name == "nt":
             flags = int(kwargs.pop("creationflags", 0))
             if self.mode is LifetimeMode.RUN_OWNED:
@@ -629,6 +655,7 @@ class ProcessSupervisor:
                     "spec_runtime.process_supervisor",
                     "--durable-helper",
                     str(metadata_path),
+                    supervision_id,
                     "--",
                     *argv,
                 ]
@@ -676,6 +703,7 @@ class ProcessSupervisor:
             job_name = _windows_job_name(supervision_id) if job is not None else ""
             if helper_token is not None:
                 job_name = helper_token.job_name
+                supervision_id = helper_token.token
             token = SupervisionToken(
                 self.mode,
                 identity,
@@ -685,6 +713,8 @@ class ProcessSupervisor:
                 pgid,
                 payload_identity,
                 job_name=job_name,
+                control_relpath=helper_token.control_relpath if helper_token is not None else "",
+                control_nonce=helper_token.control_nonce if helper_token is not None else "",
             )
             if is_test_double:
                 setattr(process, "token", token)
@@ -705,7 +735,7 @@ class ProcessSupervisor:
         """Async counterpart with the same platform-owned launch policy."""
         job = None
         metadata_path: Path | None = None
-        supervision_id = uuid.uuid4().hex
+        supervision_id = self._supervision_id or uuid.uuid4().hex
         if os.name == "nt":
             flags = int(kwargs.pop("creationflags", 0))
             flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
@@ -720,6 +750,7 @@ class ProcessSupervisor:
                     "spec_runtime.process_supervisor",
                     "--durable-helper",
                     str(metadata_path),
+                    supervision_id,
                     "--",
                     *argv,
                 ]
@@ -766,6 +797,7 @@ class ProcessSupervisor:
             job_name = _windows_job_name(supervision_id) if job is not None else ""
             if helper_token is not None:
                 job_name = helper_token.job_name
+                supervision_id = helper_token.token
             token = SupervisionToken(
                 self.mode,
                 identity,
@@ -775,6 +807,8 @@ class ProcessSupervisor:
                 pgid,
                 payload_identity,
                 job_name=job_name,
+                control_relpath=helper_token.control_relpath if helper_token is not None else "",
+                control_nonce=helper_token.control_nonce if helper_token is not None else "",
             )
             managed = ManagedAsyncProcess(process, token, job)
             if job is not None:
@@ -853,19 +887,68 @@ def adopt(token: SupervisionToken) -> SupervisionToken:
     if not identity_matches(token.identity):
         raise ProcessLookupError(token.identity.pid)
     owner = inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable")
+    control_path = _control_path(token.control_relpath)
+    with FileLock(control_path.with_suffix(".lock")):
+        try:
+            state = json.loads(control_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("adoptable token has no valid control record") from exc
+        expected = {
+            "schema": 2,
+            "supervision_id": token.token,
+            "nonce": token.control_nonce,
+            "keeper_identity": token.identity.to_dict(),
+            "payload_identity": token.payload.to_dict(),
+        }
+        if any(state.get(key) != value for key, value in expected.items()):
+            raise ValueError("adoptable token control record does not match")
+        if state.get("adopted_by") is not None:
+            raise ValueError("adoptable token was already adopted")
+        state["adopted_by"] = owner.to_dict()
+        atomic_write_text(control_path, json.dumps(state, sort_keys=True))
     adopted = SupervisionToken(
-        token.mode, token.identity, owner.pid, owner.started_at, token.token, token.pgid, token.payload_identity
+        token.mode,
+        token.identity,
+        owner.pid,
+        owner.started_at,
+        token.token,
+        token.pgid,
+        token.payload_identity,
+        job_name=token.job_name,
+        control_relpath=token.control_relpath,
+        control_nonce=token.control_nonce,
     )
     return adopted
 
 
-def _durable_helper(metadata_path: Path, argv: Sequence[str]) -> int:
+def _durable_helper(metadata_path: Path, supervision_id: str, argv: Sequence[str]) -> int:
     """Own one Windows Job for the full lifetime of a durable payload."""
-    with ProcessSupervisor(LifetimeMode.RUN_OWNED) as supervisor:
+    with ProcessSupervisor(LifetimeMode.RUN_OWNED, supervision_id=supervision_id) as supervisor:
         child = supervisor.spawn(argv)
-        from spec_runtime.platform_fs import atomic_write_text
-
-        atomic_write_text(metadata_path, json.dumps(child.token.to_dict()))
+        keeper = inspect_process(os.getpid())
+        if keeper is None:
+            raise RuntimeError("Could not inspect durable supervisor identity")
+        token = SupervisionToken(
+            LifetimeMode.ADOPTABLE,
+            keeper,
+            0,
+            "",
+            supervision_id,
+            payload_identity=child.token.identity,
+            job_name=child.token.job_name,
+        )
+        control_path = _control_path(token.control_relpath)
+        state = {
+            "schema": 2,
+            "supervision_id": token.token,
+            "nonce": token.control_nonce,
+            "keeper_identity": token.identity.to_dict(),
+            "payload_identity": token.payload.to_dict(),
+            "adopted_by": None,
+        }
+        with FileLock(control_path.with_suffix(".lock")):
+            atomic_write_text(control_path, json.dumps(state, sort_keys=True))
+        atomic_write_text(metadata_path, json.dumps(token.to_dict()))
         return int(child.wait())
 
 
@@ -873,4 +956,7 @@ if __name__ == "__main__":  # pragma: no cover - exercised by native Windows tes
     marker = "--durable-helper"
     if marker in sys.argv:
         separator = sys.argv.index("--")
-        raise SystemExit(_durable_helper(Path(sys.argv[sys.argv.index(marker) + 1]), sys.argv[separator + 1 :]))
+        marker_index = sys.argv.index(marker)
+        raise SystemExit(
+            _durable_helper(Path(sys.argv[marker_index + 1]), sys.argv[marker_index + 2], sys.argv[separator + 1 :])
+        )
