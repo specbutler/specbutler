@@ -644,6 +644,20 @@ def _terminate_held_windows_job(token: SupervisionToken, job: _WindowsJob, grace
     return _wait_for_identities_exit(identities) if identities else True
 
 
+def _abort_windows_job(job: _WindowsJob | None) -> None:
+    """Best-effort ownership cleanup that never masks the launching exception."""
+    if job is None:
+        return
+    try:
+        job.terminate()
+    except BaseException:
+        pass
+    try:
+        job.close()
+    except BaseException:
+        pass
+
+
 def claim_current_process(supervision_id: str) -> SupervisionToken:
     """Put the current Windows orchestrator in a retained kill-on-close Job."""
     if os.name != "nt":
@@ -1003,7 +1017,11 @@ class ProcessSupervisor:
             kwargs["creationflags"] = flags
         else:
             kwargs["start_new_session"] = True
-        process = subprocess.Popen(list(argv), **kwargs)
+        try:
+            process = subprocess.Popen(list(argv), **kwargs)
+        except BaseException:
+            _abort_windows_job(job)
+            raise
         try:
             if job is not None:
                 job.assign(int(process._handle))  # type: ignore[attr-defined]
@@ -1072,15 +1090,7 @@ class ProcessSupervisor:
             self._children.append(managed)
             return managed
         except BaseException:
-            if job is not None:
-                try:
-                    job.terminate()
-                except BaseException:
-                    pass
-                try:
-                    job.close()
-                except BaseException:
-                    pass
+            _abort_windows_job(job)
             try:
                 killer = getattr(process, "kill", None)
                 if callable(killer):
@@ -1121,7 +1131,11 @@ class ProcessSupervisor:
             kwargs["creationflags"] = flags
         else:
             kwargs["start_new_session"] = True
-        process = await asyncio.create_subprocess_exec(*argv, **kwargs)
+        try:
+            process = await asyncio.create_subprocess_exec(*argv, **kwargs)
+        except BaseException:
+            _abort_windows_job(job)
+            raise
         try:
             if job is not None:
                 if isinstance(process, asyncio.subprocess.Process):
@@ -1190,15 +1204,7 @@ class ProcessSupervisor:
             self._children.append(managed)
             return managed
         except BaseException:
-            if job is not None:
-                try:
-                    job.terminate()
-                except BaseException:
-                    pass
-                try:
-                    job.close()
-                except BaseException:
-                    pass
+            _abort_windows_job(job)
             try:
                 killer = getattr(process, "kill", None)
                 if callable(killer):

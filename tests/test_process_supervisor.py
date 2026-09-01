@@ -637,6 +637,74 @@ def test_windows_async_terminate_is_nonblocking(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows BaseException cleanup integration")
+def test_windows_sync_launch_baseexception_closes_unassigned_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LaunchAbort(BaseException):
+        pass
+
+    events: list[str] = []
+
+    class Job:
+        def __init__(self, _name: str) -> None:
+            events.append("open")
+
+        def terminate(self) -> None:
+            events.append("terminate")
+            raise ValueError("terminate cleanup failed")
+
+        def close(self) -> None:
+            events.append("close")
+            raise ValueError("close cleanup failed")
+
+    def aborting_popen(*_args: object, **_kwargs: object) -> subprocess.Popen[object]:
+        raise LaunchAbort
+
+    monkeypatch.setattr(process_supervisor, "_WindowsJob", Job)
+    monkeypatch.setattr(process_supervisor.subprocess, "Popen", aborting_popen)
+
+    with pytest.raises(LaunchAbort):
+        ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn([sys.executable, "-c", "pass"])
+
+    assert events == ["open", "terminate", "close"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows BaseException cleanup integration")
+def test_windows_async_launch_baseexception_closes_unassigned_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class LaunchAbort(BaseException):
+        pass
+
+    events: list[str] = []
+
+    class Job:
+        def __init__(self, _name: str) -> None:
+            events.append("open")
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def close(self) -> None:
+            events.append("close")
+
+    async def aborting_create(*_args: object, **_kwargs: object) -> asyncio.subprocess.Process:
+        raise LaunchAbort
+
+    monkeypatch.setattr(process_supervisor, "_WindowsJob", Job)
+    monkeypatch.setattr(process_supervisor.asyncio, "create_subprocess_exec", aborting_create)
+
+    async def exercise() -> None:
+        with pytest.raises(LaunchAbort):
+            await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+                [sys.executable, "-c", "pass"]
+            )
+
+    asyncio.run(exercise())
+    assert events == ["open", "terminate", "close"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows BaseException cleanup integration")
 def test_windows_sync_spawn_baseexception_closes_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
