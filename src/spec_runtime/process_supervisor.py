@@ -360,7 +360,18 @@ def identity_matches(expected: ProcessIdentity) -> bool:
     live = inspect_process(expected.pid)
     if live is None or not expected.started_at or live.started_at != expected.started_at:
         return False
-    return not expected.executable or not live.executable or Path(live.executable) == Path(expected.executable)
+    if not expected.executable or not live.executable:
+        return True
+    try:
+        # Darwin's ``ps command`` can expose either the framework launcher or
+        # its resolved Python executable at different points in interpreter
+        # startup.  They are the same file and therefore the same process
+        # identity boundary; lexical Path equality incorrectly rejects it.
+        return os.path.samefile(live.executable, expected.executable)
+    except OSError:
+        return Path(live.executable).resolve(strict=False) == Path(
+            expected.executable
+        ).resolve(strict=False)
 
 
 def list_live_process_group_members(pgid: int) -> list[int] | None:
@@ -1490,12 +1501,29 @@ class ManagedProcess:
         if os.name == "nt" and self._job is not None:
             _terminate_held_windows_job(self.token, self._job, grace_seconds)
             return
+        if os.name == "posix" and isinstance(self.process, _REAL_POPEN_TYPE):
+            # The retained Popen plus start_new_session launch is the live
+            # ownership capability.  Unlike persisted tokens, it does not
+            # need to rediscover the leader through ps before signalling the
+            # group.  That distinction matters on Darwin, where ps may report
+            # a framework executable alias and getpgid rejects an exited
+            # (unreaped) leader even while its descendants are still live.
+            _terminate_verified_posix_group(
+                self.token.pgid or self.process.pid,
+                grace_seconds=grace_seconds,
+            )
+            return
         terminate(self.token, grace_seconds=grace_seconds)
 
     def kill(self) -> None:
         """Kill the complete owned tree, never just the Popen leader."""
         if self._job is not None:
             self._job.terminate()
+        elif os.name == "posix" and isinstance(self.process, _REAL_POPEN_TYPE):
+            _terminate_verified_posix_group(
+                self.token.pgid or self.process.pid,
+                grace_seconds=0,
+            )
         else:
             terminate(self.token, grace_seconds=0)
 
@@ -1637,7 +1665,7 @@ class ManagedAsyncProcess:
             except OSError:
                 pass
             return
-        if os.name == "posix" and identity_matches(self.token.identity):
+        if os.name == "posix" and isinstance(self.process, asyncio.subprocess.Process):
             try:
                 os.killpg(self.token.pgid or self.token.identity.pid, signal.SIGTERM)
             except (OSError, ValueError):
@@ -1653,6 +1681,11 @@ class ManagedAsyncProcess:
             return
         if self._job is not None:
             self._job.terminate()
+        elif os.name == "posix" and isinstance(self.process, asyncio.subprocess.Process):
+            try:
+                os.killpg(self.token.pgid or self.token.identity.pid, signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
         else:
             terminate(self.token, grace_seconds=0)
 
@@ -1804,7 +1837,10 @@ class ProcessSupervisor:
             pgid = (
                 0
                 if is_test_double
-                else os.getpgid(process.pid)
+                # start_new_session=True makes the child the group/session
+                # leader.  Record that launch invariant directly instead of
+                # racing getpgid() against a short-lived command on Darwin.
+                else process.pid
                 if os.name == "posix"
                 else process.pid
                 if job is not None
@@ -1958,7 +1994,7 @@ class ProcessSupervisor:
             pgid = (
                 0
                 if is_test_double
-                else os.getpgid(process.pid)
+                else process.pid
                 if os.name == "posix"
                 else process.pid
                 if job is not None

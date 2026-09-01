@@ -40,6 +40,76 @@ def test_token_round_trip_preserves_reopenable_identity() -> None:
     assert token.control_nonce
 
 
+def test_identity_matches_accepts_executable_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "Python"
+    executable.write_text("binary", encoding="utf-8")
+    alias = tmp_path / "python"
+    alias.symlink_to(executable)
+    expected = ProcessIdentity(42, "created", str(alias))
+    monkeypatch.setattr(
+        process_supervisor,
+        "inspect_process",
+        lambda _pid: ProcessIdentity(42, "created", str(executable)),
+    )
+
+    assert identity_matches(expected)
+
+
+def test_identity_matches_still_rejects_different_executables(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    expected_executable = tmp_path / "python-a"
+    live_executable = tmp_path / "python-b"
+    expected_executable.write_text("a", encoding="utf-8")
+    live_executable.write_text("b", encoding="utf-8")
+    expected = ProcessIdentity(42, "created", str(expected_executable))
+    monkeypatch.setattr(
+        process_supervisor,
+        "inspect_process",
+        lambda _pid: ProcessIdentity(42, "created", str(live_executable)),
+    )
+
+    assert not identity_matches(expected)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX launch invariant")
+def test_posix_spawn_records_session_group_without_post_launch_getpgid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        process_supervisor.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(AssertionError("must not race getpgid")),
+    )
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    try:
+        assert managed.token.pgid == managed.pid
+    finally:
+        managed.kill()
+        managed.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX retained ownership")
+def test_posix_managed_process_termination_uses_retained_launch_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+
+    managed.terminate(grace_seconds=0)
+    managed.wait(timeout=5)
+
+    assert managed.returncode is not None
+
+
 def test_windows_job_name_uses_cross_session_namespace() -> None:
     assert process_supervisor._windows_job_name("boundary") == r"Global\SpecButler-boundary"
 

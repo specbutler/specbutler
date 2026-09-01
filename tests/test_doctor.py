@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -335,20 +336,26 @@ def test_required_claude_without_sandbox_dependencies_is_blocked(
         _config_text(default_agent="claude", allowed_agents=("claude",)),
     )
 
-    report = doctor.run_doctor_checks(
-        repo,
-        runner=_Runner(),
-        which=_resolver(claude=True, claude_sandbox=False),
-    )
+    # This scenario is specifically the Linux bubblewrap/socat prerequisite
+    # policy.  macOS has native Claude sandbox support and must not inherit the
+    # Linux expectation merely because the hosted suite runs there.
+    with patch(
+        "spec_runtime.agent_adapter.claude_sandbox_unavailability_reason",
+        return_value=(
+            "Claude sandbox prerequisites are missing on Linux: `bwrap`, `socat`. "
+            "Install `bubblewrap` and `socat`, then rerun `spec doctor`."
+        ),
+    ):
+        report = doctor.run_doctor_checks(
+            repo,
+            runner=_Runner(),
+            which=_resolver(claude=True, claude_sandbox=False),
+        )
 
     check = _checks_by_name(report)["agent runtime (claude)"]
     assert check.status == "error"
     assert "bubblewrap" in " ".join(check.remediation)
-    if sys.platform == "win32":
-        assert "host sandbox is not supported" in check.detail
-        assert "socat" in " ".join(check.remediation)
-    else:
-        assert "socat" in check.detail
+    assert "socat" in check.detail
     assert report.exit_code == 1
 
 
@@ -360,11 +367,18 @@ def test_optional_claude_without_sandbox_dependencies_warns(
         _config_text(allowed_agents=("codex", "claude")),
     )
 
-    report = doctor.run_doctor_checks(
-        repo,
-        runner=_Runner(),
-        which=_resolver(claude=True, claude_sandbox=False),
-    )
+    with patch(
+        "spec_runtime.agent_adapter.claude_sandbox_unavailability_reason",
+        return_value=(
+            "Claude sandbox prerequisites are missing on Linux: `bwrap`, `socat`. "
+            "Install `bubblewrap` and `socat`, then rerun `spec doctor`."
+        ),
+    ):
+        report = doctor.run_doctor_checks(
+            repo,
+            runner=_Runner(),
+            which=_resolver(claude=True, claude_sandbox=False),
+        )
 
     check = _checks_by_name(report)["agent runtime (claude)"]
     assert check.status == "warning"

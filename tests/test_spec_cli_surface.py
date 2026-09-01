@@ -421,6 +421,18 @@ class TestForgeFactory:
 
 
 class TestClaudeAgent:
+    def test_native_macos_host_does_not_require_linux_sandbox_tools(self):
+        assert host_agent_unavailability_reason(
+            "claude",
+            platform="darwin",
+            which=lambda _name: None,
+        ) == ""
+        require_host_agent_available(
+            "claude",
+            platform="darwin",
+            which=lambda _name: None,
+        )
+
     def test_native_windows_host_launch_fails_closed_with_alternatives(self):
         reason = host_agent_unavailability_reason("claude", platform="win32")
 
