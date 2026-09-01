@@ -1269,9 +1269,18 @@ class ManagedAsyncProcess:
 class ProcessSupervisor:
     """Launch children with an explicit ownership lifetime."""
 
-    def __init__(self, mode: LifetimeMode = LifetimeMode.RUN_OWNED, *, supervision_id: str | None = None):
+    def __init__(
+        self,
+        mode: LifetimeMode = LifetimeMode.RUN_OWNED,
+        *,
+        supervision_id: str | None = None,
+        publish_durable_token: bool = False,
+    ):
         self.mode = LifetimeMode(mode)
+        if publish_durable_token and self.mode is not LifetimeMode.DETACHED:
+            raise ValueError("durable token publication requires detached lifetime")
         self._supervision_id = supervision_id
+        self._publish_durable_token = publish_durable_token
         self._children: list[ManagedProcess | ManagedAsyncProcess] = []
 
     def spawn(self, argv: Sequence[str], **kwargs: Any) -> ManagedProcess:
@@ -1395,6 +1404,22 @@ class ProcessSupervisor:
             if is_test_double:
                 setattr(process, "token", token)
                 return process  # type: ignore[return-value]
+            if self._publish_durable_token and os.name != "nt":
+                # Windows DETACHED launches publish from their durable Job
+                # helper before spawn() returns. POSIX has no keeper process,
+                # so publish the exact session-leader token atomically here.
+                # Callers opt in when crash recovery needs a discoverable token
+                # before they publish their own domain-specific state.
+                try:
+                    atomic_write_text(
+                        durable_metadata_path(token.token),
+                        json.dumps(token.to_dict(), sort_keys=True) + "\n",
+                    )
+                except BaseException:
+                    # Publication is the recovery handoff. If it fails, do not
+                    # leave an undiscoverable detached process tree behind.
+                    terminate(token, grace_seconds=0)
+                    raise
             managed = ManagedProcess(process, token, job)
             if job is not None:
                 _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
@@ -1525,6 +1550,15 @@ class ProcessSupervisor:
                 control_relpath=helper_token.control_relpath if helper_token is not None else control_relpath,
                 control_nonce=helper_token.control_nonce if helper_token is not None else control_nonce,
             )
+            if self._publish_durable_token and not is_test_double and os.name != "nt":
+                try:
+                    atomic_write_text(
+                        durable_metadata_path(token.token),
+                        json.dumps(token.to_dict(), sort_keys=True) + "\n",
+                    )
+                except BaseException:
+                    terminate(token, grace_seconds=0)
+                    raise
             managed = ManagedAsyncProcess(process, token, job)
             if job is not None:
                 _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
@@ -1808,6 +1842,59 @@ def terminate_legacy_popen_tree(process: subprocess.Popen[Any], *, grace_seconds
         owner_pid=os.getpid(),
         owner_started_at=owner.started_at if owner is not None else "unavailable",
         token=uuid.uuid4().hex,
+        pgid=pgid,
+        version=1,
+    )
+    return terminate(token, grace_seconds=grace_seconds)
+
+
+def legacy_pid_record_is_live(pid: int, started_at: str = "") -> bool:
+    """Validate a tokenless pre-supervisor PID record without exposing signals.
+
+    Windows PID records never carry an ownership capability and fail closed.
+    On POSIX, a recorded start identity must match exactly. Older records that
+    predate start-identity persistence remain readable for status, but are not
+    sufficient authorization for later termination.
+    """
+    if os.name != "posix" or pid <= 0:
+        return False
+    live = inspect_process(pid)
+    if live is None:
+        return False
+    return not started_at or live.started_at == started_at
+
+
+def terminate_legacy_pid_record(
+    pid: int,
+    started_at: str = "",
+    *,
+    grace_seconds: float = 5.0,
+) -> bool:
+    """Stop an old tokenless POSIX session only while ownership still matches.
+
+    The legacy web daemon used ``setsid()``, so its PID must still be its
+    process-group ID. A persisted start identity is required. Routing the
+    reconstructed token through :func:`terminate` closes the inspect/signal
+    race with a second identity check and preserves bounded whole-group cleanup.
+    """
+    if os.name != "posix" or pid <= 0 or not started_at:
+        return False
+    identity = inspect_process(pid)
+    if identity is None or identity.started_at != started_at:
+        return False
+    try:
+        pgid = os.getpgid(pid)
+    except (OSError, ProcessLookupError):
+        return False
+    if pgid != pid:
+        return False
+    owner = inspect_process(os.getpid())
+    token = SupervisionToken(
+        LifetimeMode.DETACHED,
+        identity,
+        os.getpid(),
+        owner.started_at if owner is not None else "unavailable",
+        uuid.uuid4().hex,
         pgid=pgid,
         version=1,
     )

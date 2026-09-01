@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -216,12 +215,10 @@ def _launch_path(repo_root: Path) -> Path:
     return _web_state_dir(repo_root) / "server.launch.json"
 
 
-def _helper_metadata_path(repo_root: Path, supervision_id: str) -> Path:
-    if os.name == "nt":
-        from spec_runtime.process_supervisor import durable_metadata_path
+def _helper_metadata_path(_repo_root: Path, supervision_id: str) -> Path:
+    from spec_runtime.process_supervisor import durable_metadata_path
 
-        return durable_metadata_path(supervision_id)
-    return repo_root / f".spec-supervisor-{supervision_id}.json"
+    return durable_metadata_path(supervision_id)
 
 
 def _write_launch_reservation(
@@ -251,7 +248,7 @@ def _write_launch_reservation(
 
 
 def _recover_launch(repo_root: Path, *, readiness_timeout: float = 1.0) -> object | None:
-    """Recover or reserve a Windows launch left by another launcher.
+    """Recover or reserve a supervised launch left by another launcher.
 
     A valid live token is returned even before readiness.  Callers therefore
     treat the launch as occupied instead of starting a duplicate service.  The
@@ -511,37 +508,35 @@ def remove_pid(repo_root: Path) -> None:
 
 
 def is_server_running(repo_root: Path) -> tuple[bool, int | None]:
-    from spec_runtime.process_supervisor import SupervisionToken, identity_matches
+    from spec_runtime.process_supervisor import (
+        SupervisionToken,
+        identity_matches,
+        legacy_pid_record_is_live,
+    )
 
+    supervision_state_exists = _supervision_path(repo_root).exists()
     supervision_token = read_supervision_token(repo_root)
-    if supervision_token is None and os.name == "nt":
+    if supervision_token is None and supervision_state_exists:
+        # Never downgrade malformed durable ownership state to a raw PID.
+        return False, None
+    if supervision_token is None and _launch_path(repo_root).exists():
         supervision_token = _recover_launch(repo_root)
     if isinstance(supervision_token, SupervisionToken):
         if identity_matches(supervision_token.identity) and identity_matches(supervision_token.payload):
             return True, supervision_token.payload.pid
         remove_pid(repo_root)
         return False, None
-    if os.name == "nt":
-        # A PID record is diagnostic only on Windows; without the durable Job
-        # token there is no safe ownership primitive to inspect or signal.
+    if _launch_path(repo_root).exists():
+        # A malformed or otherwise unverifiable launch reservation is an
+        # ownership boundary, not permission to fall back to a raw PID.
         return False, None
     pid, stored_started_at = read_pid(repo_root)
     if pid is None:
         return False, None
-    # Check the process is alive at all.
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        remove_pid(repo_root)
-        return False, None
-    # If we recorded a start identity, verify the live process matches to
-    # guard against PID reuse.
-    if stored_started_at:
-        live_started_at = _read_process_started_at(pid)
-        if live_started_at and live_started_at != stored_started_at:
-            remove_pid(repo_root)
-            return False, None
-    return True, pid
+    if legacy_pid_record_is_live(pid, stored_started_at):
+        return True, pid
+    remove_pid(repo_root)
+    return False, None
 
 
 # ---------------------------------------------------------------------------
@@ -690,10 +685,10 @@ def run_server(
         pass  # chat_api may fail to import if optional deps missing
 
     if background:
-        # Pre-fork: verify the port is not already occupied by another
-        # process.  Without this check _wait_for_port() in the parent
+        # Pre-launch: verify the port is not already occupied by another
+        # process. Without this check the readiness probe in the parent
         # would succeed immediately (because something *is* listening)
-        # while the forked child later dies with EADDRINUSE.
+        # while the supervised child later dies with EADDRINUSE.
         import socket
 
         try:
@@ -706,24 +701,50 @@ def run_server(
         except OSError:
             pass  # Good — port is free
 
-        if os.name == "nt":
-            from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor, SupervisionToken
+        from spec_runtime.process_supervisor import (
+            LifetimeMode,
+            ProcessSupervisor,
+            SupervisionToken,
+            identity_matches,
+        )
 
-            state_dir = _web_state_dir(repo_root)
-            state_dir.mkdir(parents=True, exist_ok=True)
-            supervision_id = uuid.uuid4().hex
-            ready_nonce = uuid.uuid4().hex
-            helper_path = _helper_metadata_path(repo_root, supervision_id)
-            _ready_path(repo_root).unlink(missing_ok=True)
-            _write_launch_reservation(
-                repo_root,
-                supervision_id=supervision_id,
-                helper_path=helper_path,
-                nonce=ready_nonce,
-                host=host,
-                port=port,
+        state_dir = _web_state_dir(repo_root)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        supervision_id = uuid.uuid4().hex
+        ready_nonce = uuid.uuid4().hex
+        helper_path = _helper_metadata_path(repo_root, supervision_id)
+        _ready_path(repo_root).unlink(missing_ok=True)
+        _write_launch_reservation(
+            repo_root,
+            supervision_id=supervision_id,
+            helper_path=helper_path,
+            nonce=ready_nonce,
+            host=host,
+            port=port,
+        )
+        log_path = state_dir / "server.log"
+        try:
+            log_fd = os.open(
+                log_path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
             )
-            log_handle = open(state_dir / "server.log", "a", encoding="utf-8")  # noqa: SIM115
+            try:
+                log_handle = os.fdopen(log_fd, "a", encoding="utf-8")
+            except BaseException:
+                os.close(log_fd)
+                raise
+        except OSError as exc:
+            _launch_path(repo_root).unlink(missing_ok=True)
+            _ready_path(repo_root).unlink(missing_ok=True)
+            helper_path.unlink(missing_ok=True)
+            print(f"spec web failed to open server.log: {exc}", file=sys.stderr)
+            return 1
+        try:
+            try:
+                log_path.chmod(0o600)
+            except OSError:
+                pass
             command = [
                 sys.executable,
                 "-m",
@@ -737,22 +758,30 @@ def run_server(
             ]
             if verbose:
                 command.append("--verbose")
-            try:
-                child_env = os.environ.copy()
-                child_env["SPEC_WEB_READY_NONCE"] = ready_nonce
-                managed = ProcessSupervisor(
-                    LifetimeMode.DETACHED,
-                    supervision_id=supervision_id,
-                ).spawn(
-                    command,
-                    cwd=repo_root,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_handle,
-                    stderr=subprocess.STDOUT,
-                    env=child_env,
-                )
-            finally:
-                log_handle.close()
+            child_env = os.environ.copy()
+            child_env["SPEC_WEB_READY_NONCE"] = ready_nonce
+            managed = ProcessSupervisor(
+                LifetimeMode.DETACHED,
+                supervision_id=supervision_id,
+                publish_durable_token=True,
+            ).spawn(
+                command,
+                cwd=repo_root,
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+            )
+        except Exception as exc:
+            _launch_path(repo_root).unlink(missing_ok=True)
+            _ready_path(repo_root).unlink(missing_ok=True)
+            helper_path.unlink(missing_ok=True)
+            print(f"spec web failed to launch: {exc}", file=sys.stderr)
+            return 1
+        finally:
+            log_handle.close()
+
+        try:
             ready_token = _wait_for_ready_record(
                 repo_root,
                 nonce=ready_nonce,
@@ -761,8 +790,8 @@ def run_server(
                 port=port,
             )
             if isinstance(ready_token, SupervisionToken):
-                # Keep failure cleanup on the same identity that was atomically
-                # promoted in helper state.
+                # Keep failure cleanup on the same identity that readiness
+                # authenticated (and Windows atomically promoted).
                 managed.token = ready_token
             ready_confirmed = (
                 isinstance(ready_token, SupervisionToken)
@@ -776,106 +805,30 @@ def run_server(
                 and _wait_for_port(probe_host, port, timeout=0.5)
             )
             if not ready_confirmed:
-                managed.terminate(grace_seconds=0.5)
-                from spec_runtime.process_supervisor import identity_matches
-
-                if not identity_matches(managed.token.identity):
-                    remove_pid(repo_root)
-                    helper_path.unlink(missing_ok=True)
-                print("spec web failed to start (see server.log).", file=sys.stderr)
-                return 1
+                raise RuntimeError("child did not publish authenticated readiness")
             # Publish only after readiness. Publishing earlier makes the child
             # observe its own durable token and reject startup as a duplicate.
             write_supervision_token(repo_root, ready_token)
-            _launch_path(repo_root).unlink(missing_ok=True)
-            helper_path.unlink(missing_ok=True)
-            print(f"spec web running on http://{probe_host}:{port}", file=sys.stderr)
-            print(f"Authenticated URL: {auth_url}", file=sys.stderr)
-            if open_browser:
-                import webbrowser
-
-                webbrowser.open(auth_url)
-            return 0
-
-        pid = os.fork()
-        if pid > 0:
-            # Parent — verify the child actually binds the port before
-            # reporting success.  This catches port-in-use and other
-            # startup failures that a fixed sleep would miss.
-            if not _wait_for_port(host, port):
-                print(
-                    "spec web failed to start (port may already be in use).",
-                    file=sys.stderr,
-                )
-                return 1
-            # Double-check the child is still alive — guards against a
-            # narrow race where the port became occupied between our
-            # pre-fork check and the child's bind() call.
+        except Exception:
             try:
-                exited_pid, exit_status = os.waitpid(pid, os.WNOHANG)
-                if exited_pid != 0:
-                    print(
-                        "spec web child exited unexpectedly "
-                        f"(status {exit_status}).",
-                        file=sys.stderr,
-                    )
-                    return 1
-            except ChildProcessError:
-                print(
-                    "spec web child exited unexpectedly.",
-                    file=sys.stderr,
-                )
-                return 1
-            state_dir = _web_state_dir(repo_root)
-            state_dir.mkdir(parents=True, exist_ok=True)
-            _port_path(repo_root).write_text(str(port))
-            print(f"spec web running on http://{probe_host}:{port}", file=sys.stderr)
-            print(f"Authenticated URL: {auth_url}", file=sys.stderr)
-            if open_browser:
-                import webbrowser
-
-                webbrowser.open(auth_url)
-            return 0
-        # Child — detach fully so we don't hold the caller's terminal or
-        # stdio pipe open (which would make `spec web start --background`
-        # appear to hang until the daemon exits).  After setsid(), redirect
-        # the inherited stdin/stdout/stderr file descriptors: stdin from
-        # /dev/null, stdout/stderr to a rotating-ish server.log.  dup2 on the
-        # underlying fds also captures uvicorn's C-level/native writes.
-        os.setsid()
-        try:
-            log_dir = _web_state_dir(repo_root)
-            log_dir.mkdir(parents=True, exist_ok=True)
-            devnull_fd = os.open(os.devnull, os.O_RDONLY)
-            # Private (0o600) — uvicorn access logs redirected here can contain
-            # the `/?token=...` auth URL, so the log must not be world-readable
-            # even though the token file itself is chmod 600.
-            log_path = log_dir / "server.log"
-            log_fd = os.open(
-                str(log_path),
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                0o600,
-            )
-            # Enforce private mode even if the file pre-existed with looser bits
-            # (O_CREAT does not tighten an existing file's permissions).
-            try:
-                os.fchmod(log_fd, 0o600)
-            except OSError:
+                managed.terminate(grace_seconds=0.5)
+            except Exception:
                 pass
-            os.dup2(devnull_fd, 0)
-            os.dup2(log_fd, 1)
-            os.dup2(log_fd, 2)
-            if devnull_fd > 2:
-                os.close(devnull_fd)
-            if log_fd > 2:
-                os.close(log_fd)
-        except OSError:
-            # Best-effort: even if redirection fails, continue running the
-            # daemon rather than aborting the start.
-            pass
-    else:
-        # Foreground: defer the success banner until after the socket binds.
-        pass
+            if not identity_matches(managed.token.identity):
+                remove_pid(repo_root)
+                helper_path.unlink(missing_ok=True)
+            print("spec web failed to start (see server.log).", file=sys.stderr)
+            return 1
+
+        _launch_path(repo_root).unlink(missing_ok=True)
+        helper_path.unlink(missing_ok=True)
+        print(f"spec web running on http://{probe_host}:{port}", file=sys.stderr)
+        print(f"Authenticated URL: {auth_url}", file=sys.stderr)
+        if open_browser:
+            import webbrowser
+
+            webbrowser.open(auth_url)
+        return 0
 
     write_pid(repo_root, port=port)
 
@@ -886,44 +839,39 @@ def run_server(
 
         app = create_app(repo_root, token, port=port)
 
-        if not background:
-            # Use uvicorn.Server directly so we can hook into startup()
-            # and print the banner *after* the socket is bound.  The
-            # lifespan "startup" event fires *before* bind, so it is
-            # too early for the banner / browser open.
-            config = uvicorn.Config(app, host=host, port=port, log_level=uvi_log_level, proxy_headers=True, forwarded_allow_ips="*")
-            server = uvicorn.Server(config)
-            _orig_startup = server.startup
+        # Use uvicorn.Server directly so we can hook into startup() and publish
+        # authenticated readiness only after the socket binds. A supervised
+        # background child executes this same foreground path.
+        config = uvicorn.Config(app, host=host, port=port, log_level=uvi_log_level, proxy_headers=True, forwarded_allow_ips="*")
+        server = uvicorn.Server(config)
+        _orig_startup = server.startup
 
-            async def _startup_then_banner(**kw: object) -> None:
-                await _orig_startup(**kw)
-                if server.started:
-                    _publish_ready_record(
-                        repo_root,
-                        nonce=os.environ.get("SPEC_WEB_READY_NONCE", ""),
-                        host=host,
-                        port=port,
-                    )
-                    print(
-                        f"spec web running on http://{probe_host}:{port}",
-                        file=sys.stderr,
-                    )
-                    print(f"Authenticated URL: {auth_url}", file=sys.stderr)
-                    if open_browser:
-                        import webbrowser
+        async def _startup_then_banner(**kw: object) -> None:
+            await _orig_startup(**kw)
+            if server.started:
+                _publish_ready_record(
+                    repo_root,
+                    nonce=os.environ.get("SPEC_WEB_READY_NONCE", ""),
+                    host=host,
+                    port=port,
+                )
+                print(
+                    f"spec web running on http://{probe_host}:{port}",
+                    file=sys.stderr,
+                )
+                print(f"Authenticated URL: {auth_url}", file=sys.stderr)
+                if open_browser:
+                    import webbrowser
 
-                        webbrowser.open(auth_url)
+                    webbrowser.open(auth_url)
 
-            server.startup = _startup_then_banner  # type: ignore[assignment]
-            try:
-                server.run()
-            except KeyboardInterrupt:
-                # Uvicorn versions differ on whether Server.run() consumes
-                # SIGINT. A normal foreground Ctrl-C is a clean operator stop,
-                # not an application failure or traceback-worthy condition.
-                pass
-        else:
-            uvicorn.run(app, host=host, port=port, log_level=uvi_log_level, proxy_headers=True, forwarded_allow_ips="*")
+        server.startup = _startup_then_banner  # type: ignore[assignment]
+        try:
+            server.run()
+        except KeyboardInterrupt:
+            # Uvicorn versions differ on whether Server.run() consumes SIGINT.
+            # A normal foreground Ctrl-C is a clean operator stop.
+            pass
     finally:
         # Only remove PID file if it still refers to this process — avoids
         # deleting a file that a concurrent start may have written.
@@ -939,10 +887,14 @@ def stop_server(repo_root: Path) -> int:
     if not running or pid is None:
         print("spec web is not running.", file=sys.stderr)
         return 1
-    from spec_runtime.process_supervisor import SupervisionToken, terminate
+    from spec_runtime.process_supervisor import (
+        SupervisionToken,
+        terminate,
+        terminate_legacy_pid_record,
+    )
 
     supervision_token = read_supervision_token(repo_root)
-    if supervision_token is None and os.name == "nt":
+    if supervision_token is None and _launch_path(repo_root).exists():
         supervision_token = _recover_launch(repo_root, readiness_timeout=0.0)
     if isinstance(supervision_token, SupervisionToken):
         if not terminate(supervision_token):
@@ -952,16 +904,17 @@ def stop_server(repo_root: Path) -> int:
             )
             return 1
     else:
-        if os.name == "nt":
+        recorded_pid, recorded_started_at = read_pid(repo_root)
+        if recorded_pid != pid or not terminate_legacy_pid_record(
+            pid,
+            recorded_started_at,
+        ):
             print(
-                "spec web cannot stop safely because its Windows supervision token is missing.",
+                "spec web cannot stop safely because durable supervision is "
+                "missing and legacy PID ownership could not be verified.",
                 file=sys.stderr,
             )
             return 1
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
     remove_pid(repo_root)
     print(f"spec web stopped (pid {pid}).", file=sys.stderr)
     return 0

@@ -1,10 +1,12 @@
-"""Dependency-free tests for the Windows web launch ownership handshake."""
+"""Dependency-free tests for the web launch ownership handshake."""
 
 from __future__ import annotations
 
 import json
 import os
 from unittest.mock import patch
+
+import pytest
 
 from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
 from spec_runtime.web.server import (
@@ -16,6 +18,14 @@ from spec_runtime.web.server import (
     read_supervision_token,
     stop_server,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_process_control_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "process-controls"))
 
 
 def _token(name: str) -> SupervisionToken:
@@ -75,8 +85,8 @@ def test_dead_launch_is_cleared_before_retry(tmp_path):
 
 def test_stop_uses_live_launch_token(tmp_path):
     token = _token("stopping-launch")
+    _reserve(tmp_path, token)
     with (
-        patch("spec_runtime.web.server.os.name", "nt"),
         patch("spec_runtime.web.server.is_server_running", return_value=(True, 124)),
         patch("spec_runtime.web.server.read_supervision_token", return_value=None),
         patch("spec_runtime.web.server._recover_launch", return_value=token) as recover,

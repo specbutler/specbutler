@@ -23,9 +23,11 @@ from spec_runtime.process_supervisor import (
     adopt,
     identity_matches,
     inspect_process,
+    legacy_pid_record_is_live,
     promote_payload_identity,
     run,
     terminate,
+    terminate_legacy_pid_record,
 )
 
 
@@ -103,6 +105,125 @@ def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -
         lambda pid: ProcessIdentity(pid, "new", sys.executable),
     )
     assert identity_matches(expected) is False
+
+
+def test_detached_durable_token_publication_is_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+    supervision_id = f"published-{uuid.uuid4().hex}"
+    managed = ProcessSupervisor(
+        LifetimeMode.DETACHED,
+        supervision_id=supervision_id,
+        publish_durable_token=True,
+    ).spawn([sys.executable, "-c", "import time; time.sleep(30)"])
+    metadata_path = process_supervisor.durable_metadata_path(supervision_id)
+    try:
+        published = SupervisionToken.from_dict(
+            json.loads(metadata_path.read_text(encoding="utf-8"))
+        )
+        assert published == managed.token
+        assert identity_matches(published.identity)
+    finally:
+        managed.terminate(grace_seconds=0.1)
+        metadata_path.unlink(missing_ok=True)
+
+
+def test_durable_token_publication_rejects_non_detached_lifetime() -> None:
+    with pytest.raises(ValueError, match="requires detached lifetime"):
+        ProcessSupervisor(
+            LifetimeMode.RUN_OWNED,
+            publish_durable_token=True,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX ownership integration")
+def test_detached_publication_failure_terminates_launched_session(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+    real_popen = process_supervisor.subprocess.Popen
+    launched: list[subprocess.Popen[bytes]] = []
+
+    def recording_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+        process = real_popen(*args, **kwargs)
+        if kwargs.get("start_new_session") is True:
+            launched.append(process)
+        return process
+
+    monkeypatch.setattr(process_supervisor.subprocess, "Popen", recording_popen)
+    monkeypatch.setattr(
+        process_supervisor,
+        "atomic_write_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("publication failed")),
+    )
+
+    with pytest.raises(OSError, match="publication failed"):
+        ProcessSupervisor(
+            LifetimeMode.DETACHED,
+            supervision_id="failed-publication",
+            publish_durable_token=True,
+        ).spawn([sys.executable, "-c", "import time; time.sleep(30)"])
+
+    assert len(launched) == 1
+    launched[0].wait(timeout=5)
+    assert launched[0].returncode is not None
+
+
+def test_legacy_pid_record_rejects_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_supervisor.os, "name", "posix")
+    monkeypatch.setattr(
+        process_supervisor,
+        "inspect_process",
+        lambda pid: ProcessIdentity(pid, "live"),
+    )
+
+    assert legacy_pid_record_is_live(42)
+    assert not terminate_legacy_pid_record(42)
+    assert not legacy_pid_record_is_live(42, "recorded")
+    assert not terminate_legacy_pid_record(42, "recorded")
+
+
+def test_legacy_pid_record_termination_routes_through_supervision_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = ProcessIdentity(42, "created", "/usr/bin/python")
+    owner = ProcessIdentity(7, "owner", "/usr/bin/python")
+    monkeypatch.setattr(process_supervisor.os, "name", "posix")
+    monkeypatch.setattr(
+        process_supervisor,
+        "inspect_process",
+        lambda pid: process if pid == process.pid else owner,
+    )
+    monkeypatch.setattr(
+        process_supervisor.os,
+        "getpgid",
+        lambda pid: pid,
+        raising=False,
+    )
+    terminate_call: list[tuple[SupervisionToken, float]] = []
+
+    def fake_terminate(token: SupervisionToken, *, grace_seconds: float = 5.0) -> bool:
+        terminate_call.append((token, grace_seconds))
+        return True
+
+    monkeypatch.setattr(process_supervisor, "terminate", fake_terminate)
+
+    assert legacy_pid_record_is_live(process.pid, process.started_at)
+    assert terminate_legacy_pid_record(
+        process.pid,
+        process.started_at,
+        grace_seconds=0.25,
+    )
+    token, grace = terminate_call[0]
+    assert token.identity == process
+    assert token.pgid == process.pid
+    assert token.version == 1
+    assert grace == 0.25
 
 
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX ownership integration")
