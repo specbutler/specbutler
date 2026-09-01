@@ -1122,8 +1122,24 @@ description: Exercise installed Windows autopilot supervision
         text=True,
     )
     try:
+        def child_was_adopted() -> bool:
+            try:
+                active_payload = json.loads(
+                    (repo / ".spec-state" / "autopilot" / "active.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                active_item = active_payload[auto_id]
+            except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+                return False
+            return (
+                active_item.get("adoption_generation", 0) >= 1
+                and active_item.get("adopted_by", {}).get("pid")
+                == second_dispatcher.pid
+            )
+
         _wait_until(
-            lambda: "adopt:" in second_log_path.read_text(encoding="utf-8", errors="replace"),
+            child_was_adopted,
             timeout=30,
             detail="autopilot child adoption",
         )
