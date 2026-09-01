@@ -122,6 +122,31 @@ allow_from_user = "render"
             with pytest.raises(SpecConfigError, match="allow_from_user must be a list of strings"):
                 load_spec_runtime_config(require=True)
 
+    @pytest.mark.parametrize(
+        "windows_variant",
+        [
+            'command_windows = "Write-Output ok"\nshell_windows = "powershell"',
+            'argv_windows = ["py", "-m", "pytest"]',
+        ],
+    )
+    def test_load_rejects_windows_only_verify_gate_on_posix(
+        self, tmp_path: Path, windows_variant: str
+    ) -> None:
+        (tmp_path / ".spec.toml").write_text(
+            f"""
+[verify]
+[[verify.gates]]
+name = "test"
+{windows_variant}
+"""
+        )
+
+        with pytest.raises(
+            SpecConfigError,
+            match=r"verify\.gates.*requires command or argv.*additive overrides",
+        ):
+            load_spec_runtime_config(config_path=tmp_path / ".spec.toml")
+
     def test_discover_repo_root_prefers_current_repo_markers(self, tmp_path, monkeypatch):
         repo_root = tmp_path / "repo"
         nested = repo_root / "pkg" / "feature"
@@ -480,6 +505,25 @@ class TestGenerateSpecToml:
         parsed = tomllib.loads(content)
         assert parsed["bootstrap"]["install_command"] == 'bash -lc "pip install -e ."'
         assert parsed["verify"]["gates"][0]["command"] == 'bash -lc "pytest -q"'
+
+    def test_generated_windows_bootstrap_roundtrips_through_config_loader(self, tmp_path: Path):
+        from spec_runtime.config import load_repo_spec_runtime_config
+
+        content = _generate_spec_toml(
+            base_ref="origin/main",
+            default_agent="claude",
+            review_default="claude",
+            allowed_agents=["claude"],
+            gates=[],
+            install_command="python -m pip install -e .",
+        )
+        (tmp_path / ".spec.toml").write_text(content)
+
+        config = load_repo_spec_runtime_config(tmp_path, require=True)
+        selected = config.bootstrap_install.select(windows=True)
+        assert selected is not None
+        assert selected.shell == "powershell"
+        assert r".\.venv\Scripts\python.exe" in str(selected.value)
 
     def test_escapes_backslashes_in_commands(self):
         """Backslashes must be escaped for valid TOML (F2)."""

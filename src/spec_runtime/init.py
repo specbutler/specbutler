@@ -321,11 +321,21 @@ def _generate_spec_toml(
     ]
     if install_command:
         lines.append(f'install_command = "{_toml_escape(install_command)}"')
+        lines.append(
+            'install_command_windows = "python -m venv .venv; '
+            '.\\\\.venv\\\\Scripts\\\\python.exe -m pip install -e ."'
+        )
+        lines.append('install_shell_windows = "powershell"')
     else:
         lines.append(
             '# install_command = "python -m venv .venv && '
             '.venv/bin/python -m pip install -e ."'
         )
+        lines.append(
+            '# install_command_windows = "python -m venv .venv; '
+            '.\\\\.venv\\\\Scripts\\\\python.exe -m pip install -e ."'
+        )
+        lines.append('# install_shell_windows = "powershell"')
 
     lines += [
         "",

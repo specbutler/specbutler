@@ -54,7 +54,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -70,6 +70,7 @@ from .agent_adapter import (
     codex_isolated_home,
     get_agent_adapter,
 )
+from .command_runtime import CommandSpec, CommandVariants
 from .config import load_spec_runtime_config
 from .control_plane import (
     DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
@@ -2281,6 +2282,8 @@ def _build_implement_command_metadata(
         "SPEC_ID": run.spec_id,
         "SPEC_RUN_ID": run.run_id,
         "SPEC_PATH": spec_path,
+        "SPEC_WORKTREE": str(worktree_path),
+        "SPEC_ATTEMPT": str(run.attempts + 1),
     }
     args = [
         "--worktree",
@@ -2475,7 +2478,12 @@ def _run_implement_setup_command(
     run: RunState,
     worktree_path: Path,
 ) -> ImplementSetupManifest:
+    variants = SPEC_RUNTIME_CONFIG.implement.setup
+    selected = variants.select()
     command = SPEC_RUNTIME_CONFIG.implement.setup_command.strip()
+    if selected is not None and not command:
+        command = selected.display()
+    typed = selected is not None and _selected_command_uses_typed_runtime(variants, selected)
     backend = _resolve_execution_backend()
     if not command:
         _snapshot_container_workspace_after_setup(run, worktree_path, backend)
@@ -2488,7 +2496,7 @@ def _run_implement_setup_command(
     # raise past ``phase_implement``. Surfacing it as an ``ImplementSetupFailure``
     # lets the agent launch with diagnostics instead of aborting the phase.
     try:
-        split_command = shlex.split(command)
+        split_command = [] if typed else [*shlex.split(command), *args]
     except ValueError as exc:
         # ``shlex.split`` failed (e.g. unclosed quote), so we cannot rely on
         # proper tokenization. Fall back to argv-aware best-effort redaction
@@ -2513,23 +2521,31 @@ def _run_implement_setup_command(
             launch_error=True,
         )
         return ImplementSetupManifest(failure=failure)
-    setup_cmd = [*split_command, *args]
-    # Redact argv before joining: ``setup_command`` argv may carry DSNs,
-    # tokens, or API-key flags. Redacting the post-``shlex.join`` string
-    # leaves trailing secret tails when an arg with spaces was quoted
-    # (``'--connection-string=Pwd=a b'`` would only match through the
-    # first space). Per-element redaction scrubs the whole value so the
-    # failure prompt and warning log cannot leak secrets.
-    command_str = shlex.join(_redact_argv(setup_cmd))
+    command_str = selected.display() if typed and selected is not None else command
     try:
-        result = backend.run_command(
-            CommandRequest(
-                argv=setup_cmd,
+        launch = (
+            selected.launch_argv(
                 cwd=worktree_path,
-                env=env,
-                inherit_env=True,
+                arguments=_shell_metadata_arguments(selected, args),
             )
+            if typed and selected is not None
+            else nullcontext(split_command)
         )
+        with launch as setup_cmd:
+            # Use the configured display for typed scripts so a generated
+            # batch path never appears in logs or failure manifests.
+            command_str = (
+                selected.display() if typed and selected is not None
+                else shlex.join(_redact_argv(setup_cmd))
+            )
+            result = backend.run_command(
+                CommandRequest(
+                    argv=setup_cmd,
+                    cwd=worktree_path,
+                    env=env,
+                    inherit_env=True,
+                )
+            )
     except ExecutionBackendImportError:
         raise
     except OSError as exc:
@@ -2895,28 +2911,41 @@ def _position_review_retry_workspace_head(
 
 
 def _run_implement_teardown_command(run: RunState, worktree_path: Path) -> None:
+    variants = SPEC_RUNTIME_CONFIG.implement.teardown
+    selected = variants.select()
     command = SPEC_RUNTIME_CONFIG.implement.teardown_command.strip()
+    if selected is not None and not command:
+        command = selected.display()
     if not command:
         return
 
     env, args = _build_implement_command_metadata(run, worktree_path)
     _inject_worktree_venv_into_env(env, worktree_path)
-    teardown_cmd = [*shlex.split(command), *args]
+    typed = selected is not None and _selected_command_uses_typed_runtime(variants, selected)
     backend = _resolve_execution_backend()
     try:
-        result = backend.run_command(
-            CommandRequest(
-                argv=teardown_cmd,
+        launch = (
+            selected.launch_argv(
                 cwd=worktree_path,
-                env=env,
-                inherit_env=True,
+                arguments=_shell_metadata_arguments(selected, args),
             )
+            if typed and selected is not None
+            else nullcontext([*shlex.split(command), *args])
         )
+        with launch as teardown_cmd:
+            result = backend.run_command(
+                CommandRequest(
+                    argv=teardown_cmd,
+                    cwd=worktree_path,
+                    env=env,
+                    inherit_env=True,
+                )
+            )
     except OSError as exc:
         logger.warning(
             "Implement teardown command failed for %s: could not start %s: %s",
             run.run_id,
-            shlex.join(teardown_cmd),
+            selected.display() if typed and selected is not None else command,
             exc,
         )
         return
@@ -12863,13 +12892,11 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
 
         install_cmd = _host_bootstrap_install_command(backend)
         if install_cmd:
-            if not run_or_fail(
-                run,
-                ["sh", "-c", install_cmd],
-                cwd=worktree_path,
-                action=install_cmd,
-            ):
-                return "failed"
+            with install_cmd.launch_argv(cwd=worktree_path) as install_argv:
+                if not run_or_fail(
+                    run, install_argv, cwd=worktree_path, action=install_cmd.display()
+                ):
+                    return "failed"
 
         if backend.identity.backend != "container":
             try:
@@ -12980,22 +13007,29 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
     # Install dependencies so the worktree is ready to use.
     install_cmd = _host_bootstrap_install_command(backend)
     if install_cmd:
-        if not run_or_fail(
-            run,
-            ["sh", "-c", install_cmd],
-            cwd=worktree_path,
-            action=install_cmd,
-        ):
-            return "failed"
+        with install_cmd.launch_argv(cwd=worktree_path) as install_argv:
+            if not run_or_fail(
+                run, install_argv, cwd=worktree_path, action=install_cmd.display()
+            ):
+                return "failed"
 
     return "passed"
 
 
-def _host_bootstrap_install_command(backend: ExecutionBackend) -> str:
-    install_cmd = SPEC_RUNTIME_CONFIG.bootstrap_install_command
+def _host_bootstrap_install_command(backend: ExecutionBackend) -> CommandSpec | None:
+    install_cmd = _selected_bootstrap_install_command()
     if backend.identity.backend == "container":
-        return ""
+        return None
     return install_cmd
+
+
+def _selected_bootstrap_install_command() -> CommandSpec | None:
+    """Select typed bootstrap config while honoring legacy constructed configs."""
+    selected = SPEC_RUNTIME_CONFIG.bootstrap_install.select()
+    if selected is not None:
+        return selected
+    legacy = str(SPEC_RUNTIME_CONFIG.bootstrap_install_command or "").strip()
+    return CommandSpec("script", legacy, "sh", "[bootstrap].install_command") if legacy else None
 
 
 def _backend_uses_provider_sandbox_config(backend: ExecutionBackend) -> bool:
@@ -16905,21 +16939,28 @@ def _run_verify_gate(
     gate: str,
     repo_root: Path | None = None,
 ) -> VerifyGateResult:
-    command = shlex.split(VERIFY_GATE_COMMANDS.get(gate, f"make {gate}"))
+    command = _verify_gate_command_args(gate)
+    typed_command = _verify_gate_typed_command(gate)
     timeout_seconds = DEFAULT_VERIFY_GATE_TIMEOUT_SECONDS
     backend = _resolve_execution_backend()
 
     def _run_via_backend(env: dict[str, str]) -> subprocess.CompletedProcess:
         try:
-            result = backend.run_command(
-                CommandRequest(
-                    argv=command,
-                    cwd=worktree_path,
-                    env=env,
-                    inherit_env=True,
-                    timeout=timeout_seconds,
-                )
+            launch = (
+                typed_command.launch_argv(cwd=worktree_path)
+                if typed_command is not None
+                else nullcontext(command)
             )
+            with launch as launch_argv:
+                result = backend.run_command(
+                    CommandRequest(
+                        argv=launch_argv,
+                        cwd=worktree_path,
+                        env=env,
+                        inherit_env=True,
+                        timeout=timeout_seconds,
+                    )
+                )
         except subprocess.TimeoutExpired as exc:
             stderr_value = exc.stderr or ""
             if isinstance(stderr_value, bytes):
@@ -17030,7 +17071,46 @@ def _run_verify_gate(
 
 
 def _verify_gate_command_args(gate: str) -> list[str]:
+    selected = _verify_gate_typed_command(gate)
+    if selected is not None:
+        return selected.argv()
     return shlex.split(VERIFY_GATE_COMMANDS.get(gate, f"make {gate}"))
+
+
+def _verify_gate_typed_command(gate: str) -> CommandSpec | None:
+    config = next((item for item in SPEC_RUNTIME_CONFIG.verify_gates if item.name == gate), None)
+    if config is not None:
+        variants = config.command_variants
+        selected = variants.select()
+        if selected is not None and _selected_command_uses_typed_runtime(variants, selected):
+            return selected
+    return None
+
+
+def _selected_command_uses_typed_runtime(
+    variants: CommandVariants,
+    selected: CommandSpec,
+) -> bool:
+    """Whether the variant selected for this platform opts into typed execution.
+
+    Legacy POSIX command strings remain argv-split unless they declare a shell.
+    A Windows-only script is additive and must not affect that POSIX decision.
+    """
+    return bool(
+        selected.mode == "argv"
+        or variants.shell
+        or (os.name == "nt" and variants.windows_command)
+    )
+
+
+def _shell_metadata_arguments(selected: CommandSpec, arguments: list[str]) -> tuple[str, ...]:
+    """Return positional metadata only for shells that preserve its boundary.
+
+    cmd hooks receive the same metadata through SPEC_ID, SPEC_RUN_ID, SPEC_PATH,
+    and SPEC_WORKTREE in their environment. Direct argv and PowerShell hooks
+    retain positional metadata for backward compatibility.
+    """
+    return () if selected.mode == "script" and selected.shell == "cmd" else tuple(arguments)
 
 
 def _run_verify_subprocess_with_timeout(
@@ -18601,12 +18681,19 @@ def _bootstrap_review_worktree(
     summary when bootstrap did not complete cleanly.
     """
     warning_path.unlink(missing_ok=True)
-    install_cmd = str(SPEC_RUNTIME_CONFIG.bootstrap_install_command or "").strip()
-    if not install_cmd:
+    install_command = _selected_bootstrap_install_command()
+    if install_command is None:
         # No trusted bootstrap command configured: keep today's diff-only
         # review rather than guessing an install command from the tree under
         # review.
         return ""
+    if install_command.mode == "script" and (install_command.shell or "sh") == "sh":
+        # Review bootstrap historically used sh -lc. Keep that established
+        # POSIX behavior while routing the launch through the typed runner.
+        install_command = replace(install_command, login_shell=True)
+    install_display = install_command.display()
+    if SPEC_RUNTIME_CONFIG.bootstrap_install.select() is None:
+        install_display = str(SPEC_RUNTIME_CONFIG.bootstrap_install_command).strip()
 
     # Credentials stripped (no forge tokens) — reuse the hardened env the
     # reviewer subprocess runs with, then additionally drop the portable agent
@@ -18636,7 +18723,7 @@ def _bootstrap_review_worktree(
         payload = {
             "recorded_at": _now_iso(),
             "worktree": str(review_worktree),
-            "command": install_cmd,
+            "command": install_display,
             "summary": summary,
             "detail": detail[-4000:],
         }
@@ -18662,7 +18749,7 @@ def _bootstrap_review_worktree(
     try:
         try:
             proc = subprocess.Popen(
-                ["sh", "-lc", install_cmd],
+                install_command.argv(),
                 cwd=review_worktree,
                 env=env,
                 stdin=subprocess.DEVNULL,

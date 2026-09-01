@@ -174,6 +174,11 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
         cwd=tmp_path,
         check=True,
     )
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/main", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+    )
     initialized = subprocess.run(
         [sys.executable, "-m", "spec_runtime.cli", "init"],
         cwd=tmp_path,
