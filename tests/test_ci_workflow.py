@@ -259,6 +259,18 @@ def test_ci_windows_job_is_a_required_product_gate_with_diagnostics():
     parse_step = package_steps["Parse Windows lab PowerShell"]
     assert "Language.Parser]::ParseFile" in parse_step["run"]
     assert "*.ps1.template" in parse_step["run"]
+    assert "Add-Type -Path tools/windows-lab/job-supervisor.cs" in parse_step["run"]
+    supervisor_probe = package_steps["Run Windows PowerShell 5.1 supervisor probe"]
+    assert supervisor_probe["shell"] == "powershell"
+    assert "job-supervisor-selftest.ps1" in supervisor_probe["run"]
+    supervisor_upload = package_steps["Upload Windows supervisor probe diagnostics"]
+    assert supervisor_upload["if"] == "always()"
+    assert supervisor_upload["with"]["if-no-files-found"] == "error"
+    supervisor_enforcement = package_steps["Enforce Windows supervisor probe result"]
+    assert supervisor_enforcement["if"] == "always()"
+    assert supervisor_enforcement["shell"] == "powershell"
+    assert "job-supervisor-selftest.json" in supervisor_enforcement["run"]
+    assert "status -ne 'passed'" in supervisor_enforcement["run"]
     package_steps = [step for step in package["steps"] if isinstance(step, dict)]
     steps = [step for step in windows["steps"] if isinstance(step, dict)]
 

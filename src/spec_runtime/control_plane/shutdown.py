@@ -201,7 +201,14 @@ class ShutdownTracker:
         with FileLock(self._lock_path):
             current = self.state()
             timestamp = _now_iso(now)
-            phase = ShutdownPhase.FORCED if current.phase is ShutdownPhase.GRACEFUL else ShutdownPhase.GRACEFUL
+            if current.phase is ShutdownPhase.RUNNING:
+                phase = ShutdownPhase.GRACEFUL
+            elif current.phase is ShutdownPhase.GRACEFUL:
+                phase = ShutdownPhase.FORCED
+            else:
+                # Escalation is monotonic. Repeated interrupts must never
+                # release a forced-shutdown latch or reopen completed state.
+                phase = current.phase
             state = ShutdownState(
                 phase=phase,
                 instance_id=self._instance_id or current.instance_id,
@@ -209,7 +216,12 @@ class ShutdownTracker:
                 process_started_at=self._process_started_at or current.process_started_at,
                 nonce=self._nonce or current.nonce,
                 requested_at=current.requested_at or timestamp,
-                forced_at=timestamp if phase is ShutdownPhase.FORCED else current.forced_at,
+                forced_at=(
+                    timestamp
+                    if phase is ShutdownPhase.FORCED and not current.forced_at
+                    else current.forced_at
+                ),
+                completed_at=current.completed_at,
                 reason=reason or current.reason,
                 interrupt_count=current.interrupt_count + 1,
             )

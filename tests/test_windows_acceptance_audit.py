@@ -32,6 +32,7 @@ def _run_audit(
     tmp_path: Path,
     *,
     manifest: Path = MANIFEST,
+    manifest_source_path: Path | None = None,
     source_root: Path = REPO_ROOT,
     evidence_root: Path | None = None,
     revision: str = CURRENT_REVISION,
@@ -39,21 +40,24 @@ def _run_audit(
     evidence = evidence_root or (tmp_path / "evidence")
     evidence.mkdir(parents=True, exist_ok=True)
     output = tmp_path / "acceptance-audit.json"
+    arguments = [
+        sys.executable,
+        str(AUDITOR),
+        "--manifest",
+        str(manifest),
+        "--source-root",
+        str(source_root),
+        "--evidence-root",
+        str(evidence),
+        "--expected-revision",
+        revision,
+        "--output",
+        str(output),
+    ]
+    if manifest_source_path is not None:
+        arguments.extend(("--manifest-source-path", str(manifest_source_path)))
     result = subprocess.run(
-        [
-            sys.executable,
-            str(AUDITOR),
-            "--manifest",
-            str(manifest),
-            "--source-root",
-            str(source_root),
-            "--evidence-root",
-            str(evidence),
-            "--expected-revision",
-            revision,
-            "--output",
-            str(output),
-        ],
+        arguments,
         check=False,
         capture_output=True,
         text=True,
@@ -189,6 +193,51 @@ def test_audit_passes_only_with_exact_revision_and_satisfied_artifact(tmp_path: 
     assert audit["status"] == "passed"
     assert audit["counts"] == {"failed": 0, "passed": 1, "unproven": 0}
     assert {check["status"] for check in audit["global_checks"]} == {"passed"}
+
+
+def test_immutable_manifest_snapshot_is_bound_to_canonical_repository_path(
+    tmp_path: Path,
+) -> None:
+    source, manifest, revision = _write_minimal_contract(tmp_path)
+    snapshot = tmp_path / "immutable-snapshot" / "manifest.json"
+    snapshot.parent.mkdir()
+    snapshot.write_bytes(manifest.read_bytes())
+    evidence = tmp_path / "evidence"
+    _write_provenance(evidence, configured=revision, staged=revision)
+    (evidence / "evidence.json").write_text(
+        json.dumps({"status": "passed", "source_revision": revision}) + "\n",
+        encoding="utf-8",
+    )
+
+    result, audit = _run_audit(
+        tmp_path,
+        manifest=snapshot,
+        manifest_source_path=Path("manifest.json"),
+        source_root=source,
+        evidence_root=evidence,
+        revision=revision,
+    )
+
+    assert result.returncode == 0
+    assert audit["status"] == "passed"
+
+    snapshot.write_bytes(snapshot.read_bytes() + b"\n")
+    result, audit = _run_audit(
+        tmp_path,
+        manifest=snapshot,
+        manifest_source_path=Path("manifest.json"),
+        source_root=source,
+        evidence_root=evidence,
+        revision=revision,
+    )
+
+    assert result.returncode == 1
+    contract = next(
+        check
+        for check in audit["global_checks"]
+        if check["check_id"] == "global.source-contract-at-revision"
+    )
+    assert contract["status"] == "failed"
 
 
 def test_missing_evidence_is_unproven_and_blocks_release(tmp_path: Path) -> None:

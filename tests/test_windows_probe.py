@@ -764,6 +764,28 @@ def test_foreground_web_bind_and_authenticated_request(tmp_path: Path) -> None:
             with pytest.raises(urllib.error.HTTPError) as auth_error:
                 urllib.request.urlopen(wrong_token_request, timeout=2)
             assert auth_error.value.code == 401
+            status = subprocess.run(
+                [sys.executable, "-m", "spec_runtime.cli", "web", "status"],
+                cwd=tmp_path,
+                env=_clean_subprocess_env(),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            assert status.returncode == 0, status.stdout + status.stderr
+            assert "is running" in (status.stdout + status.stderr).lower()
+            stopped = subprocess.run(
+                [sys.executable, "-m", "spec_runtime.cli", "web", "stop"],
+                cwd=tmp_path,
+                env=_clean_subprocess_env(),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+            assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+            server.wait(timeout=10)
         finally:
             stop_server()
 
@@ -794,6 +816,7 @@ def test_installed_artifact_cli_matrix(tmp_path: Path) -> None:
     origin = tmp_path / "Origin snow-\u96ea.git"
     fake_bin = tmp_path / "fixture tools"
     operator_codex_home = tmp_path / "operator codex home"
+    process_control_root = tmp_path / "process controls"
     operator_codex_home.mkdir()
     (operator_codex_home / "auth.json").write_text(
         '{"OPENAI_API_KEY":"fixture-only-not-a-secret"}\n',
@@ -814,6 +837,7 @@ def test_installed_artifact_cli_matrix(tmp_path: Path) -> None:
             "PYTHONUTF8": "1",
             "SPEC_FIXTURE_PYTHON": sys.executable,
             "SPEC_NO_UPDATE_CHECK": "1",
+            "SPEC_PROCESS_CONTROL_ROOT": str(process_control_root),
         }
     )
 
@@ -1063,6 +1087,10 @@ with patch.object(orchestrator, "cmd_run", return_value=0):
         )
     try:
         _wait_for_http(f"http://127.0.0.1:{foreground_port}/", token, foreground)
+        foreground_status = _cli(repo, "web", "status", env=env)
+        assert str(foreground_port) in foreground_status.stdout
+        _cli(repo, "web", "stop", env=env, timeout=30)
+        foreground.wait(timeout=10)
     finally:
         if foreground.poll() is None:
             foreground.terminate()
@@ -1071,6 +1099,7 @@ with patch.object(orchestrator, "cmd_run", return_value=0):
         except subprocess.TimeoutExpired:
             foreground.kill()
             foreground.wait(timeout=5)
+    assert not list((process_control_root / "controls").glob("*/control.*"))
 
     background_port = _free_port()
     background_started = _cli(
@@ -1092,6 +1121,7 @@ with patch.object(orchestrator, "cmd_run", return_value=0):
     _cli(repo, "web", "stop", env=env, timeout=30)
     stopped_status = _cli(repo, "web", "status", env=env)
     assert "not running" in (stopped_status.stdout + stopped_status.stderr).lower()
+    assert not list((process_control_root / "controls").glob("*/control.*"))
 
     cleaned = _cli(repo, "clean", "--spec", lifecycle_id, env=env)
     assert "Removed worktree" in cleaned.stdout

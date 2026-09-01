@@ -1054,7 +1054,7 @@ def _retire_durable_records(metadata_path: Path, token: SupervisionToken) -> boo
 
 def _windows_job_definitively_absent(job_name: str) -> bool:
     """Return true only when Windows proves that a named Job does not exist."""
-    if os.name != "nt":
+    if not _platform_is_windows():
         return True
     job = _WindowsJob.open(job_name)
     if job is None:
@@ -1124,7 +1124,12 @@ def _remove_empty_control_artifacts(control_path: Path, metadata_path: Path) -> 
         pass
 
 
-def _reconcile_control_record(control_path: Path, supervision_id: str) -> bool:
+def _reconcile_control_record(
+    control_path: Path,
+    supervision_id: str,
+    *,
+    expected_token: SupervisionToken | None = None,
+) -> bool:
     """Retire one dead control record without trusting its path or PID alone."""
     metadata_path = durable_metadata_path(supervision_id)
     lock_path = control_path.with_suffix(".lock")
@@ -1152,6 +1157,14 @@ def _reconcile_control_record(control_path: Path, supervision_id: str) -> bool:
             if identities is None:
                 return False
             nonce, keeper, payload = identities
+            if expected_token is not None and not _same_reconciled_boundary(
+                expected_token,
+                supervision_id=supervision_id,
+                nonce=nonce,
+                keeper=keeper,
+                payload=payload,
+            ):
+                return False
             if not _control_boundary_is_inactive(supervision_id, keeper, payload):
                 return False
 
@@ -1383,6 +1396,53 @@ def reconcile_stale_control_state(*, limit: int = _CONTROL_RECONCILE_LIMIT) -> i
     finally:
         cursor_lock.release()
     return retired
+
+
+def retire_inactive_control_state(token: SupervisionToken) -> bool:
+    """Retire one exact dead Windows ownership boundary after a stop.
+
+    Generic reconciliation is deliberately bounded and cursor-based, so it is
+    unsuitable as the completion condition for a command that just stopped a
+    known process.  This path binds cleanup to the caller's nonce-bearing token
+    and still revalidates that both identities and the named Job are gone.
+    """
+    if not _platform_is_windows():
+        return True
+    expected_relpath = f"controls/{token.token}/control.json"
+    if (
+        token.version != 2
+        or token.control_relpath != expected_relpath
+        or token.job_name != _windows_job_name(token.token)
+        or not token.control_nonce
+    ):
+        return False
+    try:
+        control_path = _control_path(expected_relpath)
+        if not control_path.exists():
+            return _control_boundary_is_inactive(
+                token.token,
+                token.identity,
+                token.payload,
+            )
+        if control_path.is_symlink() or not control_path.is_file():
+            return False
+        state = json.loads(control_path.read_text(encoding="utf-8"))
+        identities = _control_record_identities(state, token.token)
+        if identities != (token.control_nonce, token.identity, token.payload):
+            return False
+        if not _control_boundary_is_inactive(
+            token.token,
+            token.identity,
+            token.payload,
+        ):
+            return False
+        return _reconcile_control_record(
+            control_path,
+            token.token,
+            expected_token=token,
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
 
 
 def _ensure_control_state_reconciled() -> None:

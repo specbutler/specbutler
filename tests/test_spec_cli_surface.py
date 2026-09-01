@@ -893,7 +893,7 @@ class TestCLIMain:
         mock_update.assert_called_once()
         mock_config.assert_not_called()
 
-    def test_init_runs_update_notice_before_dispatch(self):
+    def test_init_runs_update_notice_only_after_successful_dispatch(self):
         cli = self._import_cli()
         with (
             patch.object(cli, "_maybe_print_update_notice_for_init") as mock_notice,
@@ -903,6 +903,20 @@ class TestCLIMain:
             rc = cli.main(["init"])
         assert rc == 0
         mock_notice.assert_called_once_with()
+        mock_init.assert_called_once()
+        mock_config.assert_not_called()
+
+    def test_failed_init_has_no_update_notice_side_effect(self):
+        cli = self._import_cli()
+        with (
+            patch.object(cli, "_maybe_print_update_notice_for_init") as mock_notice,
+            patch.object(cli, "_cmd_init", return_value=1) as mock_init,
+            patch.object(cli, "_lazy_config") as mock_config,
+        ):
+            rc = cli.main(["init"])
+
+        assert rc == 1
+        mock_notice.assert_not_called()
         mock_init.assert_called_once()
         mock_config.assert_not_called()
 

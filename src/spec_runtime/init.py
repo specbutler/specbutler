@@ -8,11 +8,14 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
+from typing import Callable
 
 from packaging.requirements import InvalidRequirement, Requirement
 
+from .agent_adapter import host_agent_unavailability_reason
 from .git_common import run_git
 
 
@@ -77,11 +80,21 @@ def _detect_base_branch(repo_root: Path) -> str:
     return "origin/main" if has_origin else "main"
 
 
-def _detect_agents() -> tuple[str, list[str]]:
-    """Detect available agents on PATH. Returns (default, allowed)."""
+def _detect_agents(
+    *,
+    platform: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> tuple[str, list[str]]:
+    """Detect installed agents that can run safely on this host."""
+    active_platform = platform or sys.platform
+    resolve = which or shutil.which
     available = []
     for name in ("claude", "codex"):
-        if shutil.which(name):
+        if resolve(name) and not host_agent_unavailability_reason(
+            name,
+            platform=active_platform,
+            which=resolve,
+        ):
             available.append(name)
 
     if not available:
@@ -89,6 +102,34 @@ def _detect_agents() -> tuple[str, list[str]]:
 
     default = available[0]
     return default, available
+
+
+def _agent_detection_failure_message(
+    *,
+    platform: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> str:
+    active_platform = platform or sys.platform
+    resolve = which or shutil.which
+    installed = [name for name in ("claude", "codex") if resolve(name)]
+    if not installed:
+        return (
+            "No coding agents found on PATH (looked for: claude, codex). "
+            "Install at least one before running spec init."
+        )
+    reasons = [
+        host_agent_unavailability_reason(
+            name,
+            platform=active_platform,
+            which=resolve,
+        )
+        for name in installed
+    ]
+    actionable = " ".join(reason for reason in reasons if reason)
+    return (
+        "No installed coding agent can run safely on this host. "
+        f"{actionable}"
+    ).strip()
 
 
 def _normalize_requirement_name(name: str) -> str:
@@ -703,8 +744,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     if not default_agent:
         print(
-            "Error: No coding agents found on PATH (looked for: claude, codex). "
-            "Install at least one before running spec init.",
+            f"Error: {_agent_detection_failure_message()}",
             flush=True,
         )
         return 1

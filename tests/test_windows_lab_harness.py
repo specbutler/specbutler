@@ -31,8 +31,12 @@ REQUIRED_FILES = {
     "disarm-autologon.ps1",
     "entrypoint.sh",
     "ensure-console-session.ps1",
+    "exact_harness.py",
     "import_external_evidence.py",
     "job-runner.ps1",
+    "job-child.ps1",
+    "job-supervisor.cs",
+    "job-supervisor-selftest.ps1",
     "lab.env.example",
     "labctl",
     "launch_attestation.py",
@@ -81,7 +85,12 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "reset_lab \"$LAB_BASELINE\"" in controller
     assert 'require_free_space "$STATE_ROOT"' in controller
     assert 'local timeout="${LAB_SHUTDOWN_TIMEOUT_SECONDS:-600}"' in controller
-    assert 'vm_running || break' in controller
+    assert 'local timeout="${LAB_COMPOSE_DOWN_TIMEOUT_SECONDS:-180}"' in controller
+    assert 'local timeout="${LAB_DOCKER_QUERY_TIMEOUT_SECONDS:-30}"' in controller
+    assert 'timeout --foreground --kill-after=5s "${host_timeout}s"' in controller
+    assert 'timeout --foreground --kill-after=5s "${query_timeout}s"' in controller
+    assert "graceful shutdown timed out; forcing the VM down" in controller
+    assert "VM remained active after forced shutdown" in controller
     assert 'local keep="${LAB_PROOF_TRASH_KEEP:-1}"' in controller
     assert 'trash_keep="$(proof_trash_keep)"' in controller
     assert 'proof_trash_retention "$trash_keep" apply' in controller
@@ -93,7 +102,20 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "ensure_console_session" in controller
     assert "guest_ssh_stdin" in controller
     assert "cleanup_job_task" in controller
+    assert "preserve_unsafe_job_diagnostics" in controller
+    assert "could not prove descendant cleanup" in controller
+    assert "authoritative guest shutdown confirmed after unsafe job completion" in controller
     assert "collect_artifacts" in controller
+    assert "verify_exact_proof_harness" in controller
+    proof_controller = controller[controller.index("run_proof() {") :]
+    assert proof_controller.index(
+        'verify_exact_proof_harness "$revision"'
+    ) < proof_controller.index("if vm_running")
+    assert 'HARNESS_ROOT="$snapshot_root/tools/windows-lab"' in controller
+    assert '--project-directory "$HARNESS_ROOT"' in controller
+    assert "authoritative_shutdown_lab" in controller
+    assert 'guest_ssh_timeout "$command_timeout"' in controller
+    assert 'guest_scp_timeout "$command_timeout"' in controller
     assert 'STATE_ROOT="${SPEC_WINDOWS_LAB_STATE_ROOT:-$LAB_ROOT/state}"' in controller
     assert 'SPEC_WINDOWS_LAB_STATE_ROOT="$STATE_ROOT"' in controller
     proof = (LAB_ROOT / "proof.ps1").read_text(encoding="utf-8")
@@ -101,6 +123,28 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "'repo', 'create'" in proof
     assert "'implement', '--spec', 'add-numbers'" in proof
     assert "Write-Utf8NoBom" in proof
+    assert "Invoke-BoundedNativeProcess" in proof
+    assert proof.count("[AllowEmptyString()]") >= 4
+    assert proof.count("[AllowEmptyCollection()]") >= 3
+    assert "$processHandle = $process.Handle" in proof
+    assert "[int] $nativeExitCode = $process.ExitCode" in proof
+    assert "taskkill.exe" in proof
+    assert "timed out after $TimeoutSeconds seconds" in proof
+    assert "$env:GIT_TERMINAL_PROMPT = '0'" in proof
+    assert "$env:GCM_INTERACTIVE = '0'" in proof
+    assert "$env:GH_PROMPT_DISABLED = '1'" in proof
+    assert "'auth', 'setup-git', '--hostname', 'github.com'" in proof
+    assert "'config', '--global', 'credential.interactive', 'false'" in proof
+    assert "'repo', 'create', $repositorySlug, '--private'" in proof
+    assert "--source', $fixtureRoot" not in proof
+    assert '$expectedOrigin = "https://github.com/$repositorySlug.git"' in proof
+    assert "'remote', 'get-url', 'origin'" in proof
+    assert "'push', '-u', 'origin', 'main'" in proof
+    assert "'push', 'origin', 'main'" in proof
+    assert "-TimeoutSeconds 180" in proof
+    assert "unattended_git_auth = $true" in proof
+    assert "raw_https_push = 'passed'" in proof
+    assert "native_command_timeouts = $true" in proof
     assert "runtime_proof.py" in proof
     assert "dependent_turns" in (LAB_ROOT / "runtime_proof.py").read_text(encoding="utf-8")
     assert "autopilot-adopted-state.json" in proof
@@ -166,9 +210,55 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     runner = (LAB_ROOT / "job-runner.ps1").read_text(encoding="utf-8")
     assert "LaunchNonce" in runner
     assert "started.json.tmp" in runner
-    assert runner.index("Move-Item -LiteralPath $startedTemp") < runner.index("& powershell.exe")
+    assert runner.index("Move-Item -LiteralPath $startedTemp") < runner.index(
+        "[SpecButlerLabJobSupervisor]::Run"
+    )
     assert runner.index("Move-Item -LiteralPath $startedTemp") < runner.index("$releaseDeadline")
-    assert runner.index("$releasedNonce -cne $LaunchNonce") < runner.index("& powershell.exe")
+    assert runner.index("$releasedNonce -cne $LaunchNonce") < runner.index(
+        "[SpecButlerLabJobSupervisor]::Run"
+    )
+    assert "job_supervision = 'kill-on-close-job'" in runner
+    assert "descendants_gone = $false" in runner
+    assert "$result.descendants_gone = [bool]$supervised.DescendantsGone" in runner
+    assert "[System.IO.File]::AppendAllText" in runner
+    child_runner = (LAB_ROOT / "job-child.ps1").read_text(encoding="utf-8")
+    assert "[Console]::OutputEncoding = $utf8" in child_runner
+    assert "$global:OutputEncoding = $utf8" in child_runner
+    supervisor = (LAB_ROOT / "job-supervisor.cs").read_text(encoding="utf-8")
+    for boundary in (
+        "CREATE_SUSPENDED",
+        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+        "CreateJobObject",
+        "SetInformationJobObject",
+        "AssignProcessToJobObject",
+        "ResumeThread",
+        "TerminateJobObject",
+        "TerminateProcess",
+        "QueryInformationJobObject",
+    ):
+        assert boundary in supervisor
+    assert (
+        supervisor.index("CreateProcess(")
+        < supervisor.index("AssignProcessToJobObject(job, processInformation.hProcess)")
+        < supervisor.index("ResumeThread(processInformation.hThread)")
+    )
+    assert supervisor.index("!assigned") < supervisor.index(
+        "TerminateProcess(processInformation.hProcess, 125)"
+    )
+    supervisor_selftest = (LAB_ROOT / "job-supervisor-selftest.ps1").read_text(
+        encoding="utf-8"
+    )
+    for probe in (
+        "argv_fidelity",
+        "exit_propagation",
+        "timeout_tree_cleanup",
+        "lingering_tree_cleanup",
+        "utf8_stdout_stderr",
+        "redaction",
+    ):
+        assert probe in supervisor_selftest
+    assert "$PSVersionTable.PSEdition -eq 'Desktop'" in supervisor_selftest
+    assert "$PSVersionTable.PSVersion.Major -eq 5" in supervisor_selftest
     console_session = (LAB_ROOT / "ensure-console-session.ps1").read_text(encoding="utf-8")
     assert "[Console]::In.ReadToEnd()" in console_session
     assert "DefaultPassword" in console_session
@@ -201,7 +291,8 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "Codex code-mode host is missing from its required canonical path" in proof
     assert '$env:TEMP = $temp' in runner
     assert '$env:TMP = $temp' in runner
-    assert 'python3 "$LAB_ROOT/audit_acceptance.py"' in controller
+    assert 'python3 "$HARNESS_ROOT/audit_acceptance.py"' in controller
+    assert '--manifest-source-path "tools/windows-lab/acceptance-manifest.json"' in controller
     assert '--expected-revision "$revision"' in controller
     assert '--output "$destination/acceptance-audit.json"' in controller
     assert 'return "$audit_status"' in controller
@@ -216,6 +307,8 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "require_stopped" in retention
     env_example = (LAB_ROOT / "lab.env.example").read_text(encoding="utf-8")
     assert "LAB_SHUTDOWN_TIMEOUT_SECONDS=600" in env_example
+    assert "LAB_COMPOSE_DOWN_TIMEOUT_SECONDS=180" in env_example
+    assert "LAB_DOCKER_QUERY_TIMEOUT_SECONDS=30" in env_example
     assert "LAB_INTERACTIVE_SESSION_GRACE_SECONDS=30" in env_example
     assert "LAB_INTERACTIVE_SESSION_REPAIR=1" in env_example
     assert "LAB_PROOF_TRASH_KEEP=1" in env_example
@@ -240,6 +333,14 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     )
     assert any(
         check["id"] == "release.5.interactive-launch"
+        for check in release_five["checks"]
+    )
+    assert any(
+        check["id"] == "release.5.interactive-descendants"
+        for check in release_five["checks"]
+    )
+    assert any(
+        check["id"] == "release.5.exact-harness"
         for check in release_five["checks"]
     )
 
@@ -350,6 +451,30 @@ def test_windows_lab_redactor_removes_supported_secret_shapes(tmp_path: Path) ->
     assert report["files_processed"] == 2
     assert report["files_with_replacements"] == 2
     assert report["recognized_secret_shapes_remaining"] == []
+    assert report["undecodable_text_files"] == []
+
+
+def test_windows_lab_redactor_fails_closed_for_undecodable_text(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "raw"
+    destination = tmp_path / "sanitized"
+    source.mkdir()
+    secret = b"ghp_" + (b"A" * 36)
+    (source / "job.log").write_bytes(b"\xff\x00legacy\x80" + secret)
+
+    result = subprocess.run(
+        [sys.executable, str(LAB_ROOT / "redact.py"), str(source), str(destination)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1
+    assert secret not in (destination / "job.log").read_bytes()
+    report = json.loads((destination / "_redaction-report.json").read_text())
+    assert report["status"] == "failed"
+    assert report["undecodable_text_files"] == ["job.log"]
 
 
 def test_windows_runtime_proof_sse_parser_is_hermetic() -> None:
@@ -406,8 +531,8 @@ def test_windows_runtime_proof_declares_real_runtime_invariants() -> None:
         assert statement in proof
     assert "SPEC_AUTOPILOT_PROOF_RELEASE" in agent
     assert "report --status needs-input" in agent
-    assert "$ErrorActionPreference = 'Continue'" in runner
-    assert "$exitCode = if ($null -eq $LASTEXITCODE)" in runner
+    assert "[SpecButlerLabJobSupervisor]::Run" in runner
+    assert "$exitCode = [int]$supervised.ExitCode" in runner
 
 
 def test_windows_local_acceptance_requires_executed_unskipped_tests(tmp_path: Path) -> None:
@@ -898,6 +1023,130 @@ def test_windows_lab_job_wait_fails_fast_and_unregisters_stale_task(
         assert "authoritative guest shutdown confirmed" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "compose_down_result",
+    ["success", "failure", "hang", "query-hang-after-down"],
+)
+def test_windows_lab_unsafe_job_forces_and_verifies_guest_shutdown(
+    tmp_path: Path,
+    compose_down_result: str,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("the host controller is a Bash program")
+    bash = shutil.which("bash")
+    assert bash
+    state = tmp_path / "state"
+    fake_bin = tmp_path / "bin"
+    state.mkdir()
+    fake_bin.mkdir()
+    (state / "identity.env").write_text("LAB_UID=1\n", encoding="utf-8")
+    config = tmp_path / "lab.env"
+    config.write_text(
+        "WINDOWS_ISO=/tmp/fake.iso\n"
+        f"WINDOWS_ISO_SHA256={'0' * 64}\n"
+        "WINDOWS_IMAGE_INDEX=1\n"
+        "LAB_GUEST_COMMAND_TIMEOUT_SECONDS=1\n"
+        "LAB_SHUTDOWN_TIMEOUT_SECONDS=1\n"
+        "LAB_COMPOSE_DOWN_TIMEOUT_SECONDS=1\n"
+        "LAB_DOCKER_QUERY_TIMEOUT_SECONDS=1\n",
+        encoding="utf-8",
+    )
+    ssh_log = tmp_path / "ssh.log"
+    docker_log = tmp_path / "docker.log"
+    docker_state = tmp_path / "docker.state"
+    docker_state.write_text("running", encoding="ascii")
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        f"#!{sys.executable}\n"
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "command = sys.argv[-1]\n"
+        "with Path(os.environ['FAKE_SSH_LOG']).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(command + '\\n')\n"
+        "if 'Test-Path C:\\\\SpecHarness\\\\jobs\\\\demo.done.json' in command:\n"
+        "    print('True')\n"
+        "elif 'Get-Content C:\\\\SpecHarness\\\\jobs\\\\demo.done.json' in command:\n"
+        "    print(json.dumps({'status': 'failed', 'descendants_gone': False}))\n"
+        "elif 'Compress-Archive' in command or 'Stop-Computer' in command:\n"
+        "    time.sleep(30)\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected fake SSH command: {command}')\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    fake_scp = fake_bin / "scp"
+    fake_scp.write_text(f"#!{sys.executable}\nraise SystemExit(1)\n", encoding="utf-8")
+    fake_scp.chmod(0o755)
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        f"#!{sys.executable}\n"
+        "import os\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "state = Path(os.environ['FAKE_DOCKER_STATE'])\n"
+        "with Path(os.environ['FAKE_DOCKER_LOG']).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write(' '.join(sys.argv[1:]) + '\\n')\n"
+        "if sys.argv[1:3] == ['ps', '-a']:\n"
+        "    current = state.read_text(encoding='ascii')\n"
+        "    if current == 'query-hang':\n"
+        "        time.sleep(30)\n"
+        "    if current == 'running':\n"
+        "        print('specbutler-windows-lab|running')\n"
+        "elif sys.argv[1] == 'compose' and 'down' in sys.argv[2:]:\n"
+        "    if os.environ['FAKE_COMPOSE_DOWN_RESULT'] == 'hang':\n"
+        "        time.sleep(30)\n"
+        "    if os.environ['FAKE_COMPOSE_DOWN_RESULT'] == 'failure':\n"
+        "        raise SystemExit(23)\n"
+        "    next_state = (\n"
+        "        'query-hang'\n"
+        "        if os.environ['FAKE_COMPOSE_DOWN_RESULT'] == 'query-hang-after-down'\n"
+        "        else 'absent'\n"
+        "    )\n"
+        "    state.write_text(next_state, encoding='ascii')\n"
+        "else:\n"
+        "    raise SystemExit(f'unexpected fake Docker command: {sys.argv[1:]}')\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    result = subprocess.run(
+        [bash, str(LAB_ROOT / "labctl"), "job", "wait", "demo", "10"],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            "SPEC_WINDOWS_LAB_STATE_ROOT": str(state),
+            "SPEC_WINDOWS_LAB_CONFIG": str(config),
+            "SPEC_WINDOWS_TOOLCHAIN_CONFIG": str(tmp_path / "toolchain.json"),
+            "FAKE_SSH_LOG": str(ssh_log),
+            "FAKE_DOCKER_LOG": str(docker_log),
+            "FAKE_DOCKER_STATE": str(docker_state),
+            "FAKE_COMPOSE_DOWN_RESULT": compose_down_result,
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=12,
+    )
+    assert result.returncode == 1
+    assert "could not prove descendant cleanup" in result.stderr
+    assert "down --timeout 30" in docker_log.read_text(encoding="utf-8")
+    assert "Stop-ScheduledTask" not in ssh_log.read_text(encoding="utf-8")
+    marker = state / "unsafe-cleanup" / "demo" / "authoritative-shutdown.txt"
+    if compose_down_result != "success":
+        assert not marker.exists()
+        assert "could not confirm authoritative guest shutdown" in result.stderr
+        assert "authoritative guest shutdown confirmed" not in result.stderr
+    else:
+        assert marker.read_text(encoding="ascii").strip() == (
+            "authoritative_guest_shutdown=confirmed"
+        )
+        assert "authoritative guest shutdown confirmed" in result.stderr
+
+
 @pytest.mark.parametrize("failure_mode", ["arm", "register"])
 def test_windows_lab_submit_failure_cleans_up_without_exposing_password(
     tmp_path: Path, failure_mode: str
@@ -1000,6 +1249,96 @@ def _load_launch_attestation_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_exact_harness_module():
+    path = LAB_ROOT / "exact_harness.py"
+    spec = importlib.util.spec_from_file_location("windows_exact_harness", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
+    tmp_path: Path,
+) -> None:
+    module = _load_exact_harness_module()
+    repo = tmp_path / "repo"
+    harness = repo / "tools" / "windows-lab"
+    harness.mkdir(parents=True)
+    labctl = harness / "labctl"
+    labctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    labctl.chmod(0o755)
+    verifier = harness / "exact_harness.py"
+    verifier.write_bytes((LAB_ROOT / "exact_harness.py").read_bytes())
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Spec Test"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "spec-test@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=repo, check=True)
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    output = tmp_path / "exact.json"
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    result = module.verify_exact_harness(repo, revision, output, snapshot)
+    assert result["status"] == "passed"
+    assert result["source_revision"] == revision
+    assert result["snapshot_materialized"] is True
+    assert result["snapshot_files_verified"] == result["files_verified"]
+    assert set(result["sha256"]) == {
+        "tools/windows-lab/exact_harness.py",
+        "tools/windows-lab/labctl",
+    }
+    snapshot_labctl = snapshot / "tools" / "windows-lab" / "labctl"
+    committed_labctl = snapshot_labctl.read_bytes()
+    assert os.access(snapshot_labctl, os.X_OK)
+
+    labctl.write_text("#!/usr/bin/env bash\nexit 23\n", encoding="utf-8")
+    assert snapshot_labctl.read_bytes() == committed_labctl
+    dirty_snapshot = tmp_path / "dirty-snapshot"
+    dirty_snapshot.mkdir()
+    with pytest.raises(module.HarnessMismatch, match="differs"):
+        module.verify_exact_harness(
+            repo,
+            revision,
+            tmp_path / "dirty.json",
+            dirty_snapshot,
+        )
+    labctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    (harness / "untracked.ps1").write_text("exit 0\n", encoding="utf-8")
+    untracked_snapshot = tmp_path / "untracked-snapshot"
+    untracked_snapshot.mkdir()
+    with pytest.raises(module.HarnessMismatch, match="commit or remove"):
+        module.verify_exact_harness(
+            repo,
+            revision,
+            tmp_path / "untracked.json",
+            untracked_snapshot,
+        )
+
+    nonempty = tmp_path / "nonempty-snapshot"
+    nonempty.mkdir()
+    (nonempty / "stale").write_text("stale", encoding="ascii")
+    (harness / "untracked.ps1").unlink()
+    with pytest.raises(module.HarnessMismatch, match="must be empty"):
+        module.verify_exact_harness(
+            repo,
+            revision,
+            tmp_path / "nonempty.json",
+            nonempty,
+        )
 
 
 def _write_launch_receipt(path: Path, *, nonce: str) -> dict[str, object]:

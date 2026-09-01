@@ -17,6 +17,7 @@ from spec_runtime.config import (
 )
 from spec_runtime.git_common import run_git
 from spec_runtime.init import (
+    _agent_detection_failure_message,
     _ask_agent_for_config,
     _build_agent_merge_command,
     _build_yolo_prompt,
@@ -276,7 +277,9 @@ class TestDetectAgents:
     def test_only_claude(self, monkeypatch):
         monkeypatch.setattr(
             "spec_runtime.init.shutil.which",
-            lambda name: "/usr/bin/claude" if name == "claude" else None,
+            lambda name: f"/usr/bin/{name}"
+            if name in {"claude", "bwrap", "socat"}
+            else None,
         )
         default, allowed = _detect_agents()
         assert default == "claude"
@@ -294,6 +297,40 @@ class TestDetectAgents:
     def test_none_available(self, monkeypatch):
         monkeypatch.setattr("spec_runtime.init.shutil.which", lambda name: None)
         default, allowed = _detect_agents()
+        assert default == ""
+        assert allowed == []
+
+    def test_native_windows_filters_unusable_claude(self):
+        resolve = lambda name: f"C:\\tools\\{name}.exe"  # noqa: E731
+
+        default, allowed = _detect_agents(platform="win32", which=resolve)
+
+        assert default == "codex"
+        assert allowed == ["codex"]
+
+    def test_native_windows_claude_only_has_no_usable_agent(self):
+        resolve = lambda name: (  # noqa: E731
+            r"C:\tools\claude.exe" if name == "claude" else None
+        )
+
+        default, allowed = _detect_agents(platform="win32", which=resolve)
+
+        assert default == ""
+        assert allowed == []
+
+    def test_darwin_allows_installed_claude(self):
+        resolve = lambda name: "/usr/local/bin/claude" if name == "claude" else None  # noqa: E731
+
+        default, allowed = _detect_agents(platform="darwin", which=resolve)
+
+        assert default == "claude"
+        assert allowed == ["claude"]
+
+    def test_linux_filters_claude_without_sandbox_prerequisites(self):
+        resolve = lambda name: "/usr/bin/claude" if name == "claude" else None  # noqa: E731
+
+        default, allowed = _detect_agents(platform="linux", which=resolve)
+
         assert default == ""
         assert allowed == []
 
@@ -816,12 +853,49 @@ class TestCmdInit:
         with (
             patch(self._patch_root, return_value=tmp_path),
             patch(self._patch_agents, return_value=("", [])),
+            patch(
+                "spec_runtime.init._agent_detection_failure_message",
+                return_value=(
+                    "No coding agents found on PATH (looked for: claude, codex). "
+                    "Install at least one before running spec init."
+                ),
+            ),
         ):
             rc = cmd_init(args)
         assert rc == 1
         out = capsys.readouterr().out
         assert "No coding agents found on PATH" in out
         assert "claude, codex" in out
+
+    def test_native_windows_claude_only_fails_before_writing(self, tmp_path, capsys):
+        _init_git_repo(tmp_path)
+        args = MagicMock(force=False, yolo=False)
+        resolve = lambda name: (  # noqa: E731
+            r"C:\tools\claude.exe" if name == "claude" else None
+        )
+        with (
+            patch(self._patch_root, return_value=tmp_path),
+            patch(
+                self._patch_agents,
+                side_effect=lambda: _detect_agents(platform="win32", which=resolve),
+            ),
+            patch(
+                "spec_runtime.init._agent_detection_failure_message",
+                side_effect=lambda: _agent_detection_failure_message(
+                    platform="win32",
+                    which=resolve,
+                ),
+            ),
+        ):
+            rc = cmd_init(args)
+
+        assert rc == 1
+        output = capsys.readouterr().out
+        assert "not supported on platform 'win32'" in output
+        assert "Use Codex" in output
+        assert "WSL2" in output
+        assert not (tmp_path / ".spec.toml").exists()
+        assert not (tmp_path / "AGENTS.md").exists()
 
     def test_force_preserves_config_but_refreshes_templates(
         self,

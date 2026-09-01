@@ -39,6 +39,9 @@
         {"id": "native.2.status", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/status", "expected": "passed"},
         {"id": "native.2.revision", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
         {"id": "native.2.provider", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/provider", "expected": "codex"},
+        {"id": "native.2.git-auth", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/unattended_git_auth", "expected": true},
+        {"id": "native.2.https-push", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/raw_https_push", "expected": "passed"},
+        {"id": "native.2.native-timeouts", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/native_command_timeouts", "expected": true},
         {"id": "native.2.merged", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/pull_request_merged", "expected": true},
         {"id": "native.2.provenance", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/provenance_tag_present", "expected": true},
         {"id": "native.2.review", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/review_decision", "expected": "approved"},
@@ -331,7 +334,8 @@
         {"id": "release.4.timeout-clean", "op": "json_equals", "artifact": "timeout-tree-result.json", "pointer": "/processes_remaining", "expected": []},
         {"id": "release.4.autopilot", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/status", "expected": "passed"},
         {"id": "release.4.redaction", "op": "json_equals", "artifact": "_redaction-report.json", "pointer": "/status", "expected": "passed"},
-        {"id": "release.4.secrets", "op": "json_equals", "artifact": "_redaction-report.json", "pointer": "/recognized_secret_shapes_remaining", "expected": []}
+        {"id": "release.4.secrets", "op": "json_equals", "artifact": "_redaction-report.json", "pointer": "/recognized_secret_shapes_remaining", "expected": []},
+        {"id": "release.4.decodable", "op": "json_equals", "artifact": "_redaction-report.json", "pointer": "/undecodable_text_files", "expected": []}
       ]
     },
     {
@@ -344,7 +348,13 @@
         {"id": "release.5.clean", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/clean_snapshot_reset", "expected": true},
         {"id": "release.5.command", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/proof_command", "expected": "./labctl proof"},
         {"id": "release.5.manual-edits", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/manual_guest_edits", "expected": false},
-        {"id": "release.5.interactive-launch", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/interactive_launch_confirmed", "expected": true}
+        {"id": "release.5.interactive-launch", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/interactive_launch_confirmed", "expected": true},
+        {"id": "release.5.interactive-job", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/interactive_job_supervision", "expected": "kill-on-close-job"},
+        {"id": "release.5.interactive-descendants", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/interactive_job_descendants_gone", "expected": true},
+        {"id": "release.5.exact-harness", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/exact_harness_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "release.5.exact-harness-status", "op": "json_equals", "artifact": "exact-harness.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.5.exact-harness-revision", "op": "json_equals", "artifact": "exact-harness.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "release.5.exact-harness-snapshot", "op": "json_equals", "artifact": "exact-harness.json", "pointer": "/snapshot_materialized", "expected": true}
       ]
     },
     {

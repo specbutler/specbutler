@@ -224,11 +224,31 @@ def _resolve_expected(value: Any, source_revision: str) -> Any:
 
 
 def _source_checkout_checks(
-    *, source_root: Path, manifest_path: Path, source_revision: str, manifest: dict[str, Any]
+    *,
+    source_root: Path,
+    manifest_path: Path,
+    manifest_source_path: Path | None,
+    manifest_bytes: bytes,
+    source_revision: str,
+    manifest: dict[str, Any],
 ) -> list[CheckResult]:
     try:
         root = source_root.resolve(strict=True)
-        manifest_relative = manifest_path.resolve(strict=True).relative_to(root)
+        if manifest_source_path is None:
+            manifest_relative = manifest_path.resolve(strict=True).relative_to(root)
+        else:
+            manifest_relative = manifest_source_path
+            if (
+                manifest_relative.is_absolute()
+                or not manifest_relative.parts
+                or manifest_relative == Path(".")
+                or ".." in manifest_relative.parts
+                or ":" in manifest_relative.as_posix()
+                or "\\" in manifest_relative.as_posix()
+            ):
+                raise ValueError(
+                    f"unsafe manifest repository path: {manifest_relative}"
+                )
     except (OSError, ValueError) as exc:
         return [
             CheckResult(
@@ -281,14 +301,30 @@ def _source_checkout_checks(
         ["git", "-C", str(root), "diff", "--quiet", "HEAD", "--", *path_args],
         check=False,
     )
-    clean = tracked_run.returncode == 0 and diff_run.returncode == 0
+    manifest_blob_run = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "show",
+            f"{source_revision}:{manifest_relative.as_posix()}",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    clean = (
+        tracked_run.returncode == 0
+        and diff_run.returncode == 0
+        and manifest_blob_run.returncode == 0
+        and manifest_blob_run.stdout == manifest_bytes
+    )
     contract_result = CheckResult(
         "global.source-contract-at-revision",
         "passed" if clean else "failed",
         None,
-        "manifest and spec contracts are tracked and unchanged at source HEAD"
+        "manifest bytes match the canonical tracked contract and spec contracts are unchanged at source HEAD"
         if clean
-        else "manifest or spec contracts are untracked or differ from source HEAD",
+        else "manifest bytes or spec contracts are untracked or differ from the exact source revision",
     )
     return [revision_result, contract_result]
 
@@ -352,7 +388,12 @@ def _evaluate_check(check: dict[str, Any], evidence_root: Path, source_revision:
 
 
 def audit(
-    *, manifest_path: Path, source_root: Path, evidence_root: Path, source_revision: str
+    *,
+    manifest_path: Path,
+    manifest_source_path: Path | None,
+    source_root: Path,
+    evidence_root: Path,
+    source_revision: str,
 ) -> tuple[dict[str, Any], int]:
     if not REVISION_RE.fullmatch(source_revision):
         raise AuditInputError("expected source revision must be an exact lowercase 40-character Git SHA")
@@ -408,6 +449,8 @@ def audit(
         _source_checkout_checks(
             source_root=source_root,
             manifest_path=manifest_path,
+            manifest_source_path=manifest_source_path,
+            manifest_bytes=manifest_bytes,
             source_revision=source_revision,
             manifest=manifest,
         )
@@ -483,6 +526,11 @@ def audit(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument(
+        "--manifest-source-path",
+        type=Path,
+        help="canonical repository-relative path for an immutable manifest snapshot",
+    )
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--evidence-root", required=True, type=Path)
     parser.add_argument("--expected-revision", required=True)
@@ -495,6 +543,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         report, exit_code = audit(
             manifest_path=args.manifest,
+            manifest_source_path=args.manifest_source_path,
             source_root=args.source_root,
             evidence_root=args.evidence_root,
             source_revision=args.expected_revision,

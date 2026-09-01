@@ -377,6 +377,109 @@ def test_reconcile_stale_control_state_removes_authenticated_dead_records(
     assert token.token == "dead-boundary"
 
 
+def test_retire_inactive_control_state_removes_exact_stopped_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    token, control_path, metadata_path = _write_reconcilable_boundary(
+        root,
+        "just-stopped-boundary",
+    )
+    monkeypatch.setattr(process_supervisor, "_platform_is_windows", lambda: True)
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setattr(
+        process_supervisor,
+        "_windows_job_definitively_absent",
+        lambda _name: True,
+    )
+
+    assert process_supervisor.retire_inactive_control_state(token)
+    assert not control_path.exists()
+    assert not control_path.with_suffix(".lock").exists()
+    assert not metadata_path.exists()
+
+
+def test_retire_inactive_control_state_preserves_nonce_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    token, control_path, metadata_path = _write_reconcilable_boundary(
+        root,
+        "mismatched-stopped-boundary",
+    )
+    mismatched = SupervisionToken(
+        token.mode,
+        token.identity,
+        token.owner_pid,
+        token.owner_started_at,
+        token.token,
+        payload_identity=token.payload,
+        job_name=token.job_name,
+        control_relpath=token.control_relpath,
+        control_nonce="different-nonce",
+    )
+    monkeypatch.setattr(process_supervisor, "_platform_is_windows", lambda: True)
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setattr(
+        process_supervisor,
+        "_windows_job_definitively_absent",
+        lambda _name: True,
+    )
+
+    assert not process_supervisor.retire_inactive_control_state(mismatched)
+    assert control_path.exists()
+    assert metadata_path.exists()
+
+
+def test_retire_inactive_control_state_rejects_same_id_replacement_race(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    token, control_path, metadata_path = _write_reconcilable_boundary(
+        root,
+        "replaced-stopped-boundary",
+    )
+    monkeypatch.setattr(process_supervisor, "_platform_is_windows", lambda: True)
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setattr(
+        process_supervisor,
+        "_windows_job_definitively_absent",
+        lambda _name: True,
+    )
+    reconcile = process_supervisor._reconcile_control_record
+
+    def replace_before_locked_revalidation(
+        path: Path,
+        supervision_id: str,
+        *,
+        expected_token: SupervisionToken | None = None,
+    ) -> bool:
+        replacement = json.loads(path.read_text(encoding="utf-8"))
+        replacement["nonce"] = "replacement-nonce"
+        path.write_text(json.dumps(replacement), encoding="utf-8")
+        return reconcile(
+            path,
+            supervision_id,
+            expected_token=expected_token,
+        )
+
+    monkeypatch.setattr(
+        process_supervisor,
+        "_reconcile_control_record",
+        replace_before_locked_revalidation,
+    )
+
+    assert not process_supervisor.retire_inactive_control_state(token)
+    assert control_path.exists()
+    assert metadata_path.exists()
+
+
 def test_windows_job_absence_requires_file_not_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

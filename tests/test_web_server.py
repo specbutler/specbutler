@@ -437,6 +437,68 @@ class TestServerLifecycle:
             assert stop_server(tmp_path) == 1
         assert all(path.read_text(encoding="utf-8") == "retained" for path in paths)
 
+    def test_windows_successful_stop_retires_exact_control_state(self, tmp_path):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import stop_server
+
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            1,
+            "owner",
+            "foreground-stop",
+            payload_identity=identity,
+        )
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(True, 123)),
+            patch("spec_runtime.web.server.read_supervision_token", return_value=token),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch("spec_runtime.process_supervisor.terminate", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.retire_inactive_control_state",
+                return_value=True,
+            ) as retire,
+            patch("spec_runtime.web.server.remove_pid") as remove_pid,
+        ):
+            assert stop_server(tmp_path) == 0
+
+        retire.assert_called_once_with(token)
+        remove_pid.assert_called_once_with(tmp_path)
+
+    def test_windows_control_retirement_failure_retains_recovery_state(
+        self,
+        tmp_path,
+        capsys,
+    ):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import stop_server
+
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            1,
+            "owner",
+            "foreground-stop-failed-retirement",
+            payload_identity=identity,
+        )
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(True, 123)),
+            patch("spec_runtime.web.server.read_supervision_token", return_value=token),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch("spec_runtime.process_supervisor.terminate", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.retire_inactive_control_state",
+                return_value=False,
+            ),
+            patch("spec_runtime.web.server.remove_pid") as remove_pid,
+        ):
+            assert stop_server(tmp_path) == 1
+
+        remove_pid.assert_not_called()
+        assert "recovery state retained" in capsys.readouterr().err
+
     def test_server_status_not_running(self, tmp_path, capsys):
         with patch("spec_runtime.web.server._pid_path", return_value=tmp_path / "nonexistent"):
             from spec_runtime.web.server import server_status
@@ -673,6 +735,7 @@ class TestServerLifecycle:
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=False),
             patch("spec_runtime.web.server.write_pid"),
             patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), None)),
             patch("spec_runtime.web.server.remove_pid"),
@@ -720,6 +783,7 @@ class TestServerLifecycle:
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=False),
             patch("spec_runtime.web.server.write_pid"),
             patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), None)),
             patch("spec_runtime.web.server.remove_pid"),
@@ -744,6 +808,7 @@ class TestServerLifecycle:
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=False),
             patch("spec_runtime.web.server.write_pid"),
             patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), None)),
             patch("spec_runtime.web.server.remove_pid") as remove_pid,
@@ -757,6 +822,133 @@ class TestServerLifecycle:
 
         assert rc == 0
         remove_pid.assert_called_once_with(tmp_path)
+
+    @pytest.mark.parametrize("stale_nonce", [False, True])
+    def test_direct_windows_foreground_publishes_current_process_claim(
+        self,
+        tmp_path,
+        monkeypatch,
+        stale_nonce,
+    ):
+        from spec_runtime.process_supervisor import (
+            LifetimeMode,
+            ProcessIdentity,
+            SupervisionToken,
+        )
+
+        if stale_nonce:
+            monkeypatch.setenv("SPEC_WEB_READY_NONCE", "stale-inherited-nonce")
+        else:
+            monkeypatch.delenv("SPEC_WEB_READY_NONCE", raising=False)
+        identity = ProcessIdentity(os.getpid(), "created", "python.exe")
+        claimed = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "web-foreground-test",
+        )
+        call_order: list[str] = []
+        fake_server = MagicMock()
+        fake_server.startup = AsyncMock()
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
+            patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.claim_current_process",
+                side_effect=lambda _name: (call_order.append("claim"), claimed)[1],
+            ) as claim,
+            patch(
+                "spec_runtime.web.server.write_supervision_token",
+                side_effect=lambda *_args: call_order.append("supervision"),
+            ) as write_supervision,
+            patch(
+                "spec_runtime.web.server.write_pid",
+                side_effect=lambda *_args, **_kwargs: call_order.append("pid"),
+            ),
+            patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), "created")),
+            patch("spec_runtime.web.server.remove_pid"),
+            patch("spec_runtime.web.server.create_app", return_value=MagicMock()),
+            patch("uvicorn.Config"),
+            patch("uvicorn.Server", return_value=fake_server),
+        ):
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path, background=False) == 0
+
+        claim.assert_called_once()
+        write_supervision.assert_called_once_with(tmp_path, claimed)
+        assert call_order == ["claim", "supervision", "pid"]
+
+    def test_matching_background_payload_reservation_skips_current_process_claim(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("SPEC_WEB_READY_NONCE", "matching-payload-nonce")
+        fake_server = MagicMock()
+        fake_server.startup = AsyncMock()
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
+            patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch(
+                "spec_runtime.web.server._launch_reservation_belongs_to_current_payload",
+                return_value=True,
+            ),
+            patch("spec_runtime.process_supervisor.claim_current_process") as claim,
+            patch("spec_runtime.web.server.write_supervision_token") as write_supervision,
+            patch("spec_runtime.web.server.write_pid"),
+            patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), "created")),
+            patch("spec_runtime.web.server.remove_pid"),
+            patch("spec_runtime.web.server.create_app", return_value=MagicMock()),
+            patch("uvicorn.Config"),
+            patch("uvicorn.Server", return_value=fake_server),
+        ):
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path, background=False) == 0
+
+        claim.assert_not_called()
+        write_supervision.assert_not_called()
+
+    def test_background_windows_parent_does_not_claim_its_current_process(
+        self,
+        tmp_path,
+    ):
+        from spec_runtime.process_supervisor import (
+            LifetimeMode,
+            ProcessIdentity,
+            ProcessSupervisor,
+            SupervisionToken,
+        )
+
+        token = SupervisionToken(
+            LifetimeMode.DETACHED,
+            ProcessIdentity(123, "created"),
+            1,
+            "owner",
+            "background-no-self-claim",
+        )
+        managed = MagicMock(token=token)
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
+            patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch("spec_runtime.process_supervisor.claim_current_process") as claim,
+            patch("socket.create_connection", side_effect=OSError("free")),
+            patch.object(ProcessSupervisor, "spawn", return_value=managed),
+            patch("spec_runtime.web.server._wait_for_ready_record", return_value=token),
+            patch("spec_runtime.web.server._ready_record_matches", return_value=True),
+            patch("spec_runtime.web.server._wait_for_port", return_value=True),
+            patch("spec_runtime.web.server.write_supervision_token"),
+        ):
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path, background=True) == 0
+
+        claim.assert_not_called()
 
     def test_logging_configured_before_backend_availability_check(self, tmp_path):
         """Regression: logging.basicConfig must run before log_backend_availability

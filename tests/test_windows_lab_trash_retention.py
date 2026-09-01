@@ -51,6 +51,14 @@ def _controller_retention(
     newer = _retired(trash, "20260901T020202-202", modified_ns=2_000_000_000)
     fake_bin = tmp_path / "fake-bin"
     fake_bin.mkdir()
+    config = tmp_path / "lab.env"
+    config.write_text(
+        "WINDOWS_ISO=/tmp/fake.iso\n"
+        f"WINDOWS_ISO_SHA256={'0' * 64}\n"
+        "WINDOWS_IMAGE_INDEX=1\n"
+        "LAB_DOCKER_QUERY_TIMEOUT_SECONDS=1\n",
+        encoding="utf-8",
+    )
     fake_docker = fake_bin / "docker"
     fake_docker.write_text(
         """#!/bin/sh
@@ -69,7 +77,9 @@ esac
     script = r"""
 source <(awk '/^stage_source\(\)/ { exit } { print }' "$LABCTL_PATH")
 LAB_ROOT="$LAB_ROOT_OVERRIDE"
+HARNESS_ROOT="$LAB_ROOT"
 STATE_ROOT="$STATE_ROOT_OVERRIDE"
+CONFIG_FILE="$CONFIG_FILE_OVERRIDE"
 case "$CONTROLLER_ACTION" in
     retention) proof_trash_retention 1 apply ;;
     vm-running)
@@ -88,6 +98,7 @@ esac
         "LABCTL_PATH": str(LABCTL),
         "LAB_ROOT_OVERRIDE": str(LABCTL.parent),
         "STATE_ROOT_OVERRIDE": str(state_root),
+        "CONFIG_FILE_OVERRIDE": str(config),
         "CONTROLLER_ACTION": action,
         "PATH": os.pathsep.join((str(fake_bin), os.environ.get("PATH", ""))),
     }

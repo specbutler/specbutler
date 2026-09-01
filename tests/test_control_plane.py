@@ -763,6 +763,35 @@ def test_shutdown_tracker_second_targeted_request_forces(tmp_path: Path) -> None
     assert tracker.record_interrupt().phase is ShutdownPhase.FORCED
 
 
+def test_shutdown_tracker_repeated_interrupts_keep_forced_latched(tmp_path: Path) -> None:
+    tracker = ShutdownTracker(tmp_path, instance_id="dispatcher", pid=303, nonce="secret")
+    tracker.initialize()
+    assert tracker.record_interrupt(now=_utc("2026-01-01T00:00:00")).phase is ShutdownPhase.GRACEFUL
+    forced = tracker.record_interrupt(now=_utc("2026-01-01T00:00:01"))
+
+    third = tracker.record_interrupt(now=_utc("2026-01-01T00:00:02"))
+    fourth = tracker.record_interrupt(now=_utc("2026-01-01T00:00:03"))
+
+    assert third.phase is ShutdownPhase.FORCED
+    assert fourth.phase is ShutdownPhase.FORCED
+    assert third.forced_at == forced.forced_at
+    assert fourth.forced_at == forced.forced_at
+    assert fourth.interrupt_count == 4
+
+
+def test_shutdown_tracker_interrupt_does_not_reopen_complete_state(tmp_path: Path) -> None:
+    tracker = ShutdownTracker(tmp_path, instance_id="dispatcher", pid=303, nonce="secret")
+    tracker.initialize()
+    tracker.record_interrupt(now=_utc("2026-01-01T00:00:00"))
+    complete = tracker.mark_complete(now=_utc("2026-01-01T00:00:01"))
+
+    repeated = tracker.record_interrupt(now=_utc("2026-01-01T00:00:02"))
+
+    assert repeated.phase is ShutdownPhase.COMPLETE
+    assert repeated.completed_at == complete.completed_at
+    assert repeated.interrupt_count == complete.interrupt_count + 1
+
+
 # --------------------------------------------------------------------------- #
 # Status projection tests
 # --------------------------------------------------------------------------- #

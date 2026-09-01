@@ -995,8 +995,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if first_positional == "init":
-        if not help_requested:
-            _maybe_print_update_notice_for_init()
         init_parser = argparse.ArgumentParser(
             prog="spec init",
             description="Bootstrap a Git repository for spec-driven development",
@@ -1007,7 +1005,10 @@ def main(argv: list[str] | None = None) -> int:
             import logging
 
             logging.basicConfig(level=logging.DEBUG)
-        return _cmd_init(init_args)
+        exit_code = _cmd_init(init_args)
+        if exit_code == 0 and not help_requested:
+            _maybe_print_update_notice_for_init()
+        return exit_code
 
     if first_positional == "update":
         update_parser = argparse.ArgumentParser(prog="spec update")

@@ -22,6 +22,7 @@ Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $temp | Out-Null
 $env:TEMP = $temp
 $env:TMP = $temp
+$utf8 = New-Object System.Text.UTF8Encoding($false)
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $startedResult = [ordered]@{
     job = $JobName
@@ -38,6 +39,8 @@ $result = [ordered]@{
     job = $JobName
     status = 'failed'
     exit_code = 1
+    job_supervision = 'kill-on-close-job'
+    descendants_gone = $false
     session_id = $startedResult.session_id
     started_at = (Get-Date).ToString('o')
     finished_at = $null
@@ -57,23 +60,37 @@ try {
     if ($releasedNonce -cne $LaunchNonce) {
         throw 'The interactive job release nonce did not match its launch receipt.'
     }
-    # Windows PowerShell 5 wraps a child process's stderr as NativeCommandError.
-    # Git, pytest, and providers legitimately use stderr on successful runs, so
-    # preserve the merged live log but determine success from the exit code.
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script *>&1 |
-            Tee-Object -LiteralPath $log
-        $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
+    Add-Type -Path 'C:\SpecHarness\job-supervisor.cs'
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $child = 'C:\SpecHarness\job-child.ps1'
+    $supervised = [SpecButlerLabJobSupervisor]::Run(
+        $powershell,
+        [string[]]@(
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            $child,
+            '-ScriptPath',
+            $script
+        ),
+        $jobRoot,
+        $log,
+        14400000
+    )
+    $result.exit_code = [int]$supervised.ExitCode
+    $result.descendants_gone = [bool]$supervised.DescendantsGone
+    if ($supervised.TimedOut) {
+        throw 'Interactive proof exceeded four hours; its Windows Job was terminated.'
     }
+    if (-not $supervised.DescendantsGone) {
+        throw 'Interactive proof Job cleanup was not verified.'
+    }
+    $exitCode = [int]$supervised.ExitCode
     if ($exitCode -ne 0) { throw "Job exited with code $exitCode" }
     $result.status = 'ok'
-    $result.exit_code = 0
 } catch {
-    $_ | Out-String | Add-Content -LiteralPath $log
+    [System.IO.File]::AppendAllText($log, ($_ | Out-String), $utf8)
 } finally {
     $result.finished_at = (Get-Date).ToString('o')
     $result | ConvertTo-Json | Set-Content -LiteralPath $done -Encoding ascii

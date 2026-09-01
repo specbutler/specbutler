@@ -22,47 +22,291 @@ foreach ($freshRoot in @($evidenceRoot, $runRoot)) {
 New-Item -ItemType Directory -Path $evidenceRoot, $runRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $venvRoot | Out-Null
 
+function ConvertTo-NativeArgument {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string] $Value
+    )
+    if ($Value.Length -gt 0 -and $Value -notmatch '[\s"]') { return $Value }
+
+    $builder = New-Object System.Text.StringBuilder
+    [void] $builder.Append('"')
+    $backslashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes += 1
+            continue
+        }
+        if ($character -eq '"') {
+            [void] $builder.Append(('\' * (($backslashes * 2) + 1)))
+            [void] $builder.Append('"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            [void] $builder.Append(('\' * $backslashes))
+            $backslashes = 0
+        }
+        [void] $builder.Append($character)
+    }
+    if ($backslashes -gt 0) {
+        [void] $builder.Append(('\' * ($backslashes * 2)))
+    }
+    [void] $builder.Append('"')
+    return $builder.ToString()
+}
+
+function Get-NativeProcessTreeIdentities {
+    param([Parameter(Mandatory = $true)] [int] $RootProcessId)
+    $processes = @(Get-CimInstance -ClassName Win32_Process)
+    $children = @{}
+    foreach ($candidate in $processes) {
+        $parent = [int]$candidate.ParentProcessId
+        if (-not $children.ContainsKey($parent)) { $children[$parent] = @() }
+        $children[$parent] += $candidate
+    }
+    $byPid = @{}
+    foreach ($candidate in $processes) { $byPid[[int]$candidate.ProcessId] = $candidate }
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($RootProcessId)
+    $seen = @{}
+    $identities = @()
+    while ($queue.Count -gt 0) {
+        $processId = $queue.Dequeue()
+        if ($seen.ContainsKey($processId)) { continue }
+        $seen[$processId] = $true
+        if ($byPid.ContainsKey($processId)) {
+            $candidate = $byPid[$processId]
+            $identities += [pscustomobject]@{
+                process_id = $processId
+                creation_date = [string]$candidate.CreationDate
+            }
+        }
+        if ($children.ContainsKey($processId)) {
+            foreach ($child in $children[$processId]) {
+                $queue.Enqueue([int]$child.ProcessId)
+            }
+        }
+    }
+    return @($identities)
+}
+
+function Test-NativeProcessIdentityAlive {
+    param([Parameter(Mandatory = $true)] $Identity)
+    $current = Get-CimInstance `
+        -ClassName Win32_Process `
+        -Filter "ProcessId = $([int]$Identity.process_id)" `
+        -ErrorAction SilentlyContinue
+    return (
+        $null -ne $current -and
+        [string]$current.CreationDate -eq [string]$Identity.creation_date
+    )
+}
+
+function Stop-NativeProcessTree {
+    param(
+        [Parameter(Mandatory = $true)] [System.Diagnostics.Process] $Process,
+        [Parameter(Mandatory = $true)] $Identities
+    )
+    $killerInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $killerInfo.FileName = "$env:SystemRoot\System32\taskkill.exe"
+    $killerInfo.Arguments = "/PID $($Process.Id) /T /F"
+    $killerInfo.UseShellExecute = $false
+    $killerInfo.CreateNoWindow = $true
+    $killerInfo.RedirectStandardOutput = $true
+    $killerInfo.RedirectStandardError = $true
+    $killer = New-Object System.Diagnostics.Process
+    $killer.StartInfo = $killerInfo
+    try {
+        if (-not $killer.Start()) { throw 'taskkill did not start.' }
+        $killerOutput = $killer.StandardOutput.ReadToEndAsync()
+        $killerError = $killer.StandardError.ReadToEndAsync()
+        if (-not $killer.WaitForExit(30000)) {
+            $killer.Kill()
+            [void]$killer.WaitForExit(30000)
+            throw 'taskkill did not finish within 30 seconds.'
+        }
+        $killer.WaitForExit()
+        [int]$killerExitCode = $killer.ExitCode
+        $killerText = $killerOutput.Result + $killerError.Result
+    } finally {
+        $killer.Dispose()
+    }
+
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        $survivors = @($Identities | Where-Object {
+            Test-NativeProcessIdentityAlive -Identity $_
+        })
+        if ($survivors.Count -eq 0) { return }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    $survivorIds = @($survivors | ForEach-Object { $_.process_id }) -join ','
+    throw (
+        "taskkill exited $killerExitCode but exact native descendants remained: " +
+        "$survivorIds; output: $($killerText.Trim())"
+    )
+}
+
+function Write-NativeFailureLog {
+    param(
+        [Parameter(Mandatory = $true)] [string] $FilePath,
+        [AllowEmptyString()] [string] $StandardOutput,
+        [AllowEmptyString()] [string] $StandardError,
+        [Parameter(Mandatory = $true)] [string] $Category
+    )
+    $safeName = [System.IO.Path]::GetFileNameWithoutExtension($FilePath) -replace '[^A-Za-z0-9._-]', '-'
+    if (-not $safeName) { $safeName = 'native' }
+    $name = "$Category-$safeName-$([Guid]::NewGuid().ToString('N')).log"
+    Write-Utf8NoBom `
+        -LiteralPath (Join-Path $evidenceRoot $name) `
+        -Value ($StandardOutput + $StandardError)
+    return $name
+}
+
+function Invoke-BoundedNativeProcess {
+    param(
+        [Parameter(Mandatory = $true)] [string] $FilePath,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]] $Arguments,
+        [Parameter(Mandatory = $true)] [int] $TimeoutSeconds
+    )
+    if ($TimeoutSeconds -le 0) { throw 'Native command timeout must be positive.' }
+    $command = Get-Command -Name $FilePath -CommandType Application -ErrorAction Stop
+    $argumentLine = (@($Arguments | ForEach-Object {
+        ConvertTo-NativeArgument -Value $_
+    }) -join ' ')
+    $nativeTemp = Join-Path $runRoot 'native-command-temp'
+    New-Item -ItemType Directory -Force -Path $nativeTemp | Out-Null
+    $token = [Guid]::NewGuid().ToString('N')
+    $stdoutPath = Join-Path $nativeTemp "$token.stdout"
+    $stderrPath = Join-Path $nativeTemp "$token.stderr"
+    $process = $null
+    try {
+        $process = Start-Process `
+            -FilePath $command.Path `
+            -ArgumentList $argumentLine `
+            -WorkingDirectory (Get-Location).Path `
+            -NoNewWindow `
+            -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath `
+            -PassThru
+        # Windows PowerShell 5 can discard the native handle behind a
+        # Start-Process object with redirected streams. Force it to materialize
+        # before waiting so ExitCode remains an enforceable integer.
+        $processHandle = $process.Handle
+        if ($processHandle -eq [IntPtr]::Zero) {
+            throw 'Started native process did not expose a usable process handle.'
+        }
+        $exited = $process.WaitForExit($TimeoutSeconds * 1000)
+        if (-not $exited) {
+            # Snapshot exact PID/creation identities, bound taskkill itself,
+            # and prove every observed descendant is gone. The outer
+            # kill-on-close Job remains the final fail-closed boundary.
+            $treeIdentities = @(Get-NativeProcessTreeIdentities -RootProcessId $process.Id)
+            Stop-NativeProcessTree -Process $process -Identities $treeIdentities
+            if (-not $process.WaitForExit(30000)) {
+                throw "Timed-out native process tree $($process.Id) could not be terminated."
+            }
+        }
+        $process.WaitForExit()
+        [int] $nativeExitCode = $process.ExitCode
+        $stdout = if (Test-Path -LiteralPath $stdoutPath) {
+            [System.IO.File]::ReadAllText($stdoutPath)
+        } else { '' }
+        $stderr = if (Test-Path -LiteralPath $stderrPath) {
+            [System.IO.File]::ReadAllText($stderrPath)
+        } else { '' }
+        return [pscustomobject]@{
+            exit_code = if ($exited) { $nativeExitCode } else { 124 }
+            timed_out = -not $exited
+            standard_output = $stdout
+            standard_error = $stderr
+        }
+    } catch {
+        $supervisionFailure = $_
+        $failedStdout = if (Test-Path -LiteralPath $stdoutPath) {
+            Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
+        } else { '' }
+        $failedStderr = if (Test-Path -LiteralPath $stderrPath) {
+            Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
+        } else { '' }
+        $failureLog = Write-NativeFailureLog `
+            -FilePath $FilePath `
+            -StandardOutput ([string]$failedStdout) `
+            -StandardError ([string]$failedStderr) `
+            -Category 'native-supervision-failure'
+        throw (
+            "Native command supervision failed; diagnostic: $failureLog; " +
+            $supervisionFailure.Exception.Message
+        )
+    } finally {
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+        if ($null -ne $process) { $process.Dispose() }
+    }
+}
+
 function Invoke-LoggedNative {
     param(
         [Parameter(Mandatory = $true)] [string] $FilePath,
-        [Parameter(Mandatory = $true)] [string[]] $Arguments,
-        [Parameter(Mandatory = $true)] [string] $LogName
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]] $Arguments,
+        [Parameter(Mandatory = $true)] [string] $LogName,
+        [int] $TimeoutSeconds = 3600
     )
-    Get-Command -Name $FilePath -ErrorAction Stop | Out-Null
-    # Windows PowerShell 5 promotes native stderr to NativeCommandError when
-    # ErrorActionPreference is Stop. Healthy tools such as git emit progress on
-    # stderr, so judge native commands by their exit code instead.
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        & $FilePath @Arguments 2>&1 | Tee-Object -LiteralPath (Join-Path $evidenceRoot $LogName)
-        $nativeExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
+    $result = Invoke-BoundedNativeProcess `
+        -FilePath $FilePath `
+        -Arguments $Arguments `
+        -TimeoutSeconds $TimeoutSeconds
+    $combined = $result.standard_output + $result.standard_error
+    Write-Utf8NoBom -LiteralPath (Join-Path $evidenceRoot $LogName) -Value $combined
+    if ($combined) {
+        Write-Output ($combined.TrimEnd([char[]]"`r`n"))
     }
-    if ($nativeExitCode -ne 0) {
-        throw "$FilePath failed with exit code $nativeExitCode"
+    if ($result.timed_out) {
+        throw "$FilePath timed out after $TimeoutSeconds seconds and its process tree was terminated; diagnostic: $LogName"
+    }
+    if ($result.exit_code -ne 0) {
+        throw "$FilePath failed with exit code $($result.exit_code); diagnostic: $LogName"
     }
 }
 
 function Invoke-NativeOutput {
     param(
         [Parameter(Mandatory = $true)] [string] $FilePath,
-        [Parameter(Mandatory = $true)] [string[]] $Arguments
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]] $Arguments,
+        [int] $TimeoutSeconds = 300
     )
-    Get-Command -Name $FilePath -ErrorAction Stop | Out-Null
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        $output = @(& $FilePath @Arguments)
-        $nativeExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
+    $result = Invoke-BoundedNativeProcess `
+        -FilePath $FilePath `
+        -Arguments $Arguments `
+        -TimeoutSeconds $TimeoutSeconds
+    if ($result.timed_out) {
+        $failureLog = Write-NativeFailureLog `
+            -FilePath $FilePath `
+            -StandardOutput $result.standard_output `
+            -StandardError $result.standard_error `
+            -Category 'native-output-timeout'
+        throw "$FilePath timed out after $TimeoutSeconds seconds and its process tree was terminated; diagnostic: $failureLog"
     }
-    if ($nativeExitCode -ne 0) {
-        throw "$FilePath failed with exit code $nativeExitCode"
+    if ($result.exit_code -ne 0) {
+        $failureLog = Write-NativeFailureLog `
+            -FilePath $FilePath `
+            -StandardOutput $result.standard_output `
+            -StandardError $result.standard_error `
+            -Category 'native-output-failure'
+        throw "$FilePath failed with exit code $($result.exit_code); diagnostic: $failureLog"
     }
-    return $output
+    if (-not $result.standard_output) { return @() }
+    return @($result.standard_output.TrimEnd([char[]]"`r`n") -split "`r?`n")
 }
 
 function Write-Utf8NoBom {
@@ -174,6 +418,15 @@ if (-not (Test-Path -LiteralPath $codexHost -PathType Leaf)) {
 }
 Invoke-LoggedNative -FilePath $codex -Arguments @('--version') -LogName 'codex-version.log'
 Invoke-LoggedNative -FilePath 'gh.exe' -Arguments @('auth', 'status') -LogName 'gh-auth-status.log'
+$env:GIT_TERMINAL_PROMPT = '0'
+$env:GCM_INTERACTIVE = '0'
+$env:GH_PROMPT_DISABLED = '1'
+Invoke-LoggedNative -FilePath 'gh.exe' -Arguments @(
+    'auth', 'setup-git', '--hostname', 'github.com'
+) -LogName 'gh-auth-setup-git.log' -TimeoutSeconds 120
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'config', '--global', 'credential.interactive', 'false'
+) -LogName 'git-disable-credential-prompts.log' -TimeoutSeconds 120
 
 $sourceVenv = Join-Path $venvRoot 'source'
 $wheelVenv = Join-Path $venvRoot 'wheel'
@@ -283,8 +536,21 @@ Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
     'commit', '-m', 'Create Windows lifecycle proof fixture'
 ) -LogName 'fixture-git-commit.log'
 Invoke-LoggedNative -FilePath 'gh.exe' -Arguments @(
-    'repo', 'create', $repositorySlug, '--private', '--source', $fixtureRoot, '--remote', 'origin', '--push'
-) -LogName 'github-repository-create.log'
+    'repo', 'create', $repositorySlug, '--private'
+) -LogName 'github-repository-create.log' -TimeoutSeconds 300
+$expectedOrigin = "https://github.com/$repositorySlug.git"
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'remote', 'add', 'origin', $expectedOrigin
+) -LogName 'github-origin-add.log' -TimeoutSeconds 120
+$observedOrigin = (@(Invoke-NativeOutput -FilePath 'git.exe' -Arguments @(
+    'remote', 'get-url', 'origin'
+)) -join "`n").Trim()
+if ($observedOrigin -cne $expectedOrigin) {
+    throw "Disposable lifecycle origin is not the exact HTTPS URL: $observedOrigin"
+}
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'push', '-u', 'origin', 'main'
+) -LogName 'github-initial-push.log' -TimeoutSeconds 180
 
 Invoke-LoggedNative -FilePath $spec -Arguments @('init') -LogName 'spec-init.log'
 Write-Utf8NoBom -LiteralPath (Join-Path $fixtureRoot '.spec.toml') -Value @"
@@ -347,12 +613,14 @@ Invoke-LoggedNative -FilePath 'git.exe' -Arguments @('add', '.') -LogName 'lifec
 Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
     'commit', '-m', 'Configure Spec Butler proof lifecycle'
 ) -LogName 'lifecycle-git-commit.log'
-Invoke-LoggedNative -FilePath 'git.exe' -Arguments @('push', 'origin', 'main') -LogName 'lifecycle-git-push.log'
+Invoke-LoggedNative -FilePath 'git.exe' -Arguments @(
+    'push', 'origin', 'main'
+) -LogName 'lifecycle-git-push.log' -TimeoutSeconds 180
 
 Invoke-LoggedNative -FilePath $spec -Arguments @('doctor') -LogName 'spec-doctor.log'
 Invoke-LoggedNative -FilePath $spec -Arguments @(
     'implement', '--spec', 'add-numbers', '--agent', 'codex', '--review-agent', 'codex'
-) -LogName 'real-codex-lifecycle.log'
+) -LogName 'real-codex-lifecycle.log' -TimeoutSeconds 7200
 Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
     '-m', 'pytest', 'tests\test_calculator.py', '-q'
 ) -LogName 'fixture-final-test.log'
@@ -414,6 +682,9 @@ $lifecycleResult = [ordered]@{
     source_revision = $sourceRevision
     provider = 'codex'
     non_elevated = $true
+    unattended_git_auth = $true
+    raw_https_push = 'passed'
+    native_command_timeouts = $true
     pull_request_merged = $true
     merged_pull_request = $merged[0].url
     provenance_tag_present = $true
@@ -427,8 +698,18 @@ Write-Utf8NoBom `
     -Value ($lifecycleResult | ConvertTo-Json -Depth 8)
 Set-EvidenceClaim `
     -Id 'runtime.real-lifecycle' `
-    -Evidence @('real-codex-lifecycle.log', 'fixture-final-test.log', 'result.json') `
-    -Detail 'A real Codex implementation, review, disposable GitHub pull request, merge, and cleanup completed.'
+    -Evidence @(
+        'gh-auth-setup-git.log',
+        'git-disable-credential-prompts.log',
+        'github-origin-add.log',
+        'github-initial-push.log',
+        'lifecycle-git-push.log',
+        'real-codex-lifecycle.log',
+        'fixture-final-test.log',
+        'lifecycle-result.json',
+        'result.json'
+    ) `
+    -Detail 'Bounded, non-interactive Git authentication plus a real Codex implementation, review, disposable GitHub pull request, merge, and cleanup completed.'
 
 $foregroundWeb = $null
 try {
@@ -451,6 +732,13 @@ try {
                 -Headers @{ Authorization = "Bearer $foregroundToken" } | Out-Null
             return $true
         } catch { return $false }
+    }
+    Invoke-LoggedNative -FilePath $spec -Arguments @('web', 'status') -LogName 'web-foreground-status.log'
+    $foregroundStatus = Get-Content `
+        -LiteralPath (Join-Path $evidenceRoot 'web-foreground-status.log') `
+        -Raw
+    if ($foregroundStatus -notmatch 'spec web is running') {
+        throw 'A separate CLI process could not identify the foreground web ownership record'
     }
     Invoke-LoggedNative -FilePath $spec -Arguments @('web', 'stop') -LogName 'web-foreground-stop.log'
     Wait-ProcessExit `
@@ -514,7 +802,13 @@ Write-Utf8NoBom `
     -Value ($webLifecycleResult | ConvertTo-Json -Depth 6)
 Set-EvidenceClaim `
     -Id 'runtime.web-lifecycle' `
-    -Evidence @('web-foreground.log', 'web-foreground-stop.log', 'web-start.log', 'web-stop.log') `
+    -Evidence @(
+        'web-foreground.log',
+        'web-foreground-status.log',
+        'web-foreground-stop.log',
+        'web-start.log',
+        'web-stop.log'
+    ) `
     -Detail 'Foreground and durable background web services reached authenticated readiness and stopped with their owned processes gone.'
 Set-EvidenceClaim `
     -Id 'runtime.web-chat' `

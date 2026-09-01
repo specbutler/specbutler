@@ -21,6 +21,20 @@ PATTERNS = (
         r"[A-Za-z0-9_-]*[\"']?)\s*[:=]\s*[\"']?)[A-Za-z0-9._~+/=-]{16,}"
     ),
 )
+TEXT_SUFFIXES = {
+    ".cs",
+    ".csv",
+    ".json",
+    ".log",
+    ".md",
+    ".ps1",
+    ".py",
+    ".toml",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
 
 
 def redact_text(payload: str) -> str:
@@ -65,6 +79,7 @@ def main() -> int:
     text_files = 0
     changed_files = 0
     residual_matches: list[str] = []
+    undecodable_text_files: list[str] = []
     for path in source.rglob("*"):
         if not path.is_file():
             continue
@@ -73,6 +88,15 @@ def main() -> int:
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = path.read_bytes()
         sanitized = redact(payload)
+        if path.suffix.casefold() in TEXT_SUFFIXES:
+            try:
+                if sanitized.startswith((b"\xff\xfe", b"\xfe\xff")):
+                    sanitized.decode("utf-16")
+                else:
+                    sanitized.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                undecodable_text_files.append(relative.as_posix())
+                sanitized = b"[REDACTION FAILED: undecodable text artifact]\n"
         target.write_bytes(sanitized)
         files_processed += 1
         changed_files += int(payload != sanitized)
@@ -89,11 +113,14 @@ def main() -> int:
         ):
             residual_matches.append(relative.as_posix())
     report = {
-        "status": "passed" if not residual_matches else "failed",
+        "status": "passed"
+        if not residual_matches and not undecodable_text_files
+        else "failed",
         "files_processed": files_processed,
         "text_files_scanned": text_files,
         "files_with_replacements": changed_files,
         "recognized_secret_shapes_remaining": residual_matches,
+        "undecodable_text_files": undecodable_text_files,
     }
     if source_revision is not None:
         report["source_revision"] = source_revision
@@ -101,8 +128,10 @@ def main() -> int:
         json.dumps(report, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    if residual_matches:
-        raise SystemExit("recognized secret shape remained after redaction")
+    if residual_matches or undecodable_text_files:
+        raise SystemExit(
+            "redaction failed: recognized secret shape remained or a text artifact was undecodable"
+        )
     return 0
 
 

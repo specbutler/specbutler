@@ -62,6 +62,10 @@ class ServerOwnershipStateError(RuntimeError):
     """Persisted web ownership exists but cannot be verified safely."""
 
 
+def _native_windows_host() -> bool:
+    return os.name == "nt"
+
+
 # ---------------------------------------------------------------------------
 # Auth middleware (uses starlette types but defined as plain ASGI callable)
 # ---------------------------------------------------------------------------
@@ -885,7 +889,25 @@ def run_server(
             webbrowser.open(auth_url)
         return 0
 
-    write_pid(repo_root, port=port)
+    try:
+        if _native_windows_host() and not _launch_reservation_belongs_to_current_payload(
+            repo_root
+        ):
+            # A direct foreground Windows server has no durable helper parent.
+            # Claim the current process before publishing it so status, a
+            # second start, and an out-of-process stop all use a reopenable Job
+            # capability instead of an unsafe raw PID. The supervised
+            # background payload carries SPEC_WEB_READY_NONCE and must leave
+            # helper-token publication to its authenticated parent.
+            from spec_runtime.process_supervisor import claim_current_process
+
+            foreground_token = claim_current_process(f"web-foreground-{uuid.uuid4().hex}")
+            write_supervision_token(repo_root, foreground_token)
+        write_pid(repo_root, port=port)
+    except Exception as exc:
+        remove_pid(repo_root)
+        print(f"spec web failed to establish process ownership: {exc}", file=sys.stderr)
+        return 1
 
     uvi_log_level = "debug" if verbose else "info"
 
@@ -948,6 +970,7 @@ def stop_server(repo_root: Path) -> int:
         return 1
     from spec_runtime.process_supervisor import (
         SupervisionToken,
+        retire_inactive_control_state,
         terminate,
         terminate_legacy_pid_record,
     )
@@ -959,6 +982,15 @@ def stop_server(repo_root: Path) -> int:
         if not terminate(supervision_token):
             print(
                 f"spec web failed to stop owned process tree (pid {pid}); supervision state retained.",
+                file=sys.stderr,
+            )
+            return 1
+        if _native_windows_host() and not retire_inactive_control_state(
+            supervision_token
+        ):
+            print(
+                f"spec web stopped process tree (pid {pid}) but could not "
+                "retire its authenticated control state; recovery state retained.",
                 file=sys.stderr,
             )
             return 1

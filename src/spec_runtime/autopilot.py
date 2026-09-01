@@ -1630,6 +1630,11 @@ def is_pid_alive(pid: int, expected_started_at: str) -> bool:
     return True
 
 
+def _requires_authenticated_process_adoption() -> bool:
+    """Whether restart needs the durable Windows Job/control capability."""
+    return os.name == "nt"
+
+
 def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
     path = autopilot_active_path(repo_root)
     if not path.exists():
@@ -1677,11 +1682,42 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
         if supervision_token:
             try:
                 parsed_token = SupervisionToken.from_dict(supervision_token)
-                if parsed_token.payload.pid != pid or parsed_token.payload.started_at != process_started_at:
+                if (
+                    parsed_token.mode is not LifetimeMode.ADOPTABLE
+                    or parsed_token.payload.pid != pid
+                    or parsed_token.payload.started_at != process_started_at
+                    or (
+                        str(item.get("supervision_id", "")).strip()
+                        and parsed_token.token != str(item["supervision_id"]).strip()
+                    )
+                ):
                     continue
-                supervision_token = adopt(parsed_token).to_dict()
+                if _requires_authenticated_process_adoption():
+                    supervision_token = adopt(parsed_token).to_dict()
+                elif os.name == "posix":
+                    # POSIX ADOPTABLE children are session leaders, not
+                    # durable-helper payloads, so there is intentionally no
+                    # Windows-style control record to transfer. Validate the
+                    # exact persisted session-leader identity and continue to
+                    # the existing live PID + lease decision below.
+                    if (
+                        parsed_token.identity != parsed_token.payload
+                        or parsed_token.pgid != pid
+                    ):
+                        continue
+                    supervision_token = parsed_token.to_dict()
+                else:
+                    continue
             except (KeyError, TypeError, ValueError, ProcessLookupError):
                 continue
+        elif _requires_authenticated_process_adoption():
+            print(
+                format_status_line(
+                    "stale",
+                    f"{spec_id} pid={pid} has no authenticated supervision token; skipping",
+                )
+            )
+            continue
 
         if not run_id:
             # Newly dispatched spec: the child `spec implement` has not yet

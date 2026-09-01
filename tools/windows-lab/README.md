@@ -139,6 +139,35 @@ nonce, receipt hash, guest receipt, and proof user/session. Ready or missing
 tasks without completion records fail immediately and are unregistered; if
 teardown cannot be verified, the controller performs an authoritative guest
 shutdown and fails the run.
+The scheduled-task runner launches the complete proof suspended inside a
+kill-on-close Windows Job before resuming it. Stopping or crashing that runner
+therefore terminates its provider, Git, and test descendants; a successful
+completion record is emitted only after the Job reports no active processes.
+
+The proof configures `gh` as Git's credential helper before creating its
+disposable lifecycle repository. Git terminal prompts, Git Credential Manager
+UI, and `gh` prompts are disabled for the proof and inherited agent sessions;
+authentication failures therefore fail closed instead of waiting at an unseen
+dialog. Every native command is bounded, and a timeout terminates its Windows
+process tree before evidence collection continues.
+
+Before it stops, resets, prunes, or launches the VM, `labctl proof` resolves the
+requested source commit and requires it to be the controller checkout's exact
+`HEAD`. Every tracked file under `tools/windows-lab/` must be byte-identical and
+the directory must have no tracked or untracked changes. The retained
+`exact-harness.json` records a SHA-256 for each verified controller/helper file.
+The controller then materializes those committed blobs into a private snapshot
+and routes VM control, guest staging, redaction, evidence import, and final audit
+through that snapshot. A concurrent worktree edit therefore cannot change the
+code attributed to the proof revision.
+
+Interactive-job diagnostics and shutdown requests are individually bounded. If
+the Windows Job cannot prove that its descendants are gone, the controller does
+not attempt an unbounded scheduled-task cleanup: it preserves what it can,
+forces the Compose guest down after the graceful deadline, verifies that the VM
+is no longer active, and only then records authoritative shutdown. The Docker
+CLI call is itself bounded; Compose's `--timeout` controls only the container
+stop grace period and is not treated as a host-side wall-clock deadline.
 
 If the interactive harness fails, it terminates the Job/root while its output
 reader is still draining, closes ConPTY only afterward, and retains
@@ -176,6 +205,10 @@ Clean shutdown allows 600 seconds by default because Windows may need more than
 three minutes even when it exits successfully. Set the positive integer
 `LAB_SHUTDOWN_TIMEOUT_SECONDS` in `lab.env` to tune that fail-closed deadline;
 the controller never resets or prunes after an unconfirmed shutdown.
+`LAB_COMPOSE_DOWN_TIMEOUT_SECONDS` separately bounds an unresponsive Docker
+client or daemon (180 seconds by default), while
+`LAB_DOCKER_QUERY_TIMEOUT_SECONDS` bounds each state query (30 seconds by
+default). A timed-out query is never interpreted as proof that the VM stopped.
 
 Provisioning uses the administrative SSH control plane. Interactive proof jobs
 use the logged-on account's filtered, non-elevated token and fail unless they are

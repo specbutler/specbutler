@@ -291,6 +291,43 @@ jobs:
           if ($parseErrors.Count -gt 0) {
             throw ($parseErrors -join [Environment]::NewLine)
           }
+          Add-Type -Path tools/windows-lab/job-supervisor.cs
+      - name: Run Windows PowerShell 5.1 supervisor probe
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force artifacts/windows-supervisor-probe | Out-Null
+          try {
+            & tools/windows-lab/job-supervisor-selftest.ps1 `
+              -SourceRoot $env:GITHUB_WORKSPACE `
+              -OutputRoot artifacts/windows-supervisor-probe
+          } catch {
+            [System.IO.File]::WriteAllText(
+              'artifacts/windows-supervisor-probe/runner-error.txt',
+              ($_ | Out-String),
+              (New-Object System.Text.UTF8Encoding($false))
+            )
+            throw
+          }
+      - name: Upload Windows supervisor probe diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-supervisor-probe-${{ github.run_id }}
+          path: artifacts/windows-supervisor-probe
+          if-no-files-found: error
+          retention-days: 14
+      - name: Enforce Windows supervisor probe result
+        if: always()
+        shell: powershell
+        run: |
+          $path = 'artifacts/windows-supervisor-probe/job-supervisor-selftest.json'
+          if (-not (Test-Path -LiteralPath $path)) {
+            throw 'Windows supervisor probe produced no result.'
+          }
+          $result = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+          if ($result.status -ne 'passed') {
+            throw "Windows supervisor probe failed: $($result.error)"
+          }
       - name: Build wheel and source distribution
         shell: pwsh
         run: |

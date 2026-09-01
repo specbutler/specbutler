@@ -9447,6 +9447,102 @@ class TestSpecAutopilot:
         assert "adopt" in captured.out
         assert "my-spec" in captured.out
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX session-leader adoption")
+    @pytest.mark.parametrize("run_id", ["", "live-spec-run-1"])
+    def test_adopt_active_processes_recovers_real_posix_adoptable_child(
+        self,
+        repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        run_id: str,
+    ):
+        monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+        managed = process_supervisor.ProcessSupervisor(
+            LifetimeMode.ADOPTABLE,
+            supervision_id=f"real-posix-{run_id or 'prelease'}",
+        ).spawn(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            identity = managed.token.payload
+            active = autopilot.ActiveRunProcess(
+                spec_id="live-spec",
+                agent="codex",
+                pid=identity.pid,
+                started_at="2026-09-01T00:00:00+00:00",
+                started_monotonic=0.0,
+                log_path=str(tmp_path / "live.log"),
+                run_id=run_id,
+                phase="implement",
+                process_started_at=identity.started_at,
+                supervision_token=managed.token.to_dict(),
+                supervision_id=managed.token.token,
+            )
+            autopilot.write_active_state(repo, {"live-spec": active})
+            if run_id:
+                save_run_lease(
+                    autopilot.runs_dir(repo),
+                    build_lease(
+                        run_id=run_id,
+                        spec_id="live-spec",
+                        phase="implement",
+                        process_pid=identity.pid,
+                        process_started_at=identity.started_at,
+                    ),
+                )
+
+            adopted = autopilot.adopt_active_processes(repo)
+
+            assert adopted["live-spec"].pid == identity.pid
+            assert adopted["live-spec"].adoption_generation == 1
+            assert autopilot.is_pid_alive(identity.pid, identity.started_at)
+            assert not (tmp_path / "controls" / managed.token.control_relpath).exists()
+        finally:
+            managed.terminate(grace_seconds=0.1)
+
+    def test_adopt_active_processes_windows_requires_authenticated_token(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        active_path = autopilot.autopilot_active_path(repo)
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps(
+                {
+                    "unsafe-windows": {
+                        "pid": 9191,
+                        "agent": "codex",
+                        "started_at": "2026-09-01T00:00:00+00:00",
+                        "phase": "implement",
+                        "run_id": "",
+                        "log_path": "/tmp/unsafe.log",
+                        "process_started_at": "created",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            autopilot,
+            "_requires_authenticated_process_adoption",
+            lambda: True,
+        )
+        monkeypatch.setattr(autopilot, "is_pid_alive", lambda *_args: True)
+        monkeypatch.setattr(
+            autopilot,
+            "read_process_identity",
+            lambda pid: orch.ProcessIdentity(pid=pid, started_at="created", command="spec"),
+        )
+
+        assert autopilot.adopt_active_processes(repo) == {}
+        assert "no authenticated supervision token" in capsys.readouterr().out
+
     def test_adopt_active_processes_drops_dead_entries(
         self,
         repo: Path,
