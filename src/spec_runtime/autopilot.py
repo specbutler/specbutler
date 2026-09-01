@@ -68,6 +68,15 @@ from spec_runtime.orchestrator import (
     format_attempt_progress,
     read_spec_lock_owner,
 )
+from spec_runtime.process_supervisor import (
+    LifetimeMode,
+    ProcessSupervisor,
+    SupervisionToken,
+    adopt,
+    inspect_process,
+    iter_processes,
+    process_cwd,
+)
 from spec_runtime.spec_merge_tags import (
     MergeTagProvenance,
     annotated_tag_command,
@@ -470,6 +479,7 @@ class ActiveRunProcess:
     run_id: str = ""
     phase: str = "launching"
     process_started_at: str = ""
+    supervision_token: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1654,6 +1664,7 @@ def write_active_state(repo_root: Path, active: dict[str, ActiveRunProcess]) -> 
             "run_id": proc.run_id,
             "log_path": proc.log_path,
             "process_started_at": proc.process_started_at,
+            "supervision_token": proc.supervision_token,
         }
         for spec_id, proc in sorted(active.items())
     }
@@ -1697,6 +1708,8 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
         pid = int(item.get("pid", 0))
         process_started_at = str(item.get("process_started_at", "")).strip()
         run_id = str(item.get("run_id", "")).strip()
+        token_data = item.get("supervision_token", {})
+        supervision_token = dict(token_data) if isinstance(token_data, dict) else {}
         if pid <= 0:
             continue
         if not process_started_at:
@@ -1711,6 +1724,11 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
         process_alive = is_pid_alive(pid, process_started_at)
         live_identity = read_process_identity(pid) if process_alive else None
         live_started_at = live_identity.started_at if live_identity is not None else ""
+        if supervision_token:
+            try:
+                supervision_token = adopt(SupervisionToken.from_dict(supervision_token)).to_dict()
+            except (KeyError, TypeError, ValueError, ProcessLookupError):
+                continue
 
         if not run_id:
             # Newly dispatched spec: the child `spec implement` has not yet
@@ -1731,6 +1749,7 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
                 run_id="",
                 phase=str(item.get("phase", "unknown")),
                 process_started_at=process_started_at,
+                supervision_token=supervision_token,
             )
             print(
                 format_status_line(
@@ -1769,6 +1788,7 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
             run_id=run_id,
             phase=str(item.get("phase", "unknown")),
             process_started_at=process_started_at,
+            supervision_token=supervision_token,
         )
         print(format_status_line("adopt", f"{spec_id} pid={pid} phase={adopted[spec_id].phase}"))
     return adopted
@@ -2070,14 +2090,13 @@ def start_candidate(
     child_env["SPEC_ACTOR"] = "autopilot"
     if preallocated_run_id and not candidate.run_id:
         child_env["SPEC_PREALLOCATED_RUN_ID"] = preallocated_run_id
-    process = subprocess.Popen(
+    process = ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
         command,
         cwd=repo_root,
         stdin=subprocess.DEVNULL,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
         env=child_env,
-        start_new_session=True,
     )
     log_handle.close()
     identity = read_process_identity(process.pid)
@@ -2094,6 +2113,7 @@ def start_candidate(
         log_path=str(log_path),
         run_id=candidate.run_id or preallocated_run_id,
         process_started_at=identity.started_at,
+        supervision_token=process.token.to_dict(),
     )
     if proc.run_id:
         write_run_log_alias(repo_root, proc.run_id, proc.log_path)
@@ -2103,31 +2123,10 @@ def start_candidate(
 def read_process_identity(pid: int) -> ProcessIdentity | None:
     if pid <= 0:
         return None
-    try:
-        result = subprocess.run(
-            ["ps", "-ww", "-o", "pid=", "-o", "lstart=", "-o", "command=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
+    identity = inspect_process(pid)
+    if identity is None:
         return None
-    if result.returncode != 0:
-        return None
-    line = next((item.strip() for item in result.stdout.splitlines() if item.strip()), "")
-    if not line:
-        return None
-    parts = line.split(None, 6)
-    if len(parts) != 7:
-        return None
-    try:
-        live_pid = int(parts[0])
-    except ValueError:
-        return None
-    return ProcessIdentity(
-        pid=live_pid,
-        started_at=" ".join(parts[1:6]),
-        command=parts[6].strip(),
-    )
+    return ProcessIdentity(pid=identity.pid, started_at=identity.started_at, command=identity.command)
 
 
 def current_process_identity() -> ProcessIdentity:
@@ -2245,31 +2244,7 @@ def read_process_cwd(pid: int) -> Path | None:
     Used only to scope process scans to this repository. Callers must treat None
     as "unknown, do not touch" — never as a match.
     """
-    if pid <= 0:
-        return None
-    try:
-        return Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
-    except OSError:
-        pass
-    try:
-        result = subprocess.run(
-            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    for line in result.stdout.splitlines():
-        if line.startswith("n"):
-            candidate = line[1:].strip()
-            if candidate:
-                try:
-                    return Path(candidate).resolve()
-                except OSError:
-                    return None
-    return None
+    return process_cwd(pid)
 
 
 def _cwd_belongs_to_repo(cwd: Path, repo_root: Path) -> bool:
@@ -2308,39 +2283,18 @@ def find_autopilot_processes_for_repo(repo_root: Path) -> list[ProcessIdentity]:
     inside this repo.
     """
     repo_root = repo_root.resolve()
-    try:
-        result = subprocess.run(
-            ["ps", "-ww", "-e", "-o", "pid=", "-o", "lstart=", "-o", "command="],
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return []
-    if result.returncode != 0:
-        return []
     own_pid = os.getpid()
     matches: list[ProcessIdentity] = []
-    for line in result.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        parts = stripped.split(None, 6)
-        if len(parts) != 7:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
+    for identity in iter_processes():
+        pid = identity.pid
         if pid == own_pid:
             continue
-        command = parts[6].strip()
+        command = identity.command
         if not _is_autopilot_run_command(command):
             continue
         if _process_belongs_to_repo(pid, repo_root) is not True:
             continue
-        matches.append(
-            ProcessIdentity(pid=pid, started_at=" ".join(parts[1:6]), command=command)
-        )
+        matches.append(ProcessIdentity(pid=pid, started_at=identity.started_at, command=command))
     return matches
 
 

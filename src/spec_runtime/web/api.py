@@ -18,6 +18,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+
 
 def _repo_root(request: Request) -> Path:
     return request.app.state.repo_root
@@ -360,7 +362,7 @@ async def implement_spec(request: Request) -> Response:
     pre_run = pre_index.latest_by_spec.get(spec_id)
     pre_run_id = pre_run.get("run_id", "") if pre_run else ""
 
-    proc = subprocess.Popen(
+    proc = ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
         [
             _spec_executable(),
             "implement",
@@ -370,7 +372,6 @@ async def implement_spec(request: Request) -> Response:
             *(["--review-agent", review_agent] if review_agent else []),
         ],
         cwd=str(repo_root),
-        start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -523,10 +524,9 @@ async def dispatch_start(request: Request) -> Response:
             "stderr": completed.stderr,
         })
 
-    proc = subprocess.Popen(
+    proc = ProcessSupervisor(LifetimeMode.DETACHED).spawn(
         cmd,
         cwd=str(repo_root),
-        start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )

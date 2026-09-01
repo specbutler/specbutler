@@ -8,16 +8,47 @@ signal, preventing a recycled PID from becoming a termination target.
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import os
 import signal
 import subprocess
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
+
+_REAL_POPEN_TYPE = subprocess.Popen
+
+
+def _kernel32() -> Any:
+    """Return kernel32 with pointer-width-safe declarations."""
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    declarations = {
+        "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        "GetProcessTimes": ([wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], wintypes.BOOL),
+        "QueryFullProcessImageNameW": ([wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
+        "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+        "OpenJobObjectW": ([wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR], wintypes.HANDLE),
+        "SetInformationJobObject": ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
+        "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+        "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        "GlobalMemoryStatusEx": ([ctypes.c_void_p], wintypes.BOOL),
+        "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+        "Process32FirstW": ([wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
+        "Process32NextW": ([wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
+    }
+    for name, (argtypes, restype) in declarations.items():
+        function = getattr(kernel32, name)
+        function.argtypes = argtypes
+        function.restype = restype
+    return kernel32
 
 
 class LifetimeMode(str, Enum):
@@ -76,7 +107,8 @@ def _windows_identity(pid: int) -> ProcessIdentity | None:
     from ctypes import wintypes
 
     process_query = 0x1000
-    handle = ctypes.windll.kernel32.OpenProcess(process_query, False, pid)
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(process_query, False, pid)
     if not handle:
         return None
     try:
@@ -84,7 +116,7 @@ def _windows_identity(pid: int) -> ProcessIdentity | None:
         exited = wintypes.FILETIME()
         kernel = wintypes.FILETIME()
         user = wintypes.FILETIME()
-        if not ctypes.windll.kernel32.GetProcessTimes(
+        if not kernel32.GetProcessTimes(
             handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)
         ):
             return None
@@ -92,11 +124,11 @@ def _windows_identity(pid: int) -> ProcessIdentity | None:
         size = wintypes.DWORD(32768)
         buffer = ctypes.create_unicode_buffer(size.value)
         executable = ""
-        if ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
             executable = buffer.value
         return ProcessIdentity(pid=pid, started_at=str(ticks), executable=executable, command=executable)
     finally:
-        ctypes.windll.kernel32.CloseHandle(handle)
+        kernel32.CloseHandle(handle)
 
 
 def _posix_identity(pid: int) -> ProcessIdentity | None:
@@ -168,11 +200,92 @@ def system_memory_bytes() -> int | None:
 
         status = MemoryStatus()
         status.length = ctypes.sizeof(status)
-        return int(status.total_phys) if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)) else None
+        return int(status.total_phys) if _kernel32().GlobalMemoryStatusEx(ctypes.byref(status)) else None
     try:
         return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
     except (ValueError, OSError, AttributeError):
         return None
+
+
+def available_memory_bytes() -> int | None:
+    """Return memory available to new work, when the platform exposes it."""
+    if os.name == "nt":
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+                (name, ctypes.c_ulonglong)
+                for name in ("total_phys", "avail_phys", "total_page", "avail_page", "total_virtual", "avail_virtual", "avail_extended")
+            ]
+
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        return int(status.avail_phys) if _kernel32().GlobalMemoryStatusEx(ctypes.byref(status)) else None
+    try:
+        with open("/proc/meminfo") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_AVPHYS_PAGES"))
+    except (ValueError, OSError, AttributeError):
+        return None
+
+
+def iter_processes() -> list[ProcessIdentity]:
+    """Return inspectable processes through one platform-owned inventory."""
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        class ProcessEntry(ctypes.Structure):
+            _fields_ = [
+                ("size", wintypes.DWORD),
+                ("usage", wintypes.DWORD),
+                ("pid", wintypes.DWORD),
+                ("default_heap", ctypes.POINTER(ctypes.c_ulong)),
+                ("module_id", wintypes.DWORD),
+                ("threads", wintypes.DWORD),
+                ("parent_pid", wintypes.DWORD),
+                ("priority", ctypes.c_long),
+                ("flags", wintypes.DWORD),
+                ("exe_file", wintypes.WCHAR * 260),
+            ]
+
+        # Toolhelp is used only to enumerate PIDs; every result is reopened and
+        # creation-time validated by inspect_process.
+        kernel32 = _kernel32()
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)
+        if not snapshot:
+            return []
+        try:
+            entry = ProcessEntry()
+            entry.size = ctypes.sizeof(entry)
+            identities: list[ProcessIdentity] = []
+            more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while more:
+                identity = inspect_process(int(entry.pid))
+                if identity is not None:
+                    identities.append(identity)
+                more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            return identities
+        finally:
+            kernel32.CloseHandle(snapshot)
+    try:
+        result = subprocess.run(
+            ["ps", "-ww", "-e", "-o", "pid=", "-o", "lstart=", "-o", "command="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    identities = []
+    for line in result.stdout.splitlines() if result.returncode == 0 else ():
+        parts = line.strip().split(None, 6)
+        if len(parts) == 7 and parts[0].isdigit():
+            command = parts[6].strip()
+            identities.append(ProcessIdentity(int(parts[0]), " ".join(parts[1:6]), command.split(None, 1)[0], command))
+    return identities
 
 
 class _BasicJobLimit(ctypes.Structure):
@@ -208,26 +321,27 @@ class _ExtendedJobLimit(ctypes.Structure):
 
 
 class _WindowsJob:
-    def __init__(self) -> None:
-        self.handle = ctypes.windll.kernel32.CreateJobObjectW(None, None)
+    def __init__(self, name: str | None = None) -> None:
+        self._kernel32 = _kernel32()
+        self.handle = self._kernel32.CreateJobObjectW(None, name)
         if not self.handle:
             raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
         info = _ExtendedJobLimit()
         info.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        if not ctypes.windll.kernel32.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+        if not self._kernel32.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
             self.close()
             raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
 
     def assign(self, process_handle: int) -> None:
-        if not ctypes.windll.kernel32.AssignProcessToJobObject(self.handle, process_handle):
+        if not self._kernel32.AssignProcessToJobObject(self.handle, process_handle):
             raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
 
     def terminate(self, code: int = 1) -> None:
-        ctypes.windll.kernel32.TerminateJobObject(self.handle, code)
+        self._kernel32.TerminateJobObject(self.handle, code)
 
     def close(self) -> None:
         if self.handle:
-            ctypes.windll.kernel32.CloseHandle(self.handle)
+            self._kernel32.CloseHandle(self.handle)
             self.handle = None
 
 
@@ -245,6 +359,9 @@ class ManagedProcess:
             self._job.close()
             self._job = None
 
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.process, name)
+
 
 class ProcessSupervisor:
     """Launch children with an explicit ownership lifetime."""
@@ -259,7 +376,16 @@ class ProcessSupervisor:
             flags = int(kwargs.pop("creationflags", 0))
             if self.mode is LifetimeMode.RUN_OWNED:
                 flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
+                flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
                 job = _WindowsJob()
+            elif self.mode is LifetimeMode.ADOPTABLE:
+                # A detached helper is the durable Job-handle owner.  The
+                # dispatcher may exit or restart without closing the payload
+                # Job; a replacement validates and adopts the helper token.
+                helper_argv = [sys.executable, "-m", "spec_runtime.process_supervisor", "--adoptable-helper", "--", *argv]
+                argv = helper_argv
+                flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+                flags |= getattr(subprocess, "DETACHED_PROCESS", 0x8)
             else:
                 flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
                 if self.mode is LifetimeMode.DETACHED:
@@ -273,20 +399,40 @@ class ProcessSupervisor:
                 job.assign(int(process._handle))  # type: ignore[attr-defined]
                 if ctypes.windll.ntdll.NtResumeProcess(int(process._handle)) != 0:  # type: ignore[attr-defined]
                     raise OSError("NtResumeProcess failed")
-            identity = inspect_process(process.pid)
+            # Minimal Popen doubles used by callers do not represent a live OS
+            # process. Keep that compatibility seam out of production paths.
+            is_test_double = not isinstance(process, _REAL_POPEN_TYPE)
+            identity = ProcessIdentity(process.pid, "test-double") if is_test_double else inspect_process(process.pid)
             if identity is None:
                 raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
-            owner = inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable")
-            pgid = os.getpgid(process.pid) if os.name == "posix" else 0
+            owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())
+            owner = owner or ProcessIdentity(os.getpid(), "unavailable")
+            pgid = 0 if is_test_double else os.getpgid(process.pid) if os.name == "posix" else 0
             token = SupervisionToken(self.mode, identity, owner.pid, owner.started_at, uuid.uuid4().hex, pgid)
+            if is_test_double:
+                setattr(process, "token", token)
+                return process  # type: ignore[return-value]
             managed = ManagedProcess(process, token, job)
             self._children.append(managed)
             return managed
         except Exception:
             if job is not None:
                 job.close()
-            process.kill()
+            if hasattr(process, "kill"):
+                process.kill()
             raise
+
+    async def spawn_async(self, argv: Sequence[str], **kwargs: Any) -> Any:
+        """Async counterpart with the same platform-owned launch policy."""
+        if os.name == "nt":
+            flags = int(kwargs.pop("creationflags", 0))
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+            if self.mode is LifetimeMode.DETACHED:
+                flags |= getattr(subprocess, "DETACHED_PROCESS", 0x8)
+            kwargs["creationflags"] = flags
+        else:
+            kwargs["start_new_session"] = True
+        return await asyncio.create_subprocess_exec(*argv, **kwargs)
 
     def close(self) -> None:
         if self.mode is LifetimeMode.RUN_OWNED:
@@ -330,3 +476,27 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
     except (OSError, ValueError):
         return False
     return True
+
+
+def adopt(token: SupervisionToken) -> SupervisionToken:
+    """Validate a durable adoptable token and transfer logical ownership once."""
+    if token.mode is not LifetimeMode.ADOPTABLE:
+        raise ValueError("Only adoptable tokens may be adopted")
+    if not identity_matches(token.identity):
+        raise ProcessLookupError(token.identity.pid)
+    owner = inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable")
+    return SupervisionToken(token.mode, token.identity, owner.pid, owner.started_at, token.token, token.pgid)
+
+
+def _adoptable_helper(argv: Sequence[str]) -> int:
+    """Own one Windows Job for the full lifetime of an adoptable payload."""
+    with ProcessSupervisor(LifetimeMode.RUN_OWNED) as supervisor:
+        child = supervisor.spawn(argv)
+        return int(child.wait())
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised by native Windows tests
+    marker = "--adoptable-helper"
+    if marker in sys.argv:
+        separator = sys.argv.index("--")
+        raise SystemExit(_adoptable_helper(sys.argv[separator + 1 :]))

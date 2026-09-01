@@ -39,6 +39,7 @@ from .config import (
     SpecRuntimeConfig,
 )
 from .platform_fs import FileLock, remove_tree
+from .process_supervisor import LifetimeMode, ProcessSupervisor
 
 CONTAINER_WORKER_ENV_DENYLIST = frozenset(
     {
@@ -744,14 +745,14 @@ class WorktreeExecutionBackend:
             if request.capture_stdout:
                 popen_kwargs.setdefault("stdout", subprocess.PIPE)
                 popen_kwargs.setdefault("stderr", subprocess.PIPE)
-            proc = subprocess.Popen(request.argv, **popen_kwargs)
+            proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
             stdout, stderr = proc.communicate()
             return AgentResult(
                 returncode=proc.returncode,
                 stdout=stdout or "",
                 stderr=stderr or "",
             )
-        proc = subprocess.Popen(request.argv, **popen_kwargs)
+        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
         returncode = monitor(proc)
         return AgentResult(returncode=returncode)
 
@@ -910,7 +911,7 @@ class CloneExecutionBackend:
             if request.capture_stdout:
                 popen_kwargs.setdefault("stdout", subprocess.PIPE)
                 popen_kwargs.setdefault("stderr", subprocess.PIPE)
-            proc = subprocess.Popen(request.argv, **popen_kwargs)
+            proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
             stdout, stderr = proc.communicate()
             self._write_command_log(
                 kind="agent",
@@ -932,7 +933,7 @@ class CloneExecutionBackend:
                 stdout=stdout or "",
                 stderr=stderr or "",
             )
-        proc = subprocess.Popen(request.argv, **popen_kwargs)
+        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
         returncode = monitor(proc)
         self._write_command_log(
             kind="agent",
@@ -1735,7 +1736,7 @@ class ContainerCliRunner:
         kwargs.setdefault("cwd", str(cwd))
         if env is not None:
             kwargs.setdefault("env", env)
-        return subprocess.Popen(argv, **kwargs)
+        return ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(argv, **kwargs)
 
 
 class ContainerExecutionBackend(CloneExecutionBackend):

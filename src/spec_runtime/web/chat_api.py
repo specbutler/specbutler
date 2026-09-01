@@ -25,6 +25,7 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from spec_runtime.platform_fs import remove_tree
+from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
 
 from .bridge import (
     AgentEvent,
@@ -1254,7 +1255,7 @@ async def implement_chat_task(request: Request) -> Response:
     from .api import _spec_executable
 
     try:
-        proc = subprocess.Popen(
+        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
             [
                 _spec_executable(),
                 "implement",
@@ -1264,7 +1265,6 @@ async def implement_chat_task(request: Request) -> Response:
                 *(["--review-agent", review_agent] if review_agent else []),
             ],
             cwd=str(repo_root),
-            start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )

@@ -109,6 +109,7 @@ from .execution_backend import get_execution_backend as _factory_get_execution_b
 from .forge import GitHubForge, PushResult
 from .git_common import resolve_common_root
 from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
+from .process_supervisor import LifetimeMode, ProcessSupervisor
 from .spec_identity import (
     SPEC_ID_RE,
     authoring_branch_identity,
@@ -4415,7 +4416,7 @@ def run_subprocess(
         kwargs["stdin"] = subprocess.DEVNULL
     else:
         kwargs["stdin"] = subprocess.PIPE
-    proc = subprocess.Popen(cmd, **kwargs)
+    proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(cmd, **kwargs)
     started_at = time.monotonic()
     communicate_input = input_text
     while True:
@@ -4467,7 +4468,7 @@ def _run_local_review_subprocess(
     }
     proc: subprocess.Popen[str] | None = None
     try:
-        proc = subprocess.Popen(cmd, **popen_kwargs)
+        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(cmd, **popen_kwargs)
         process_identity = read_process_identity(proc.pid)
         process_started_at = process_identity.started_at if process_identity is not None else ""
         pgid = 0
@@ -18748,30 +18749,33 @@ def _bootstrap_review_worktree(
     # the kill blocks forever and defeats the timeout entirely.
     try:
         try:
-            proc = subprocess.Popen(
-                install_command.argv(),
-                cwd=review_worktree,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
+            launch_argv = install_command.launch_argv(cwd=review_worktree)
+            with launch_argv as argv:
+                proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+                    argv,
+                    cwd=review_worktree,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    stdout_text, stderr_text = proc.communicate(
+                        timeout=REVIEW_BOOTSTRAP_TIMEOUT_SECONDS
+                    )
+                except subprocess.TimeoutExpired:
+                    _terminate_agent_process(proc)
+                    return _record_warning(
+                        "Review worktree bootstrap timed out; reviewer may not be able to run "
+                        "tests (falling back to diff-only review).",
+                        f"Timed out after {REVIEW_BOOTSTRAP_TIMEOUT_SECONDS:.0f}s",
+                    )
         except OSError as exc:
             return _record_warning(
                 "Review worktree bootstrap could not be launched; reviewer may not be "
                 "able to run tests (falling back to diff-only review).",
                 str(exc),
-            )
-        try:
-            stdout_text, stderr_text = proc.communicate(timeout=REVIEW_BOOTSTRAP_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            _terminate_agent_process(proc)
-            return _record_warning(
-                "Review worktree bootstrap timed out; reviewer may not be able to run "
-                "tests (falling back to diff-only review).",
-                f"Timed out after {REVIEW_BOOTSTRAP_TIMEOUT_SECONDS:.0f}s",
             )
         if proc.returncode != 0:
             detail = (stderr_text or "").strip() or (stdout_text or "").strip()

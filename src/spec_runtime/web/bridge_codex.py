@@ -22,6 +22,8 @@ import signal
 import uuid
 from typing import AsyncIterator
 
+from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+
 from .bridge import AgentEvent
 
 logger = logging.getLogger(__name__)
@@ -166,14 +168,13 @@ class _CodexSession:
             )
         cmd = [codex_bin, "app-server"]
         env = {**os.environ, "CODEX_APP_SERVER": "1"}
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd,
+        self._proc = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+            cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
             env=env,
-            start_new_session=True,
         )
 
         # Drain stderr in the background so the pipe buffer never fills

@@ -48,6 +48,7 @@ from spec_runtime.autopilot_tui.dashboard import (  # noqa: F401 — re-exported
 from spec_runtime.config import load_repo_spec_runtime_config
 from spec_runtime.container import container_image_source
 from spec_runtime.platform_fs import remove_tree
+from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
 from spec_runtime.spec_identity import SPEC_ID_RE
 from spec_runtime.spec_metadata import iter_spec_metadata
 
@@ -74,14 +75,13 @@ def _launch_make_code(
 
     log_handle = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
     try:
-        subprocess.Popen(
+        ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
             command,
             cwd=repo_root,
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             env=env,
-            start_new_session=True,
         )
     finally:
         log_handle.close()
@@ -716,7 +716,7 @@ def _stream_chat_provider_process(
     process group and waits for the leader.
     """
     with tempfile.TemporaryFile(mode="w+b") as stderr_file:
-        proc = subprocess.Popen(
+        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
             command,
             cwd=cwd,
             env=env,
@@ -724,7 +724,6 @@ def _stream_chat_provider_process(
             stdout=subprocess.PIPE,
             stderr=stderr_file,
             text=True,
-            start_new_session=True,
         )
         assert proc.stdout is not None
         stdout = proc.stdout
