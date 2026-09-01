@@ -450,6 +450,13 @@ class GitHubForge:
         try:
             checks = json.loads(result.stdout)
         except (json.JSONDecodeError, TypeError):
+            # gh exits 1 and emits prose rather than ``[]`` when the branch
+            # has no required checks. That is a definitive empty set, not a
+            # transient query failure; treating it as unknown makes readiness
+            # wait for the entire merge timeout on unprotected repositories.
+            detail = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+            if "no required checks reported" in detail:
+                return []
             return None
         if not isinstance(checks, list):
             return None

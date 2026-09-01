@@ -209,6 +209,19 @@ class TestGitHubForgeProtocol:
         """GitHubForge must satisfy the ForgeAdapter protocol."""
         assert isinstance(GitHubForge(), ForgeAdapter)
 
+    def test_required_checks_treats_gh_no_required_prose_as_empty(self, tmp_path):
+        def run_fn(cmd, cwd=None, **kw):  # noqa: ARG001
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                stdout="",
+                stderr="no required checks reported on the 'code/example' branch\n",
+            )
+
+        checks = GitHubForge(run_fn=run_fn).get_required_checks(12, cwd=tmp_path)
+
+        assert checks == []
+
     def test_mark_pr_ready_uses_gh_pr_ready(self, tmp_path):
         captured = {}
 
