@@ -14,7 +14,6 @@ state, outbox, logs, and forge authority outside the worker.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -39,6 +38,7 @@ from .config import (
     ExecutionConfig,
     SpecRuntimeConfig,
 )
+from .platform_fs import FileLock, remove_tree
 
 CONTAINER_WORKER_ENV_DENYLIST = frozenset(
     {
@@ -960,7 +960,7 @@ class CloneExecutionBackend:
         snapshots.mkdir(parents=True, exist_ok=True)
         target = snapshots / _safe_artifact_name(label)
         if target.exists():
-            shutil.rmtree(target)
+            remove_tree(target)
         shutil.copytree(workspace.path, target, symlinks=True)
         ref = SnapshotRef(
             label=label,
@@ -1039,7 +1039,7 @@ class CloneExecutionBackend:
             )
         self._assert_workspace_deletable(source, allow_unpushed_work=allow_unpushed_work)
         if run_root.name and run_root.parent.name:
-            shutil.rmtree(run_root, ignore_errors=False)
+            remove_tree(run_root)
 
     def _record_snapshot_fallback(
         self,
@@ -1080,7 +1080,7 @@ class CloneExecutionBackend:
         if not repo_root.is_absolute():
             repo_root = repo_root.resolve()
         if workspace.path.exists():
-            shutil.rmtree(workspace.path)
+            remove_tree(workspace.path)
         refreshed = self.prepare_workspace(
             run_id=run_id,
             spec_id=spec_id,
@@ -1100,7 +1100,7 @@ class CloneExecutionBackend:
         workspace_path.mkdir(parents=True, exist_ok=True)
         for child in workspace_path.iterdir():
             if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child)
+                remove_tree(child)
             else:
                 child.unlink()
         for child in snapshot_path.iterdir():
@@ -1176,7 +1176,7 @@ class CloneExecutionBackend:
         if clone.returncode == 0:
             return
         if self._is_cross_device_link_clone_failure(clone):
-            shutil.rmtree(source, ignore_errors=True)
+            remove_tree(source, ignore_errors=True)
             retry = self._run_git(
                 ["clone", "--no-local", "--no-checkout", str(repo_root), str(source)],
                 cwd=repo_root,
@@ -2558,7 +2558,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             except ValueError:
                 continue
             if path.exists():
-                shutil.rmtree(path, ignore_errors=True)
+                remove_tree(path, ignore_errors=True)
         for container_id in state.get("containers", []):
             if container_id:
                 self._runner.run(
@@ -2619,12 +2619,10 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         lock_dir = run_root.parent / ".image-build-locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_digest = hashlib.sha256(f"{self._container.engine}\0{tag}".encode()).hexdigest()
-        lock_fd = os.open(str(lock_dir / f"{lock_digest}.lock"), os.O_CREAT | os.O_RDWR)
-        try:
+        with FileLock(lock_dir / f"{lock_digest}.lock"):
             # Concurrent autopilot runs commonly resolve the same cold image.
             # Serialize the inspect/build decision so the first process builds
             # it and every waiter reuses that completed tag.
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
             inspect = self._runner.run(
                 [self._container.engine, "image", "inspect", tag],
                 cwd=repo_root,
@@ -2701,9 +2699,6 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     f"Container backend image build failed for {tag}. See {logs / 'image-build.log'}"
                 )
             return tag
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
 
     def _prepare_build_context(
         self,
@@ -2714,7 +2709,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
     ) -> Path:
         context = run_root / "container-build"
         if context.exists():
-            shutil.rmtree(context)
+            remove_tree(context)
         context.mkdir(parents=True)
         manifest_dir = context / "dependency-inputs"
         manifest_dir.mkdir()
@@ -3452,7 +3447,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             return
         snapshot_root = run_root / "snapshots" / f"{_safe_artifact_name(label)}.service-volumes"
         if snapshot_root.exists():
-            shutil.rmtree(snapshot_root)
+            remove_tree(snapshot_root)
         snapshot_root.mkdir(parents=True)
         captured: dict[str, str] = {}
         for volume in volumes:
@@ -4203,7 +4198,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         if state_dir.is_symlink() or state_dir.is_file():
             state_dir.unlink()
         elif state_dir.is_dir():
-            shutil.rmtree(state_dir)
+            remove_tree(state_dir)
 
     @staticmethod
     def _translate_container_paths(value: str, mappings: list[tuple[str, str]]) -> str:

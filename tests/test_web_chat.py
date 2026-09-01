@@ -2895,6 +2895,34 @@ class TestImplementEndpoint:
         assert resp.status_code == 422
         assert "No task spec found" in resp.json()["error"]
 
+    @pytest.mark.parametrize("spec_id", ["con", "a" * 65])
+    def test_implement_rejects_windows_unsafe_detected_spec_id(self, tmp_path, spec_id):
+        import subprocess
+
+        from spec_runtime.web.bridge import create_session
+
+        client = self._make_client(tmp_path)
+        task_dir = tmp_path / "specs" / "tasks"
+        task_dir.mkdir(parents=True)
+        (task_dir / f"{spec_id}.md").write_text(f"---\nid: {spec_id}\n---\n")
+        session = create_session(mode="task", agent="claude")
+        session.worktree_path = str(tmp_path)
+        session.branch = "task/web-task-test"
+        session.base_sha = "abc123"
+        mock_diff = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f"specs/tasks/{spec_id}.md\n", stderr=""
+        )
+
+        with patch("spec_runtime.orchestrator.run_subprocess", return_value=mock_diff):
+            resp = client.post(
+                f"/api/v1/chat/sessions/{session.session_id}/implement",
+                json={},
+                headers=self._auth_headers(),
+            )
+
+        assert resp.status_code == 422
+        assert "invalid" in resp.json()["error"]
+
     def test_implement_uses_detected_spec_not_request_body(self, tmp_path):
         """The implement endpoint uses _detect_task_spec to find the correct
         spec, not blindly trusting whatever spec_id the client sends."""

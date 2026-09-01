@@ -212,8 +212,8 @@ def _cmd_clean(args: argparse.Namespace) -> int:
     # process inspection, or filesystem mutation can occur.
     if not SPEC_ID_RE.fullmatch(spec_id):
         print(
-            "Error: Invalid spec ID. Use lowercase letters, digits, and hyphens; "
-            "the first character must be alphanumeric.",
+            "Error: Invalid spec ID. Use at most 64 lowercase letters, digits, and hyphens; "
+            "start with an alphanumeric character and avoid Windows device names.",
             file=sys.stderr,
         )
         return 1
@@ -548,9 +548,9 @@ def _remove_worktree_path(target: Path) -> int:
             print(f"Removed worktree {target}")
             return 1
     elif target.is_dir():
-        import shutil
+        from .platform_fs import remove_tree
 
-        shutil.rmtree(target)
+        remove_tree(target)
         print(f"Removed stale directory {target}")
         return 1
     return 0

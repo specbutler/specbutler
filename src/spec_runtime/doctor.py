@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config
+from .platform import is_unc_path, is_windows
 
 DoctorStatus = Literal["ok", "warning", "error"]
 CommandRunner = Callable[[list[str], Path, float], subprocess.CompletedProcess[str]]
@@ -119,6 +120,16 @@ def run_doctor_checks(
     load_config = config_loader or _load_config
     requested_root = requested_root.expanduser().resolve()
     checks: list[DoctorCheck] = []
+
+    if is_windows() and is_unc_path(requested_root):
+        checks.append(
+            _error(
+                "local filesystem",
+                f"UNC or network repository roots are unsupported: {requested_root}",
+                "Move the checkout to a fixed local NTFS volume and rerun `spec doctor`.",
+            )
+        )
+        return DoctorReport(tuple(checks))
 
     repo_result = run(
         ["git", "rev-parse", "--show-toplevel"],

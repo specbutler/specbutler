@@ -36,7 +36,6 @@ Internal orchestrator subcommands (available via spec_runtime.orchestrator:main)
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import inspect
 import json
@@ -108,7 +107,10 @@ from .execution_backend import (
 from .execution_backend import get_execution_backend as _factory_get_execution_backend
 from .forge import GitHubForge, PushResult
 from .git_common import resolve_common_root
+from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
 from .spec_identity import (
+    SPEC_ID_RE,
+    authoring_branch_identity,
     format_pr_review_owner,
     implementation_branch_identity,
     is_authoring_branch,
@@ -998,7 +1000,7 @@ def _cleanup_worktree_checkout(
             logger.warning("worktree remove reported failure: %s", detail[-240:])
     elif worktree_path.is_dir():
         try:
-            shutil.rmtree(worktree_path)
+            remove_tree(worktree_path)
         except OSError as exc:
             return f"Could not remove worktree directory {worktree_path}: {exc}"
 
@@ -5502,13 +5504,8 @@ def _spec_authoring_session_token_from_branch(branch: str) -> str | None:
 
 
 def _spec_id_from_authoring_branch(branch: str) -> str | None:
-    match = re.fullmatch(
-        rf"{re.escape(SPEC_AUTHORING_BRANCH_PREFIX)}([a-z0-9][a-z0-9-]*)",
-        branch,
-    )
-    if match is None:
-        return None
-    return match.group(1)
+    identity = authoring_branch_identity(branch)
+    return identity.spec_id if identity is not None and identity.kind == "spec" else None
 
 
 def _registered_worktrees(repo_root: Path) -> tuple[list[tuple[Path, str]], str]:
@@ -5705,7 +5702,7 @@ def _prepare_spec_authoring_worktree(
         resumed = True
     else:
         if worktree_path.exists():
-            shutil.rmtree(worktree_path)
+            remove_tree(worktree_path)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
         should_reuse_existing_branch = spec_id is not None
@@ -5936,23 +5933,13 @@ def _lock_path_for(path: Path) -> Path:
 def _locked_state_path(path: Path) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = _lock_path_for(path)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with FileLock(lock_path):
         yield
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
 
 
 def _write_json_file_atomically(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp_path, path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def _read_json_dict(path: Path) -> dict | None:
@@ -7333,7 +7320,7 @@ class OrchestratorRequest:
 
     def validate(self) -> list[str]:
         errors = []
-        if not re.match(r"^[a-z0-9][a-z0-9-]*$", self.spec_id):
+        if not SPEC_ID_RE.fullmatch(self.spec_id):
             errors.append(f"Invalid spec_id: {self.spec_id!r}")
         if not re.match(
             (
@@ -10236,7 +10223,7 @@ def _spec_lock_path(repo_root: Path, spec_id: str) -> Path:
 
 
 class SpecLock:
-    """Per-spec file lock using fcntl.flock (non-blocking).
+    """Cross-platform non-blocking per-spec file lock.
 
     The holder records its process identity (pid, start time, command) in the
     lock file so a contender can surface *who* holds the lock instead of only
@@ -10246,25 +10233,22 @@ class SpecLock:
     def __init__(self, repo_root: Path, spec_id: str):
         self._path = _spec_lock_path(repo_root, spec_id)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._fd: int | None = None
+        self._lock: FileLock | None = None
 
     def __enter__(self) -> SpecLock:
-        self._fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR)
-        try:
-            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            os.close(self._fd)
-            self._fd = None
+        self._lock = FileLock(self._path, blocking=False)
+        if not self._lock.acquire():
+            self._lock = None
             owner = read_spec_lock_owner_from_path(self._path)
             owner_hint = f" (held by {owner.describe()})" if owner is not None else ""
             raise RuntimeError(
                 f"Lock contention: another process holds the lock for {self._path.stem}{owner_hint}"
-            ) from exc
+            )
         self._record_owner()
         return self
 
     def _record_owner(self) -> None:
-        if self._fd is None:
+        if self._lock is None or self._lock.file is None:
             return
         identity: ProcessIdentity | None
         try:
@@ -10277,25 +10261,29 @@ class SpecLock:
             "command": identity.command if identity is not None else "",
         }
         try:
-            os.ftruncate(self._fd, 0)
-            os.lseek(self._fd, 0, os.SEEK_SET)
-            os.write(self._fd, (json.dumps(payload) + "\n").encode("utf-8"))
+            stream = self._lock.file
+            stream.seek(lock_metadata_offset())
+            stream.truncate()
+            stream.write((json.dumps(payload) + "\n").encode("utf-8"))
+            stream.flush()
         except OSError:
             pass
 
     def __exit__(self, *_: object) -> None:
-        if self._fd is not None:
+        if self._lock is not None:
             try:
-                os.ftruncate(self._fd, 0)
+                stream = self._lock.file
+                if stream is not None:
+                    stream.seek(lock_metadata_offset())
+                    stream.truncate()
             except OSError:
                 pass
-            fcntl.flock(self._fd, fcntl.LOCK_UN)
-            os.close(self._fd)
-            self._fd = None
+            self._lock.release()
+            self._lock = None
 
 
 def _parse_lock_owner_payload(raw: str) -> LockOwner:
-    text = (raw or "").strip()
+    text = (raw or "").lstrip("\0").strip()
     if not text:
         return LockOwner(pid=0)
     try:
@@ -10326,23 +10314,19 @@ def read_spec_lock_owner_from_path(path: Path) -> LockOwner | None:
     if not path.exists():
         return None
     try:
-        fd = os.open(str(path), os.O_RDWR)
+        probe = FileLock(path, blocking=False)
     except OSError:
         return None
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        if not probe.acquire():
             try:
-                raw = path.read_text()
+                raw = read_lock_metadata(path)
             except OSError:
                 raw = ""
             return _parse_lock_owner_payload(raw)
-        else:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            return None
+        return None
     finally:
-        os.close(fd)
+        probe.release()
 
 
 def read_spec_lock_owner(repo_root: Path, spec_id: str) -> LockOwner | None:
@@ -12198,7 +12182,7 @@ def _cleanup_stale_block_debugger_worktrees(repo_root: Path) -> None:
         if marker_pid > 0 and marker_started_at and is_pid_alive(marker_pid, marker_started_at):
             continue
         _restore_tree_writable(candidate)
-        shutil.rmtree(candidate, ignore_errors=True)
+        remove_tree(candidate, ignore_errors=True)
 
 
 def _validated_block_debugger_surviving_workspace(
@@ -12262,7 +12246,7 @@ def _create_private_block_debugger_clone(
     )
     if clone_result.returncode != 0:
         detail = clone_result.stderr.strip() or clone_result.stdout.strip() or "git clone failed"
-        shutil.rmtree(destination, ignore_errors=True)
+        remove_tree(destination, ignore_errors=True)
         raise ValueError(f"private debugger clone failed: {detail}")
 
     checkout_result = run_subprocess(
@@ -12271,7 +12255,7 @@ def _create_private_block_debugger_clone(
     )
     if checkout_result.returncode != 0:
         detail = checkout_result.stderr.strip() or checkout_result.stdout.strip() or "git checkout failed"
-        shutil.rmtree(destination, ignore_errors=True)
+        remove_tree(destination, ignore_errors=True)
         raise ValueError(f"private debugger checkout failed: {detail}")
 
     # The clone must have no path back to the authoritative workspace. The
@@ -12463,7 +12447,7 @@ def _temporary_block_debugger_worktree(
     if actual_head_sha and actual_head_sha != head_sha:
         if private_clone:
             _restore_tree_writable(worktree_path)
-            shutil.rmtree(worktree_path, ignore_errors=True)
+            remove_tree(worktree_path, ignore_errors=True)
             cleanup_error = ""
         else:
             cleanup_error = _cleanup_worktree_checkout(
@@ -12510,9 +12494,9 @@ def _temporary_block_debugger_worktree(
         _restore_tree_writable(worktree_path)
         for temp_dir in guard_temp_dirs:
             _restore_tree_writable(temp_dir)
-            shutil.rmtree(str(temp_dir), ignore_errors=True)
+            remove_tree(temp_dir, ignore_errors=True)
         if private_clone:
-            shutil.rmtree(worktree_path, ignore_errors=True)
+            remove_tree(worktree_path, ignore_errors=True)
             cleanup_error = ""
         else:
             cleanup_error = _cleanup_worktree_checkout(
@@ -12919,7 +12903,7 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
     else:
         # Clean up stale directory if present
         if worktree_path.exists():
-            shutil.rmtree(worktree_path)
+            remove_tree(worktree_path)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
         if run.resumed_from_branch:
@@ -13268,7 +13252,7 @@ def _resolve_scoped_task_spec(
         raise RuntimeError(
             f"Task spec file path `{task_spec.name}` does not match frontmatter id `{frontmatter_slug}`."
         )
-    if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", chosen_slug):
+    if not SPEC_ID_RE.fullmatch(chosen_slug):
         raise RuntimeError(f"Task spec id '{chosen_slug}' is invalid; use lowercase kebab-case.")
     _assert_task_spec_id_is_unambiguous(
         repo_root,
@@ -13381,7 +13365,7 @@ def phase_scoping(run: RunState, repo_root: Path) -> str:
 
     # Read slug from the task spec file and rename branch to match.
     chosen_slug = _read_slug_from_spec(scoped_spec) or scoped_spec.stem
-    if chosen_slug and re.fullmatch(r"[a-z0-9][a-z0-9-]*", chosen_slug):
+    if chosen_slug and SPEC_ID_RE.fullmatch(chosen_slug):
         old_branch = run.branch
         # Extract the run token from the current branch.
         # Branch format: task/<spec_id>--<token>
@@ -18711,7 +18695,7 @@ def _bootstrap_review_worktree(
             )
         return ""
     finally:
-        shutil.rmtree(isolated_home, ignore_errors=True)
+        remove_tree(isolated_home, ignore_errors=True)
 
 
 def _review_env_prompt_note(review_worktree: Path) -> str:
@@ -21538,7 +21522,7 @@ def cmd_spec(args: argparse.Namespace) -> int:
     if agent not in VALID_AGENTS:
         print(f"Error: AGENT must be one of {VALID_AGENTS}", file=sys.stderr)
         return 1
-    if raw_spec_id and not re.fullmatch(r"[a-z0-9][a-z0-9-]*", raw_spec_id):
+    if raw_spec_id and not SPEC_ID_RE.fullmatch(raw_spec_id):
         print(
             "Error: SPEC must be a lowercase slug matching `[a-z0-9][a-z0-9-]*`.",
             file=sys.stderr,

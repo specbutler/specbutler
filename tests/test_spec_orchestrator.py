@@ -22,7 +22,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -372,6 +372,16 @@ class TestOrchestratorRequest:
         errors = req.validate()
         assert len(errors) == 1
         assert "spec_id" in errors[0]
+
+    @pytest.mark.parametrize("spec_id", ["con", "a" * 65])
+    def test_windows_unsafe_spec_id(self, spec_id):
+        req = orch.OrchestratorRequest(
+            request_id="req-windows-unsafe",
+            spec_id=spec_id,
+            branch="spec/my-feature",
+            action="run",
+        )
+        assert any("spec_id" in error for error in req.validate())
 
     def test_invalid_branch(self):
         req = orch.OrchestratorRequest(
@@ -30201,6 +30211,38 @@ class TestCmdTask:
         assert result == "passed"
         assert run.spec_id == "my-fix"
         assert run.branch == "task/my-fix--token123"
+
+    @pytest.mark.parametrize("spec_id", ["con", "a" * 65])
+    def test_scoped_task_rejects_windows_unsafe_spec_id(self, repo: Path, spec_id: str):
+        worktree = repo / ".worktrees" / "task-token"
+        task_spec = worktree / "specs" / "tasks" / f"{spec_id}.md"
+        task_spec.parent.mkdir(parents=True)
+        task_spec.write_text(f"---\nid: {spec_id}\n---\n")
+        run = orch.RunState(
+            run_id="task-token-20260101T000000",
+            spec_id="task-token",
+            branch="task/task-token--token",
+            worktree_path=str(worktree),
+            run_mode="task",
+        )
+
+        with (
+            patch.object(
+                orch,
+                "_narrow_new_specs_with_git",
+                side_effect=lambda _worktree, _candidates, *, spec_dir, **_kwargs: (
+                    [task_spec] if spec_dir == PurePosixPath(orch.TASK_SPEC_DIR) else []
+                ),
+            ),
+            pytest.raises(RuntimeError, match="invalid"),
+        ):
+            orch._resolve_scoped_task_spec(
+                repo,
+                run,
+                worktree,
+                preexisting_task_specs=set(),
+                preexisting_catalog_specs=set(),
+            )
 
     def test_phase_scoping_fails_when_branch_rename_fails(self, repo: Path):
         """Branch rename failure must surface as 'failed' with last_error."""
