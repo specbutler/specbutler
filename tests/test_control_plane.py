@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -961,14 +962,19 @@ def test_old_run_lease_can_be_validated_for_adoption() -> None:
 
 def test_fetch_timeout_kills_whole_process_group(tmp_path):
     """A hung transport child must die with the fetch, not become orphaned."""
-    import subprocess
     import time as _time
-    from pathlib import Path
 
     from spec_runtime.control_plane.git_timeouts import _run_fetch_process_group
+    from spec_runtime.process_supervisor import inspect_process
 
     pidfile = tmp_path / "child.pid"
-    cmd = ["bash", "-c", f"sleep 30 & echo $! > {pidfile}; wait"]
+    child_code = "import time; time.sleep(30)"
+    parent_code = (
+        "import subprocess,sys,time; "
+        "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
+        "open(sys.argv[1],'w').write(str(child.pid)); time.sleep(30)"
+    )
+    cmd = [sys.executable, "-c", parent_code, str(pidfile), child_code]
     started = _time.monotonic()
     try:
         _run_fetch_process_group(cmd, timeout=0.5)
@@ -977,13 +983,12 @@ def test_fetch_timeout_kills_whole_process_group(tmp_path):
         pass
     assert _time.monotonic() - started < 5.0
     child_pid = int(pidfile.read_text().strip())
-    # killpg must have taken the backgrounded child down too.
     deadline = _time.monotonic() + 2.0
     while _time.monotonic() < deadline:
-        if not Path(f"/proc/{child_pid}").exists():
+        if inspect_process(child_pid) is None:
             break
         _time.sleep(0.05)
-    assert not Path(f"/proc/{child_pid}").exists()
+    assert inspect_process(child_pid) is None
 
 
 def test_consumed_operator_request_projects_retryable_not_needs_input(tmp_path):

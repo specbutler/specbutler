@@ -5,7 +5,6 @@ import os
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -648,28 +647,6 @@ def _wait_chat_provider_process(
         return proc.wait()
 
 
-def _signal_chat_provider_process_group(
-    proc: subprocess.Popen[str],
-    sig: signal.Signals,
-) -> bool:
-    """Signal the isolated provider process group, falling back to its leader."""
-    pid = getattr(proc, "pid", 0)
-    if os.name == "posix" and isinstance(pid, int) and pid > 0:
-        try:
-            os.killpg(pid, sig)
-            return True
-        except (OSError, ProcessLookupError, PermissionError):
-            pass
-    try:
-        if sig == signal.SIGKILL:
-            proc.kill()
-        else:
-            proc.terminate()
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
 def _terminate_chat_provider_process(proc: subprocess.Popen[str]) -> None:
     """Terminate a provider group, escalate to kill, and reap its leader."""
     try:
@@ -678,7 +655,10 @@ def _terminate_chat_provider_process(proc: subprocess.Popen[str]) -> None:
         running = False
 
     if running:
-        _signal_chat_provider_process_group(proc, signal.SIGTERM)
+        try:
+            proc.terminate(grace_seconds=CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS)
+        except TypeError:  # minimal Popen test doubles
+            proc.terminate()
         try:
             _wait_chat_provider_process(
                 proc,
@@ -686,7 +666,7 @@ def _terminate_chat_provider_process(proc: subprocess.Popen[str]) -> None:
             )
             return
         except subprocess.TimeoutExpired:
-            _signal_chat_provider_process_group(proc, signal.SIGKILL)
+            proc.kill()
 
     # Even an already-exited process needs wait() to release its process table
     # entry. After SIGKILL this second bounded wait normally returns at once.

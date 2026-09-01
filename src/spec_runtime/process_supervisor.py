@@ -357,6 +357,9 @@ class _WindowsJob:
             self.handle = None
 
 
+_LIVE_WINDOWS_JOBS: dict[tuple[int, str], _WindowsJob] = {}
+
+
 class ManagedProcess:
     def __init__(self, process: subprocess.Popen[Any], token: SupervisionToken, job: _WindowsJob | None = None):
         self.process = process
@@ -373,6 +376,7 @@ class ManagedProcess:
 
     def close(self) -> None:
         if self._job is not None:
+            _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
             self._job.close()
             self._job = None
 
@@ -409,6 +413,7 @@ class ManagedAsyncProcess:
 
     def close(self) -> None:
         if self._job is not None:
+            _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
             self._job.close()
             self._job = None
 
@@ -465,6 +470,8 @@ class ProcessSupervisor:
                 setattr(process, "token", token)
                 return process  # type: ignore[return-value]
             managed = ManagedProcess(process, token, job)
+            if job is not None:
+                _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
             self._children.append(managed)
             return managed
         except Exception:
@@ -505,6 +512,8 @@ class ProcessSupervisor:
             pgid = os.getpgid(process.pid) if os.name == "posix" else 0
             token = SupervisionToken(self.mode, identity, owner.pid, owner.started_at, uuid.uuid4().hex, pgid)
             managed = ManagedAsyncProcess(process, token, job)
+            if job is not None:
+                _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
             self._children.append(managed)
             return managed
         except Exception:
@@ -530,6 +539,8 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
     """Revalidate identity, request cancellation, then kill the owned tree."""
     if not identity_matches(token.identity):
         return False
+    if job is None and os.name == "nt":
+        job = _LIVE_WINDOWS_JOBS.get((token.identity.pid, token.identity.started_at))
     try:
         if os.name == "posix":
             os.killpg(token.pgid or token.identity.pid, signal.SIGTERM)

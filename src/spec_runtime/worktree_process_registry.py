@@ -4,13 +4,18 @@ import hashlib
 import json
 import os
 import re
-import signal
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .process_supervisor import ProcessIdentity, inspect_process
+from .process_supervisor import (
+    LifetimeMode,
+    ProcessIdentity,
+    SupervisionToken,
+    inspect_process,
+    terminate,
+)
 
 PROCESS_TERMINATION_TIMEOUT_SECONDS = 5.0
 
@@ -225,14 +230,6 @@ def prune_dead_processes(state_root: Path, worktree_path: Path) -> tuple[str, ..
     return tuple(removed)
 
 
-def _signal_entry(entry: RegisteredProcess, sig: int) -> None:
-    if entry.termination_scope == "pgid" and os.name == "posix":
-        target_pgid = entry.pgid or entry.pid
-        os.killpg(target_pgid, sig)
-        return
-    os.kill(entry.pid, sig)
-
-
 def _wait_for_exit(entry: RegisteredProcess, timeout_seconds: float) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -267,32 +264,17 @@ def reap_registered_processes(
             stale.append(f"{entry.name} pid={entry.pid} already exited")
             continue
 
-        try:
-            _signal_entry(entry, signal.SIGTERM)
-        except ProcessLookupError:
-            stale.append(f"{entry.name} pid={entry.pid} already exited")
-            continue
-        except OSError as exc:
-            surviving.append(f"{entry.name} pid={entry.pid} could not terminate: {exc}")
-            still_alive.append(entry)
-            continue
-
-        if _wait_for_exit(entry, timeout_seconds):
+        identity = ProcessIdentity(entry.pid, entry.started_at, command=entry.command)
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            os.getpid(),
+            "registry-reaper",
+            f"registry-{entry.pid}-{entry.started_at}",
+            entry.pgid if entry.termination_scope == "pgid" else 0,
+        )
+        if terminate(token, grace_seconds=timeout_seconds) and _wait_for_exit(entry, 1.0):
             terminated.append(f"{entry.name} pid={entry.pid} terminated")
-            continue
-
-        try:
-            _signal_entry(entry, signal.SIGKILL)
-        except ProcessLookupError:
-            terminated.append(f"{entry.name} pid={entry.pid} terminated")
-            continue
-        except OSError as exc:
-            surviving.append(f"{entry.name} pid={entry.pid} could not kill: {exc}")
-            still_alive.append(entry)
-            continue
-
-        if _wait_for_exit(entry, 1.0):
-            terminated.append(f"{entry.name} pid={entry.pid} killed")
             continue
 
         surviving.append(f"{entry.name} pid={entry.pid} survived reap")
