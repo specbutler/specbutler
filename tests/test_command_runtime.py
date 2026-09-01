@@ -147,6 +147,29 @@ def test_cmd_hook_metadata_requires_environment_or_direct_argv() -> None:
         command.argv(windows=True, arguments=("path with space", "x&y"))
 
 
+def test_cmd_launch_materializes_and_removes_batch_file(tmp_path: Path) -> None:
+    command = CommandSpec("script", '"C:\\Program Files\\tool.exe" "path with space"', "cmd")
+    with command.launch_argv(cwd=tmp_path, windows=True) as argv:
+        assert argv[:3] == ["cmd.exe", "/d", "/c"]
+        script_path = Path(argv[3])
+        assert script_path.suffix == ".cmd"
+        assert script_path.read_text().strip() == str(command.value)
+        assert str(command.value) not in argv
+    assert not script_path.exists()
+
+
+def test_cmd_batch_file_is_removed_after_timeout(tmp_path: Path) -> None:
+    launched_path: Path | None = None
+    with pytest.raises(subprocess.TimeoutExpired):
+        command = CommandSpec("script", "echo ok", "cmd")
+        with command.launch_argv(cwd=tmp_path, windows=True) as argv:
+            launched_path = Path(argv[3])
+            assert launched_path.exists()
+            raise subprocess.TimeoutExpired(argv, 1)
+    assert launched_path is not None
+    assert not launched_path.exists()
+
+
 def test_missing_declared_powershell_is_targeted() -> None:
     command = CommandSpec("script", "Write-Output ok", "pwsh")
     with pytest.raises(FileNotFoundError, match="declared shell 'pwsh' is not installed"):
@@ -226,14 +249,7 @@ def test_cmd_hook_metadata_is_lossless_via_environment(tmp_path: Path) -> None:
         f'"{sys.executable}" "{helper}" "{output}"',
         "cmd",
     )
-    completed = subprocess.run(
-        command.argv(windows=True),
-        cwd=tmp_path,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
+    completed = run_command(command, cwd=tmp_path, env=env)
     assert completed.returncode == 0, completed.stderr
     assert json.loads(output.read_text()) == expected
 

@@ -54,7 +54,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -2496,11 +2496,7 @@ def _run_implement_setup_command(
     # raise past ``phase_implement``. Surfacing it as an ``ImplementSetupFailure``
     # lets the agent launch with diagnostics instead of aborting the phase.
     try:
-        split_command = (
-            selected.argv(arguments=_shell_metadata_arguments(selected, args))
-            if typed and selected is not None
-            else [*shlex.split(command), *args]
-        )
+        split_command = [] if typed else [*shlex.split(command), *args]
     except ValueError as exc:
         # ``shlex.split`` failed (e.g. unclosed quote), so we cannot rely on
         # proper tokenization. Fall back to argv-aware best-effort redaction
@@ -2525,23 +2521,31 @@ def _run_implement_setup_command(
             launch_error=True,
         )
         return ImplementSetupManifest(failure=failure)
-    setup_cmd = split_command
-    # Redact argv before joining: ``setup_command`` argv may carry DSNs,
-    # tokens, or API-key flags. Redacting the post-``shlex.join`` string
-    # leaves trailing secret tails when an arg with spaces was quoted
-    # (``'--connection-string=Pwd=a b'`` would only match through the
-    # first space). Per-element redaction scrubs the whole value so the
-    # failure prompt and warning log cannot leak secrets.
-    command_str = shlex.join(_redact_argv(setup_cmd))
+    command_str = selected.display() if typed and selected is not None else command
     try:
-        result = backend.run_command(
-            CommandRequest(
-                argv=setup_cmd,
+        launch = (
+            selected.launch_argv(
                 cwd=worktree_path,
-                env=env,
-                inherit_env=True,
+                arguments=_shell_metadata_arguments(selected, args),
             )
+            if typed and selected is not None
+            else nullcontext(split_command)
         )
+        with launch as setup_cmd:
+            # Use the configured display for typed scripts so a generated
+            # batch path never appears in logs or failure manifests.
+            command_str = (
+                selected.display() if typed and selected is not None
+                else shlex.join(_redact_argv(setup_cmd))
+            )
+            result = backend.run_command(
+                CommandRequest(
+                    argv=setup_cmd,
+                    cwd=worktree_path,
+                    env=env,
+                    inherit_env=True,
+                )
+            )
     except ExecutionBackendImportError:
         raise
     except OSError as exc:
@@ -2918,26 +2922,30 @@ def _run_implement_teardown_command(run: RunState, worktree_path: Path) -> None:
     env, args = _build_implement_command_metadata(run, worktree_path)
     _inject_worktree_venv_into_env(env, worktree_path)
     typed = selected is not None and _selected_command_uses_typed_runtime(variants, selected)
-    teardown_cmd = (
-        selected.argv(arguments=_shell_metadata_arguments(selected, args))
-        if typed and selected is not None
-        else [*shlex.split(command), *args]
-    )
     backend = _resolve_execution_backend()
     try:
-        result = backend.run_command(
-            CommandRequest(
-                argv=teardown_cmd,
+        launch = (
+            selected.launch_argv(
                 cwd=worktree_path,
-                env=env,
-                inherit_env=True,
+                arguments=_shell_metadata_arguments(selected, args),
             )
+            if typed and selected is not None
+            else nullcontext([*shlex.split(command), *args])
         )
+        with launch as teardown_cmd:
+            result = backend.run_command(
+                CommandRequest(
+                    argv=teardown_cmd,
+                    cwd=worktree_path,
+                    env=env,
+                    inherit_env=True,
+                )
+            )
     except OSError as exc:
         logger.warning(
             "Implement teardown command failed for %s: could not start %s: %s",
             run.run_id,
-            shlex.join(_redact_argv(teardown_cmd)),
+            selected.display() if typed and selected is not None else command,
             exc,
         )
         return
@@ -12884,13 +12892,11 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
 
         install_cmd = _host_bootstrap_install_command(backend)
         if install_cmd:
-            if not run_or_fail(
-                run,
-                install_cmd.argv(),
-                cwd=worktree_path,
-                action=install_cmd.display(),
-            ):
-                return "failed"
+            with install_cmd.launch_argv(cwd=worktree_path) as install_argv:
+                if not run_or_fail(
+                    run, install_argv, cwd=worktree_path, action=install_cmd.display()
+                ):
+                    return "failed"
 
         if backend.identity.backend != "container":
             try:
@@ -13001,13 +13007,11 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
     # Install dependencies so the worktree is ready to use.
     install_cmd = _host_bootstrap_install_command(backend)
     if install_cmd:
-        if not run_or_fail(
-            run,
-            install_cmd.argv(),
-            cwd=worktree_path,
-            action=install_cmd.display(),
-        ):
-            return "failed"
+        with install_cmd.launch_argv(cwd=worktree_path) as install_argv:
+            if not run_or_fail(
+                run, install_argv, cwd=worktree_path, action=install_cmd.display()
+            ):
+                return "failed"
 
     return "passed"
 
@@ -16936,20 +16940,27 @@ def _run_verify_gate(
     repo_root: Path | None = None,
 ) -> VerifyGateResult:
     command = _verify_gate_command_args(gate)
+    typed_command = _verify_gate_typed_command(gate)
     timeout_seconds = DEFAULT_VERIFY_GATE_TIMEOUT_SECONDS
     backend = _resolve_execution_backend()
 
     def _run_via_backend(env: dict[str, str]) -> subprocess.CompletedProcess:
         try:
-            result = backend.run_command(
-                CommandRequest(
-                    argv=command,
-                    cwd=worktree_path,
-                    env=env,
-                    inherit_env=True,
-                    timeout=timeout_seconds,
-                )
+            launch = (
+                typed_command.launch_argv(cwd=worktree_path)
+                if typed_command is not None
+                else nullcontext(command)
             )
+            with launch as launch_argv:
+                result = backend.run_command(
+                    CommandRequest(
+                        argv=launch_argv,
+                        cwd=worktree_path,
+                        env=env,
+                        inherit_env=True,
+                        timeout=timeout_seconds,
+                    )
+                )
         except subprocess.TimeoutExpired as exc:
             stderr_value = exc.stderr or ""
             if isinstance(stderr_value, bytes):
@@ -17060,13 +17071,20 @@ def _run_verify_gate(
 
 
 def _verify_gate_command_args(gate: str) -> list[str]:
+    selected = _verify_gate_typed_command(gate)
+    if selected is not None:
+        return selected.argv()
+    return shlex.split(VERIFY_GATE_COMMANDS.get(gate, f"make {gate}"))
+
+
+def _verify_gate_typed_command(gate: str) -> CommandSpec | None:
     config = next((item for item in SPEC_RUNTIME_CONFIG.verify_gates if item.name == gate), None)
     if config is not None:
         variants = config.command_variants
         selected = variants.select()
         if selected is not None and _selected_command_uses_typed_runtime(variants, selected):
-            return selected.argv()
-    return shlex.split(VERIFY_GATE_COMMANDS.get(gate, f"make {gate}"))
+            return selected
+    return None
 
 
 def _selected_command_uses_typed_runtime(

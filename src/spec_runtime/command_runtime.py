@@ -7,9 +7,11 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal, Mapping
+from typing import Callable, Iterator, Literal, Mapping
 
 CommandMode = Literal["argv", "script"]
 ShellName = Literal["sh", "powershell", "pwsh", "cmd"]
@@ -93,6 +95,39 @@ class CommandSpec:
             argv[script_index] = _redact_script(argv[script_index])
         argv = _redact_argv(argv)
         return subprocess.list2cmdline(argv) if use_windows else shlex.join(argv)
+
+    @contextmanager
+    def launch_argv(
+        self,
+        *,
+        cwd: Path,
+        which: Callable[[str], str | None] = shutil.which,
+        windows: bool | None = None,
+        arguments: tuple[str, ...] = (),
+    ) -> Iterator[list[str]]:
+        """Materialize any launch-only resources and yield the process argv.
+
+        Python's Windows argv encoder cannot safely carry an arbitrary cmd.exe
+        program as the single argument after ``/c``: quotes inside that program
+        become backslash-quote text.  A batch file gives cmd its native parsing
+        boundary and is removed regardless of the process result or timeout.
+        """
+        use_windows = os.name == "nt" if windows is None else windows
+        if self.mode != "script" or self.shell != "cmd" or not use_windows:
+            yield self.argv(which=which, windows=windows, arguments=arguments)
+            return
+        if arguments:
+            # Keep the targeted configuration error from argv().
+            self.argv(which=which, windows=windows, arguments=arguments)
+        fd, raw_path = tempfile.mkstemp(prefix="spec-command-", suffix=".cmd")
+        script_path = Path(raw_path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n") as handle:
+                handle.write(str(self.value))
+                handle.write("\r\n")
+            yield ["cmd.exe", "/d", "/c", str(script_path)]
+        finally:
+            script_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -182,11 +217,12 @@ def run_command(
 ) -> subprocess.CompletedProcess[str]:
     """Launch a typed command without interpreting argv-mode arguments."""
     try:
-        return subprocess.run(
-            command.argv(), cwd=cwd, env=None if env is None else dict(env),
-            capture_output=True, text=True, stdin=subprocess.DEVNULL,
-            timeout=timeout, check=False,
-        )
+        with command.launch_argv(cwd=cwd) as argv:
+            return subprocess.run(
+                argv, cwd=cwd, env=None if env is None else dict(env),
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                timeout=timeout, check=False,
+            )
     except FileNotFoundError as exc:
         return subprocess.CompletedProcess(command.display(), 127, "", str(exc))
     except OSError as exc:
