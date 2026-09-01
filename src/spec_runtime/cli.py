@@ -52,6 +52,33 @@ def _lazy_config():
     return load_spec_runtime_config()
 
 
+def _configure_windows_stdio(
+    *,
+    platform: str | None = None,
+    streams: tuple[object, ...] | None = None,
+) -> None:
+    """Keep Unicode CLI output lossless in redirected native Windows shells.
+
+    Python uses the active ANSI code page for redirected Windows streams. A
+    repository path can therefore work internally and still crash a command
+    such as ``spec doctor`` when it is printed through OpenSSH or a pipe.
+    UTF-8 is also the native path boundary used by Git for Windows.
+    """
+    if (platform or sys.platform) != "win32":
+        return
+    effective_streams = streams if streams is not None else (sys.stdout, sys.stderr)
+    for stream in effective_streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, OSError, ValueError):
+            # Embedded/captured streams may not be reconfigurable. They must
+            # remain usable rather than making every CLI command unavailable.
+            continue
+
+
 def _lazy_orchestrator():
     """Lazy-import the orchestrator module."""
     from . import orchestrator
@@ -862,6 +889,7 @@ def _maybe_print_update_notice_for_init() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``spec`` CLI."""
+    _configure_windows_stdio()
     effective_argv = argv if argv is not None else sys.argv[1:]
     help_requested = any(arg in {"-h", "--help"} for arg in effective_argv)
 

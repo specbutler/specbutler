@@ -8,6 +8,7 @@ no git repos, no subprocesses.
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -710,6 +711,18 @@ class TestCLIMain:
         from spec_runtime import cli
 
         return cli
+
+    def test_windows_redirected_stdio_is_reconfigured_to_utf8(self):
+        cli = self._import_cli()
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="cp1252")
+
+        cli._configure_windows_stdio(platform="win32", streams=(stream,))
+        stream.write("snow-雪")
+        stream.flush()
+
+        assert stream.encoding.lower().replace("-", "") == "utf8"
+        assert raw.getvalue() == "snow-雪".encode()
 
     def test_version_flag_prints_version_without_config(self, capsys):
         cli = self._import_cli()
