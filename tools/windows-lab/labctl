@@ -298,8 +298,64 @@ PY
     chmod 0600 "$STATE_ROOT/unattend/Autounattend.xml" "$STATE_ROOT/unattend/bootstrap.ps1"
 }
 
+require_admin_password_state() {
+    local password_file="$STATE_ROOT/secrets/admin-password" metadata password
+    test -f "$password_file" && test ! -L "$password_file" && test -r "$password_file" && test -s "$password_file" || \
+        die "private lab credential is missing or unreadable: $password_file; restore the original credential or recreate the lab"
+    metadata="$(stat -c '%u:%a:%s' -- "$password_file")" || \
+        die "could not inspect private lab credential metadata: $password_file"
+    test "$metadata" = "$(id -u):600:37" || \
+        die "private lab credential must be owned by the current user, mode 0600, and use the generated format: $password_file"
+    IFS= read -r password < "$password_file" || \
+        die "private lab credential is not newline-terminated: $password_file"
+    if [[ ! "$password" =~ ^Sb1\![0-9a-f]{32}$ ]]; then
+        unset password
+        die "private lab credential does not use the generated format: $password_file"
+    fi
+    unset password
+}
+
+lab_has_guest_state() {
+    local path root
+    for path in \
+        "$STATE_ROOT/unattend/Autounattend.xml" \
+        "$STATE_ROOT/unattend/bootstrap.ps1" \
+        "$STATE_ROOT/unattend.iso" \
+        "$STATE_ROOT/disk/run.qcow2" \
+        "$STATE_ROOT/run/nvram.fd" \
+        "$STATE_ROOT/run/tpm"; do
+        test ! -e "$path" || return 0
+    done
+    for root in "$STATE_ROOT/baselines" "$STATE_ROOT/trash"; do
+        test -d "$root" || continue
+        if find "$root" -mindepth 2 -maxdepth 2 \
+            \( -name disk.qcow2 -o -name run.qcow2 -o -name nvram.fd -o -name tpm \) \
+            -print -quit | grep -q .; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+preflight_init_admin_password_state() {
+    local password_file="$STATE_ROOT/secrets/admin-password"
+    if [ -L "$password_file" ]; then
+        die "private lab credential must not be a symbolic link: $password_file"
+    fi
+    if [ -e "$password_file" ]; then
+        require_admin_password_state
+        return
+    fi
+    if lab_has_guest_state; then
+        die "initialized lab is missing its original private credential; refusing to generate a password that would not match the guest"
+    fi
+}
+
 init_lab() {
     load_config
+    # Refuse mismatched recovery before creating identity or any other durable
+    # state. A new password cannot unlock a guest created with the old value.
+    preflight_init_admin_password_state
     for command in awk df docker git python3 sha256sum ssh ssh-keygen scp; do
         require_command "$command"
     done
@@ -331,7 +387,7 @@ print("LAB_ATTACH_UNATTEND=1")
 PY
         chmod 0600 "$IDENTITY_FILE"
     fi
-    if [ ! -f "$STATE_ROOT/secrets/admin-password" ]; then
+    if [ ! -e "$STATE_ROOT/secrets/admin-password" ]; then
         python3 - <<'PY' > "$STATE_ROOT/secrets/admin-password"
 import secrets
 
@@ -339,6 +395,7 @@ print("Sb1!" + secrets.token_hex(16))
 PY
         chmod 0600 "$STATE_ROOT/secrets/admin-password"
     fi
+    require_admin_password_state
     if [ ! -f "$STATE_ROOT/ssh/id_ed25519" ]; then
         ssh-keygen -q -t ed25519 -N '' -C specbutler-windows-lab -f "$STATE_ROOT/ssh/id_ed25519"
     fi
@@ -675,6 +732,7 @@ ensure_console_session() {
 
     # The generated password travels only on SSH stdin. The guest script never
     # writes or emits it, and disarms Winlogon immediately after the reboot.
+    require_admin_password_state
     if ! guest_ssh_stdin \
         "$STATE_ROOT/secrets/admin-password" \
         '& C:\SpecHarness\ensure-console-session.ps1 -Mode Arm' >/dev/null; then
@@ -928,6 +986,10 @@ run_proof() {
     [[ "$LAB_GITHUB_OWNER" != *'<'* ]] || die "LAB_GITHUB_OWNER still contains a placeholder"
     [[ "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" = /* ]] || die "SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT must be an absolute path"
     test -d "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" || die "external acceptance evidence root does not exist: $SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT"
+    # Validate irreplaceable host-only state before shutdown or overlay reset.
+    # Generating a new value would not match the password inside an existing
+    # guest or baseline.
+    require_admin_password_state
     validate_name "$LAB_BASELINE"
     local trash_keep revision
     revision="$(resolve_source_revision "${LAB_SOURCE_REF:-HEAD}")"

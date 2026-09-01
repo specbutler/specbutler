@@ -265,9 +265,64 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "DefaultPassword" in console_session
     assert "Remove-ItemProperty" in console_session
     assert "AutoLogonCount" in console_session
-    assert console_session.index("Register-ScheduledTask") < console_session.index("DefaultPassword")
+    arm_session = console_session[console_session.index("if ($Mode -eq 'Arm')") :]
+    assert (
+        arm_session.index("Register-ScheduledTask")
+        < arm_session.index(
+            "New-ItemProperty -LiteralPath $winlogon -Name AutoAdminLogon"
+        )
+        < arm_session.index(
+            "New-ItemProperty -LiteralPath $winlogon -Name AutoLogonCount"
+        )
+        < arm_session.index(
+            "New-ItemProperty -LiteralPath $winlogon -Name DefaultPassword"
+        )
+    )
     assert "-Value 1 -PropertyType DWord" in console_session
     assert "disarm-autologon.ps1" in console_session
+    assert "takeown.exe '/F' $cleanupScript '/A'" in console_session
+    assert "$systemSidValue = 'S-1-5-18'" in console_session
+    assert "$administratorsSidValue = 'S-1-5-32-544'" in console_session
+    assert "$acl.SetAccessRuleProtection($true, $false)" in console_session
+    assert "$rules.Count -ne $expectedRules.Count" in console_session
+    assert "FileAttributes]::ReparsePoint" in console_session
+    assert "fsutil.exe hardlink list $LiteralPath" in console_session
+    assert "Expected a single-link file" in console_session
+    assert "Assert-TrustedExistingPath" in console_session
+    assert "grants write access to an untrusted principal" in console_session
+    assert "'/T' '/C'" not in console_session
+    assert "if (-not (Test-Path -LiteralPath $winlogon))" in console_session
+    assert "New-Item -Path $winlogon -Force" not in console_session
+    assert "Invoke-DirectDisarm" in console_session
+    assert "& $cleanupSource -RemoveTask" not in console_session
+    assert "& $cleanupScript -RemoveTask" not in console_session
+    assert (
+        console_session.index(
+            "Set-ExactProtectedAcl -LiteralPath $harnessRoot -Container $true"
+        )
+        < console_session.index("[System.IO.File]::ReadAllBytes($cleanupSource)")
+        < console_session.index(
+            "Set-ExactProtectedAcl -LiteralPath $secureRoot -Container $true"
+        )
+        < console_session.index(
+            "[System.IO.FileMode]::CreateNew"
+        )
+        < console_session.index(
+            "Set-ExactProtectedAcl -LiteralPath $cleanupScript -Container $false"
+        )
+        < console_session.index("Register-ScheduledTask")
+    )
+    assert "Remove-Item -LiteralPath $cleanupScript -Force -ErrorAction Stop" in console_session
+    assert "Console cleanup script remained after checked removal" in console_session
+    assert (
+        console_session.index(
+            "Set-ExactProtectedAcl -LiteralPath $secureRoot -Container $true"
+        )
+        < console_session.index(
+            "Get-FileHash -LiteralPath $cleanupScript -Algorithm SHA256"
+        )
+        < console_session.index("Register-ScheduledTask")
+    )
     assert controller.index("ensure_console_session()") < controller.index("job_submit()")
     assert '"$STATE_ROOT/secrets/admin-password"' in controller
     assert "-Mode Arm' >/dev/null" in controller
@@ -283,6 +338,12 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     arm_call = controller[controller.index("guest_ssh_stdin") : controller.index("Restart-Computer")]
     assert "if ! guest_ssh_stdin" in arm_call
     assert "shutdown_lab" in arm_call
+    recovery = controller[
+        controller.index("ensure_console_session() {") : controller.index("job_submit() {")
+    ]
+    assert recovery.rindex("require_admin_password_state") < recovery.index(
+        "guest_ssh_stdin"
+    )
     assert 'guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.started.json"' in controller
     provision = (LAB_ROOT / "provision.ps1").read_text(encoding="utf-8")
     assert 'icacls.exe $harnessRoot /grant:r "${account}:(OI)(CI)M" /T /C' in provision
@@ -316,6 +377,9 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     proof_run = controller[
         controller.index("run_proof() {") : controller.index('command="${1:-help}"')
     ]
+    assert proof_run.index("require_admin_password_state") < proof_run.index(
+        "shutdown_lab"
+    )
     assert (
         proof_run.index("shutdown_lab")
         < proof_run.index('proof_trash_retention "$trash_keep"')
@@ -395,6 +459,182 @@ def test_windows_lab_templates_render_only_into_ignored_state() -> None:
     assert '"$STATE_ROOT/unattend/Autounattend.xml"' in controller
     assert '"$STATE_ROOT/unattend/bootstrap.ps1"' in controller
     assert 'chmod 0600 "$STATE_ROOT/unattend/Autounattend.xml"' in controller
+    assert "refusing to generate a password that would not match the guest" in controller
+    for guest_state in (
+        '"$STATE_ROOT/unattend.iso"',
+        '"$STATE_ROOT/disk/run.qcow2"',
+        '"$STATE_ROOT/run/nvram.fd"',
+        '"$STATE_ROOT/run/tpm"',
+        '"$STATE_ROOT/baselines" "$STATE_ROOT/trash"',
+    ):
+        assert guest_state in controller
+
+
+@pytest.mark.parametrize(
+    "credential_state",
+    ["missing", "bad-mode", "symlink", "empty-effective", "malformed"],
+)
+def test_windows_lab_proof_validates_private_credential_before_mutation(
+    tmp_path: Path, credential_state: str
+) -> None:
+    if os.name == "nt":
+        pytest.skip("the host controller is a Bash program")
+    bash = shutil.which("bash")
+    assert bash
+    state = tmp_path / "state"
+    (state / "disk").mkdir(parents=True)
+    overlay = state / "disk" / "run.qcow2"
+    overlay.write_bytes(b"do-not-reset")
+    if credential_state == "bad-mode":
+        secret_dir = state / "secrets"
+        secret_dir.mkdir()
+        password = secret_dir / "admin-password"
+        password.write_text("Sb1!" + ("a" * 32) + "\n", encoding="ascii")
+        password.chmod(0o644)
+    elif credential_state == "symlink":
+        secret_dir = state / "secrets"
+        secret_dir.mkdir()
+        password = secret_dir / "admin-password"
+        password.symlink_to(tmp_path / "outside-secret")
+    elif credential_state in {"empty-effective", "malformed"}:
+        secret_dir = state / "secrets"
+        secret_dir.mkdir()
+        password = secret_dir / "admin-password"
+        value = "\n" if credential_state == "empty-effective" else "bad!" + ("a" * 32) + "\n"
+        password.write_text(value, encoding="ascii")
+        password.chmod(0o600)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    config = tmp_path / "lab.env"
+    config.write_text(
+        "WINDOWS_ISO=/tmp/not-used.iso\n"
+        f"WINDOWS_ISO_SHA256={'0' * 64}\n"
+        "WINDOWS_IMAGE_INDEX=1\n"
+        "LAB_BASELINE=toolchain\n"
+        "LAB_GITHUB_OWNER=example\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [bash, str(LAB_ROOT / "labctl"), "proof"],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "SPEC_WINDOWS_LAB_STATE_ROOT": str(state),
+            "SPEC_WINDOWS_LAB_CONFIG": str(config),
+            "SPEC_WINDOWS_TOOLCHAIN_CONFIG": str(tmp_path / "toolchain.json"),
+            "SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT": str(evidence),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert "private lab credential" in result.stderr
+    assert overlay.read_bytes() == b"do-not-reset"
+
+
+@pytest.mark.parametrize(
+    "guest_state",
+    [
+        "disk/run.qcow2",
+        "run/nvram.fd",
+        "run/tpm/state.bin",
+        "unattend.iso",
+        "trash/retained/run.qcow2",
+    ],
+)
+def test_windows_lab_init_refuses_missing_credential_before_identity_mutation(
+    tmp_path: Path, guest_state: str
+) -> None:
+    if os.name == "nt":
+        pytest.skip("the host controller is a Bash program")
+    bash = shutil.which("bash")
+    assert bash
+    state = tmp_path / "state"
+    path = state / guest_state
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"existing-guest-state")
+    config = tmp_path / "lab.env"
+    config.write_text(
+        "WINDOWS_ISO=/tmp/not-used.iso\n"
+        f"WINDOWS_ISO_SHA256={'0' * 64}\n"
+        "WINDOWS_IMAGE_INDEX=1\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [bash, str(LAB_ROOT / "labctl"), "init"],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "SPEC_WINDOWS_LAB_STATE_ROOT": str(state),
+            "SPEC_WINDOWS_LAB_CONFIG": str(config),
+            "SPEC_WINDOWS_TOOLCHAIN_CONFIG": str(tmp_path / "toolchain.json"),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert "refusing to generate a password" in result.stderr
+    assert not (state / "identity.env").exists()
+    assert not (state / "secrets" / "admin-password").exists()
+    assert path.read_bytes() == b"existing-guest-state"
+
+
+@pytest.mark.parametrize(
+    ("credential", "mode"),
+    [
+        ("\n", 0o600),
+        ("bad!" + ("a" * 32) + "\n", 0o600),
+        ("Sb1!" + ("a" * 32) + "\n", 0o644),
+    ],
+)
+def test_windows_lab_init_refuses_invalid_credential_before_identity_mutation(
+    tmp_path: Path, credential: str, mode: int
+) -> None:
+    if os.name == "nt":
+        pytest.skip("the host controller is a Bash program")
+    bash = shutil.which("bash")
+    assert bash
+    state = tmp_path / "state"
+    secret_dir = state / "secrets"
+    secret_dir.mkdir(parents=True)
+    password = secret_dir / "admin-password"
+    password.write_text(credential, encoding="ascii")
+    password.chmod(mode)
+    config = tmp_path / "lab.env"
+    config.write_text(
+        "WINDOWS_ISO=/tmp/not-used.iso\n"
+        f"WINDOWS_ISO_SHA256={'0' * 64}\n"
+        "WINDOWS_IMAGE_INDEX=1\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [bash, str(LAB_ROOT / "labctl"), "init"],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "SPEC_WINDOWS_LAB_STATE_ROOT": str(state),
+            "SPEC_WINDOWS_LAB_CONFIG": str(config),
+            "SPEC_WINDOWS_TOOLCHAIN_CONFIG": str(tmp_path / "toolchain.json"),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert "private lab credential" in result.stderr
+    assert not (state / "identity.env").exists()
+    assert password.read_text(encoding="ascii") == credential
 
 
 def test_windows_lab_contains_no_checked_in_identity_or_common_secret_shape() -> None:
@@ -1148,7 +1388,7 @@ def test_windows_lab_unsafe_job_forces_and_verifies_guest_shutdown(
         assert "authoritative guest shutdown confirmed" in result.stderr
 
 
-@pytest.mark.parametrize("failure_mode", ["arm", "register"])
+@pytest.mark.parametrize("failure_mode", ["credential", "arm", "register"])
 def test_windows_lab_submit_failure_cleans_up_without_exposing_password(
     tmp_path: Path, failure_mode: str
 ) -> None:
@@ -1161,9 +1401,12 @@ def test_windows_lab_submit_failure_cleans_up_without_exposing_password(
     (state / "secrets").mkdir(parents=True)
     fake_bin.mkdir()
     (state / "identity.env").write_text("LAB_UID=1\n", encoding="utf-8")
-    password = "Sb1!transport-failure-secret"
+    password = "Sb1!" + ("d" * 32)
     (state / "secrets" / "admin-password").write_text(
         password + "\n", encoding="ascii"
+    )
+    (state / "secrets" / "admin-password").chmod(
+        0o644 if failure_mode == "credential" else 0o600
     )
     config = tmp_path / "lab.env"
     config.write_text(
@@ -1186,7 +1429,7 @@ def test_windows_lab_submit_failure_cleans_up_without_exposing_password(
         "    stream.write(command + '\\n')\n"
         "mode = os.environ['FAKE_FAILURE_MODE']\n"
         "if '-Mode Check' in command:\n"
-        "    raise SystemExit(2 if mode == 'arm' else 0)\n"
+        "    raise SystemExit(2 if mode in {'credential', 'arm'} else 0)\n"
         "if '-Mode Arm' in command:\n"
         "    sys.stdin.read()\n"
         "    raise SystemExit(23 if mode == 'arm' else 0)\n"
@@ -1237,6 +1480,10 @@ def test_windows_lab_submit_failure_cleans_up_without_exposing_password(
         assert "-Mode Arm" in commands
         assert "-Mode Disarm" in commands
         assert "authoritative guest shutdown was confirmed" in result.stderr
+    elif failure_mode == "credential":
+        assert "-Mode Arm" not in commands
+        assert "private lab credential" in result.stderr
+        assert "authoritative guest shutdown" not in result.stderr
     else:
         assert "register-job.ps1" in commands
         assert "Stop-ScheduledTask" in commands
