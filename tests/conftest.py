@@ -3,11 +3,33 @@
 from __future__ import annotations
 
 import itertools
+import os
 from pathlib import Path
 
 import pytest
 
 _CONTROL_ROOT_SEQUENCE = itertools.count()
+
+
+@pytest.fixture(autouse=True)
+def _pin_current_checkout_for_subprocesses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Make child interpreters exercise the checkout pytest is collecting.
+
+    Worktrees commonly share one editable virtualenv.  Pytest adds this
+    checkout's ``src`` directory to its own import path, but a child launched
+    from a temporary repository otherwise falls back to whichever checkout
+    that virtualenv last installed.  Put the collected checkout first while
+    still retaining any caller-supplied import paths.  Individual tests remain
+    free to clear or replace ``PYTHONPATH`` when that is the behavior at issue.
+    """
+    source_root = Path(__file__).resolve().parent.parent / "src"
+    inherited = os.environ.get("PYTHONPATH", "")
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(part for part in (str(source_root), inherited) if part),
+    )
 
 
 @pytest.fixture(autouse=True)

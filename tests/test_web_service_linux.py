@@ -28,9 +28,6 @@ pytestmark = pytest.mark.skipif(
     reason="real Linux web service integration",
 )
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
 def _repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str, dict[str, str]]:
     token = "linux-web-service-token"
     (tmp_path / ".spec-state" / "web").mkdir(parents=True)
@@ -45,16 +42,6 @@ def _repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str, d
     monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(control_root))
     env = os.environ.copy()
     env.pop("SPEC_WEB_READY_NONCE", None)
-    # The service starts from a temporary repository, outside pytest's import
-    # path.  Point that child at this checkout explicitly: developers commonly
-    # run the suite from a worktree while their shared virtualenv is editable-
-    # installed from a different checkout.  Without this boundary the test can
-    # exercise stale installed code and, on assertion failure, leak its daemon.
-    env["PYTHONPATH"] = os.pathsep.join(
-        part
-        for part in (str(REPO_ROOT / "src"), env.get("PYTHONPATH", ""))
-        if part
-    )
     env["SPEC_NO_UPDATE_CHECK"] = "1"
     return tmp_path, token, env
 
