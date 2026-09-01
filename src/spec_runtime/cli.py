@@ -43,6 +43,13 @@ import sys
 from pathlib import Path
 
 from .git_common import run_git
+from .worktree_safety import (
+    UnsafeWorktreePathError,
+    configured_worktrees_root,
+    expected_run_worktree_names,
+    paths_equal,
+    validate_owned_worktree_path,
+)
 
 
 def _lazy_config():
@@ -364,56 +371,100 @@ def _clean_inactive_spec_artifacts(
     config: object,
     runs: list[object],
 ) -> int:
-    worktrees_root = common_root / config.paths.worktrees_dir
+    try:
+        worktrees_root = configured_worktrees_root(
+            common_root,
+            config.paths.worktrees_dir,
+        )
+    except UnsafeWorktreePathError as exc:
+        print(f"Error: Refusing unsafe worktree cleanup configuration: {exc}", file=sys.stderr)
+        return 1
 
-    # Remove matching worktree directories
-    patterns = [
-        f"spec-{spec_id}",
-        spec_id,
-    ]
+    # Resolve and validate every path before starting the destructive half.
+    # This prevents a tampered Git worktree record from being discovered only
+    # after valid local artifacts have already been removed.
+    patterns = [f"spec-{spec_id}", spec_id]
     glob_patterns = [
         f"code-{spec_id}--*",
         f"task-{spec_id}--*",
         f"specrun-{spec_id}--*",
     ]
+    candidates: dict[str, tuple[Path, tuple[str, ...], bool]] = {}
+    try:
+        for pattern in patterns:
+            target = worktrees_root / pattern
+            if target.exists():
+                validated = validate_owned_worktree_path(
+                    owner_root=worktrees_root,
+                    target=target,
+                    relative_to=common_root,
+                    expected_names=(pattern,),
+                )
+                candidates[str(validated)] = (validated, (pattern,), False)
+
+        for glob_pattern in glob_patterns:
+            for target in worktrees_root.glob(glob_pattern):
+                from .spec_identity import parse_worktree_name
+
+                identity = parse_worktree_name(target.name)
+                if identity is None or identity.spec_id != spec_id:
+                    raise UnsafeWorktreePathError(
+                        f"worktree name does not match spec identity: {target.name}"
+                    )
+                expected_names = (target.name,)
+                validated = validate_owned_worktree_path(
+                    owner_root=worktrees_root,
+                    target=target,
+                    relative_to=common_root,
+                    expected_names=expected_names,
+                )
+                candidates[str(validated)] = (validated, expected_names, False)
+
+        wt_path = ""
+        wt_list = run_git(["worktree", "list", "--porcelain"])
+        if wt_list.returncode != 0:
+            detail = wt_list.stderr.strip() or wt_list.stdout.strip() or "unknown Git error"
+            raise UnsafeWorktreePathError(
+                f"could not prove worktree registration before cleanup: {detail}"
+            )
+        for line in wt_list.stdout.splitlines():
+            if line.startswith("worktree "):
+                wt_path = line[len("worktree ") :]
+                continue
+            if not line.startswith("branch refs/heads/") or not wt_path:
+                continue
+            branch_ref = line[len("branch refs/heads/") :]
+            expected_names = expected_run_worktree_names(spec_id, branch_ref)
+            if not expected_names:
+                continue
+            validated = validate_owned_worktree_path(
+                owner_root=worktrees_root,
+                target=wt_path,
+                relative_to=common_root,
+                expected_names=expected_names,
+            )
+            candidates[str(validated)] = (validated, expected_names, True)
+    except UnsafeWorktreePathError as exc:
+        print(f"Error: Refusing unsafe worktree cleanup target: {exc}", file=sys.stderr)
+        return 1
 
     removed_worktrees = 0
-    for pattern in patterns:
-        target = worktrees_root / pattern
-        if target.exists():
-            removed_worktrees += _remove_worktree_path(target)
-
-    for gp in glob_patterns:
-        for target in worktrees_root.glob(gp):
-            removed_worktrees += _remove_worktree_path(target)
+    for target, expected_names, by_branch in candidates.values():
+        removed = _remove_worktree_path(
+            target,
+            common_root=common_root,
+            worktrees_root=worktrees_root,
+            expected_names=expected_names,
+        )
+        if removed and by_branch:
+            print(f"Removed worktree {target} (by branch)")
+        removed_worktrees += removed
 
     removed_workspaces, workspace_failures = _cleanup_run_owned_workspaces(
         common_root=common_root,
         config=config,
         runs=runs,
     )
-
-    # Remove worktrees discovered by branch name
-    wt_path = ""
-    wt_list = run_git(
-        ["worktree", "list", "--porcelain"],
-    )
-    for line in wt_list.stdout.splitlines():
-        if line.startswith("worktree "):
-            wt_path = line[len("worktree ") :]
-        elif line.startswith("branch refs/heads/"):
-            branch_ref = line[len("branch refs/heads/") :]
-            if (
-                branch_ref.startswith(f"code/{spec_id}--")
-                or branch_ref.startswith(f"task/{spec_id}--")
-                or branch_ref.startswith(f"specrun/{spec_id}--")
-            ) and wt_path:
-                result = run_git(
-                    ["worktree", "remove", wt_path, "--force"],
-                )
-                if result.returncode == 0:
-                    print(f"Removed worktree {wt_path} (by branch)")
-                    removed_worktrees += 1
 
     # Remove local branches
     branch_patterns = [
@@ -541,17 +592,36 @@ def _cleanup_run_owned_workspaces(
     return removed, failures
 
 
-def _remove_worktree_path(target: Path) -> int:
+def _remove_worktree_path(
+    target: Path,
+    *,
+    common_root: Path,
+    worktrees_root: Path,
+    expected_names: tuple[str, ...],
+) -> int:
     """Remove a worktree or stale directory. Returns 1 if removed, 0 otherwise."""
+    target = validate_owned_worktree_path(
+        owner_root=worktrees_root,
+        target=target,
+        relative_to=common_root,
+        expected_names=expected_names,
+    )
     # Check if it's a registered worktree
     wt_list = run_git(
         ["worktree", "list", "--porcelain"],
     )
+    if wt_list.returncode != 0:
+        detail = wt_list.stderr.strip() or wt_list.stdout.strip() or "unknown Git error"
+        raise RuntimeError(
+            f"refusing raw worktree cleanup because Git registration could not be inspected: {detail}"
+        )
     registered = False
     for line in wt_list.stdout.splitlines():
-        if line.startswith("worktree ") and line[len("worktree ") :] == str(target):
-            registered = True
-            break
+        if line.startswith("worktree "):
+            listed = Path(line[len("worktree ") :]).expanduser().resolve(strict=False)
+            if paths_equal(listed, target):
+                registered = True
+                break
 
     if registered:
         result = run_git(
@@ -563,6 +633,12 @@ def _remove_worktree_path(target: Path) -> int:
     elif target.is_dir():
         from .platform_fs import remove_tree
 
+        target = validate_owned_worktree_path(
+            owner_root=worktrees_root,
+            target=target,
+            relative_to=common_root,
+            expected_names=expected_names,
+        )
         remove_tree(target)
         print(f"Removed stale directory {target}")
         return 1

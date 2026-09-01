@@ -26,6 +26,11 @@ from starlette.routing import Route
 
 from spec_runtime.platform_fs import remove_tree
 from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+from spec_runtime.worktree_safety import (
+    UnsafeWorktreePathError,
+    expected_branch_worktree_names,
+    validate_owned_worktree_path,
+)
 
 from .bridge import (
     AgentEvent,
@@ -225,9 +230,28 @@ def _cleanup_chat_worktree(
     branch: str | None,
 ) -> None:
     """Remove the worktree directory and local branch created for a chat session."""
-    from spec_runtime.orchestrator import run_subprocess
+    from spec_runtime.orchestrator import _worktrees_root, run_subprocess
 
     if worktree_path:
+        # Browser chat always creates the current generated layout.  Legacy
+        # run names are accepted by lifecycle cleanup, but are not valid for a
+        # newly created in-memory chat session.
+        expected_names = expected_branch_worktree_names(branch or "")[:1]
+        if not expected_names:
+            raise RuntimeError(
+                "Refusing chat worktree cleanup because its branch has no recognized identity"
+            )
+        try:
+            worktree_path = str(
+                validate_owned_worktree_path(
+                    owner_root=_worktrees_root(repo_root),
+                    target=worktree_path,
+                    relative_to=repo_root,
+                    expected_names=expected_names,
+                )
+            )
+        except UnsafeWorktreePathError as exc:
+            raise RuntimeError(f"Refusing unsafe chat worktree cleanup: {exc}") from exc
         run_subprocess(
             ["git", "worktree", "remove", "--force", str(worktree_path)],
             cwd=repo_root,

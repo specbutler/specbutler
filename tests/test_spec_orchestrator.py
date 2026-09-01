@@ -17891,7 +17891,12 @@ class TestLocalReviewHelpers:
         ):
             orch._cleanup_stale_review_worktrees(repo)
 
-        cleanup.assert_called_once_with(repo, stale, delete_branch=False)
+        cleanup.assert_called_once_with(
+            repo,
+            stale,
+            delete_branch=False,
+            temporary_prefix=orch.LOCAL_REVIEW_WORKTREE_PREFIX,
+        )
 
 
 # ---------------------------------------------------------------------------

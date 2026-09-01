@@ -151,6 +151,13 @@ from .spec_merge_tags import (
 from .spec_metadata import parse_spec_frontmatter as load_spec_frontmatter
 from .spec_status import collect_git_spec_state, is_spec_merged, refresh_merge_completion_state
 from .spec_status import get_spec_status as read_spec_status
+from .worktree_safety import (
+    UnsafeWorktreePathError,
+    configured_worktrees_root,
+    expected_run_worktree_names,
+    paths_equal,
+    validate_owned_worktree_path,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -703,7 +710,10 @@ def _is_task_spec_path(spec_path: Path, repo_root: Path) -> bool:
 
 
 def _worktrees_root(repo_root: Path | None = None) -> Path:
-    return resolve_common_root(repo_root) / SPEC_RUNTIME_CONFIG.paths.worktrees_dir
+    return configured_worktrees_root(
+        resolve_common_root(repo_root),
+        SPEC_RUNTIME_CONFIG.paths.worktrees_dir,
+    )
 
 
 def _common_state_root(repo_root: Path | None = None) -> Path:
@@ -880,12 +890,13 @@ def _worktree_is_registered(repo_root: Path, worktree_path: Path) -> tuple[bool,
     if result.returncode != 0:
         detail = redact_sensitive(tail_lines(result.stderr or result.stdout))
         return False, f"git worktree list failed: {detail[-240:]}"
-    resolved = str(worktree_path.resolve())
+    resolved = worktree_path.expanduser().resolve(strict=False)
     for line in result.stdout.splitlines():
         if not line.startswith("worktree "):
             continue
         registered_path = line[len("worktree ") :]
-        if registered_path == str(worktree_path) or registered_path == resolved:
+        listed = Path(registered_path).expanduser().resolve(strict=False)
+        if paths_equal(listed, resolved):
             return True, ""
     return False, ""
 
@@ -990,14 +1001,60 @@ def _stop_worktree_postgres_if_present(worktree_path: Path) -> None:
         )
 
 
+def _validated_worktree_cleanup_target(
+    repo_root: Path,
+    worktree_path: Path,
+    *,
+    branch: str | None = None,
+    expected_spec_id: str = "",
+    temporary_prefix: str = "",
+) -> Path:
+    """Return an authorized canonical target for lifecycle cleanup."""
+    if temporary_prefix:
+        return validate_owned_worktree_path(
+            owner_root=LOCAL_REVIEW_WORKTREE_ROOT,
+            target=worktree_path,
+            expected_prefix=temporary_prefix,
+        )
+    expected_names = ()
+    if expected_spec_id:
+        expected_names = expected_run_worktree_names(
+            expected_spec_id,
+            branch or "",
+        )
+        if not expected_names:
+            raise UnsafeWorktreePathError(
+                "persisted run branch/spec identity does not authorize a worktree path"
+            )
+    return validate_owned_worktree_path(
+        owner_root=_worktrees_root(repo_root),
+        target=worktree_path,
+        relative_to=resolve_common_root(repo_root),
+        expected_names=expected_names,
+    )
+
+
 def _cleanup_worktree_checkout(
     repo_root: Path,
     worktree_path: Path,
     *,
     branch: str | None = None,
     delete_branch: bool,
+    expected_spec_id: str = "",
+    temporary_prefix: str = "",
 ) -> str:
     """Remove a spec worktree and optionally its branch, failing on leftovers."""
+    try:
+        worktree_path = _validated_worktree_cleanup_target(
+            repo_root,
+            worktree_path,
+            branch=branch,
+            expected_spec_id=expected_spec_id,
+            temporary_prefix=temporary_prefix,
+        )
+    except UnsafeWorktreePathError as exc:
+        return f"Refusing unsafe worktree cleanup for {worktree_path}: {exc}"
+
     _reap_registered_worktree_processes(
         repo_root,
         worktree_path,
@@ -1024,16 +1081,30 @@ def _cleanup_worktree_checkout(
             # metadata Git left behind.
             if worktree_path.is_dir():
                 try:
+                    worktree_path = _validated_worktree_cleanup_target(
+                        repo_root,
+                        worktree_path,
+                        branch=branch,
+                        expected_spec_id=expected_spec_id,
+                        temporary_prefix=temporary_prefix,
+                    )
                     remove_tree(worktree_path)
-                except OSError as exc:
+                except (OSError, UnsafeWorktreePathError) as exc:
                     return (
                         f"git worktree remove failed for {worktree_path}: {detail[-240:]}; "
                         f"fallback directory removal also failed: {exc}"
                     )
     elif worktree_path.is_dir():
         try:
+            worktree_path = _validated_worktree_cleanup_target(
+                repo_root,
+                worktree_path,
+                branch=branch,
+                expected_spec_id=expected_spec_id,
+                temporary_prefix=temporary_prefix,
+            )
             remove_tree(worktree_path)
-        except OSError as exc:
+        except (OSError, UnsafeWorktreePathError) as exc:
             return f"Could not remove worktree directory {worktree_path}: {exc}"
 
     prune_result = run_subprocess(["git", "worktree", "prune"], cwd=repo_root)
@@ -1070,6 +1141,20 @@ def _cleanup_worktree_checkout(
     if branch_check.returncode not in (0, 1):
         detail = redact_sensitive(tail_lines(branch_check.stderr or branch_check.stdout))
         return f"git show-ref failed while checking {branch}: {detail[-240:]}"
+    return ""
+
+
+def _remove_temporary_worktree_tree(worktree_path: Path, *, prefix: str) -> str:
+    """Raw-remove a generated temporary checkout after proving its boundary."""
+    try:
+        target = validate_owned_worktree_path(
+            owner_root=LOCAL_REVIEW_WORKTREE_ROOT,
+            target=worktree_path,
+            expected_prefix=prefix,
+        )
+    except UnsafeWorktreePathError as exc:
+        return f"Refusing unsafe temporary worktree cleanup for {worktree_path}: {exc}"
+    remove_tree(target, ignore_errors=True)
     return ""
 
 
@@ -5891,6 +5976,17 @@ def _prepare_spec_authoring_worktree(
         resumed = True
     else:
         if worktree_path.exists():
+            try:
+                worktree_path = validate_owned_worktree_path(
+                    owner_root=_worktrees_root(repo_root),
+                    target=worktree_path,
+                    relative_to=resolve_common_root(repo_root),
+                    expected_names=(worktree_path.name,),
+                )
+            except UnsafeWorktreePathError as exc:
+                raise RuntimeError(
+                    f"Refusing unsafe stale spec-authoring worktree cleanup: {exc}"
+                ) from exc
             remove_tree(worktree_path)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -12135,6 +12231,7 @@ def _cleanup_stale_detached_temp_worktrees(
             repo_root,
             candidate,
             delete_branch=False,
+            temporary_prefix=prefix,
         )
         if cleanup_error:
             logger.warning(
@@ -12242,6 +12339,7 @@ def _temporary_review_worktree(
             repo_root,
             worktree_path,
             delete_branch=False,
+            temporary_prefix=LOCAL_REVIEW_WORKTREE_PREFIX,
         )
         if cleanup_error:
             logger.warning(
@@ -12261,6 +12359,7 @@ def _temporary_review_worktree(
             repo_root,
             worktree_path,
             delete_branch=False,
+            temporary_prefix=LOCAL_REVIEW_WORKTREE_PREFIX,
         )
         if cleanup_error:
             logger.warning(
@@ -12316,6 +12415,7 @@ def _temporary_mergeability_worktree(
             repo_root,
             worktree_path,
             delete_branch=False,
+            temporary_prefix=LOCAL_MERGEABILITY_WORKTREE_PREFIX,
         )
         if cleanup_error:
             logger.warning(
@@ -12335,6 +12435,7 @@ def _temporary_mergeability_worktree(
             repo_root,
             worktree_path,
             delete_branch=False,
+            temporary_prefix=LOCAL_MERGEABILITY_WORKTREE_PREFIX,
         )
         if cleanup_error:
             logger.warning(
@@ -12372,7 +12473,12 @@ def _cleanup_stale_block_debugger_worktrees(repo_root: Path) -> None:
         if marker_pid > 0 and marker_started_at and is_pid_alive(marker_pid, marker_started_at):
             continue
         _restore_tree_writable(candidate)
-        remove_tree(candidate, ignore_errors=True)
+        cleanup_error = _remove_temporary_worktree_tree(
+            candidate,
+            prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+        )
+        if cleanup_error:
+            logger.warning("Could not remove stale private debugger clone: %s", cleanup_error)
 
 
 def _validated_block_debugger_surviving_workspace(
@@ -12436,7 +12542,12 @@ def _create_private_block_debugger_clone(
     )
     if clone_result.returncode != 0:
         detail = clone_result.stderr.strip() or clone_result.stdout.strip() or "git clone failed"
-        remove_tree(destination, ignore_errors=True)
+        cleanup_error = _remove_temporary_worktree_tree(
+            destination,
+            prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+        )
+        if cleanup_error:
+            logger.warning("Could not remove failed private debugger clone: %s", cleanup_error)
         raise ValueError(f"private debugger clone failed: {detail}")
 
     checkout_result = run_subprocess(
@@ -12445,7 +12556,12 @@ def _create_private_block_debugger_clone(
     )
     if checkout_result.returncode != 0:
         detail = checkout_result.stderr.strip() or checkout_result.stdout.strip() or "git checkout failed"
-        remove_tree(destination, ignore_errors=True)
+        cleanup_error = _remove_temporary_worktree_tree(
+            destination,
+            prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+        )
+        if cleanup_error:
+            logger.warning("Could not remove failed private debugger checkout: %s", cleanup_error)
         raise ValueError(f"private debugger checkout failed: {detail}")
 
     # The clone must have no path back to the authoritative workspace. The
@@ -12638,13 +12754,16 @@ def _temporary_block_debugger_worktree(
     if actual_head_sha and actual_head_sha != head_sha:
         if private_clone:
             _restore_tree_writable(worktree_path)
-            remove_tree(worktree_path, ignore_errors=True)
-            cleanup_error = ""
+            cleanup_error = _remove_temporary_worktree_tree(
+                worktree_path,
+                prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+            )
         else:
             cleanup_error = _cleanup_worktree_checkout(
                 repo_root,
                 worktree_path,
                 delete_branch=False,
+                temporary_prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
             )
         if cleanup_error:
             logger.warning(
@@ -12687,13 +12806,16 @@ def _temporary_block_debugger_worktree(
             _restore_tree_writable(temp_dir)
             remove_tree(temp_dir, ignore_errors=True)
         if private_clone:
-            remove_tree(worktree_path, ignore_errors=True)
-            cleanup_error = ""
+            cleanup_error = _remove_temporary_worktree_tree(
+                worktree_path,
+                prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+            )
         else:
             cleanup_error = _cleanup_worktree_checkout(
                 repo_root,
                 worktree_path,
                 delete_branch=False,
+                temporary_prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
             )
         if cleanup_error:
             logger.warning(
@@ -13000,6 +13122,24 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
             return "blocked"
 
         worktree_path = resolve_worktree_path(run, repo_root)
+    if backend.identity.backend == "worktree":
+        expected_names = expected_run_worktree_names(run.spec_id, run.branch)
+        if not expected_names:
+            run.last_error = (
+                "Refusing worktree access because run branch/spec identity does not "
+                "authorize a worktree path"
+            )
+            return "failed"
+        try:
+            worktree_path = validate_owned_worktree_path(
+                owner_root=_worktrees_root(repo_root),
+                target=worktree_path,
+                relative_to=resolve_common_root(repo_root),
+                expected_names=expected_names,
+            )
+        except UnsafeWorktreePathError as exc:
+            run.last_error = f"Refusing unsafe persisted worktree path: {exc}"
+            return "failed"
     run.worktree_path = str(worktree_path)
     branch = run.branch
 
@@ -13092,6 +13232,23 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
     else:
         # Clean up stale directory if present
         if worktree_path.exists():
+            expected_names = expected_run_worktree_names(run.spec_id, branch)
+            if not expected_names:
+                run.last_error = (
+                    "Refusing stale worktree cleanup because run branch/spec identity "
+                    "does not authorize a worktree path"
+                )
+                return "failed"
+            try:
+                worktree_path = validate_owned_worktree_path(
+                    owner_root=_worktrees_root(repo_root),
+                    target=worktree_path,
+                    relative_to=resolve_common_root(repo_root),
+                    expected_names=expected_names,
+                )
+            except UnsafeWorktreePathError as exc:
+                run.last_error = f"Refusing unsafe stale worktree cleanup: {exc}"
+                return "failed"
             remove_tree(worktree_path)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -20601,6 +20758,7 @@ def phase_cleanup(run: RunState, repo_root: Path) -> str:
         worktree_path,
         branch=run.branch,
         delete_branch=True,
+        expected_spec_id=run.spec_id,
     )
     if cleanup_error:
         run.last_error = cleanup_error
