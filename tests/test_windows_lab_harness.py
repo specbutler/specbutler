@@ -107,8 +107,34 @@ def test_windows_lab_has_complete_controller_surface() -> None:
         "WaitForProviderExit",
         'inputWriter.Write("q")',
         "KILL_ON_JOB_CLOSE",
+        "CREATE_SUSPENDED",
+        "ResumeThread",
+        "TerminateJobObject",
+        "watch-interactive-failure.json",
     ):
         assert native_boundary in watch_harness
+    main = watch_harness[watch_harness.index("public static int Main") :]
+    assert (
+        main.index("job = CreateJobObject")
+        < main.index("CreateProcess(")
+        < main.index("AssignProcessToJobObject")
+        < main.index("ResumeThread(")
+    )
+    graceful = main[main.index("// q must end the root app") :]
+    assert (
+        graceful.index("ClosePseudoConsole(pseudoConsole)")
+        < graceful.index("WaitForObservedExit(15, true)")
+        < graceful.index("CloseHandle(empty watch Job)")
+    )
+    emergency = watch_harness[
+        watch_harness.index("private static void EmergencyCleanup") :
+        watch_harness.index("private static string JsonEscape")
+    ]
+    assert (
+        emergency.index("TerminateJobObject")
+        < emergency.index("TerminateProcess")
+        < emergency.index("ClosePseudoConsole(pseudoConsole);")
+    )
     assert "Set-EvidenceClaim" in proof
     assert "Proof must run with a non-elevated user token" in proof
     register_job = (LAB_ROOT / "register-job.ps1").read_text(encoding="utf-8")
@@ -383,6 +409,12 @@ def test_windows_local_acceptance_requires_real_retained_conpty_watch(
         "marker_matched": True,
         "quit_key": "q",
         "root_exit_code": 0,
+        "root_created_suspended": True,
+        "job_assigned_before_resume": True,
+        "root_resumed": True,
+        "graceful_cleanup_observed": True,
+        "graceful_owned_processes_remaining": 0,
+        "emergency_cleanup_invoked": False,
         "provider_processes_remaining": 0,
         "dispatcher_processes_remaining": 0,
         "owned_processes_remaining": 0,
@@ -399,6 +431,16 @@ def test_windows_local_acceptance_requires_real_retained_conpty_watch(
     )
     assert validated["expected_marker"] == marker
 
+    failure = tmp_path / "watch-interactive-failure.json"
+    failure.write_text('{"status":"failed"}', encoding="utf-8")
+    with pytest.raises(module.EvidenceError, match="contradictory emergency-cleanup"):
+        module.validate_interactive_watch_evidence(
+            result,
+            revision=revision,
+            expected_spec_executable=executable,
+        )
+    failure.unlink()
+
     payload["marker_matched"] = False
     result.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(module.EvidenceError, match="marker_matched"):
@@ -409,6 +451,16 @@ def test_windows_local_acceptance_requires_real_retained_conpty_watch(
         )
 
     payload["marker_matched"] = True
+    payload["emergency_cleanup_invoked"] = True
+    result.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(module.EvidenceError, match="emergency_cleanup_invoked"):
+        module.validate_interactive_watch_evidence(
+            result,
+            revision=revision,
+            expected_spec_executable=executable,
+        )
+
+    payload["emergency_cleanup_invoked"] = False
     payload["transcript_sha256"] = "0" * 64
     result.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(module.EvidenceError, match="hash does not match"):

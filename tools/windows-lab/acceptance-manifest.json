@@ -241,6 +241,12 @@
         {"id": "web.6.provider", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/chat_provider", "expected": "codex"},
         {"id": "web.6.marker", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/real_codex_marker_matched", "expected": true},
         {"id": "web.6.quit", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/quit_key", "expected": "q"},
+        {"id": "web.6.suspended", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/root_created_suspended", "expected": true},
+        {"id": "web.6.assigned", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/job_assigned_before_resume", "expected": true},
+        {"id": "web.6.resumed", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/root_resumed", "expected": true},
+        {"id": "web.6.graceful", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/graceful_cleanup_observed", "expected": true},
+        {"id": "web.6.graceful-cleanup", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/graceful_owned_processes_remaining", "expected": 0},
+        {"id": "web.6.no-emergency-cleanup", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/emergency_cleanup_invoked", "expected": false},
         {"id": "web.6.provider-cleanup", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/provider_processes_remaining", "expected": 0},
         {"id": "web.6.dispatcher-cleanup", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/dispatcher_processes_remaining", "expected": 0},
         {"id": "web.6.owned-cleanup", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/owned_processes_remaining", "expected": 0}

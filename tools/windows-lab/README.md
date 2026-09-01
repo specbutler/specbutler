@@ -95,9 +95,11 @@ The proof:
 8. compiles the checked-in Win32 harness and launches the installed wheel's
    isolated `spec_runtime.cli watch` module through its own venv interpreter
    and the native ConPTY API in the logged-on desktop
-   session, observes the dashboard, live status, selected-run detail, and chat
-   screen, obtains a retained marker from a real Codex child, exits through the
-   `q` binding, and verifies every exact provider/owned process identity is gone;
+   session, assigns the suspended watch root to a kill-on-close Job before its
+   first instruction runs, observes the dashboard, live status, selected-run
+   detail, and chat screen, obtains a retained marker from a real Codex child,
+   exits through the `q` binding, and verifies every exact provider/owned process
+   identity drains while the emergency Job backstop remains open and unused;
 9. retains the exact staged Git revision and sanitized logs under
    `tools/windows-lab/artifacts/<run-name>/`, then evaluates every one of the
    26 acceptance criteria in the three Windows specs against the checked-in
@@ -108,13 +110,20 @@ The proof:
 Before the controller audit, `local_acceptance.py` parses the two JUnit reports
 and requires exact, unskipped test names for each local claim. It also validates
 the real lifecycle, web, and interactive watch result fields and actively probes
-executable discovery, Windows path behavior, the retained ConPTY transcript and
-Codex process identity, wheel/sdist imports,
+executable discovery, Windows path behavior, the retained ConPTY transcript,
+launch ordering, graceful-versus-emergency cleanup, and Codex process identity,
+wheel/sdist imports,
 `pip check`, warning-free `spec doctor`, documentation, and credential cleanup.
 It writes each machine-readable local result only after that result's complete
 prerequisite set passes. The host controller adds its own result only after the
 clean-snapshot reset, staging, job execution, collection, and guest-side static
 harness audit have all completed.
+
+If the interactive harness fails, it terminates the Job/root while its output
+reader is still draining, closes ConPTY only afterward, and retains
+`watch-interactive-failure.json` plus a failed transcript. Successful acceptance
+rejects that emergency-cleanup artifact rather than allowing it to coexist with
+a nominal pass.
 
 The deterministic autopilot provider is intentionally distinct from the real
 Codex evidence: adoption must hold children at a reproducible boundary across a

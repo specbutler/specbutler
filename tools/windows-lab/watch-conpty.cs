@@ -16,12 +16,15 @@ using Microsoft.Win32.SafeHandles;
 public static class WatchConptyProof
 {
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+    private const uint CREATE_SUSPENDED = 0x00000004;
     private const uint PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016;
     private const int STARTF_USESTDHANDLES = 0x00000100;
     private const uint TH32CS_SNAPPROCESS = 0x00000002;
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
     private const int JobObjectExtendedLimitInformation = 9;
     private const uint WAIT_OBJECT_0 = 0;
+    private const uint WAIT_TIMEOUT = 258;
+    private const uint INVALID_RESUME_RESULT = 0xffffffff;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct COORD
@@ -207,6 +210,12 @@ public static class WatchConptyProof
     private static extern bool GetExitCodeProcess(IntPtr hProcess, out uint lpExitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr hThread);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -219,6 +228,9 @@ public static class WatchConptyProof
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
@@ -446,6 +458,10 @@ public static class WatchConptyProof
 
     private static void TrackDescendants()
     {
+        if (RootPid <= 0)
+        {
+            return;
+        }
         List<PROCESSENTRY32> entries = ProcessSnapshot();
         Dictionary<uint, uint> parents = new Dictionary<uint, uint>();
         foreach (PROCESSENTRY32 entry in entries)
@@ -583,6 +599,27 @@ public static class WatchConptyProof
         return count;
     }
 
+    private static int WaitForObservedExit(int timeoutSeconds, bool discoverNewDescendants)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+        int remaining;
+        do
+        {
+            if (discoverNewDescendants)
+            {
+                TrackDescendants();
+            }
+            remaining = CountAlive(Observed.Values);
+            if (remaining == 0)
+            {
+                return 0;
+            }
+            Thread.Sleep(100);
+        }
+        while (DateTime.UtcNow < deadline);
+        return remaining;
+    }
+
     private static string DescribeAlive(IEnumerable<ProcessIdentity> identities)
     {
         List<string> values = new List<string>();
@@ -601,6 +638,43 @@ public static class WatchConptyProof
         lock (OutputLock)
         {
             return Output.ToString();
+        }
+    }
+
+    private static bool ProcessIsRunning(IntPtr processHandle)
+    {
+        if (processHandle == IntPtr.Zero)
+        {
+            return false;
+        }
+        return WaitForSingleObject(processHandle, 0) == WAIT_TIMEOUT;
+    }
+
+    private static void EmergencyCleanup(
+        ref IntPtr job,
+        IntPtr processHandle,
+        ref IntPtr pseudoConsole
+    )
+    {
+        // KILL_ON_JOB_CLOSE must fire before ClosePseudoConsole. A stuck client
+        // can otherwise make pseudoconsole teardown wait forever and prevent
+        // the ownership backstop from ever running. The output reader remains
+        // active while this method kills clients and closes the ConPTY.
+        if (job != IntPtr.Zero)
+        {
+            TerminateJobObject(job, 1);
+            CloseHandle(job);
+            job = IntPtr.Zero;
+        }
+        if (ProcessIsRunning(processHandle))
+        {
+            TerminateProcess(processHandle, 1);
+            WaitForSingleObject(processHandle, 5000);
+        }
+        if (pseudoConsole != IntPtr.Zero && !ProcessIsRunning(processHandle))
+        {
+            ClosePseudoConsole(pseudoConsole);
+            pseudoConsole = IntPtr.Zero;
         }
     }
 
@@ -672,7 +746,10 @@ public static class WatchConptyProof
         uint childSession,
         uint exitCode,
         int ownedRemaining,
-        int providerRemaining
+        int providerRemaining,
+        bool rootCreatedSuspended,
+        bool jobAssignedBeforeResume,
+        bool rootResumed
     )
     {
         string json = "{\n"
@@ -700,6 +777,14 @@ public static class WatchConptyProof
             + "  \"marker_matched\": true,\n"
             + "  \"quit_key\": \"q\",\n"
             + "  \"root_exit_code\": " + exitCode + ",\n"
+            + "  \"root_created_suspended\": "
+            + (rootCreatedSuspended ? "true" : "false") + ",\n"
+            + "  \"job_assigned_before_resume\": "
+            + (jobAssignedBeforeResume ? "true" : "false") + ",\n"
+            + "  \"root_resumed\": " + (rootResumed ? "true" : "false") + ",\n"
+            + "  \"graceful_cleanup_observed\": true,\n"
+            + "  \"graceful_owned_processes_remaining\": " + ownedRemaining + ",\n"
+            + "  \"emergency_cleanup_invoked\": false,\n"
             + "  \"provider_processes_remaining\": " + providerRemaining + ",\n"
             // The watch app has no dispatcher child. Reuse the exhaustive
             // owned-descendant audit rather than asserting a synthetic zero.
@@ -716,6 +801,43 @@ public static class WatchConptyProof
             File.Delete(path);
         }
         File.Move(temporary, path);
+    }
+
+    private static void WriteFailureResult(
+        string path,
+        string revision,
+        Exception failure,
+        bool emergencyCleanupInvoked,
+        int ownedBeforeEmergencyCleanup,
+        int ownedAfterEmergencyCleanup,
+        string aliveAfterEmergencyCleanup,
+        bool rootRemaining,
+        bool rootCreatedSuspended,
+        bool jobAssignedBeforeResume,
+        bool rootResumed
+    )
+    {
+        string json = "{\n"
+            + "  \"status\": \"failed\",\n"
+            + "  \"source_revision\": \"" + JsonEscape(revision) + "\",\n"
+            + "  \"failure\": \"" + JsonEscape(failure.Message) + "\",\n"
+            + "  \"root_created_suspended\": "
+            + (rootCreatedSuspended ? "true" : "false") + ",\n"
+            + "  \"job_assigned_before_resume\": "
+            + (jobAssignedBeforeResume ? "true" : "false") + ",\n"
+            + "  \"root_resumed\": " + (rootResumed ? "true" : "false") + ",\n"
+            + "  \"emergency_cleanup_invoked\": "
+            + (emergencyCleanupInvoked ? "true" : "false") + ",\n"
+            + "  \"owned_processes_before_emergency_cleanup\": "
+            + ownedBeforeEmergencyCleanup + ",\n"
+            + "  \"owned_processes_after_emergency_cleanup\": "
+            + ownedAfterEmergencyCleanup + ",\n"
+            + "  \"alive_after_emergency_cleanup\": \""
+            + JsonEscape(aliveAfterEmergencyCleanup) + "\",\n"
+            + "  \"root_process_remaining\": "
+            + (rootRemaining ? "true" : "false") + "\n"
+            + "}\n";
+        File.WriteAllText(path, json, new UTF8Encoding(false));
     }
 
     private static void ConfigureKillOnCloseJob(IntPtr job)
@@ -765,6 +887,10 @@ public static class WatchConptyProof
             evidenceRoot,
             "watch-interactive-failed-transcript.log"
         );
+        string failureResultPath = Path.Combine(
+            evidenceRoot,
+            "watch-interactive-failure.json"
+        );
         string resultPath = Path.Combine(evidenceRoot, "watch-interactive-result.json");
         string expectedMarker = "SPEC_WATCH_CODEX_" + nonce;
 
@@ -779,6 +905,9 @@ public static class WatchConptyProof
         StreamWriter inputWriter = null;
         StreamReader outputReader = null;
         Thread readerThread = null;
+        bool rootCreatedSuspended = false;
+        bool jobAssignedBeforeResume = false;
+        bool rootResumed = false;
 
         try
         {
@@ -800,6 +929,10 @@ public static class WatchConptyProof
             if (File.Exists(failedTranscriptPath))
             {
                 File.Delete(failedTranscriptPath);
+            }
+            if (File.Exists(failureResultPath))
+            {
+                File.Delete(failureResultPath);
             }
 
             RequireWin32(CreatePipe(out pseudoInput, out hostInput, IntPtr.Zero, 0), "CreatePipe(input)");
@@ -850,6 +983,12 @@ public static class WatchConptyProof
             {
                 nLength = securityAttributeSize
             };
+            // Establish the ownership boundary before there is any child to
+            // escape it. The root starts suspended, is assigned to this
+            // kill-on-close Job, and only then may execute user/package code.
+            job = CreateJobObject(IntPtr.Zero, null);
+            RequireWin32(job != IntPtr.Zero, "CreateJobObject");
+            ConfigureKillOnCloseJob(job);
             string commandLine = BuildCommandLine(specExe, repoRoot);
             RequireWin32(
                 CreateProcess(
@@ -858,7 +997,7 @@ public static class WatchConptyProof
                     ref processSecurity,
                     ref threadSecurity,
                     false,
-                    EXTENDED_STARTUPINFO_PRESENT,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                     IntPtr.Zero,
                     repoRoot,
                     ref startup,
@@ -866,6 +1005,18 @@ public static class WatchConptyProof
                 ),
                 "CreateProcess(spec watch)"
             );
+            rootCreatedSuspended = true;
+            RootPid = (int)processInformation.dwProcessId;
+            RequireWin32(
+                AssignProcessToJobObject(job, processInformation.hProcess),
+                "AssignProcessToJobObject"
+            );
+            jobAssignedBeforeResume = true;
+            uint resumeResult = ResumeThread(processInformation.hThread);
+            RequireWin32(resumeResult != INVALID_RESUME_RESULT, "ResumeThread(spec watch)");
+            rootResumed = true;
+            CloseHandle(processInformation.hThread);
+            processInformation.hThread = IntPtr.Zero;
             // The pseudoconsole keeps these pipe ends only after its first
             // client process is attached. Closing them before CreateProcess
             // can silently leave the child with ordinary redirected streams,
@@ -874,17 +1025,6 @@ public static class WatchConptyProof
             pseudoInput = null;
             pseudoOutput.Dispose();
             pseudoOutput = null;
-            RootPid = (int)processInformation.dwProcessId;
-
-            job = CreateJobObject(IntPtr.Zero, null);
-            RequireWin32(job != IntPtr.Zero, "CreateJobObject");
-            ConfigureKillOnCloseJob(job);
-            RequireWin32(
-                AssignProcessToJobObject(job, processInformation.hProcess),
-                "AssignProcessToJobObject"
-            );
-            CloseHandle(processInformation.hThread);
-            processInformation.hThread = IntPtr.Zero;
 
             uint childSession;
             RequireWin32(
@@ -977,36 +1117,35 @@ public static class WatchConptyProof
             );
             Require(exitCode == 0, "spec watch exited with code " + exitCode);
 
-            // q must end the root app. Close the pseudoconsole and the harness'
-            // kill-on-close ownership job before the final descendant audit so
-            // ConPTY helper processes cannot be mistaken for leaked provider or
-            // dispatcher children. The provider was already required to exit on
-            // its own immediately after producing the chat response.
+            // q must end the root app. Normal terminal teardown closes ConPTY,
+            // but the kill-on-close Job stays open throughout the descendant
+            // audit. A success therefore proves that no Job termination was
+            // needed to turn leaked children into an apparent clean result.
             TrackDescendants();
             inputWriter.Dispose();
             inputWriter = null;
             ClosePseudoConsole(pseudoConsole);
             pseudoConsole = IntPtr.Zero;
-            if (readerThread != null)
-            {
-                readerThread.Join(5000);
-            }
-            CloseHandle(job);
-            job = IntPtr.Zero;
-            DateTime descendantsDeadline = DateTime.UtcNow.AddSeconds(10);
-            int remaining = CountAlive(Observed.Values);
-            while (remaining > 0 && DateTime.UtcNow < descendantsDeadline)
-            {
-                Thread.Sleep(100);
-                remaining = CountAlive(Observed.Values);
-            }
+            int remaining = WaitForObservedExit(15, true);
             int providerRemaining = CountAliveProviders();
             Require(
                 remaining == 0,
-                remaining + " owned descendant process(es) survived cleanup after q: "
+                remaining + " owned descendant process(es) survived graceful q cleanup: "
                     + DescribeAlive(Observed.Values)
             );
             Require(providerRemaining == 0, "Codex provider process survived q");
+            if (readerThread != null)
+            {
+                Require(
+                    readerThread.Join(5000),
+                    "ConPTY output reader did not finish after graceful q cleanup"
+                );
+            }
+
+            // All exact descendants are already gone. Releasing the now-empty
+            // Job cannot conceal a leak and is not emergency cleanup.
+            RequireWin32(CloseHandle(job), "CloseHandle(empty watch Job)");
+            job = IntPtr.Zero;
 
             string transcript = CapturedOutput();
             File.WriteAllText(transcriptPath, transcript, new UTF8Encoding(false));
@@ -1025,20 +1164,78 @@ public static class WatchConptyProof
                 childSession,
                 exitCode,
                 remaining,
-                providerRemaining
+                providerRemaining,
+                rootCreatedSuspended,
+                jobAssignedBeforeResume,
+                rootResumed
             );
             Console.WriteLine("interactive ConPTY spec watch proof passed: " + expectedMarker);
             return 0;
         }
         catch (Exception exception)
         {
+            int beforeEmergencyCleanup = -1;
+            int afterEmergencyCleanup = -1;
+            try
+            {
+                TrackDescendants();
+                beforeEmergencyCleanup = CountAlive(Observed.Values);
+            }
+            catch (Exception processInspectionException)
+            {
+                Console.Error.WriteLine(
+                    "could not inspect descendants before emergency cleanup: "
+                        + processInspectionException.Message
+                );
+            }
+            bool emergencyCleanupInvoked = job != IntPtr.Zero
+                || ProcessIsRunning(processInformation.hProcess);
+            // Exceptional teardown deliberately kills the Job/process before
+            // touching ConPTY; the output reader continues draining meanwhile.
+            EmergencyCleanup(
+                ref job,
+                processInformation.hProcess,
+                ref pseudoConsole
+            );
+            if (inputWriter != null)
+            {
+                inputWriter.Dispose();
+                inputWriter = null;
+            }
+            if (readerThread != null)
+            {
+                readerThread.Join(5000);
+            }
+            if (outputReader != null)
+            {
+                outputReader.Dispose();
+                outputReader = null;
+                if (readerThread != null && readerThread.IsAlive)
+                {
+                    readerThread.Join(5000);
+                }
+            }
             try
             {
                 Directory.CreateDirectory(evidenceRoot);
+                afterEmergencyCleanup = WaitForObservedExit(10, false);
                 File.WriteAllText(
                     failedTranscriptPath,
                     CapturedOutput(),
                     new UTF8Encoding(false)
+                );
+                WriteFailureResult(
+                    failureResultPath,
+                    revision,
+                    exception,
+                    emergencyCleanupInvoked,
+                    beforeEmergencyCleanup,
+                    afterEmergencyCleanup,
+                    DescribeAlive(Observed.Values),
+                    ProcessIsRunning(processInformation.hProcess),
+                    rootCreatedSuspended,
+                    jobAssignedBeforeResume,
+                    rootResumed
                 );
             }
             catch (Exception transcriptException)
@@ -1052,13 +1249,25 @@ public static class WatchConptyProof
         }
         finally
         {
+            // This path is idempotent with catch. Most importantly, Job/root
+            // termination always precedes ConPTY closure on every exception.
+            if (job != IntPtr.Zero
+                || ProcessIsRunning(processInformation.hProcess)
+                || pseudoConsole != IntPtr.Zero)
+            {
+                EmergencyCleanup(
+                    ref job,
+                    processInformation.hProcess,
+                    ref pseudoConsole
+                );
+            }
             if (inputWriter != null)
             {
                 inputWriter.Dispose();
             }
-            if (pseudoConsole != IntPtr.Zero)
+            if (readerThread != null && readerThread.IsAlive)
             {
-                ClosePseudoConsole(pseudoConsole);
+                readerThread.Join(5000);
             }
             if (outputReader != null)
             {
@@ -1092,11 +1301,6 @@ public static class WatchConptyProof
             {
                 DeleteProcThreadAttributeList(attributeList);
                 Marshal.FreeHGlobal(attributeList);
-            }
-            if (job != IntPtr.Zero)
-            {
-                // KILL_ON_JOB_CLOSE is the fail-safe for every exceptional path.
-                CloseHandle(job);
             }
         }
     }

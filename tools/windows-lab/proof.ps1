@@ -889,6 +889,12 @@ if (
     -or -not $watchInteractive.marker_matched `
     -or $watchInteractive.quit_key -ne 'q' `
     -or $watchInteractive.root_exit_code -ne 0 `
+    -or -not $watchInteractive.root_created_suspended `
+    -or -not $watchInteractive.job_assigned_before_resume `
+    -or -not $watchInteractive.root_resumed `
+    -or -not $watchInteractive.graceful_cleanup_observed `
+    -or $watchInteractive.graceful_owned_processes_remaining -ne 0 `
+    -or $watchInteractive.emergency_cleanup_invoked `
     -or $watchInteractive.provider_processes_remaining -ne 0 `
     -or $watchInteractive.dispatcher_processes_remaining -ne 0 `
     -or $watchInteractive.owned_processes_remaining -ne 0
@@ -903,7 +909,7 @@ Set-EvidenceClaim `
         'watch-conpty-build.log',
         'watch-conpty-proof.log'
     ) `
-    -Detail 'The installed wheel module rendered dashboard, live status, detail, and per-spec chat through ConPTY; a real Codex child returned the retained marker, q exited cleanly, and every exact owned process identity was gone.'
+    -Detail 'The installed wheel module rendered dashboard, live status, detail, and per-spec chat through ConPTY; its suspended root was assigned to the Job before resume, a real Codex child returned the retained marker, and q drained every exact owned identity without emergency Job termination.'
 
 $operatorCodexHome = $env:CODEX_HOME
 if (-not $operatorCodexHome) {

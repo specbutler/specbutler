@@ -207,6 +207,11 @@ def validate_interactive_watch_evidence(
     expected_spec_executable: Path,
 ) -> dict[str, Any]:
     """Validate retained proof from the real Windows pseudoconsole session."""
+    failure_path = path.with_name("watch-interactive-failure.json")
+    if failure_path.exists():
+        raise EvidenceError(
+            "interactive spec watch retained contradictory emergency-cleanup evidence"
+        )
     payload = _require_fields(
         path,
         {
@@ -225,6 +230,12 @@ def validate_interactive_watch_evidence(
             "marker_matched": True,
             "quit_key": "q",
             "root_exit_code": 0,
+            "root_created_suspended": True,
+            "job_assigned_before_resume": True,
+            "root_resumed": True,
+            "graceful_cleanup_observed": True,
+            "graceful_owned_processes_remaining": 0,
+            "emergency_cleanup_invoked": False,
             "provider_processes_remaining": 0,
             "dispatcher_processes_remaining": 0,
             "owned_processes_remaining": 0,
@@ -683,6 +694,14 @@ def produce(args: argparse.Namespace) -> None:
             "chat_provider": interactive_watch["chat_provider"],
             "real_codex_marker_matched": interactive_watch["marker_matched"],
             "quit_key": interactive_watch["quit_key"],
+            "root_created_suspended": interactive_watch["root_created_suspended"],
+            "job_assigned_before_resume": interactive_watch["job_assigned_before_resume"],
+            "root_resumed": interactive_watch["root_resumed"],
+            "graceful_cleanup_observed": interactive_watch["graceful_cleanup_observed"],
+            "graceful_owned_processes_remaining": interactive_watch[
+                "graceful_owned_processes_remaining"
+            ],
+            "emergency_cleanup_invoked": interactive_watch["emergency_cleanup_invoked"],
             "provider_processes_remaining": interactive_watch["provider_processes_remaining"],
             "dispatcher_processes_remaining": interactive_watch["dispatcher_processes_remaining"],
             "owned_processes_remaining": interactive_watch["owned_processes_remaining"],
