@@ -280,6 +280,20 @@ def test_ci_windows_job_is_a_required_product_gate_with_diagnostics():
     assert '-m pytest -o "pythonpath=" tests/test_windows_probe.py -v' in commands[
         "Run Windows integration probes"
     ]
+    assert (
+        "tests/test_windows_probe.py::test_installed_artifact_cli_matrix"
+        in commands["Run installed-artifact Windows CLI matrix"]
+    )
+    assert "Remove-Item Env:PYTHONPATH" in commands[
+        "Run installed-artifact Windows CLI matrix"
+    ]
+    cli_matrix_step = next(
+        step
+        for step in steps
+        if step.get("name") == "Run installed-artifact Windows CLI matrix"
+    )
+    assert cli_matrix_step["if"] == "${{ matrix.cli_matrix }}"
+    assert cli_matrix_step["env"]["SPEC_WINDOWS_INSTALLED_CLI_MATRIX"] == "1"
 
     summary = next(step for step in steps if step.get("name") == "Summarize Windows gate")
     upload = next(step for step in steps if step.get("name") == "Upload Windows probe logs")
@@ -303,6 +317,15 @@ def test_ci_windows_matrix_covers_supported_python_and_both_distribution_types()
         entry["distribution"] == "sdist" and str(entry["python-version"]) == "3.12"
         for entry in include
     )
+    cli_matrix_entries = [entry for entry in include if entry["cli_matrix"] is True]
+    assert cli_matrix_entries == [
+        {
+            "python-version": "3.12",
+            "distribution": "wheel",
+            "full_suite": True,
+            "cli_matrix": True,
+        }
+    ]
     assert windows["strategy"]["fail-fast"] is False
     assert "windows-package" in windows["needs"]
 

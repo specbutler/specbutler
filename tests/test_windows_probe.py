@@ -26,8 +26,6 @@ pytestmark = pytest.mark.skipif(
 
 
 def _clean_subprocess_env() -> dict[str, str]:
-    import os
-
     env = os.environ.copy()
     env.pop("SPEC_CONFIG", None)
     return env
@@ -48,6 +46,134 @@ def _wait_for_identity_exit(identity: object, *, timeout: float = 10.0) -> None:
     while identity_matches(identity) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not identity_matches(identity), f"process identity remained live: {identity}"
+
+
+def _run(
+    argv: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    timeout: float = 30,
+    expected: int | set[int] = 0,
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        argv,
+        cwd=cwd,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    expected_codes = {expected} if isinstance(expected, int) else expected
+    assert completed.returncode in expected_codes, (
+        f"command returned {completed.returncode}, expected {sorted(expected_codes)}: "
+        f"{argv!r}\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    )
+    return completed
+
+
+def _cli(
+    repo: Path,
+    *args: str,
+    env: dict[str, str],
+    timeout: float = 30,
+    expected: int | set[int] = 0,
+) -> subprocess.CompletedProcess[str]:
+    """Run the installed module in isolated mode, never checkout source."""
+    return _run(
+        [sys.executable, "-I", "-m", "spec_runtime.cli", *args],
+        cwd=repo,
+        env=env,
+        timeout=timeout,
+        expected=expected,
+    )
+
+
+def _git(
+    repo: Path,
+    *args: str,
+    expected: int | set[int] = 0,
+) -> subprocess.CompletedProcess[str]:
+    return _run(["git", *args], cwd=repo, expected=expected)
+
+
+def _wait_until(predicate, *, timeout: float, detail: str) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"timed out waiting for {detail}")
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _write_fake_cli_tools(fake_bin: Path, python: Path) -> None:
+    """Install deterministic model/forge doubles at the external CLI boundary."""
+    fake_bin.mkdir()
+    (fake_bin / "fake-gh.py").write_text(
+        """import json, sys
+args = sys.argv[1:]
+if args[:2] == ["auth", "status"]:
+    raise SystemExit(0)
+if args[:2] == ["auth", "token"]:
+    print("fixture-token")
+elif args[:2] == ["pr", "list"]:
+    print("[]")
+elif args[:2] == ["repo", "view"]:
+    print(json.dumps({"nameWithOwner": "example/windows-ci-fixture"}))
+elif args and args[0] == "api":
+    print("[]")
+raise SystemExit(0)
+""",
+        encoding="utf-8",
+    )
+    (fake_bin / "gh.cmd").write_text(
+        f'@echo off\r\n"{python}" -I "%~dp0fake-gh.py" %*\r\n',
+        encoding="utf-8",
+    )
+    (fake_bin / "codex.cmd").write_text(
+        """@echo off
+if "%1"=="exec" if "%2"=="--help" (
+  echo codex exec --json --output-schema
+  exit /b 0
+)
+if not exist ".fixture-agent-needs-input" (
+  echo waiting>".fixture-agent-needs-input"
+  "%SPEC_FIXTURE_PYTHON%" -I -m spec_runtime.cli report --status needs-input --summary "Choose fixture behavior A or B"
+  exit /b %ERRORLEVEL%
+)
+echo resolved>"windows-resolution.txt"
+git add .fixture-agent-needs-input windows-resolution.txt
+git -c user.name="Windows CI" -c user.email="windows-ci@example.invalid" commit -m "Resolve Windows fixture input"
+if errorlevel 1 exit /b %ERRORLEVEL%
+"%SPEC_FIXTURE_PYTHON%" -I -m spec_runtime.cli report --status ok --summary "Selected fixture behavior A"
+exit /b %ERRORLEVEL%
+""".replace("\n", "\r\n"),
+        encoding="utf-8",
+    )
+
+
+def _wait_for_http(url: str, token: str, process: subprocess.Popen[str] | None = None) -> None:
+    def reachable() -> bool:
+        if process is not None and process.poll() is not None:
+            return False
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            with urllib.request.urlopen(request, timeout=1) as response:
+                return response.status == 200
+        except (OSError, urllib.error.URLError):
+            return False
+
+    _wait_until(reachable, timeout=30, detail=f"HTTP listener at {url}")
 
 
 def test_lifecycle_module_imports() -> None:
@@ -512,3 +638,466 @@ def test_foreground_web_bind_and_authenticated_request(tmp_path: Path) -> None:
             assert auth_error.value.code == 401
         finally:
             stop_server()
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPEC_WINDOWS_INSTALLED_CLI_MATRIX") != "1",
+    reason="run once in the Python 3.12 wheel job",
+)
+def test_installed_artifact_cli_matrix(tmp_path: Path) -> None:
+    """Exercise AC2 through the installed wheel with only external-boundary fakes.
+
+    Git, CLI dispatch, worktrees, state files, HTTP listeners, detached web
+    supervision, update workers, and autopilot processes are real.  Only GitHub,
+    model turns, interactive-tty presentation, and the update network/installer
+    provider are replaced with deterministic local fixtures.
+    """
+    import spec_runtime
+    from spec_runtime.orchestrator import RunState
+
+    checkout = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+    imported = Path(spec_runtime.__file__).resolve()
+    with pytest.raises(ValueError):
+        imported.relative_to(checkout)
+
+    # The product repository itself deliberately contains both a space and a
+    # non-ASCII character.  Every command below operates from this path.
+    repo = tmp_path / "Spec Butler snow-\u96ea"
+    origin = tmp_path / "Origin snow-\u96ea.git"
+    fake_bin = tmp_path / "fixture tools"
+    operator_codex_home = tmp_path / "operator codex home"
+    operator_codex_home.mkdir()
+    (operator_codex_home / "auth.json").write_text(
+        '{"OPENAI_API_KEY":"fixture-only-not-a-secret"}\n',
+        encoding="utf-8",
+    )
+    _write_fake_cli_tools(fake_bin, Path(sys.executable))
+
+    env = _clean_subprocess_env()
+    env.pop("PYTHONPATH", None)
+    env.update(
+        {
+            "CODEX_HOME": str(operator_codex_home),
+            "PATH": os.pathsep.join([str(fake_bin), env.get("PATH", "")]),
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+            "SPEC_FIXTURE_PYTHON": sys.executable,
+            "SPEC_NO_UPDATE_CHECK": "1",
+        }
+    )
+
+    _run(["git", "init", "--bare", "--initial-branch=main", str(origin)], cwd=tmp_path)
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    (repo / "README.md").write_text("Windows installed CLI fixture\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(
+        repo,
+        "-c",
+        "user.name=Windows CI",
+        "-c",
+        "user.email=windows-ci@example.invalid",
+        "commit",
+        "-m",
+        "Initialize Unicode fixture",
+    )
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-u", "origin", "main")
+
+    initialized = _cli(repo, "init", env=env)
+    assert "Initialized" in initialized.stdout
+    doctor = _cli(repo, "doctor", env=env)
+    assert "0 error" in doctor.stdout.lower()
+
+    lifecycle_id = "windows-cli-flow"
+    lifecycle_spec = repo / "specs" / f"{lifecycle_id}.md"
+    lifecycle_spec.write_text(
+        """---
+id: windows-cli-flow
+area: backend
+priority: 10
+depends_on: []
+description: Exercise the installed Windows lifecycle fixture
+---
+
+# Installed Windows lifecycle fixture
+
+## Acceptance Criteria
+
+- [ ] Resolve the deterministic operator question and commit the answer.
+""",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(
+        repo,
+        "-c",
+        "user.name=Windows CI",
+        "-c",
+        "user.email=windows-ci@example.invalid",
+        "commit",
+        "-m",
+        "Add lifecycle fixture",
+    )
+    _git(repo, "push", "origin", "main")
+
+    listed = _cli(repo, "list", env=env)
+    assert lifecycle_id in listed.stdout
+    shown = _cli(repo, "show", "--spec", lifecycle_id, env=env)
+    assert "Installed Windows lifecycle fixture" in shown.stdout
+    queued_status = _cli(repo, "status", "--spec", lifecycle_id, env=env)
+    assert "No runs found" in queued_status.stdout
+
+    # Foreground update dispatch runs in an isolated installed interpreter. The
+    # release lookup and installer command are local fakes; the upgrade child is
+    # still a real subprocess and the public CLI path is unchanged.
+    foreground_update = """
+import sys
+from unittest.mock import patch
+from spec_runtime.cli import main
+from spec_runtime.update import InstallInfo
+info = InstallInfo(
+    method="pip",
+    current_version="0.0.0",
+    upgrade_command=(sys.executable, "-I", "-c", "print('fixture upgrade child')"),
+)
+with patch("spec_runtime.update.detect_installation", return_value=info), patch(
+    "spec_runtime.update.resolve_repo_slug", return_value=None
+):
+    raise SystemExit(main(["update"]))
+"""
+    updated = _run(
+        [sys.executable, "-I", "-c", foreground_update],
+        cwd=repo,
+        env=env,
+    )
+    assert "fixture upgrade child" in updated.stdout
+    assert "Updated Spec Butler" in updated.stdout
+
+    # Exercise the background refresh entry in its own process while replacing
+    # only the HTTP release provider. This writes the production cache and lock
+    # artifacts without relying on public network availability.
+    background_update = """
+import sys
+from pathlib import Path
+from unittest.mock import patch
+from spec_runtime.update import _background_refresh_entry
+repo, cache, lock = map(Path, sys.argv[1:4])
+with patch("spec_runtime.update.resolve_repo_slug", return_value="fixture/spec"), patch(
+    "spec_runtime.update.fetch_latest_version", return_value="9.9.9"
+):
+    _background_refresh_entry(repo, cache, lock)
+"""
+    update_cache = repo / ".spec-state" / "update-check.json"
+    update_lock = repo / ".spec-state" / "update-check.lock"
+    update_lock.parent.mkdir(parents=True, exist_ok=True)
+    update_lock.write_text('{"started_at":"2026-09-01T00:00:00Z"}\n', encoding="utf-8")
+    _run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            background_update,
+            str(repo),
+            str(update_cache),
+            str(update_lock),
+        ],
+        cwd=tmp_path,
+        env=env,
+    )
+    assert json.loads(update_cache.read_text(encoding="utf-8"))["latest_version"] == "9.9.9"
+    assert not update_lock.exists()
+
+    # Build a genuine linked worktree and invoke the real implement phase. The
+    # fake Codex binary reports needs-input through the public `spec report`
+    # handshake, exactly as a model process would.
+    run_id = f"{lifecycle_id}-ci-matrix"
+    branch = f"code/{lifecycle_id}--ci-matrix"
+    worktree = repo / ".worktrees" / f"code-{lifecycle_id}--ci-matrix"
+    worktree.parent.mkdir(exist_ok=True)
+    _git(repo, "worktree", "add", "-b", branch, str(worktree), "origin/main")
+    head = _git(repo, "rev-parse", "origin/main").stdout.strip()
+    RunState(
+        run_id=run_id,
+        spec_id=lifecycle_id,
+        branch=branch,
+        worktree_path=str(worktree),
+        spec_path=f"specs/{lifecycle_id}.md",
+        spec_revision=head,
+        phase="implement",
+        status="pending",
+        agent="codex",
+        review_agent="codex",
+        base_ref="origin/main",
+        backend="worktree",
+        safety_mode="safe",
+        backend_source="repo-config",
+        backend_workspace_root=".worktrees",
+    ).save(repo)
+    first_implement = _cli(
+        repo,
+        "phase",
+        "--spec",
+        lifecycle_id,
+        "--phase",
+        "implement",
+        "--agent",
+        "codex",
+        "--review-agent",
+        "codex",
+        "--run",
+        run_id,
+        env=env,
+        timeout=60,
+        expected={1, 2},
+    )
+    assert "needs-input" in (
+        repo / ".spec-state" / "runs" / f"{run_id}.json"
+    ).read_text(encoding="utf-8")
+    waiting_status = _cli(repo, "status", "--spec", lifecycle_id, env=env)
+    assert "waiting-for-input" in waiting_status.stdout
+    assert "Choose fixture behavior A or B" in waiting_status.stdout
+    assert first_implement.returncode != 0
+
+    # `input` is intentionally interactive. Hosted pytest has no console, so
+    # this shim supplies only the isatty boundary; the actual command launches
+    # the fake model subprocess, consumes its fresh report, and resolves the
+    # persisted operator request. Continuing late forge phases is outside this
+    # smoke and is replaced with a no-op return.
+    input_runner = f"""
+import sys
+from unittest.mock import patch
+import spec_runtime.orchestrator as orchestrator
+from spec_runtime.cli import main
+class Tty:
+    def __init__(self, wrapped): self.wrapped = wrapped
+    def isatty(self): return True
+    def __getattr__(self, name): return getattr(self.wrapped, name)
+sys.stdin = Tty(sys.stdin)
+with patch.object(orchestrator, "cmd_run", return_value=0):
+    raise SystemExit(main(["input", "--spec", {lifecycle_id!r}, "--agent", "codex"]))
+"""
+    resolved = _run(
+        [sys.executable, "-I", "-c", input_runner],
+        cwd=repo,
+        env=env,
+        timeout=60,
+    )
+    assert "Operator intervention resolved" in resolved.stdout
+    run_payload = json.loads(
+        (repo / ".spec-state" / "runs" / f"{run_id}.json").read_text(encoding="utf-8")
+    )
+    assert run_payload["status"] == "passed"
+    assert run_payload["input_response"] == "Selected fixture behavior A"
+    assert (worktree / "windows-resolution.txt").read_text().strip() == "resolved"
+
+    # Foreground and background web modes both bind real sockets and serve an
+    # authenticated request. Background status/stop traverse durable Windows
+    # supervision rather than terminating a pytest-owned process directly.
+    token = "windows-installed-matrix-token"
+    token_path = repo / ".spec-state" / "web" / "auth-token"
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(token, encoding="utf-8")
+    foreground_port = _free_port()
+    foreground_log = repo / ".spec-state" / "web" / "foreground-test.log"
+    with foreground_log.open("w", encoding="utf-8") as web_log:
+        foreground = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-m",
+                "spec_runtime.cli",
+                "web",
+                "start",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(foreground_port),
+            ],
+            cwd=repo,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=web_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    try:
+        _wait_for_http(f"http://127.0.0.1:{foreground_port}/", token, foreground)
+    finally:
+        if foreground.poll() is None:
+            foreground.terminate()
+        try:
+            foreground.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            foreground.kill()
+            foreground.wait(timeout=5)
+
+    background_port = _free_port()
+    background_started = _cli(
+        repo,
+        "web",
+        "start",
+        "--background",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(background_port),
+        env=env,
+        timeout=45,
+    )
+    assert "spec web running" in (background_started.stdout + background_started.stderr)
+    web_status = _cli(repo, "web", "status", env=env)
+    assert str(background_port) in web_status.stdout
+    _wait_for_http(f"http://127.0.0.1:{background_port}/", token)
+    _cli(repo, "web", "stop", env=env, timeout=30)
+    stopped_status = _cli(repo, "web", "status", env=env, expected=1)
+    assert "not running" in (stopped_status.stdout + stopped_status.stderr).lower()
+
+    cleaned = _cli(repo, "clean", "--spec", lifecycle_id, env=env)
+    assert "Removed worktree" in cleaned.stdout
+    assert not worktree.exists()
+    assert (
+        _git(
+            repo,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            expected=1,
+        ).returncode
+        == 1
+    )
+
+    # Keep the resolved lifecycle record out of the autopilot queue and add a
+    # fresh dispatch target. The child command deliberately stays alive so a
+    # replacement dispatcher must adopt it instead of starting a duplicate.
+    _git(repo, "rm", f"specs/{lifecycle_id}.md")
+    auto_id = "windows-auto-ready"
+    (repo / "specs" / f"{auto_id}.md").write_text(
+        """---
+id: windows-auto-ready
+area: backend
+priority: 1
+depends_on: []
+description: Exercise installed Windows autopilot supervision
+---
+
+# Windows autopilot fixture
+""",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "specs")
+    _git(
+        repo,
+        "-c",
+        "user.name=Windows CI",
+        "-c",
+        "user.email=windows-ci@example.invalid",
+        "commit",
+        "-m",
+        "Prepare autopilot fixture",
+    )
+    _git(repo, "push", "origin", "main")
+
+    auto_marker = tmp_path / "autopilot-child.json"
+    (fake_bin / "fake-spec-implement.py").write_text(
+        """import json, os, pathlib, time
+marker = pathlib.Path(os.environ["SPEC_FIXTURE_AUTO_MARKER"])
+count = 0
+if marker.exists():
+    count = int(json.loads(marker.read_text()).get("launch_count", 0))
+marker.write_text(json.dumps({"pid": os.getpid(), "launch_count": count + 1}))
+while True:
+    time.sleep(0.2)
+""",
+        encoding="utf-8",
+    )
+    (fake_bin / "spec.cmd").write_text(
+        f'@echo off\r\n"{sys.executable}" -I "%~dp0fake-spec-implement.py"\r\n',
+        encoding="utf-8",
+    )
+    auto_env = env.copy()
+    auto_env["PYTHONUNBUFFERED"] = "1"
+    auto_env["SPEC_FIXTURE_AUTO_MARKER"] = str(auto_marker)
+    auto_command = [
+        sys.executable,
+        "-I",
+        "-m",
+        "spec_runtime.cli",
+        "auto",
+        "run",
+        "--repo-root",
+        str(repo),
+        "--concurrency",
+        "1",
+        "--poll-interval",
+        "1",
+        "--agent",
+        "codex",
+    ]
+    first_log_path = tmp_path / "autopilot-first.log"
+    first_log = first_log_path.open("w", encoding="utf-8")
+    first_dispatcher = subprocess.Popen(
+        auto_command,
+        cwd=repo,
+        env=auto_env,
+        stdin=subprocess.DEVNULL,
+        stdout=first_log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        _wait_until(auto_marker.exists, timeout=30, detail="autopilot dispatch")
+        first_payload = json.loads(auto_marker.read_text(encoding="utf-8"))
+        assert first_payload["launch_count"] == 1
+        _wait_until(
+            lambda: (repo / ".spec-state" / "autopilot" / "active.json").exists(),
+            timeout=15,
+            detail="autopilot active state",
+        )
+        first_dispatcher.terminate()
+        first_dispatcher.wait(timeout=10)
+    finally:
+        if first_dispatcher.poll() is None:
+            first_dispatcher.kill()
+            first_dispatcher.wait(timeout=5)
+        first_log.close()
+
+    second_log_path = tmp_path / "autopilot-second.log"
+    second_log = second_log_path.open("w", encoding="utf-8")
+    second_dispatcher = subprocess.Popen(
+        auto_command,
+        cwd=repo,
+        env=auto_env,
+        stdin=subprocess.DEVNULL,
+        stdout=second_log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        _wait_until(
+            lambda: "adopt:" in second_log_path.read_text(encoding="utf-8", errors="replace"),
+            timeout=30,
+            detail="autopilot child adoption",
+        )
+        assert json.loads(auto_marker.read_text(encoding="utf-8"))["launch_count"] == 1
+        stopped = _cli(
+            repo,
+            "auto",
+            "stop",
+            "--repo-root",
+            str(repo),
+            env=auto_env,
+            timeout=30,
+        )
+        assert "acknowledged shutdown" in (stopped.stdout + stopped.stderr)
+        second_dispatcher.wait(timeout=15)
+    finally:
+        if second_dispatcher.poll() is None:
+            second_dispatcher.kill()
+            second_dispatcher.wait(timeout=5)
+        second_log.close()
+
+    active_path = repo / ".spec-state" / "autopilot" / "active.json"
+    if active_path.exists():
+        assert json.loads(active_path.read_text(encoding="utf-8")) == {}

@@ -250,15 +250,19 @@ jobs:
           - python-version: "3.11"
             distribution: wheel
             full_suite: true
+            cli_matrix: false
           - python-version: "3.12"
             distribution: wheel
             full_suite: true
+            cli_matrix: true
           - python-version: "3.13"
             distribution: wheel
             full_suite: true
+            cli_matrix: false
           - python-version: "3.12"
             distribution: sdist
             full_suite: false
+            cli_matrix: false
     steps:
       - name: Checkout test suite without credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -363,6 +367,15 @@ jobs:
           Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests/test_windows_probe.py -v 2>&1 | Tee-Object artifacts/focused.log
           exit $LASTEXITCODE
+      - name: Run installed-artifact Windows CLI matrix
+        if: ${{ matrix.cli_matrix }}
+        shell: pwsh
+        env:
+          SPEC_WINDOWS_INSTALLED_CLI_MATRIX: "1"
+        run: |
+          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests/test_windows_probe.py::test_installed_artifact_cli_matrix -vv 2>&1 | Tee-Object artifacts/installed-cli-matrix.log
+          exit $LASTEXITCODE
       - name: Summarize Windows gate
         if: ${{ always() }}
         shell: pwsh
@@ -372,7 +385,8 @@ jobs:
 
           Python ${{ matrix.python-version }} / ${{ matrix.distribution }}: installation,
           dependency checks, CLI and import smoke tests are required. Wheel jobs also
-          require lint, the portable test suite, and native Windows integrations.
+          require lint, the portable test suite, and native Windows integrations. The
+          Python 3.12 wheel additionally runs the installed-artifact end-to-end CLI matrix.
           "@ >> $env:GITHUB_STEP_SUMMARY
       - name: Upload Windows probe logs
         if: ${{ always() }}
