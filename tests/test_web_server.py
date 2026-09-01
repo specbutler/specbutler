@@ -302,9 +302,14 @@ class TestServerLifecycle:
             ),
             patch("spec_runtime.web.server._wait_for_port", return_value=True),
         ):
-            assert _recover_launch(tmp_path) is None
-        assert _launch_path(tmp_path).exists()
-        assert helper_path.exists()
+            recovered = _recover_launch(tmp_path)
+        if corruption == "wrong-listener":
+            assert recovered == token
+            assert _launch_path(tmp_path).exists()
+        else:
+            assert recovered is None
+            assert _launch_path(tmp_path).exists() == (corruption == "malformed")
+        assert helper_path.exists() == (corruption != "stale-identity")
 
     def test_is_server_running_false_when_no_pid(self, tmp_path):
         with patch("spec_runtime.web.server._pid_path", return_value=tmp_path / "nonexistent"):

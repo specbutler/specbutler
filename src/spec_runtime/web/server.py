@@ -246,8 +246,14 @@ def _write_launch_reservation(
     atomic_write_text(path, json.dumps(payload, sort_keys=True) + "\n")
 
 
-def _recover_launch(repo_root: Path) -> object | None:
-    """Publish a helper token left behind by an interrupted Windows launcher."""
+def _recover_launch(repo_root: Path, *, readiness_timeout: float = 1.0) -> object | None:
+    """Recover or reserve a Windows launch left by another launcher.
+
+    A valid live token is returned even before readiness.  Callers therefore
+    treat the launch as occupied instead of starting a duplicate service.  The
+    durable public token is only written after the authenticated child-ready
+    record and listener probe both succeed.
+    """
     from spec_runtime.process_supervisor import SupervisionToken, identity_matches
 
     try:
@@ -264,22 +270,48 @@ def _recover_launch(repo_root: Path) -> object | None:
             return None
         if reservation.get("listener") != listener or not supervision_id or not nonce:
             return None
+        # The payload executes the normal foreground start path.  It must not
+        # mistake its own reservation for an already-running server.
+        if os.environ.get("SPEC_WEB_READY_NONCE") == nonce:
+            return None
         token = SupervisionToken.from_dict(json.loads(expected_helper.read_text(encoding="utf-8")))
-        ready = json.loads(_ready_path(repo_root).read_text(encoding="utf-8"))
-        if (
-            token.token != supervision_id
-            or ready.get("nonce") != nonce
-            or ready.get("host") != host
-            or int(ready.get("port", -1)) != port
-            or ready.get("listener") != listener
-            or ready.get("payload_identity") != token.payload.to_dict()
-            or not identity_matches(token.identity)
-            or not identity_matches(token.payload)
-            or not _wait_for_port(host, port, timeout=0.25)
-        ):
+        if token.token != supervision_id:
             return None
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
+
+    helper_live = identity_matches(token.identity)
+    payload_live = identity_matches(token.payload)
+    if not helper_live and not payload_live:
+        _launch_path(repo_root).unlink(missing_ok=True)
+        _ready_path(repo_root).unlink(missing_ok=True)
+        expected_helper.unlink(missing_ok=True)
+        return None
+
+    if helper_live and payload_live:
+        _wait_for_ready_record(
+            repo_root,
+            nonce=nonce,
+            token=token,
+            timeout=readiness_timeout,
+        )
+    try:
+        ready = json.loads(_ready_path(repo_root).read_text(encoding="utf-8"))
+        payload_live = identity_matches(token.payload)
+        authenticated_ready = (
+            ready.get("nonce") == nonce
+            and ready.get("host") == host
+            and int(ready.get("port", -1)) == port
+            and ready.get("listener") == listener
+            and ready.get("payload_identity") == token.payload.to_dict()
+            and payload_live
+            and _wait_for_port(host, port, timeout=0.25)
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        authenticated_ready = False
+    if not authenticated_ready:
+        return token
+
     write_supervision_token(repo_root, token)
     _launch_path(repo_root).unlink(missing_ok=True)
     expected_helper.unlink(missing_ok=True)
@@ -821,6 +853,8 @@ def stop_server(repo_root: Path) -> int:
     from spec_runtime.process_supervisor import SupervisionToken, terminate
 
     supervision_token = read_supervision_token(repo_root)
+    if supervision_token is None and os.name == "nt":
+        supervision_token = _recover_launch(repo_root, readiness_timeout=0.0)
     if isinstance(supervision_token, SupervisionToken):
         if not terminate(supervision_token):
             print(
