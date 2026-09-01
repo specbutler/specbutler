@@ -79,7 +79,7 @@ def test_clean_rejects_invalid_spec_id_before_any_lookup_or_mutation(
         patch("spec_runtime.git_common.resolve_common_root") as resolve_root,
         patch.object(cli, "_lazy_config") as load_config,
         patch.object(cli, "_lazy_orchestrator") as load_orchestrator,
-        patch.object(cli.subprocess, "run") as run_subprocess,
+        patch("spec_runtime.git_common.subprocess.run") as run_subprocess,
         patch.object(shutil, "rmtree") as remove_tree,
     ):
         result = cli._cmd_clean(argparse.Namespace(spec=spec_id))
@@ -112,7 +112,10 @@ def test_clean_refuses_live_identity_matched_process_group_before_any_deletion(
         patch("spec_runtime.git_common.resolve_common_root", return_value=repo),
         patch.object(cli, "_lazy_config", return_value=_config(backend="container")),
         patch.object(cli, "_lazy_orchestrator", return_value=orch),
-        patch.object(cli.subprocess, "run", side_effect=AssertionError("no subprocess after refusal")),
+        patch(
+            "spec_runtime.git_common.subprocess.run",
+            side_effect=AssertionError("no subprocess after refusal"),
+        ),
         patch.object(shutil, "rmtree", side_effect=AssertionError("no rmtree after refusal")),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature", force=True))
@@ -171,7 +174,7 @@ def test_clean_treats_reused_pid_with_different_start_time_as_stale(
         patch.object(cli, "_lazy_config", return_value=_config(backend="clone")),
         patch.object(cli, "_lazy_orchestrator", return_value=orch),
         patch("spec_runtime.execution_backend.get_execution_backend", return_value=backend),
-        patch.object(cli.subprocess, "run", side_effect=_git_read_only),
+        patch("spec_runtime.git_common.subprocess.run", side_effect=_git_read_only),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
 
@@ -201,7 +204,7 @@ def test_clean_routes_container_workspace_and_volumes_through_backend_only(
         patch.object(cli, "_lazy_config", return_value=_config(backend="container")),
         patch.object(cli, "_lazy_orchestrator", return_value=orch),
         patch("spec_runtime.execution_backend.get_execution_backend", return_value=backend),
-        patch.object(cli.subprocess, "run", side_effect=_git_read_only),
+        patch("spec_runtime.git_common.subprocess.run", side_effect=_git_read_only),
         patch.object(shutil, "rmtree", side_effect=AssertionError("CLI must not raw-delete backend resources")),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
@@ -231,7 +234,7 @@ def test_clean_missing_container_state_preserves_workspace_and_recommends_gc(
         patch.object(cli, "_lazy_config", return_value=_config(backend="container")),
         patch.object(cli, "_lazy_orchestrator", return_value=orch),
         patch("spec_runtime.execution_backend.get_execution_backend", backend_factory),
-        patch.object(cli.subprocess, "run", side_effect=_git_read_only),
+        patch("spec_runtime.git_common.subprocess.run", side_effect=_git_read_only),
         patch.object(shutil, "rmtree", side_effect=AssertionError("workspace must survive")),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
@@ -263,7 +266,10 @@ def test_clean_refuses_live_registered_agent_with_pid_start_identity(
             return_value=[entry],
         ),
         patch("spec_runtime.worktree_process_registry.is_process_alive", return_value=True),
-        patch.object(cli.subprocess, "run", side_effect=AssertionError("no destructive subprocess")),
+        patch(
+            "spec_runtime.git_common.subprocess.run",
+            side_effect=AssertionError("no destructive subprocess"),
+        ),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
 
