@@ -5497,7 +5497,12 @@ def _stop_worktree_local_postgres(
 
 def _count_sysv_shm_segments() -> int | None:
     """Return count of SysV shared-memory segments, or None when unavailable."""
-    result = run_subprocess(["ipcs", "-m"])
+    if os.name == "nt":
+        return None
+    try:
+        result = run_subprocess(["ipcs", "-m"])
+    except FileNotFoundError:
+        return None
     if result.returncode != 0:
         return None
     segment_count = 0

@@ -15227,6 +15227,22 @@ class TestSharedMemoryPreflight:
         with patch.object(orch, "run_subprocess", return_value=linux_result):
             assert orch._count_sysv_shm_segments() == 4
 
+    def test_count_sysv_shm_segments_skips_native_windows(self):
+        with (
+            patch.object(orch.os, "name", "nt"),
+            patch.object(orch, "run_subprocess") as mock_run,
+        ):
+            assert orch._count_sysv_shm_segments() is None
+
+        mock_run.assert_not_called()
+
+    def test_count_sysv_shm_segments_handles_missing_ipcs(self):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", side_effect=FileNotFoundError),
+        ):
+            assert orch._count_sysv_shm_segments() is None
+
     def test_verify_preflight_skips_when_usage_is_low(self, repo: Path):
         run = self._make_run()
         low_count = max(0, orch.SHM_PREFLIGHT_CLEANUP_THRESHOLD - 1)
