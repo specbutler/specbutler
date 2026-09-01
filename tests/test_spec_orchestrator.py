@@ -17347,6 +17347,7 @@ class TestLocalReviewHelpers:
     def test_build_local_review_env_strips_push_credentials(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ):
         monkeypatch.setenv("GITHUB_TOKEN", "secret")
         monkeypatch.setenv("GH_TOKEN", "secret-two")
@@ -17356,7 +17357,8 @@ class TestLocalReviewHelpers:
         monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.name")
         monkeypatch.setenv("GIT_CONFIG_VALUE_0", "Test")
 
-        env = orch._build_local_review_env()
+        scratch_dir = tmp_path / "review-scratch"
+        env = orch._build_local_review_env(temp_dir=scratch_dir)
 
         assert "GITHUB_TOKEN" not in env
         assert "GH_TOKEN" not in env
@@ -17368,6 +17370,10 @@ class TestLocalReviewHelpers:
         assert env["GIT_CONFIG_VALUE_1"] == ""
         assert env["GIT_CONFIG_KEY_2"] == "remote.origin.pushurl"
         assert env["GIT_CONFIG_VALUE_2"] == "codex-review-disabled://origin"
+        assert env["TMPDIR"] == str(scratch_dir.resolve())
+        assert env["TMP"] == str(scratch_dir.resolve())
+        assert env["TEMP"] == str(scratch_dir.resolve())
+        assert env["PYTHONDONTWRITEBYTECODE"] == "1"
 
     def test_build_local_review_command_delegates_to_agent_adapter(
         self,
@@ -17375,6 +17381,7 @@ class TestLocalReviewHelpers:
     ):
         schema_path = tmp_path / "schema.json"
         output_path = tmp_path / "out.json"
+        scratch_dir = tmp_path / "review-scratch"
 
         cmd = orch._build_local_review_command(
             prompt="review this change",
@@ -17382,10 +17389,12 @@ class TestLocalReviewHelpers:
             output_path=output_path,
             agent_name="codex",
             reasoning_effort=orch.LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT,
+            writable_temp_dir=scratch_dir,
         )
 
         assert cmd[0:5] == ["codex", "exec", "--ephemeral", "-s", "read-only"]
         assert "--output-schema" in cmd
+        assert cmd[cmd.index("--add-dir") + 1] == str(scratch_dir)
         assert "review this change" in cmd
 
     def test_build_local_review_command_works_with_claude(
@@ -18507,6 +18516,7 @@ class TestLocalReviewPhase:
         (schema_dir / "codex-review.schema.json").write_text("{}\n")
         review_worktree = tmp_path / "review"
         review_worktree.mkdir()
+        observed_scratch: list[Path] = []
 
         @contextmanager
         def fake_review_worktree(repo_root: Path, *, head_sha: str, branch=None):  # noqa: ARG001
@@ -18525,6 +18535,15 @@ class TestLocalReviewPhase:
             assert repo_root == repo
             assert cmd[0] == "codex"
             assert cwd == review_worktree
+            scratch_dir = Path(cmd[cmd.index("--add-dir") + 1])
+            observed_scratch.append(scratch_dir)
+            assert scratch_dir.is_dir()
+            assert scratch_dir != review_worktree
+            assert env["TMPDIR"] == str(scratch_dir)
+            assert env["TMP"] == str(scratch_dir)
+            assert env["TEMP"] == str(scratch_dir)
+            assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+            (scratch_dir / "pytest-probe").write_text("writable\n")
             output_idx = cmd.index("-o")
             Path(cmd[output_idx + 1]).write_text(
                 json.dumps(
@@ -18555,6 +18574,11 @@ class TestLocalReviewPhase:
             )
 
         assert review_result.status == "approved"
+        assert len(observed_scratch) == 1
+        assert not orch.LOCAL_REVIEW_SCRATCH_PREFIX.startswith(
+            orch.LOCAL_REVIEW_WORKTREE_PREFIX
+        )
+        assert not observed_scratch[0].exists()
         assert "[spec] my-feature: review running with codex for PR #42" in capsys.readouterr().err
 
     def test_run_local_review_timeout_preserves_partial_output(
@@ -37081,7 +37105,7 @@ class TestEnforcePlaywrightBrowserPin:
 
 
 class TestReviewGateEvidence:
-    """The reviewer runs read-only and cannot execute the suite."""
+    """The reviewer gets authoritative gates plus read-only re-execution."""
 
     def _run(self, tmp_path: Path):
         run = orch.RunState(run_id="r1", spec_id="s", branch="code/s--1")
@@ -37108,7 +37132,8 @@ class TestReviewGateEvidence:
 
         assert "make test" in out and "passed" in out
         assert "authoritative" in out
-        assert "do not report an inability to run tests as a finding" in out
+        assert "dedicated writable scratch directory" in out
+        assert "Do not report an inability to run tests as a product finding" in out
 
     def test_empty_when_no_gate_status(self, tmp_path: Path):
         run = self._run(tmp_path)

@@ -450,6 +450,7 @@ class AgentAdapter(Protocol):
         output_path: Path,
         schema_path: Path | None = None,
         mcp_config_path: Path | None = None,
+        writable_temp_dir: Path | None = None,
     ) -> list[str]:
         """Build the shell command to run an independent code review.
 
@@ -538,8 +539,9 @@ class ClaudeAgent:
         output_path: Path,
         schema_path: Path | None = None,
         mcp_config_path: Path | None = None,
+        writable_temp_dir: Path | None = None,
     ) -> list[str]:
-        del output_path, schema_path  # Claude streams review JSON to stdout.
+        del output_path, schema_path, writable_temp_dir  # Claude streams review JSON to stdout.
         cmd = ["claude", "-p", "--dangerously-skip-permissions"]
         if mcp_config_path:
             cmd += ["--mcp-config", str(mcp_config_path), "--strict-mcp-config"]
@@ -642,6 +644,7 @@ class CodexAgent:
         output_path: Path,
         schema_path: Path | None = None,
         mcp_config_path: Path | None = None,
+        writable_temp_dir: Path | None = None,
     ) -> list[str]:
         del mcp_config_path  # Codex non-interactive isolation uses CODEX_HOME, not a config file path.
         cmd = [
@@ -652,6 +655,10 @@ class CodexAgent:
             "read-only",
         ]
         cmd += _codex_linux_sandbox_overrides()
+        if writable_temp_dir is not None:
+            # Keep the checkout read-only while allowing test runners to use
+            # one disposable scratch root for temporary files.
+            cmd += ["--add-dir", str(writable_temp_dir)]
         if schema_path:
             cmd += ["--output-schema", str(schema_path)]
         cmd += ["-o", str(output_path), prompt]

@@ -274,6 +274,10 @@ REVIEW_FINDING_CLASS_INSTRUCTION = (
 LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX = "Local review must rerun before merge"
 LOCAL_REVIEW_RERUN_AFTER_SYNC_LEGACY_PREFIX = "Local review must rerun after syncing with origin/main"
 LOCAL_REVIEW_WORKTREE_PREFIX = "spec-review-"
+# Deliberately does not match LOCAL_REVIEW_WORKTREE_PREFIX: concurrent stale
+# worktree cleanup must never mistake a live reviewer scratch root for a stale
+# detached Git checkout.
+LOCAL_REVIEW_SCRATCH_PREFIX = "spec-reviewer-scratch-"
 LOCAL_MERGEABILITY_WORKTREE_PREFIX = "spec-mergeability-"
 LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX = "spec-block-debugger-"
 BLOCK_DEBUGGER_PRIVATE_CLONE_MARKER = ".spec-block-debugger-owner.json"
@@ -11437,12 +11441,11 @@ def _is_local_review_timeout_message(message: object) -> bool:
 def _format_gate_evidence_for_review(repo_root: Path, run: "RunState") -> str:
     """Summarize the orchestrator's own gate run for the reviewer.
 
-    The review agent runs under a read-only sandbox, so it cannot execute the
-    suite: reviews repeatedly reported "the read-only environment had no usable
-    temporary directory" and fell back to reading the diff. Meanwhile the
-    orchestrator has just run every required gate against this exact head.
-    Hand over that result instead of leaving the reviewer to guess -- or worse,
-    to assert coverage claims it had no way to check.
+    The review agent receives a read-only checkout plus one disposable writable
+    temporary directory, so it can run tests without being able to mutate the
+    source. The orchestrator has also just run every required gate against this
+    exact head. Hand over those authoritative results so the reviewer can focus
+    any additional execution on the changed behavior.
     """
     _, gate_data = _read_gate_status(repo_root, run)
     if not isinstance(gate_data, dict):
@@ -11467,11 +11470,13 @@ def _format_gate_evidence_for_review(repo_root: Path, run: "RunState") -> str:
         "These gates were run against this exact head commit by the orchestrator, "
         "outside your sandbox, before review started:\n\n"
         + "\n".join(lines)
-        + "\n\nTreat these as authoritative. You are running read-only and cannot "
-        "execute the suite yourself, so do not report an inability to run tests as "
-        "a finding, and do not assume a gate failed merely because you could not "
-        "run it. Judge the diff on correctness against the spec, and rely on the "
-        "results above for whether the suite passes.\n"
+        + "\n\nTreat these as authoritative. The source checkout is read-only, but "
+        "the standard temporary-directory environment variables point to a dedicated "
+        "writable scratch directory, so you may run targeted tests or the suite. Do "
+        "not report an inability to run tests as a product finding unless the changed "
+        "behavior itself prevents validation, and do not assume a gate failed merely "
+        "because your additional run could not start. Judge the diff on correctness "
+        "against the spec and rely on the results above for required-gate status.\n"
     )
 
 
@@ -11656,10 +11661,19 @@ def _summarize_local_review_timeout(
 def _build_local_review_env(
     *,
     extra_git_configs: dict[str, str] | None = None,
+    temp_dir: Path | None = None,
 ) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key not in LOCAL_REVIEW_DISABLED_CREDENTIAL_ENV_VARS}
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = shutil.which("false") or "/usr/bin/false"
+    if temp_dir is not None:
+        rendered_temp_dir = str(temp_dir.resolve())
+        env["TMPDIR"] = rendered_temp_dir
+        env["TMP"] = rendered_temp_dir
+        env["TEMP"] = rendered_temp_dir
+        # Python's default bytecode cache lives beside imported source files,
+        # which is intentionally forbidden in a read-only review checkout.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     try:
         config_count = int(env.get("GIT_CONFIG_COUNT", "0") or "0")
@@ -11698,6 +11712,7 @@ def _build_local_review_command(
     agent_name: str = "",
     reasoning_effort: str = LOCAL_REVIEW_REASONING_EFFORT,
     mcp_config_path: Path | None = None,
+    writable_temp_dir: Path | None = None,
 ) -> list[str]:
     from .agent_adapter import get_agent_adapter
 
@@ -11709,6 +11724,8 @@ def _build_local_review_command(
     }
     if _adapter_method_accepts_kwarg(agent.build_review_command, "mcp_config_path"):
         review_kwargs["mcp_config_path"] = mcp_config_path
+    if _adapter_method_accepts_kwarg(agent.build_review_command, "writable_temp_dir"):
+        review_kwargs["writable_temp_dir"] = writable_temp_dir
     return agent.build_review_command(**review_kwargs)
 
 
@@ -12248,6 +12265,28 @@ def _cleanup_stale_review_worktrees(repo_root: Path) -> None:
         prefix=LOCAL_REVIEW_WORKTREE_PREFIX,
         label="review worktree",
     )
+
+
+@contextmanager
+def _temporary_local_review_scratch_dir() -> Iterator[Path]:
+    """Yield the only writable filesystem root exposed to a local reviewer."""
+    scratch_path = Path(
+        tempfile.mkdtemp(
+            prefix=LOCAL_REVIEW_SCRATCH_PREFIX,
+            dir=LOCAL_REVIEW_WORKTREE_ROOT,
+        )
+    ).resolve()
+    try:
+        yield scratch_path
+    finally:
+        try:
+            shutil.rmtree(scratch_path)
+        except OSError as exc:
+            logger.warning(
+                "Could not remove local review scratch directory %s: %s",
+                scratch_path,
+                exc,
+            )
 
 
 def _commit_present(repo_root: Path, head_sha: str) -> subprocess.CompletedProcess:
@@ -19284,9 +19323,12 @@ def _run_local_review(
             f"```json\n{schema_text}\n```"
         )
 
-    with _temporary_review_worktree(
-        repo_root, head_sha=expected_head_sha, branch=run.branch
-    ) as review_worktree:
+    with (
+        _temporary_review_worktree(
+            repo_root, head_sha=expected_head_sha, branch=run.branch
+        ) as review_worktree,
+        _temporary_local_review_scratch_dir() as review_scratch_dir,
+    ):
         review_exec_failed_summary = ""
         review_mcp_config_path: Path | None = None
         review_codex_home: Path | None = None
@@ -19341,8 +19383,9 @@ def _run_local_review(
             agent_name=review_agent,
             reasoning_effort=reasoning_effort,
             mcp_config_path=review_mcp_config_path,
+            writable_temp_dir=review_scratch_dir,
         )
-        review_env = _build_local_review_env()
+        review_env = _build_local_review_env(temp_dir=review_scratch_dir)
         # Put the review worktree's venv on the reviewer's PATH so bootstrap
         # actually pays off: the reviewer can run bare ``pytest`` / ``ruff``
         # against the installed project instead of falling back to diff-only.
