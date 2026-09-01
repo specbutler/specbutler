@@ -302,7 +302,7 @@ def publish_sticky_comment(
 
 def load_review_result(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise ValueError(f"Could not read review result file: {path} ({exc})") from exc
     except json.JSONDecodeError as exc:

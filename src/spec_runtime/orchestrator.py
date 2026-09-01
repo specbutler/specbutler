@@ -1564,16 +1564,18 @@ def _write_latest_and_attempt_artifacts(
     run_dir.mkdir(parents=True, exist_ok=True)
     latest_path = run_dir / filename
     rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    latest_path.write_text(rendered)
+    latest_path.write_text(rendered, encoding="utf-8")
     if attempt_number is not None and attempt_number > 0:
-        _attempt_artifact_path(run_dir, filename, attempt_number).write_text(rendered)
+        _attempt_artifact_path(run_dir, filename, attempt_number).write_text(
+            rendered, encoding="utf-8"
+        )
     if launch_number is not None and launch_number > 0:
         launch_path = run_dir / _launch_artifact_filename(filename, launch_number)
         # Launch identifiers are monotonic and immutable. A later annotation of
         # the latest/attempt alias must not erase the evidence captured when the
         # agent launch was first recorded.
         if not launch_path.exists():
-            launch_path.write_text(rendered)
+            launch_path.write_text(rendered, encoding="utf-8")
     return latest_path
 
 
@@ -2671,7 +2673,8 @@ def _snapshot_container_workspace_after_setup(
         logs = run_root / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         (logs / "snapshot-restore-fallback.log").write_text(
-            f"Container backend setup snapshot unavailable: {exc}\n"
+            f"Container backend setup snapshot unavailable: {exc}\n",
+            encoding="utf-8",
         )
 
 
@@ -2704,7 +2707,8 @@ def _restore_container_workspace_for_retry(
         logs = run_root / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         (logs / "snapshot-restore-fallback.log").write_text(
-            f"Container backend retry restore unavailable: {exc}\n"
+            f"Container backend retry restore unavailable: {exc}\n",
+            encoding="utf-8",
         )
         return workspace
     _reposition_restored_workspace_head(restored, backend, ctx, prior_head)
@@ -2715,7 +2719,7 @@ def _latest_rescue_bundle_for_head(run_root: Path, head_sha: str) -> Path | None
     """Return the newest rescue bundle whose manifest recorded ``head_sha``."""
     index_path = run_root / "rescue" / "index.json"
     try:
-        entries = json.loads(index_path.read_text())
+        entries = json.loads(index_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(entries, list):
@@ -3565,7 +3569,7 @@ def _claude_credentials_preflight_error(
         # evidence of expiry.
         return ""
     try:
-        payload = json.loads(src.read_text())
+        payload = json.loads(src.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
     oauth = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
@@ -4377,7 +4381,7 @@ def _audit_intake_reset(
         "previous_intake": previous_payload,
     }
     (audit_dir / f"{run.run_id}-intake-reset-{ts}.json").write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
 
@@ -4841,7 +4845,7 @@ def _backend_mcp_servers_for_workspace(worktree_path: Path) -> dict[str, dict[st
             )
         return {}
     try:
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Could not read container backend state %s: %s", state_path, exc)
         return {}
@@ -4928,7 +4932,8 @@ def _write_claude_mcp_config(
             },
             indent=2,
         )
-        + "\n"
+        + "\n",
+        encoding="utf-8",
     )
 
 
@@ -5042,7 +5047,7 @@ def _user_mcp_servers_for_passthrough(
     if agent_name == "codex":
         source = _user_codex_home() / "config.toml"
         try:
-            payload = tomllib.loads(source.read_text())
+            payload = tomllib.loads(source.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError) as exc:
             logger.warning(
                 "Could not read Codex MCP user config %s for [mcp].allow_from_user passthrough: %s",
@@ -5056,7 +5061,7 @@ def _user_mcp_servers_for_passthrough(
     elif agent_name == "claude":
         source = Path.home() / ".claude.json"
         try:
-            payload = json.loads(source.read_text())
+            payload = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning(
                 "Could not read Claude MCP user config %s for [mcp].allow_from_user passthrough: %s",
@@ -5237,7 +5242,7 @@ def _write_claude_isolated_home(
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
             directory.unlink()
         directory.mkdir(parents=True, exist_ok=True)
-    (home / ".gitignore").write_text("*\n")
+    (home / ".gitignore").write_text("*\n", encoding="utf-8")
 
     src_config = source_config if source_config is not None else Path.home() / ".claude.json"
     dst_config = home / ".claude.json"
@@ -5267,7 +5272,7 @@ def _write_claude_isolated_home(
     dst_creds = home / ".claude" / ".credentials.json"
     if src_creds.exists():
         try:
-            payload = json.loads(src_creds.read_text())
+            payload = json.loads(src_creds.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
                 oauth = payload.get("claudeAiOauth")
                 if isinstance(oauth, dict):
@@ -5780,7 +5785,7 @@ def _load_spec_creation_prompt(
 ) -> str:
     prompt_path = repo_root / SPEC_CREATION_PROMPT_FILE
     if prompt_path.exists():
-        prompt = prompt_path.read_text().strip()
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
         prompt = (
             "Author a focused spec for this repository. Read AGENTS.md and "
@@ -6192,7 +6197,7 @@ def _write_json_file_atomically(path: Path, payload: dict) -> None:
 
 def _read_json_dict(path: Path) -> dict | None:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return None
     return data if isinstance(data, dict) else None
@@ -6216,7 +6221,7 @@ def _worktree_registry_state_root(repo_root: Path, worktree_path: Path) -> Path:
 def _read_worktree_postgres_pid(worktree_path: Path) -> int:
     pid_file = worktree_path / ".local" / "postgres" / "data" / "postmaster.pid"
     try:
-        first_line = pid_file.read_text().splitlines()[0].strip()
+        first_line = pid_file.read_text(encoding="utf-8").splitlines()[0].strip()
     except (IndexError, OSError):
         return 0
     try:
@@ -6649,7 +6654,7 @@ def _persist_pinned_spec(
     _set_pinned_spec_metadata(run, spec_path=spec_path, text=text)
     snapshot_path = _run_spec_snapshot_path(repo_root, run.run_id)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_path.write_text(text)
+    snapshot_path.write_text(text, encoding="utf-8")
 
 
 def _set_pinned_spec_metadata(
@@ -6674,7 +6679,7 @@ def _pin_run_spec_from_file(
         repo_root,
         run,
         spec_path=rel_path,
-        text=spec_file.read_text(),
+        text=spec_file.read_text(encoding="utf-8"),
     )
 
 
@@ -6686,7 +6691,7 @@ def _spec_path_matches_revision(spec_path: Path, spec_revision: str) -> bool:
     if not spec_revision:
         return True
     try:
-        return _spec_revision_for_text(spec_path.read_text()) == spec_revision
+        return _spec_revision_for_text(spec_path.read_text(encoding="utf-8")) == spec_revision
     except OSError:
         return False
 
@@ -6723,7 +6728,7 @@ def _ensure_run_spec_binding(run: RunState, repo_root: Path) -> RunState:
 
     snapshot_path = _run_spec_snapshot_path(repo_root, run.run_id)
     if snapshot_path.exists():
-        revision = _spec_revision_for_text(snapshot_path.read_text())
+        revision = _spec_revision_for_text(snapshot_path.read_text(encoding="utf-8"))
         if run.spec_revision != revision:
             run.spec_revision = revision
             changed = True
@@ -6731,7 +6736,7 @@ def _ensure_run_spec_binding(run: RunState, repo_root: Path) -> RunState:
         source_path = _existing_spec_source_path(repo_root, run)
         if source_path is not None:
             if source_path == _legacy_current_spec_path(repo_root, run):
-                source_text = source_path.read_text()
+                source_text = source_path.read_text(encoding="utf-8")
                 try:
                     _persist_pinned_spec(
                         repo_root,
@@ -6747,7 +6752,7 @@ def _ensure_run_spec_binding(run: RunState, repo_root: Path) -> RunState:
                     )
                 changed = True
             elif source_path != snapshot_path:
-                source_text = source_path.read_text()
+                source_text = source_path.read_text(encoding="utf-8")
                 try:
                     worktree_root = resolve_worktree_path(run, repo_root)
                     if source_path.is_relative_to(worktree_root):
@@ -6791,13 +6796,13 @@ def _restore_pinned_spec_into_worktree(
     if not snapshot_path.exists():
         raise FileNotFoundError(f"Pinned spec snapshot missing for run {run.run_id}: {snapshot_path}")
 
-    expected_text = snapshot_path.read_text()
+    expected_text = snapshot_path.read_text(encoding="utf-8")
     target_path = _spec_path_in_tree(worktree_path, run)
-    if target_path.exists() and target_path.read_text() == expected_text:
+    if target_path.exists() and target_path.read_text(encoding="utf-8") == expected_text:
         return target_path
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(expected_text)
+    target_path.write_text(expected_text, encoding="utf-8")
     return target_path
 
 
@@ -6890,7 +6895,7 @@ def _read_gate_status(repo_root: Path, run: RunState) -> tuple[Path, dict | None
         if not path.exists():
             continue
         try:
-            return path, json.loads(path.read_text())
+            return path, json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             return path, None
     return _gate_status_path(repo_root, run), None
@@ -7622,7 +7627,7 @@ class RunState:
     @classmethod
     def load(cls, repo_root: Path, run_id: str) -> RunState:
         p = _run_state_path(repo_root, run_id)
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8"))
         return cls.from_dict(data)
 
     @classmethod
@@ -7734,7 +7739,7 @@ class RunState:
         runs: list[RunState] = []
         for candidate in sorted(runs_dir.glob("*.json"), key=lambda path: path.name):
             try:
-                data = json.loads(candidate.read_text())
+                data = json.loads(candidate.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
             runs.append(cls.from_dict(data))
@@ -7787,7 +7792,7 @@ class RunState:
         runs: list[RunState] = []
         for candidate in sorted(runs_dir.glob("*.json"), key=lambda path: path.name):
             try:
-                data = json.loads(candidate.read_text())
+                data = json.loads(candidate.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
             if data.get("spec_id") != spec_id:
@@ -7863,7 +7868,10 @@ class IntakeResult:
         d = _state_root(repo_root) / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
         p = d / "intake.json"
-        p.write_text(json.dumps(asdict(self), indent=2, sort_keys=True) + "\n")
+        p.write_text(
+            json.dumps(asdict(self), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         return p
 
     @classmethod
@@ -7872,7 +7880,7 @@ class IntakeResult:
         if not p.exists():
             return None
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
             return cls(**data)
         except (json.JSONDecodeError, TypeError):
             return None
@@ -7959,7 +7967,7 @@ class ImplementContext:
         if not p.exists():
             return None
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
             data.pop("implement_dev_server_warning", None)
             return cls(**data)
         except (json.JSONDecodeError, TypeError):
@@ -8047,7 +8055,7 @@ class ImplementResult:
         if not p.exists():
             return None
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
             return cls(**data)
         except (json.JSONDecodeError, TypeError):
             return None
@@ -8239,7 +8247,7 @@ class ReviewResult:
         if not p.exists():
             return None
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, TypeError):
             return None
 
@@ -8328,7 +8336,7 @@ class BlockDiagnosis:
         if not p.exists():
             return None
         try:
-            return _coerce_block_diagnosis(json.loads(p.read_text()))
+            return _coerce_block_diagnosis(json.loads(p.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -8465,9 +8473,9 @@ class OperatorSteering:
         payload = asdict(self)
         rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
         event_path = run_dir / _operator_steering_event_filename(self.event_id)
-        event_path.write_text(rendered)
+        event_path.write_text(rendered, encoding="utf-8")
         if update_latest:
-            (run_dir / OPERATOR_STEERING_FILENAME).write_text(rendered)
+            (run_dir / OPERATOR_STEERING_FILENAME).write_text(rendered, encoding="utf-8")
         return event_path
 
     @classmethod
@@ -8476,7 +8484,7 @@ class OperatorSteering:
         if not path.exists():
             return None
         try:
-            return _coerce_operator_steering(json.loads(path.read_text()))
+            return _coerce_operator_steering(json.loads(path.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -8488,7 +8496,7 @@ class OperatorSteering:
         events: list[OperatorSteering] = []
         for path in sorted(run_dir.glob("operator-steering.event-*.json")):
             try:
-                payload = json.loads(path.read_text())
+                payload = json.loads(path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 continue
             steering = _coerce_operator_steering(payload)
@@ -8643,7 +8651,7 @@ class OperatorRequest:
         if not p.exists():
             return None
         try:
-            return _coerce_operator_request(json.loads(p.read_text()))
+            return _coerce_operator_request(json.loads(p.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -9383,7 +9391,7 @@ def _latest_rescue_snapshot(run: RunState, repo_root: Path) -> dict | None:
         workspace_root = repo_root / workspace_root
     index_path = workspace_root / run.run_id / "rescue" / "index.json"
     try:
-        entries = json.loads(index_path.read_text())
+        entries = json.loads(index_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(entries, list) or not entries:
@@ -9704,7 +9712,7 @@ def _read_optional_json_payload(path: Path) -> object | None:
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -10002,7 +10010,9 @@ def _write_block_debugger_context(
         ],
     }
     artifact_paths["context"].parent.mkdir(parents=True, exist_ok=True)
-    artifact_paths["context"].write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    artifact_paths["context"].write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return artifact_paths["context"], head_sha, worktree_status
 
 
@@ -10120,7 +10130,7 @@ def _stage_block_debugger_isolated_config(
     if agent.name == "claude":
         empty_config = _mcp_config_path(debug_worktree)
         empty_config.parent.mkdir(parents=True, exist_ok=True)
-        empty_config.write_text('{"mcpServers": {}}\n')
+        empty_config.write_text('{"mcpServers": {}}\n', encoding="utf-8")
         return empty_config, None
     if agent.name == "codex":
         codex_home = _write_codex_isolated_home(
@@ -10194,7 +10204,7 @@ def _maybe_run_block_debugger(
                 run.last_error = original_last_error
                 raise ValueError(validation_error)
             if agent.capabilities.review_output_on_stdout and schema_path.is_file():
-                schema_text = schema_path.read_text().strip()
+                schema_text = schema_path.read_text(encoding="utf-8").strip()
                 prompt = (
                     f"{prompt}\n\n"
                     "You MUST output a single JSON object (no markdown wrapping) matching this schema:\n"
@@ -10205,7 +10215,7 @@ def _maybe_run_block_debugger(
                 # writable, and Claude has no equivalent read-only grant.
                 # Inline the complete evidence package for both agents.
                 try:
-                    context_content = context_path.read_text().strip()
+                    context_content = context_path.read_text(encoding="utf-8").strip()
                     prompt += (
                         "\n\nInlined evidence context "
                         f"(from {_try_relative_posix(context_path, repo_root)}):\n"
@@ -10213,7 +10223,7 @@ def _maybe_run_block_debugger(
                     )
                 except OSError:
                     pass
-            artifact_paths["prompt"].write_text(prompt)
+            artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
             # Always use a temporary worktree so the debugger cannot mutate
             # the real PR branch. At bootstrap-time
             # blocks no worktree/head SHA exists yet, so fall back to the
@@ -10306,7 +10316,7 @@ def _maybe_run_block_debugger(
                             brace_end = stdout_text.rfind("}")
                             if brace_start >= 0 and brace_end > brace_start:
                                 json_text = stdout_text[brace_start : brace_end + 1]
-                            artifact_paths["raw_output"].write_text(json_text)
+                            artifact_paths["raw_output"].write_text(json_text, encoding="utf-8")
                     if completed.returncode != 0:
                         raise ValueError(
                             f"Blocked-run debugger agent failed (exit_code={completed.returncode}): "
@@ -11454,7 +11464,9 @@ def _write_local_review_process_diagnostics(
     debug_path = artifact_paths["process_debug"]
     existing = _read_json_dict(debug_path) or {}
     existing.update(payload)
-    debug_path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
+    debug_path.write_text(
+        json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _write_local_review_timeout_diagnostics(
@@ -11475,7 +11487,7 @@ def _write_local_review_timeout_diagnostics(
         raw_review_size_bytes = raw_review_path.stat().st_size
         if raw_review_text.strip():
             partial_path = artifact_paths["raw_review_partial"]
-            partial_path.write_text(raw_review_text)
+            partial_path.write_text(raw_review_text, encoding="utf-8")
             raw_review_excerpt = redact_sensitive(raw_review_text[:LOCAL_REVIEW_TIMEOUT_RAW_REVIEW_MAX_CHARS].strip())
 
     stdout_text = _coerce_subprocess_stream_text(
@@ -11507,7 +11519,9 @@ def _write_local_review_timeout_diagnostics(
         "timeout_seconds": timeout_exc.timeout,
     }
     debug_path = artifact_paths["timeout_debug"]
-    debug_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    debug_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return debug_path, partial_path
 
 
@@ -11710,7 +11724,7 @@ def _render_block_debugger_prompt(
 
 def _load_block_diagnosis_from_output(path: Path) -> BlockDiagnosis:
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Could not parse blocked-run debugger output {path}: line {exc.lineno} column {exc.colno}"
@@ -11741,7 +11755,9 @@ def _write_failed_local_review_payload(
         "reviewed_at": _now_iso(),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    output_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _is_local_review_timeout_result(review_result: ReviewResult) -> bool:
@@ -11750,7 +11766,7 @@ def _is_local_review_timeout_result(review_result: ReviewResult) -> bool:
 
 def _load_review_result_from_gate_output(result_path: Path) -> ReviewResult:
     try:
-        payload = json.loads(result_path.read_text())
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Could not parse local review gate output {result_path}: line {exc.lineno} column {exc.colno}"
@@ -12337,7 +12353,7 @@ def _cleanup_stale_block_debugger_worktrees(repo_root: Path) -> None:
         if not candidate.is_dir() or not marker.is_file() or not (candidate / ".git").is_dir():
             continue
         try:
-            payload = json.loads(marker.read_text())
+            payload = json.loads(marker.read_text(encoding="utf-8"))
             owner = Path(str(payload.get("repo_root") or "")).resolve()
             marker_pid = int(payload.get("pid") or 0)
             marker_started_at = str(payload.get("process_started_at") or "").strip()
@@ -12441,7 +12457,8 @@ def _create_private_block_debugger_clone(
                 "process_started_at": _current_process_started_at(),
             }
         )
-        + "\n"
+        + "\n",
+        encoding="utf-8",
     )
 
 
@@ -12451,7 +12468,7 @@ def _resolve_worktree_linked_gitdir(worktree_path: Path) -> Path | None:
     if not dot_git.is_file():
         return None
     try:
-        text = dot_git.read_text().strip()
+        text = dot_git.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     prefix = "gitdir: "
@@ -12547,7 +12564,7 @@ def _setup_debugger_common_dir_guard(
     temp_dirs.append(hooks_dir)
     for hook_name in ("pre-commit", "pre-merge-commit", "pre-push"):
         hook_path = hooks_dir / hook_name
-        hook_path.write_text("#!/bin/sh\nexit 1\n")
+        hook_path.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         hook_path.chmod(0o555)
     # Inject core.hooksPath via GIT_CONFIG_* env vars so it merges cleanly
     # with the caller's existing GIT_CONFIG entries.
@@ -13205,7 +13222,7 @@ def _read_slug_from_spec(spec_path: Path) -> str:
     frontmatter_id = str(frontmatter.get("id", "")).strip()
     if frontmatter_id:
         return frontmatter_id
-    for line in spec_path.read_text().splitlines():
+    for line in spec_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped.lower().startswith("slug:"):
             return stripped.split(":", 1)[1].strip()
@@ -13223,7 +13240,7 @@ def _load_task_scoping_prompt(
     prompt_path = repo_root / TASK_SCOPING_PROMPT_FILE
     top_level_spec_pattern = f"{SPEC_RUNTIME_CONFIG.paths.specs_dir}/*.md"
     if prompt_path.exists():
-        prompt = prompt_path.read_text().strip()
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
         prompt = (
             "You are a task-scoping assistant. Ask the user what they want to build, "
@@ -13624,7 +13641,7 @@ def phase_intake(run: RunState, repo_root: Path) -> str:
             previous_payload = asdict(existing_intake)
         else:
             try:
-                previous_payload = json.loads(intake_path.read_text())
+                previous_payload = json.loads(intake_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 previous_payload = {}
         _audit_intake_reset(
@@ -13826,7 +13843,9 @@ def _write_sandbox_config(
                 ],
             },
         }
-        (config_dir / "settings.local.json").write_text(json.dumps(config, indent=2) + "\n")
+        (config_dir / "settings.local.json").write_text(
+            json.dumps(config, indent=2) + "\n", encoding="utf-8"
+        )
         _write_claude_mcp_config(
             worktree_path,
             extra_mcp_servers=extra_mcp_servers,
@@ -13848,7 +13867,8 @@ def _write_sandbox_config(
             'sandbox_mode = "workspace-write"\n'
             'approval_policy = "never"\n\n'
             "[sandbox_workspace_write]\n"
-            "network_access = true\n"
+            "network_access = true\n",
+            encoding="utf-8",
         )
 
 
@@ -14353,6 +14373,8 @@ def _prepare_implement_launch_plan(
         "cwd": worktree_path,
         "env": agent_env,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     progress_tracker: AgentProgressTracker | None = None
     if run.agent == "claude" and use_stream_json:
@@ -15481,6 +15503,8 @@ def _attempt_no_handshake_recovery(
             "cwd": worktree_path,
             "env": recovery_env,
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
         }
         if run.agent == "claude" and use_stream_json:
             popen_kwargs["stdout"] = subprocess.PIPE
@@ -15852,7 +15876,7 @@ def _load_container_outbox_completion_result(
     if result_path is None or not result_path.is_file():
         return None
     try:
-        payload = json.loads(result_path.read_text())
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(payload, dict) or payload.get("run_id") != run_id:
@@ -17499,7 +17523,7 @@ def _record_gate_result(
 ) -> None:
     """Record gate result in gate-status.json (same format as spec_workflow.sh)."""
     if state_file.exists():
-        data = json.loads(state_file.read_text())
+        data = json.loads(state_file.read_text(encoding="utf-8"))
     else:
         data = {"spec_id": spec_id, "gates": {}}
 
@@ -17570,7 +17594,9 @@ def _record_gate_result(
         "history": history[-GATE_HISTORY_LIMIT:],
     }
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    state_file.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _check_spec_authoring_policy(worktree_path: Path, branch: str) -> str:
@@ -18008,7 +18034,7 @@ def _extract_markdown_section_items(
     if not spec_path.exists():
         return []
 
-    text = spec_path.read_text()
+    text = spec_path.read_text(encoding="utf-8")
     in_section = False
     items: list[str] = []
     heading_pattern = f"## {heading}"
@@ -18062,7 +18088,7 @@ def _known_issues_markdown(state_file: Path) -> str:
     if not state_file.exists():
         return "- Gate status file is missing; required gates have not been recorded."
     try:
-        data = json.loads(state_file.read_text())
+        data = json.loads(state_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, TypeError):
         return "- Gate status file is corrupt."
     gates = data.get("gates", {})
@@ -18775,7 +18801,7 @@ def _emit_retry_cap_escalation_summary(
     )
     summary_path = _retry_cap_escalation_summary_path(repo_root, run)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(summary)
+    summary_path.write_text(summary, encoding="utf-8")
 
     if pr_number is not None:
         try:
@@ -18924,7 +18950,10 @@ def _bootstrap_review_worktree(
         }
         try:
             warning_path.parent.mkdir(parents=True, exist_ok=True)
-            warning_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            warning_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         except OSError:
             pass
         logger.warning(
@@ -19070,7 +19099,7 @@ def _run_local_review(
         review_changes=run.review_changes,
         gate_evidence=_format_gate_evidence_for_review(repo_root, run),
     )
-    artifact_paths["prompt"].write_text(prompt)
+    artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
 
     # Resolve schema: repo-level override, then bundled
     schema_path = repo_root / ".github" / "schemas" / "codex-review.schema.json"
@@ -19088,7 +19117,7 @@ def _run_local_review(
     # For agents that write to stdout (no --output-schema), embed the
     # expected JSON structure in the prompt so the agent knows the format.
     if agent.capabilities.review_output_on_stdout and schema_path.is_file():
-        schema_text = schema_path.read_text().strip()
+        schema_text = schema_path.read_text(encoding="utf-8").strip()
         prompt = (
             f"{prompt}\n\n"
             "You MUST output a single JSON object (no markdown wrapping) matching this schema:\n"
@@ -19121,7 +19150,7 @@ def _run_local_review(
         env_note = _review_env_prompt_note(review_worktree)
         if env_note:
             prompt = f"{prompt}{env_note}"
-            artifact_paths["prompt"].write_text(prompt)
+            artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
         if agent.capabilities.supports_mcp:
             # The reviewer subprocess is launched on the host via
             # ``_run_local_review_subprocess``, never through the container
@@ -19194,7 +19223,7 @@ def _run_local_review(
                     if brace_start >= 0 and brace_end > brace_start:
                         json_text = stdout_text[brace_start : brace_end + 1]
                     artifact_paths["raw_review"].parent.mkdir(parents=True, exist_ok=True)
-                    artifact_paths["raw_review"].write_text(json_text)
+                    artifact_paths["raw_review"].write_text(json_text, encoding="utf-8")
 
             if review_exec.returncode != 0:
                 detail = _format_subprocess_failure(review_exec)
@@ -19232,11 +19261,19 @@ def _run_local_review(
         check_name=REVIEW_GATE_CHECK_NAME,
     )
     artifact_paths["review_result"].parent.mkdir(parents=True, exist_ok=True)
-    artifact_paths["review_result"].write_text(json.dumps(evaluation.result_payload, indent=2, sort_keys=True) + "\n")
+    artifact_paths["review_result"].write_text(
+        json.dumps(evaluation.result_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     artifact_paths["summary"].parent.mkdir(parents=True, exist_ok=True)
-    artifact_paths["summary"].write_text(json.dumps(evaluation.machine_summary, indent=2, sort_keys=True) + "\n")
+    artifact_paths["summary"].write_text(
+        json.dumps(evaluation.machine_summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     artifact_paths["job_summary"].parent.mkdir(parents=True, exist_ok=True)
-    artifact_paths["job_summary"].write_text(evaluation.human_summary.rstrip() + "\n")
+    artifact_paths["job_summary"].write_text(
+        evaluation.human_summary.rstrip() + "\n", encoding="utf-8"
+    )
 
     if not artifact_paths["review_result"].is_file():
         raise ValueError("Local review gate did not produce review output")
@@ -19330,7 +19367,10 @@ def _phase_review_local(
     review_result.source_check_name = REVIEW_GATE_CHECK_NAME
     review_result.source_check_url = str(latest_pr.get("url", "")).strip()
     review_result.attempt_number = _current_attempt_number(run)
-    review_result_path.write_text(json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n")
+    review_result_path.write_text(
+        json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     review_result.save(repo_root, run.run_id)
 
     if _is_local_review_timeout_result(review_result):
@@ -19352,7 +19392,10 @@ def _phase_review_local(
         else:
             if check_url:
                 review_result.source_check_url = check_url
-                review_result_path.write_text(json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n")
+                review_result_path.write_text(
+                    json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
                 review_result.save(repo_root, run.run_id)
 
         run.review_decision_status = "blocked"
@@ -19390,7 +19433,10 @@ def _phase_review_local(
 
     if check_url:
         review_result.source_check_url = check_url
-        review_result_path.write_text(json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n")
+        review_result_path.write_text(
+            json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     conclusion = "success" if review_result.status == "approved" else "failure"
     return _apply_review_result(
@@ -21229,7 +21275,9 @@ def _persist_audit(
         "phase": phase,
         "result": asdict(result),
     }
-    audit_path.write_text(json.dumps(audit_data, indent=2, sort_keys=True) + "\n")
+    audit_path.write_text(
+        json.dumps(audit_data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _convergence_attempts(run: RunState) -> int:
@@ -22062,7 +22110,7 @@ def cmd_input(args: argparse.Namespace) -> int:
     spec_file = worktree_path / _spec_path_for_run(run)
     spec_content = ""
     if spec_file.exists():
-        spec_content = spec_file.read_text()
+        spec_content = spec_file.read_text(encoding="utf-8")
 
     request_label = "agent question" if request.kind == "agent_question" else "debugger guidance"
     question = request.prompt or "No specific request recorded."
@@ -23289,7 +23337,7 @@ def _compute_orchestrator_analytics(
 
     for audit_path in sorted(audit_dir.glob("*.json")) if audit_dir.exists() else []:
         try:
-            payload = json.loads(audit_path.read_text())
+            payload = json.loads(audit_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         if not isinstance(payload, dict):
@@ -23529,7 +23577,9 @@ def _cmd_report_completion_to_outbox(
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     except OSError as exc:
         print(f"Error: failed to write container completion outbox {path}: {exc}", file=sys.stderr)
         return 1

@@ -138,7 +138,7 @@ def _is_pipx_environment(dist_name: str) -> bool:
     """
     metadata_path = Path(sys.prefix) / "pipx_metadata.json"
     try:
-        payload = json.loads(metadata_path.read_text())
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
     if not isinstance(payload, dict):
@@ -325,6 +325,8 @@ def _display_command(command: tuple[str, ...]) -> str:
 def detect_installation(dist_name: str = PACKAGE_NAME) -> InstallInfo:
     dist = _read_distribution(dist_name)
     current_version = metadata.version(dist_name)
+    # ``importlib.metadata.Distribution.read_text`` defines its own UTF-8
+    # resource boundary and accepts only the resource name.
     direct_url = _read_json_text(dist.read_text("direct_url.json"))
     installer = str(dist.read_text("INSTALLER") or "").strip().lower()
     source_urls = _distribution_source_urls(dist)
@@ -632,7 +634,7 @@ def update_cache_lock_path(repo_root: Path, config: SpecRuntimeConfig) -> Path:
 
 def read_update_cache(cache_path: Path) -> UpdateCacheEntry | None:
     try:
-        payload = json.loads(cache_path.read_text())
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
 
@@ -655,12 +657,12 @@ def write_update_cache(cache_path: Path, latest_version: str | None, *, checked_
         "latest_version": _normalize_version(latest_version) if latest_version is not None else None,
         "checked_at": _format_utc(checked_at or _now_utc()),
     }
-    cache_path.write_text(json.dumps(payload, indent=2) + "\n")
+    cache_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _parse_refresh_lock(lock_path: Path) -> datetime | None:
     try:
-        payload = json.loads(lock_path.read_text())
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
@@ -973,9 +975,11 @@ def _check_template_drift(repo_root: Path, old_templates: dict[str, str]) -> boo
             new_bundled = subprocess.check_output(
                 [
                     sys.executable, "-I", "-c",
-                    f"from spec_runtime.init import _read_bundled_template; print(_read_bundled_template({template_name!r}), end='')",
+                    "import sys; from spec_runtime.init import _read_bundled_template; "
+                    f"sys.stdout.buffer.write(_read_bundled_template({template_name!r}).encode('utf-8'))",
                 ],
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 stderr=subprocess.DEVNULL,
             )
         except (subprocess.CalledProcessError, OSError):

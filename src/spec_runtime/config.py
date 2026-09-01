@@ -511,12 +511,12 @@ def load_spec_runtime_config(
             ),
         )
 
-    raw = tomllib.loads(path.read_text())
+    raw = tomllib.loads(path.read_text(encoding="utf-8"))
     local_path = path.parent / _LOCAL_CONFIG_FILENAME
     local_raw: dict[str, object] = {}
     if local_path.is_file():
         try:
-            local_raw = tomllib.loads(local_path.read_text())
+            local_raw = tomllib.loads(local_path.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError):
             local_raw = {}
 

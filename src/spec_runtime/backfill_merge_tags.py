@@ -79,7 +79,7 @@ def _short_sha(value: str) -> str:
 
 
 def _parse_frontmatter(spec_path: Path) -> dict[str, str]:
-    text = spec_path.read_text()
+    text = spec_path.read_text(encoding="utf-8")
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return {}

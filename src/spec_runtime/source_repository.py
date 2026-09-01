@@ -74,7 +74,7 @@ def _source_checkout_repository_url() -> str:
     try:
         if source_module.resolve() != Path(__file__).resolve():
             return ""
-        raw = tomllib.loads(pyproject.read_text())
+        raw = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         project = raw.get("project", {})
         if not isinstance(project, dict) or project.get("name") != PACKAGE_NAME:
             return ""

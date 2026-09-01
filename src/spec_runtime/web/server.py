@@ -466,9 +466,9 @@ def write_pid(repo_root: Path, port: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pid = os.getpid()
     started_at = _read_process_started_at(pid)
-    path.write_text(f"{pid}\n{started_at}")
+    path.write_text(f"{pid}\n{started_at}", encoding="utf-8")
     if port is not None:
-        _port_path(repo_root).write_text(str(port))
+        _port_path(repo_root).write_text(str(port), encoding="utf-8")
 
 
 def read_pid(repo_root: Path) -> tuple[int | None, str]:
@@ -477,7 +477,7 @@ def read_pid(repo_root: Path) -> tuple[int | None, str]:
     if not path.exists():
         return None, ""
     try:
-        lines = path.read_text().strip().splitlines()
+        lines = path.read_text(encoding="utf-8").strip().splitlines()
         pid = int(lines[0])
         started_at = lines[1] if len(lines) > 1 else ""
         return pid, started_at
@@ -490,7 +490,7 @@ def read_port(repo_root: Path) -> int | None:
     if not path.exists():
         return None
     try:
-        return int(path.read_text().strip())
+        return int(path.read_text(encoding="utf-8").strip())
     except (ValueError, OSError):
         return None
 
@@ -567,7 +567,7 @@ def create_app(
     async def index(request: object) -> object:
         index_path = static_dir / "index.html"
         if index_path.exists():
-            return HTMLResponse(index_path.read_text())
+            return HTMLResponse(index_path.read_text(encoding="utf-8"))
         return HTMLResponse("<h1>spec web</h1><p>Static files not found.</p>")
 
     routes.append(Route("/", index))

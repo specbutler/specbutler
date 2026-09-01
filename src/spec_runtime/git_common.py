@@ -41,12 +41,15 @@ def subprocess_text_kwargs(command: Sequence[str]) -> dict[str, object]:
     malformed bytes keeps diagnostics available instead of turning an
     otherwise recoverable command failure into ``UnicodeDecodeError``.
 
-    Other commands retain Python's normal locale behavior.
+    Other commands retain Python's normal locale decoder, with replacement for
+    bytes that decoder cannot represent.
     """
-    kwargs: dict[str, object] = {"text": True}
+    # Arbitrary project commands may emit bytes that do not match the host's
+    # active locale. Diagnostics should degrade visibly instead of raising from
+    # ``subprocess`` and masking the command's real exit status.
+    kwargs: dict[str, object] = {"text": True, "errors": "replace"}
     if is_git_command(command) or is_github_cli_command(command):
         kwargs["encoding"] = "utf-8"
-        kwargs["errors"] = "replace"
     return kwargs
 
 

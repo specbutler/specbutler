@@ -235,7 +235,7 @@ def evaluate_review_gate(
         )
 
     try:
-        schema_payload = json.loads(schema_path.read_text())
+        schema_payload = json.loads(schema_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         return _build_failed_evaluation(
             summary=(f"Could not parse review schema JSON: {schema_path} (line {exc.lineno}, column {exc.colno})"),
@@ -392,12 +392,12 @@ def evaluate_review_gate(
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text.rstrip() + "\n")
+    path.write_text(text.rstrip() + "\n", encoding="utf-8")
 
 
 def build_parser() -> argparse.ArgumentParser:

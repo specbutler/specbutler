@@ -1046,7 +1046,7 @@ def write_run_log_alias(repo_root: Path, run_id: str, log_path: str) -> None:
         return
     alias_path = run_log_alias_path(repo_root, normalized_run_id)
     alias_path.parent.mkdir(parents=True, exist_ok=True)
-    alias_path.write_text(normalized_log_path + "\n")
+    alias_path.write_text(normalized_log_path + "\n", encoding="utf-8")
 
 
 def maybe_write_run_log_alias(repo_root: Path, proc: ActiveRunProcess, run_record: dict) -> None:
@@ -1073,7 +1073,7 @@ def load_run_record_index(repo_root: Path, *, config: SpecRuntimeConfig | None =
 
     for path in rd.glob("*.json"):
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         all_records.append(data)
@@ -1134,7 +1134,7 @@ def read_spec_status_overrides(repo_root: Path) -> dict[str, dict[str, str]]:
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return {}
     if not isinstance(payload, dict):
@@ -1177,7 +1177,9 @@ def write_spec_status_override(
         entry["worktree_path"] = str(worktree_path)
     overrides[spec_id] = entry
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(overrides, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(overrides, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def select_agent(spec: SpecMetadata, *, override: str = "", config: SpecRuntimeConfig | None = None) -> str:
@@ -1633,7 +1635,7 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return {}
     if not isinstance(payload, dict):
@@ -1764,7 +1766,7 @@ def cleanup_unadopted_container_runs(
     if not path.exists():
         return
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return
     if not isinstance(payload, dict):
@@ -1784,7 +1786,7 @@ def cleanup_unadopted_container_runs(
         handled_run_ids.add(run_id)
         run_path = state_runs_dir / f"{run_id}.json"
         try:
-            run_record = json.loads(run_path.read_text())
+            run_record = json.loads(run_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         if not isinstance(run_record, dict):
@@ -1851,10 +1853,20 @@ def _notify_macos(title: str, message: str) -> None:
         message=message.replace("\\", "\\\\").replace('"', '\\"'),
         title=title.replace("\\", "\\\\").replace('"', '\\"'),
     )
-    subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
     sound = Path("/System/Library/Sounds/Glass.aiff")
     if sound.exists():
-        subprocess.run(["afplay", str(sound)], capture_output=True, text=True)
+        subprocess.run(
+            ["afplay", str(sound)],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
 
 
 def _notify_ntfy(topic: str, message: str) -> None:
@@ -1866,6 +1878,7 @@ def _notify_ntfy(topic: str, message: str) -> None:
         ["curl", "-fsS", "-d", message, f"{server}/{topic}"],
         capture_output=True,
         text=True,
+        errors="replace",
     )
 
 
@@ -2156,7 +2169,7 @@ def _is_autopilot_run_command(command: str) -> bool:
 
 def _read_pid_file(path: Path) -> PidFileRecord | None:
     try:
-        raw = path.read_text().strip()
+        raw = path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     if not raw:
@@ -3442,7 +3455,7 @@ def watch_command(args: argparse.Namespace) -> int:
         active_path = autopilot_active_path(repo_root)
         if active_path.exists():
             try:
-                return json.loads(active_path.read_text())
+                return json.loads(active_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 pass
         return {}
@@ -3700,7 +3713,7 @@ def gc_command(args: argparse.Namespace) -> int:
 
     for path in sorted(runs_dir.glob("*.json")):
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         spec_id = str(data.get("spec_id", "")).strip()
@@ -3773,7 +3786,10 @@ def gc_command(args: argparse.Namespace) -> int:
             changes.append(f"  {action} {run_id}: {reason}")
             if apply:
                 data["updated_at"] = datetime.now(UTC).isoformat()
-                path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+                path.write_text(
+                    json.dumps(data, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
 
         final_status = str(data.get("status", "")).strip()
         raw_worktree_path = str(data.get("worktree_path", "")).strip()

@@ -113,7 +113,7 @@ class GateRecordStore:
         if not self._path.exists():
             return []
         try:
-            payload = json.loads(self._path.read_text())
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return []
         items = payload.get("records") if isinstance(payload, dict) else None

@@ -232,6 +232,73 @@ def test_lifecycle_module_imports() -> None:
     importlib.import_module("spec_runtime.orchestrator")
 
 
+def test_repository_text_survives_utf8_mode_off(tmp_path: Path) -> None:
+    """Exercise the installed package under the default Windows code page."""
+    repo = tmp_path / "Repo snow-雪"
+    specs = repo / "specs-雪"
+    specs.mkdir(parents=True)
+    (repo / ".spec.toml").write_text(
+        'base_ref = "HEAD"\n\n[paths]\nspecs_dir = "specs-雪"\n',
+        encoding="utf-8",
+    )
+    spec_text = """---
+id: unicode-content
+description: Snow 雪 and probe 🧪
+---
+
+# Unicode content
+
+Preserve snow 雪 and probe 🧪 exactly.
+"""
+    spec_path = specs / "unicode-content.md"
+    spec_path.write_text(spec_text, encoding="utf-8")
+
+    script = r"""
+import json
+import locale
+import sys
+from pathlib import Path
+
+from spec_runtime.config import load_spec_runtime_config
+from spec_runtime.spec_metadata import parse_spec_body, parse_spec_frontmatter
+
+repo = Path(sys.argv[1])
+config = load_spec_runtime_config(config_path=repo / ".spec.toml")
+spec_path = repo / config.paths.specs_dir / "unicode-content.md"
+frontmatter = parse_spec_frontmatter(spec_path)
+body = parse_spec_body(spec_path)
+assert frontmatter["description"] == "Snow 雪 and probe 🧪"
+assert "Preserve snow 雪 and probe 🧪 exactly." in body
+print(json.dumps({
+    "default_encoding": locale.getencoding(),
+    "utf8_mode": sys.flags.utf8_mode,
+    "specs_dir": config.paths.specs_dir,
+}))
+"""
+    env = _clean_subprocess_env()
+    env.pop("PYTHONIOENCODING", None)
+    env["PYTHONUTF8"] = "0"
+    completed = subprocess.run(
+        [sys.executable, "-I", "-X", "utf8=0", "-c", script, str(repo)],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        encoding="ascii",
+        errors="strict",
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout)
+    assert result["utf8_mode"] == 0
+    assert result["specs_dir"] == "specs-雪"
+    assert result["default_encoding"].lower().replace("-", "") not in {
+        "utf8",
+        "utf8sig",
+    }
+
+
 def test_cross_process_spec_lock_contention(tmp_path: Path) -> None:
     from spec_runtime.orchestrator import SpecLock
 

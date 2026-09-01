@@ -42,9 +42,11 @@ def test_claude_chat_provider_uses_oauth_compatible_safe_argv(
     tmp_path: Path,
 ) -> None:
     calls: list[list[str]] = []
+    spawn_kwargs: list[dict[str, object]] = []
 
-    def fake_spawn(_supervisor, command, **_kwargs):
+    def fake_spawn(_supervisor, command, **kwargs):
         calls.append(command)
+        spawn_kwargs.append(kwargs)
         return _CompletedChatProcess(
             '{"type":"assistant","message":{"content":'
             '[{"type":"text","text":"claude-ok"}]}}\n'
@@ -61,6 +63,8 @@ def test_claude_chat_provider_uses_oauth_compatible_safe_argv(
     assert calls[0][-2:] == ["--", "provider prompt"]
     tools_index = calls[0].index("--tools")
     assert calls[0][tools_index + 1] == ""
+    assert spawn_kwargs[0]["encoding"] == "utf-8"
+    assert spawn_kwargs[0]["errors"] == "replace"
 
 
 def test_native_windows_hides_claude_chat_when_host_sandbox_is_unavailable(
@@ -107,9 +111,11 @@ def test_codex_chat_provider_uses_read_only_ephemeral_argv(
     tmp_path: Path,
 ) -> None:
     calls: list[list[str]] = []
+    spawn_kwargs: list[dict[str, object]] = []
 
-    def fake_spawn(_supervisor, command, **_kwargs):
+    def fake_spawn(_supervisor, command, **kwargs):
         calls.append(command)
+        spawn_kwargs.append(kwargs)
         return _CompletedChatProcess(
             '{"type":"item.completed","item":{"type":"agent_message",'
             '"id":"assistant-1","text":"codex-ok"}}\n'
@@ -123,6 +129,8 @@ def test_codex_chat_provider_uses_read_only_ephemeral_argv(
     assert "--ephemeral" in calls[0]
     assert calls[0][calls[0].index("-s") + 1] == "read-only"
     assert calls[0][-1] == "provider prompt"
+    assert spawn_kwargs[0]["encoding"] == "utf-8"
+    assert spawn_kwargs[0]["errors"] == "replace"
 
 
 def _stream_synthetic_chat_provider(tmp_path: Path, script: str):

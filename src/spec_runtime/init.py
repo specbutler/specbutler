@@ -97,7 +97,7 @@ def _detect_python_tooling(repo_root: Path) -> tuple[bool, bool, frozenset[str] 
         return False, False, None
 
     try:
-        raw = tomllib.loads(pyproject_path.read_text())
+        raw = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
     except Exception:
         return False, False, None
 
@@ -142,7 +142,9 @@ def _detect_install_command(repo_root: Path) -> str:
     makefile_path = repo_root / "Makefile"
     if makefile_path.is_file():
         try:
-            if re.search(r"^install\s*:", makefile_path.read_text(), re.MULTILINE):
+            if re.search(
+                r"^install\s*:", makefile_path.read_text(encoding="utf-8"), re.MULTILINE
+            ):
                 return "make install"
         except Exception:
             pass
@@ -221,7 +223,7 @@ def _detect_verify_gates(repo_root: Path) -> list[dict]:
     makefile_path = repo_root / "Makefile"
     if makefile_path.is_file():
         try:
-            makefile_text = makefile_path.read_text()
+            makefile_text = makefile_path.read_text(encoding="utf-8")
             target_re = re.compile(r"^(test|lint|check|e2e|typecheck)\s*:", re.MULTILINE)
             for match in target_re.finditer(makefile_text):
                 name = match.group(1)
@@ -241,7 +243,7 @@ def _detect_verify_gates(repo_root: Path) -> list[dict]:
     pkg_json_path = repo_root / "package.json"
     if pkg_json_path.is_file():
         try:
-            pkg = json.loads(pkg_json_path.read_text())
+            pkg = json.loads(pkg_json_path.read_text(encoding="utf-8"))
             scripts = pkg.get("scripts", {})
             for name in ("test", "lint", "check", "e2e", "typecheck"):
                 if name in scripts and name not in seen_names:
@@ -404,7 +406,7 @@ def _update_gitignore(repo_root: Path) -> bool:
     gitignore_path = repo_root / ".gitignore"
     existing = ""
     if gitignore_path.is_file():
-        existing = gitignore_path.read_text()
+        existing = gitignore_path.read_text(encoding="utf-8")
 
     existing_lines = set(line.strip() for line in existing.splitlines())
     entries_to_add = []
@@ -427,7 +429,7 @@ def _update_gitignore(repo_root: Path) -> bool:
         return False
 
     separator = "" if existing.endswith("\n") or not existing else "\n"
-    with open(gitignore_path, "a") as f:
+    with open(gitignore_path, "a", encoding="utf-8") as f:
         f.write(separator + "\n".join(entries_to_add) + "\n")
     return True
 
@@ -477,7 +479,7 @@ def _gather_repo_context(repo_root: Path) -> str:
         readme_path = repo_root / readme_name
         if readme_path.is_file():
             try:
-                lines = readme_path.read_text().splitlines()[:100]
+                lines = readme_path.read_text(encoding="utf-8").splitlines()[:100]
                 sections.append(f"--- {readme_name} ---\n" + "\n".join(lines))
             except OSError:
                 pass
@@ -495,7 +497,7 @@ def _gather_repo_context(repo_root: Path) -> str:
             ci_configs.append(ci_path)
     for ci_path in ci_configs:
         try:
-            lines = ci_path.read_text().splitlines()[:50]
+            lines = ci_path.read_text(encoding="utf-8").splitlines()[:50]
             rel = ci_path.relative_to(repo_root).as_posix()
             sections.append(f"--- {rel} ---\n" + "\n".join(lines))
         except OSError:
@@ -515,7 +517,7 @@ def _gather_repo_context(repo_root: Path) -> str:
         manifest_path = repo_root / manifest_name
         if manifest_path.is_file():
             try:
-                lines = manifest_path.read_text().splitlines()[:50]
+                lines = manifest_path.read_text(encoding="utf-8").splitlines()[:50]
                 sections.append(f"--- {manifest_name} ---\n" + "\n".join(lines))
             except OSError:
                 pass
@@ -524,7 +526,7 @@ def _gather_repo_context(repo_root: Path) -> str:
     contributing = repo_root / "CONTRIBUTING.md"
     if contributing.is_file():
         try:
-            lines = contributing.read_text().splitlines()[:50]
+            lines = contributing.read_text(encoding="utf-8").splitlines()[:50]
             sections.append("--- CONTRIBUTING.md ---\n" + "\n".join(lines))
         except OSError:
             pass
@@ -579,6 +581,8 @@ def _ask_agent_for_config(agent: str, prompt: str) -> dict | None:
             input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         if result.returncode != 0:
@@ -657,6 +661,8 @@ def _merge_file_with_agent(
             input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
         if result.returncode != 0:
@@ -811,7 +817,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 f"_read_bundled_template('{template_name}'))\""
             )
             if answer.strip().lower() in ("", "y"):
-                existing_content = (repo_root / path).read_text()
+                existing_content = (repo_root / path).read_text(encoding="utf-8")
                 template_content = _read_bundled_template(
                     template_name,
                 )

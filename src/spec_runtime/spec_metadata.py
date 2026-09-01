@@ -33,7 +33,7 @@ class SpecMetadata:
 
 def parse_spec_frontmatter(spec_path: Path) -> dict:
     """Parse YAML frontmatter from a spec file."""
-    text = spec_path.read_text()
+    text = spec_path.read_text(encoding="utf-8")
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return {}
@@ -56,7 +56,7 @@ def parse_spec_frontmatter(spec_path: Path) -> dict:
 
 def parse_spec_body(spec_path: Path) -> str:
     """Return the spec body without YAML frontmatter."""
-    text = spec_path.read_text()
+    text = spec_path.read_text(encoding="utf-8")
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return text

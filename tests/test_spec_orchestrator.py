@@ -7739,10 +7739,11 @@ class TestSpecAutopilot:
                 return 4096
             raise AssertionError(f"unexpected sysconf lookup: {name}")
 
-        def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+        def fake_run(cmd, capture_output, text, errors, check):  # noqa: ANN001
             assert cmd == ["vm_stat"]
             assert capture_output is True
             assert text is True
+            assert errors == "replace"
             assert check is False
             return subprocess.CompletedProcess(cmd, 0, stdout=vm_stat_output, stderr="")
 
@@ -14622,6 +14623,8 @@ class TestImplementSetupTeardownHelpers:
         assert plan.agent_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
         assert plan.agent_env_redactions == ("anthropic-secret", "oauth-secret")
         assert "start_new_session" not in plan.popen_kwargs
+        assert plan.popen_kwargs["encoding"] == "utf-8"
+        assert plan.popen_kwargs["errors"] == "replace"
         assert (worktree / ".spec-claude-home" / ".claude.json").read_text() == (
             '{"oauthAccount":{"uuid":"u"}}'
         )

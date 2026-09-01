@@ -139,7 +139,7 @@ def load_run_lease(state_runs_dir: Path, run_id: str) -> RunLease | None:
     if not path.exists():
         return None
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(payload, dict):

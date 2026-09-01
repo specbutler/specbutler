@@ -174,7 +174,7 @@ def _is_adjacent_spec_runtime_checkout(source_root: Path) -> bool:
     try:
         if source_module.resolve() != Path(__file__).resolve():
             return False
-        raw = tomllib.loads(pyproject.read_text())
+        raw = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         project = raw.get("project", {})
         return isinstance(project, dict) and project.get("name") == "specbutler"
     except (OSError, tomllib.TOMLDecodeError):
@@ -192,7 +192,11 @@ def host_spec_runtime_version() -> str:
         source_root = Path(__file__).resolve().parents[2]
         pyproject = source_root / "pyproject.toml"
         if _is_adjacent_spec_runtime_checkout(source_root):
-            match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject.read_text(), re.MULTILINE)
+            match = re.search(
+                r'^version\s*=\s*"([^"]+)"',
+                pyproject.read_text(encoding="utf-8"),
+                re.MULTILINE,
+            )
             if match:
                 return match.group(1)
     except OSError:
@@ -214,6 +218,8 @@ def host_spec_runtime_source_id() -> str:
         from importlib import metadata
 
         dist = metadata.distribution("specbutler")
+        # ``importlib.metadata.Distribution.read_text`` handles package
+        # metadata as UTF-8 and accepts only the resource name.
         direct_url_text = dist.read_text("direct_url.json")
         if direct_url_text:
             direct_url = json.loads(direct_url_text)
@@ -645,7 +651,7 @@ def _read_outbox_metadata(outbox_path: Path) -> OutboxMetadata | None:
     if not candidate.is_file():
         return None
     try:
-        payload = json.loads(candidate.read_text())
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(payload, dict):
@@ -743,6 +749,7 @@ class WorktreeExecutionBackend:
             popen_kwargs.setdefault("env", request.env)
         if monitor is None:
             popen_kwargs.setdefault("text", True)
+            popen_kwargs.setdefault("errors", "replace")
             if request.capture_stdout:
                 popen_kwargs.setdefault("stdout", subprocess.PIPE)
                 popen_kwargs.setdefault("stderr", subprocess.PIPE)
@@ -876,6 +883,7 @@ class CloneExecutionBackend:
             env=env,
             input=request.input_text,
             text=True,
+            errors="replace",
             capture_output=True,
             timeout=request.timeout,
             stdin=stdin,
@@ -909,6 +917,7 @@ class CloneExecutionBackend:
             popen_kwargs.setdefault("env", request.env)
         if monitor is None:
             popen_kwargs.setdefault("text", True)
+            popen_kwargs.setdefault("errors", "replace")
             if request.capture_stdout:
                 popen_kwargs.setdefault("stdout", subprocess.PIPE)
                 popen_kwargs.setdefault("stderr", subprocess.PIPE)
@@ -973,7 +982,8 @@ class CloneExecutionBackend:
             },
         )
         (snapshots / f"{target.name}.json").write_text(
-            json.dumps(ref.metadata | {"label": label, "path": str(target)}, indent=2, sort_keys=True)
+            json.dumps(ref.metadata | {"label": label, "path": str(target)}, indent=2, sort_keys=True),
+            encoding="utf-8",
         )
         return ref
 
@@ -1060,7 +1070,7 @@ class CloneExecutionBackend:
                 f"reason: {reason}",
             ]
         )
-        with path.open("a") as handle:
+        with path.open("a", encoding="utf-8") as handle:
             if path.stat().st_size:
                 handle.write("\n---\n")
             handle.write(entry)
@@ -1153,9 +1163,9 @@ class CloneExecutionBackend:
             common_dir = repo_root / common_dir
         exclude = common_dir / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        existing = exclude.read_text().splitlines() if exclude.exists() else []
+        existing = exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []
         if rel not in existing:
-            with exclude.open("a") as handle:
+            with exclude.open("a", encoding="utf-8") as handle:
                 if existing and existing[-1].strip():
                     handle.write("\n")
                 handle.write(f"{rel}\n")
@@ -1276,7 +1286,8 @@ class CloneExecutionBackend:
                     f"$ git status --short --branch\n{status.stdout}{status.stderr}",
                     f"$ git rev-parse HEAD\n{rev.stdout}{rev.stderr}",
                 ]
-            )
+            ),
+            encoding="utf-8",
         )
 
     def _next_log_path(self, logs: Path, kind: str, argv: list[str]) -> Path:
@@ -1323,7 +1334,7 @@ class CloneExecutionBackend:
             "stderr:",
             _redact_log_text(stderr, redactions),
         ]
-        path.write_text("\n".join(payload))
+        path.write_text("\n".join(payload), encoding="utf-8")
 
     def _write_agent_result(
         self,
@@ -1347,7 +1358,9 @@ class CloneExecutionBackend:
             "stdout": stdout,
             "stderr": stderr,
         }
-        (outbox / "agent-result.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
+        (outbox / "agent-result.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
         self._write_completion_artifacts(source=run_root / "source", outbox=outbox)
 
     def _write_completion_artifacts(self, *, source: Path, outbox: Path) -> None:
@@ -1385,9 +1398,11 @@ class CloneExecutionBackend:
                 "final_patch": diff.stderr if diff.returncode != 0 else "",
             },
         }
-        (outbox / "commit-metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
+        (outbox / "commit-metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
+        )
         if diff.returncode == 0:
-            (outbox / "final.patch").write_text(diff.stdout)
+            (outbox / "final.patch").write_text(diff.stdout, encoding="utf-8")
 
     _BASE_REF_FILENAME = "base-ref"
 
@@ -1406,14 +1421,14 @@ class CloneExecutionBackend:
         if not sha:
             return
         try:
-            (run_root / self._BASE_REF_FILENAME).write_text(f"{sha}\n")
+            (run_root / self._BASE_REF_FILENAME).write_text(f"{sha}\n", encoding="utf-8")
         except OSError:
             pass
 
     def _read_persisted_base_sha(self, run_root: Path, source: Path) -> str:
         """Return the recorded base SHA if it still resolves in ``source``."""
         try:
-            sha = (run_root / self._BASE_REF_FILENAME).read_text().strip()
+            sha = (run_root / self._BASE_REF_FILENAME).read_text(encoding="utf-8").strip()
         except OSError:
             return ""
         if not sha:
@@ -1560,7 +1575,7 @@ class CloneExecutionBackend:
             diff = self._run_git(["diff", "HEAD", "--binary"], cwd=source)
             if diff.returncode == 0:
                 try:
-                    patch_path.write_text(diff.stdout)
+                    patch_path.write_text(diff.stdout, encoding="utf-8")
                 except OSError as exc:
                     manifest.setdefault("errors", {})["uncommitted_patch"] = str(exc)
                     unpreserved.append("uncommitted tracked changes")
@@ -1613,18 +1628,26 @@ class CloneExecutionBackend:
             manifest["unpreserved"] = unpreserved
 
         manifest_path = rescue_dir / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+        )
         manifest["manifest_path"] = str(manifest_path)
 
         index_path = rescue_root / self.RESCUE_INDEX_FILENAME
         try:
-            existing = json.loads(index_path.read_text()) if index_path.exists() else []
+            existing = (
+                json.loads(index_path.read_text(encoding="utf-8"))
+                if index_path.exists()
+                else []
+            )
             if not isinstance(existing, list):
                 existing = []
         except (json.JSONDecodeError, OSError):
             existing = []
         existing.append(manifest)
-        index_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
+        index_path.write_text(
+            json.dumps(existing, indent=2, sort_keys=True), encoding="utf-8"
+        )
         return manifest
 
     def _assert_workspace_deletable(self, source: Path, *, allow_unpushed_work: bool) -> None:
@@ -2123,7 +2146,12 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 "service_volume_snapshots": state.get("service_volume_snapshots", {}).get(label, {}),
             }
             (ref.path.parent / f"{ref.path.name}.json").write_text(
-                json.dumps(metadata | {"label": label, "path": str(ref.path)}, indent=2, sort_keys=True)
+                json.dumps(
+                    metadata | {"label": label, "path": str(ref.path)},
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
             )
             return SnapshotRef(label=ref.label, path=ref.path, metadata=metadata)
         finally:
@@ -2392,7 +2420,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     f"logged_at: {datetime.now(timezone.utc).isoformat()}",
                     reason,
                 ]
-            )
+            ),
+            encoding="utf-8",
         )
 
     def _write_teardown_failure_log(self, logs: Path, container_id: str, detail: str) -> None:
@@ -2406,7 +2435,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             ]
         )
         has_content = path.exists() and path.stat().st_size > 0
-        with path.open("a") as handle:
+        with path.open("a", encoding="utf-8") as handle:
             if has_content:
                 handle.write("\n---\n")
             handle.write(entry)
@@ -2472,7 +2501,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                         "after teardown):",
                         *removed,
                     ]
-                )
+                ),
+                encoding="utf-8",
             )
 
     def _clear_stale_volume_postmaster_pids(
@@ -2675,7 +2705,9 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             # only run when the tag is new (one per spec upgrade), so forcing
             # --no-cache for those Dockerfiles buys correctness at bounded cost;
             # template-generated Dockerfiles cache normally via the ARG reference.
-            if "SPEC_BUTLER_VERSION" not in dockerfile.read_text(errors="replace"):
+            if "SPEC_BUTLER_VERSION" not in dockerfile.read_text(
+                encoding="utf-8", errors="replace"
+            ):
                 build_argv.append("--no-cache")
             if self._container.build_ssh:
                 build_argv.extend(["--ssh", self._container.build_ssh])
@@ -2746,7 +2778,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, target)
         self._copy_build_source(repo_root=repo_root, context=context)
-        source_dockerfile = dockerfile.read_text()
+        source_dockerfile = dockerfile.read_text(encoding="utf-8")
         wrapper = [
             source_dockerfile.rstrip(),
             "",
@@ -2764,14 +2796,15 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 ]
             )
         wrapper.append(f"COPY . {CONTAINER_BOOTSTRAP_SOURCE}/")
-        (context / "Dockerfile").write_text("\n".join(wrapper) + "\n")
+        (context / "Dockerfile").write_text("\n".join(wrapper) + "\n", encoding="utf-8")
         (context / "README.txt").write_text(
             "Generated by spec container backend. Dependency manifests are copied "
             "with their repo-relative paths before the optional bootstrap cache "
             "layer, and full source is copied after that layer so dependency "
             "installs can be cached across ordinary source edits. Runtime source "
             "is mounted at /workspace/source so it does not hide the cached "
-            "bootstrap layer under /workspace/bootstrap.\n"
+            "bootstrap layer under /workspace/bootstrap.\n",
+            encoding="utf-8",
         )
         return context
 
@@ -2984,7 +3017,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     },
                     indent=2,
                     sort_keys=True,
-                )
+                ),
+                encoding="utf-8",
             )
             raise RuntimeError(
                 "Playwright MCP browser/runtime version mismatch: "
@@ -3070,7 +3104,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             if not package_path.is_file():
                 continue
             try:
-                payload = json.loads(package_path.read_text())
+                payload = json.loads(package_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 continue
             if not isinstance(payload, dict):
@@ -3183,7 +3217,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 },
                 indent=2,
                 sort_keys=True,
-            )
+            ),
+            encoding="utf-8",
         )
 
     def _remove_playwright_mcp_sidecar(
@@ -3358,7 +3393,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     },
                     indent=2,
                     sort_keys=True,
-                )
+                ),
+                encoding="utf-8",
             )
             raise RuntimeError(
                 "Container backend sidecar service startup failed "
@@ -3375,7 +3411,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         labels = state.get("resource_labels", {})
 
         try:
-            compose = yaml.safe_load(compose_file.read_text()) or {}
+            compose = yaml.safe_load(compose_file.read_text(encoding="utf-8")) or {}
         except (OSError, yaml.YAMLError):
             compose = {}
         services = compose.get("services", {}) if isinstance(compose, dict) else {}
@@ -3403,7 +3439,9 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 if not isinstance(value, dict) or not value.get("external")
             }
         path = run_root / "container-compose-labels.json"
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         return path
 
     def _stop_sidecar_services(self, run_root: Path, state: dict[str, Any]) -> None:
@@ -3604,7 +3642,11 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         argv.extend([state["image"], "sh", "-lc", "sleep infinity"])
         result = self._runner.run(argv, cwd=run_root)
         self._write_image_log(run_root / "logs", "in-worker-services.log", result)
-        container_id = cidfile.read_text().strip() if cidfile.is_file() else result.stdout.strip()
+        container_id = (
+            cidfile.read_text(encoding="utf-8").strip()
+            if cidfile.is_file()
+            else result.stdout.strip()
+        )
         if container_id:
             state["worker_container"] = container_id
             state["containers"] = list(dict.fromkeys([*state.get("containers", []), container_id]))
@@ -3632,7 +3674,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     },
                     indent=2,
                     sort_keys=True,
-                )
+                ),
+                encoding="utf-8",
             )
             if container_id:
                 # ``docker run -d`` failed but a container id was captured
@@ -3889,7 +3932,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     },
                     indent=2,
                     sort_keys=True,
-                )
+                ),
+                encoding="utf-8",
             )
             raise ExecutionBackendImportError(
                 f"Container backend import failed: could not import source volume {volume}.",
@@ -4111,7 +4155,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         if cp.returncode != 0 or not dest_path.is_file():
             return None
         try:
-            return dest_path.read_text()
+            return dest_path.read_text(encoding="utf-8")
         except OSError:
             return None
 
@@ -4141,7 +4185,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     result.stderr or "",
                 ]
             )
-        (logs / name).write_text("\n".join(sections))
+        (logs / name).write_text("\n".join(sections), encoding="utf-8")
 
     @staticmethod
     def _passwd_line_has_id(line: str, target_id: int) -> bool:
@@ -4198,8 +4242,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         shim_dir.mkdir(parents=True, exist_ok=True)
         passwd_path = shim_dir / "passwd"
         group_path = shim_dir / "group"
-        passwd_path.write_text("\n".join(passwd_lines) + "\n")
-        group_path.write_text("\n".join(group_lines) + "\n")
+        passwd_path.write_text("\n".join(passwd_lines) + "\n", encoding="utf-8")
+        group_path.write_text("\n".join(group_lines) + "\n", encoding="utf-8")
         os.chmod(passwd_path, 0o644)
         os.chmod(group_path, 0o644)
         return passwd_path, group_path
@@ -4242,7 +4286,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         containers = list(state.get("containers", []))
         for cidfile in logs.glob("container-*.cid"):
             try:
-                container_id = cidfile.read_text().strip()
+                container_id = cidfile.read_text(encoding="utf-8").strip()
             except OSError:
                 continue
             if container_id and container_id not in containers:
@@ -4266,7 +4310,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 return {}
             raise RuntimeError(f"Container backend state is missing: {path}")
         try:
-            payload = json.loads(path.read_text())
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Container backend state is invalid: {path}") from exc
         return payload if isinstance(payload, dict) else {}
@@ -4274,7 +4318,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
     def _write_container_state(self, run_root: Path, state: dict[str, Any]) -> None:
         path = self._container_state_path(run_root)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2, sort_keys=True))
+        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
     @staticmethod
     def _write_image_log(
@@ -4303,7 +4347,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     "stderr:",
                     ContainerExecutionBackend._redact_log_text(result.stderr or "", redactions),
                 ]
-            )
+            ),
+            encoding="utf-8",
         )
 
     @staticmethod

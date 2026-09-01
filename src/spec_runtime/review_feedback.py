@@ -95,10 +95,10 @@ class ReviewResult:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / "review-result.json"
         rendered = json.dumps(asdict(self), indent=2, sort_keys=True) + "\n"
-        output_path.write_text(rendered)
+        output_path.write_text(rendered, encoding="utf-8")
         if self.attempt_number is not None and self.attempt_number > 0:
             attempt_path = output_dir / f"review-result.attempt-{self.attempt_number}.json"
-            attempt_path.write_text(rendered)
+            attempt_path.write_text(rendered, encoding="utf-8")
         return output_path
 
     @classmethod
@@ -107,7 +107,7 @@ class ReviewResult:
         if not input_path.exists():
             return None
         try:
-            data = json.loads(input_path.read_text())
+            data = json.loads(input_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, TypeError):
             return None
 
@@ -492,7 +492,7 @@ def load_review_payload_from_gate_artifact(
         if not candidate_paths:
             raise ValueError(f"artifact {REVIEW_GATE_ARTIFACT_NAME} does not contain {REVIEW_GATE_ARTIFACT_FILE}")
 
-        parsed = parse_json_object(candidate_paths[0].read_text())
+        parsed = parse_json_object(candidate_paths[0].read_text(encoding="utf-8"))
         if parsed is None:
             raise ValueError(f"artifact {REVIEW_GATE_ARTIFACT_NAME} contains invalid JSON payload")
 

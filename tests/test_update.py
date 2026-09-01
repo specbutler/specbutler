@@ -1089,7 +1089,7 @@ def test_check_template_drift_detects_difference(tmp_path):
     (tmp_path / "AGENTS.md").write_text("old repo content")
     old_templates = {"AGENTS.md": "old bundled content"}
 
-    def fake_check_output(cmd, *, text=False, stderr=None):
+    def fake_check_output(cmd, *, encoding=None, errors=None, stderr=None):
         # Post-upgrade bundled content differs from both old bundled and repo-local
         return "new bundled content"
 
@@ -1102,7 +1102,7 @@ def test_check_template_drift_no_difference_when_bundled_unchanged(tmp_path):
     (tmp_path / "AGENTS.md").write_text("customized content")
     old_templates = {"AGENTS.md": "same bundled content"}
 
-    def fake_check_output(cmd, *, text=False, stderr=None):
+    def fake_check_output(cmd, *, encoding=None, errors=None, stderr=None):
         # Post-upgrade bundled content is same as pre-upgrade
         return "same bundled content"
 
@@ -1116,7 +1116,7 @@ def test_check_template_drift_no_false_positive_for_customized_files(tmp_path):
     (tmp_path / "CLAUDE.md").write_text("user added project-specific notes")
     old_templates = {"AGENTS.md": "bundled agents", "CLAUDE.md": "bundled claude"}
 
-    def fake_check_output(cmd, *, text=False, stderr=None):
+    def fake_check_output(cmd, *, encoding=None, errors=None, stderr=None):
         # Bundled templates are the same after upgrade
         if "AGENTS.md" in cmd[-1]:
             return "bundled agents"
@@ -1133,7 +1133,7 @@ def test_check_template_drift_no_drift_when_repo_matches_new(tmp_path):
     (tmp_path / "AGENTS.md").write_text("new bundled content")
     old_templates = {"AGENTS.md": "old bundled content"}
 
-    def fake_check_output(cmd, *, text=False, stderr=None):
+    def fake_check_output(cmd, *, encoding=None, errors=None, stderr=None):
         return "new bundled content"
 
     with patch("spec_runtime.update.subprocess.check_output", side_effect=fake_check_output):

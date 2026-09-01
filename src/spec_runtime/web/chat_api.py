@@ -1326,7 +1326,9 @@ async def implement_chat_task(request: Request) -> Response:
     import json as _json_mod
 
     try:
-        run_state = _json_mod.loads(_run_state_path(repo_root, run_id).read_text())
+        run_state = _json_mod.loads(
+            _run_state_path(repo_root, run_id).read_text(encoding="utf-8")
+        )
     except (OSError, _json_mod.JSONDecodeError):
         run_state = {
             "spec_id": spec_id,

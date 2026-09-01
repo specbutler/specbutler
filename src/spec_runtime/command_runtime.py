@@ -237,7 +237,7 @@ def run_command(
         with command.launch_argv(cwd=cwd) as argv:
             return run_supervised(
                 argv, cwd=cwd, env=None if env is None else dict(env),
-                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL,
                 timeout=timeout, check=False,
             )
     except FileNotFoundError as exc:

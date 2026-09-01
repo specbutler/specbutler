@@ -263,7 +263,7 @@ async def get_run_log(request: Request) -> Response:
         return _json({"run_id": run_id, "lines": []})
 
     try:
-        all_lines = log_path.read_text(errors="replace").splitlines()
+        all_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return _json({"run_id": run_id, "lines": []})
 
@@ -519,6 +519,8 @@ async def dispatch_start(request: Request) -> Response:
             cwd=str(repo_root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         return _json({
@@ -556,6 +558,8 @@ async def dispatch_stop(request: Request) -> Response:
         cwd=str(repo_root),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
     combined = f"{proc.stdout}\n{proc.stderr}".lower()

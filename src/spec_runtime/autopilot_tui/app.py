@@ -136,12 +136,15 @@ def _clear_spec_runtime_artifacts(repo_root: Path, spec_id: str) -> None:
         active_path = state_root / "autopilot" / "active.json"
         if active_path.exists():
             try:
-                payload = json.loads(active_path.read_text())
+                payload = json.loads(active_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
             if isinstance(payload, dict) and spec_id in payload:
                 payload.pop(spec_id, None)
-                active_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                active_path.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
 
 
 def _clear_run_implement_results(repo_root: Path, run: orch.RunState) -> None:
@@ -161,7 +164,7 @@ def _remove_spec_run_state(repo_root: Path, spec_id: str) -> None:
         if runs_root.exists():
             for run_json in runs_root.glob("*.json"):
                 try:
-                    payload = json.loads(run_json.read_text())
+                    payload = json.loads(run_json.read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, OSError, TypeError):
                     continue
                 if str(payload.get("spec_id", "")).strip() != spec_id:
@@ -203,6 +206,8 @@ def _run_code_clean(repo_root: Path, spec_id: str) -> None:
         cwd=repo_root,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if result.returncode != 0:
@@ -211,7 +216,7 @@ def _run_code_clean(repo_root: Path, spec_id: str) -> None:
 
 
 def _mark_spec_obsolete(spec_path: Path) -> None:
-    text = spec_path.read_text()
+    text = spec_path.read_text(encoding="utf-8")
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         raise RuntimeError(f"Spec file does not have YAML frontmatter: {spec_path}")
@@ -240,7 +245,7 @@ def _mark_spec_obsolete(spec_path: Path) -> None:
                 insert_at = idx + 1
                 break
         lines.insert(insert_at, "obsolete: true")
-    spec_path.write_text("\n".join(lines) + "\n")
+    spec_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _clear_spec_status_override(repo_root: Path, spec_id: str) -> None:
@@ -251,7 +256,9 @@ def _clear_spec_status_override(repo_root: Path, spec_id: str) -> None:
     overrides.pop(spec_id, None)
     if overrides:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(overrides, indent=2, sort_keys=True) + "\n")
+        path.write_text(
+            json.dumps(overrides, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         return
     path.unlink(missing_ok=True)
 
@@ -281,7 +288,7 @@ def _has_task_run_records(repo_root: Path, spec_id: str) -> bool:
             continue
         for run_json in runs_root.glob("*.json"):
             try:
-                payload = json.loads(run_json.read_text())
+                payload = json.loads(run_json.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
             if (
@@ -713,6 +720,8 @@ def _stream_chat_provider_process(
             stdout=subprocess.PIPE,
             stderr=stderr_file,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         assert proc.stdout is not None
         stdout = proc.stdout

@@ -66,7 +66,10 @@ def test_utf8_cli_malformed_output_is_replaced_instead_of_crashing() -> None:
 
 
 def test_non_utf8_cli_retains_locale_text_mode() -> None:
-    assert subprocess_text_kwargs(["python", "-V"]) == {"text": True}
+    assert subprocess_text_kwargs(["python", "-V"]) == {
+        "text": True,
+        "errors": "replace",
+    }
 
 
 def test_runtime_github_cli_subprocess_seams_request_utf8(

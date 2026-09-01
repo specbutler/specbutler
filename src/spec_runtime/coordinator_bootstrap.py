@@ -338,14 +338,14 @@ def _read_local_toml(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        parsed = tomllib.loads(path.read_text())
+        parsed = tomllib.loads(path.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
 
 def _write_local_coordination(path: Path, values: dict[str, str]) -> None:
-    lines = path.read_text().splitlines() if path.exists() else []
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     output: list[str] = []
     index = 0
     in_coordination = False
@@ -375,7 +375,7 @@ def _write_local_coordination(path: Path, values: dict[str, str]) -> None:
             output.append("")
         output.append("[coordination]")
         output.extend(_coordination_lines(values))
-    path.write_text("\n".join(output).rstrip() + "\n")
+    path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
 
 
 def _coordination_lines(values: dict[str, str]) -> list[str]:

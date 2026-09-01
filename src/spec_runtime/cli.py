@@ -224,7 +224,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             print(f"Error: Spec not found: {spec_path}", file=sys.stderr)
             return 1
 
-    print(spec_path.read_text())
+    print(spec_path.read_text(encoding="utf-8"))
     return 0
 
 

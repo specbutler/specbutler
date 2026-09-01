@@ -297,7 +297,7 @@ def _codex_linux_sandbox_overrides() -> list[str]:
 def _read_gitdir_file(path: Path) -> Path | None:
     """Resolve a Git ``.git`` file or ``commondir`` file path."""
     try:
-        text = path.read_text().strip()
+        text = path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     if text.startswith("gitdir:"):

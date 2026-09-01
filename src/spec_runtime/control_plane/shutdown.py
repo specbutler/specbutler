@@ -51,7 +51,7 @@ def _load(state_run_dir: Path) -> ShutdownState:
     if not path.exists():
         return ShutdownState(phase=ShutdownPhase.RUNNING)
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return ShutdownState(phase=ShutdownPhase.RUNNING)
     if not isinstance(payload, dict):

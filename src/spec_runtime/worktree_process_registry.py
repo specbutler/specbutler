@@ -67,7 +67,7 @@ def _registry_path(state_root: Path, worktree_path: Path) -> Path:
 
 def _read_json_dict(path: Path) -> dict | None:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return None
     return data if isinstance(data, dict) else None

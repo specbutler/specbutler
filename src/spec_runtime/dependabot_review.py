@@ -260,7 +260,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
-        json.dumps(build_review_payload(args.base_sha, args.head_sha), indent=2) + "\n"
+        json.dumps(build_review_payload(args.base_sha, args.head_sha), indent=2) + "\n",
+        encoding="utf-8",
     )
     print(f"Validated Dependabot dependency update: {', '.join(changed_files)}")
     return 0

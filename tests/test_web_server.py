@@ -1578,6 +1578,8 @@ class TestAPIRoutes:
         assert "Queue:" in body["stdout"]
         # The --dry-run flag must be present in the spawned command.
         assert "--dry-run" in mock_run.call_args[0][0]
+        assert mock_run.call_args.kwargs["encoding"] == "utf-8"
+        assert mock_run.call_args.kwargs["errors"] == "replace"
 
     def test_dispatch_stop(self, tmp_path):
         with patch("subprocess.run") as mock_run:
@@ -1587,6 +1589,8 @@ class TestAPIRoutes:
 
         assert resp.status_code == 200
         assert resp.json()["status"] == "stopped"
+        assert mock_run.call_args.kwargs["encoding"] == "utf-8"
+        assert mock_run.call_args.kwargs["errors"] == "replace"
 
     def test_dispatch_stop_not_running(self, tmp_path):
         # `spec auto stop` reports "not running" (and may exit non-zero) when

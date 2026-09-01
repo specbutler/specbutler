@@ -331,6 +331,7 @@ def _posix_identity(pid: int) -> ProcessIdentity | None:
             ["ps", "-ww", "-o", "pid=", "-o", "lstart=", "-o", "command=", "-p", str(pid)],
             capture_output=True,
             text=True,
+            errors="replace",
             check=False,
         )
     except OSError:
@@ -371,6 +372,7 @@ def list_live_process_group_members(pgid: int) -> list[int] | None:
             ["ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
             capture_output=True,
             text=True,
+            errors="replace",
             check=False,
         )
     except OSError:
@@ -419,7 +421,12 @@ def process_cwd(pid: int) -> Path | None:
     except OSError:
         pass
     try:
-        result = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True)
+        result = subprocess.run(
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
     except OSError:
         return None
     for line in result.stdout.splitlines() if result.returncode == 0 else ():
@@ -479,6 +486,7 @@ def _vm_stat_available_bytes() -> int | None:
             ["vm_stat"],
             capture_output=True,
             text=True,
+            errors="replace",
             check=False,
         )
     except OSError:
@@ -568,6 +576,7 @@ def iter_processes() -> list[ProcessIdentity]:
             ["ps", "-ww", "-e", "-o", "pid=", "-o", "lstart=", "-o", "command="],
             capture_output=True,
             text=True,
+            errors="replace",
             check=False,
         )
     except OSError:
