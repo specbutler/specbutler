@@ -7067,7 +7067,7 @@ def stop_run(spec_id: str, *, repo_root: Path | None = None) -> RunState:
             "orphaned or reused process group without a verifiable leader; inspect and "
             "terminate only the run-owned processes manually."
         )
-    if process_was_alive:
+    if process_group is not None and process_was_alive:
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError as exc:

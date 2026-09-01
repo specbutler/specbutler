@@ -291,8 +291,8 @@ def is_server_running(repo_root: Path) -> tuple[bool, int | None]:
 
     supervision_token = read_supervision_token(repo_root)
     if isinstance(supervision_token, SupervisionToken):
-        if identity_matches(supervision_token.identity):
-            return True, supervision_token.identity.pid
+        if identity_matches(supervision_token.identity) and identity_matches(supervision_token.payload):
+            return True, supervision_token.payload.pid
         remove_pid(repo_root)
         return False, None
     pid, stored_started_at = read_pid(repo_root)
@@ -504,7 +504,6 @@ def run_server(
                     stderr=subprocess.STDOUT,
                     env=os.environ.copy(),
                 )
-                write_supervision_token(repo_root, managed.token)
             finally:
                 log_handle.close()
             if not _wait_for_port(host, port):
@@ -512,6 +511,9 @@ def run_server(
                 remove_pid(repo_root)
                 print("spec web failed to start (see server.log).", file=sys.stderr)
                 return 1
+            # Publish only after readiness. Publishing earlier makes the child
+            # observe its own durable token and reject startup as a duplicate.
+            write_supervision_token(repo_root, managed.token)
             print(f"spec web running on http://{probe_host}:{port}", file=sys.stderr)
             print(f"Authenticated URL: {auth_url}", file=sys.stderr)
             if open_browser:

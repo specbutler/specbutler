@@ -68,6 +68,7 @@ from spec_runtime.orchestrator import (
     format_attempt_progress,
     read_spec_lock_owner,
 )
+from spec_runtime.platform_fs import FileLock, atomic_write_text
 from spec_runtime.process_supervisor import (
     LifetimeMode,
     ProcessSupervisor,
@@ -1670,7 +1671,7 @@ def write_active_state(repo_root: Path, active: dict[str, ActiveRunProcess]) -> 
     }
     path = autopilot_active_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def read_log_tail(log_path: str, n: int = ERROR_TAIL_LINES) -> list[str]:
@@ -1726,7 +1727,10 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
         live_started_at = live_identity.started_at if live_identity is not None else ""
         if supervision_token:
             try:
-                supervision_token = adopt(SupervisionToken.from_dict(supervision_token)).to_dict()
+                parsed_token = SupervisionToken.from_dict(supervision_token)
+                if parsed_token.payload.pid != pid or parsed_token.payload.started_at != process_started_at:
+                    continue
+                supervision_token = adopt(parsed_token).to_dict()
             except (KeyError, TypeError, ValueError, ProcessLookupError):
                 continue
 
@@ -2099,7 +2103,9 @@ def start_candidate(
         env=child_env,
     )
     log_handle.close()
-    identity = read_process_identity(process.pid)
+    identity = process.token.payload
+    if identity.started_at == "test-double":
+        identity = read_process_identity(process.pid)
     if identity is None:
         raise RuntimeError(
             f"Could not read process identity for pid {process.pid} ({candidate.spec_id}); cannot track child safely.",
@@ -2107,7 +2113,7 @@ def start_candidate(
     proc = ActiveRunProcess(
         spec_id=candidate.spec_id,
         agent=candidate.agent,
-        pid=process.pid,
+        pid=identity.pid,
         started_at=now_iso(),
         started_monotonic=time.monotonic(),
         log_path=str(log_path),
@@ -2336,7 +2342,14 @@ def run_loop(args: argparse.Namespace) -> int:
         print(format_status_line("error", backend_error), file=sys.stderr)
         return 1
     args.concurrency = concurrency_policy.cap
-    ensure_pid_file(repo_root)
+    dispatcher_lock = FileLock(autopilot_state_root(repo_root) / "dispatcher.lock", blocking=False)
+    if not dispatcher_lock.acquire():
+        raise RuntimeError("Autopilot already running for this repository.")
+    try:
+        ensure_pid_file(repo_root)
+    except Exception:
+        dispatcher_lock.release()
+        raise
     print(
         format_status_line(
             "config",
@@ -2423,6 +2436,10 @@ def run_loop(args: argparse.Namespace) -> int:
 
     try:
         while True:
+            requested = shutdown_tracker.state()
+            if requested.phase in {ShutdownPhase.GRACEFUL, ShutdownPhase.FORCED}:
+                stop_requested = True
+                force_shutdown = requested.phase is ShutdownPhase.FORCED
             stale_source_warning = source_staleness.check()
             if stale_source_warning:
                 print(format_status_line("stale-source", stale_source_warning))
@@ -2799,6 +2816,7 @@ def run_loop(args: argparse.Namespace) -> int:
         remove_pid_file(repo_root)
         if stop_requested:
             shutdown_tracker.mark_complete()
+        dispatcher_lock.release()
 
     return 0
 
@@ -3389,10 +3407,22 @@ def watch_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _signal_autopilot(pid: int) -> int:
+def _signal_autopilot(pid: int, repo_root: Path | None = None) -> int:
+    if os.name == "nt":
+        if repo_root is None:
+            raise ValueError("repo_root is required for portable Windows shutdown")
+        tracker = ShutdownTracker(autopilot_state_root(repo_root))
+        tracker.record_interrupt(reason=f"stop-command:{os.getpid()}")
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if tracker.is_complete() or read_process_identity(pid) is None:
+                print(f"Autopilot pid {pid} acknowledged shutdown request.")
+                return 0
+            time.sleep(0.05)
+        print(f"Autopilot pid {pid} did not acknowledge shutdown request.", file=sys.stderr)
+        return 1
     try:
-        graceful_signal = signal.CTRL_BREAK_EVENT if os.name == "nt" else signal.SIGTERM
-        os.kill(pid, graceful_signal)
+        os.kill(pid, signal.SIGTERM)
     except OSError as exc:
         print(f"Failed to stop autopilot pid {pid}: {exc}", file=sys.stderr)
         print(f"Stop it manually with: kill -TERM {pid}", file=sys.stderr)
@@ -3429,7 +3459,7 @@ def _stop_via_repo_scan(repo_root: Path, *, why: str) -> int:
         f"is running in {repo_root}: {found.command}",
         file=sys.stderr,
     )
-    return _signal_autopilot(found.pid)
+    return _signal_autopilot(found.pid, repo_root)
 
 
 def stop_command(args: argparse.Namespace) -> int:
@@ -3471,7 +3501,7 @@ def stop_command(args: argparse.Namespace) -> int:
         # runs with a working directory outside the repo, and demanding a cwd
         # match would reintroduce the very "cannot stop my own daemon" failure
         # this path exists to fix.
-        return _signal_autopilot(record.pid)
+        return _signal_autopilot(record.pid, repo_root)
 
     # Relaxed path. `started_at`/`command` equality is a nice-to-have, not a
     # gate: the pid file is written once at launch, while `spec auto stop` runs
@@ -3517,7 +3547,7 @@ def stop_command(args: argparse.Namespace) -> int:
     )
     for reason in reasons:
         print(f"  {reason}", file=sys.stderr)
-    return _signal_autopilot(record.pid)
+    return _signal_autopilot(record.pid, repo_root)
 
 
 def gc_command(args: argparse.Namespace) -> int:

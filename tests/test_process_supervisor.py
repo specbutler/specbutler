@@ -39,9 +39,7 @@ def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -
     assert identity_matches(expected) is False
 
 
-def test_adoptable_token_transfers_only_once_per_owner(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_adoptable_token_records_new_logical_owner(monkeypatch: pytest.MonkeyPatch) -> None:
     identity = ProcessIdentity(42, "created", "python.exe")
     token = SupervisionToken(LifetimeMode.ADOPTABLE, identity, 7, "owner", "unique-adoption-token")
     monkeypatch.setattr("spec_runtime.process_supervisor.identity_matches", lambda _identity: True)
@@ -49,31 +47,16 @@ def test_adoptable_token_transfers_only_once_per_owner(
         "spec_runtime.process_supervisor.inspect_process",
         lambda pid: ProcessIdentity(pid, "new-owner", sys.executable),
     )
-    monkeypatch.setattr("spec_runtime.process_supervisor.tempfile.gettempdir", lambda: str(tmp_path))
     assert adopt(token).owner_pid == os.getpid()
-    with pytest.raises(ValueError, match="already adopted"):
-        adopt(token)
 
 
-def test_adoption_claim_is_exclusive_across_processes(tmp_path: Path) -> None:
-    """Two replacement dispatchers cannot claim the same owner transition."""
-    token_file = tmp_path / "token.json"
-    token = SupervisionToken(
-        LifetimeMode.ADOPTABLE,
-        inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable"),
-        7,
-        "concurrent-owner",
-        f"concurrent-{uuid.uuid4().hex}",
-    )
-    token_file.write_text(json.dumps(token.to_dict()), encoding="utf-8")
-    script = (
-        "import json,sys; from pathlib import Path; "
-        "from spec_runtime.process_supervisor import SupervisionToken,adopt; "
-        "adopt(SupervisionToken.from_dict(json.loads(Path(sys.argv[1]).read_text())))"
-    )
-    processes = [subprocess.Popen([sys.executable, "-c", script, str(token_file)]) for _ in range(2)]
-    returncodes = sorted(process.wait(timeout=10) for process in processes)
-    assert returncodes == [0, 1]
+def test_token_distinguishes_supervisor_and_payload_identity() -> None:
+    helper = ProcessIdentity(41, "helper")
+    payload = ProcessIdentity(42, "payload")
+    token = SupervisionToken(LifetimeMode.ADOPTABLE, helper, 7, "owner", uuid.uuid4().hex, 0, payload)
+    restored = SupervisionToken.from_dict(token.to_dict())
+    assert restored.identity == helper
+    assert restored.payload == payload
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")

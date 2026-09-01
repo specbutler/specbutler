@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
-import hashlib
+import json
 import os
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -24,30 +23,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 _REAL_POPEN_TYPE = subprocess.Popen
-
-def _adoption_claim_path(token: SupervisionToken) -> Path:
-    """Return the durable claim for one logical ownership transition."""
-    transition = f"{token.token}\0{token.owner_pid}\0{token.owner_started_at}"
-    digest = hashlib.sha256(transition.encode("utf-8")).hexdigest()
-    return Path(tempfile.gettempdir()) / "spec-runtime-adoptions" / f"{digest}.claim"
-
-
-def _claim_adoption(token: SupervisionToken, owner: ProcessIdentity) -> None:
-    """Atomically arbitrate adoption across independent dispatcher processes."""
-    path = _adoption_claim_path(token)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError as exc:
-        raise ValueError("Supervision token ownership transition was already adopted") from exc
-    try:
-        payload = f"{owner.pid}\n{owner.started_at}\n"
-        os.write(fd, payload.encode("utf-8"))
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
 
 def _kernel32() -> Any:
     """Return kernel32 with pointer-width-safe declarations."""
@@ -122,21 +97,37 @@ class SupervisionToken:
     owner_started_at: str
     token: str
     pgid: int = 0
+    payload_identity: ProcessIdentity | None = None
+
+    def __post_init__(self) -> None:
+        if self.payload_identity is None:
+            object.__setattr__(self, "payload_identity", self.identity)
 
     def to_dict(self) -> dict[str, object]:
         result = asdict(self)
         result["mode"] = self.mode.value
+        result["supervisor_identity"] = result["identity"]
+        result["payload_identity"] = asdict(self.payload)
         return result
+
+    @property
+    def payload(self) -> ProcessIdentity:
+        return self.payload_identity or self.identity
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> SupervisionToken:
         return cls(
             mode=LifetimeMode(str(value["mode"])),
-            identity=ProcessIdentity.from_dict(dict(value["identity"])),  # type: ignore[arg-type]
+            identity=ProcessIdentity.from_dict(
+                dict(value.get("supervisor_identity", value["identity"]))  # type: ignore[arg-type]
+            ),
             owner_pid=int(value.get("owner_pid", 0)),
             owner_started_at=str(value.get("owner_started_at", "")),
             token=str(value.get("token", "")),
             pgid=int(value.get("pgid", 0)),
+            payload_identity=ProcessIdentity.from_dict(dict(value["payload_identity"]))
+            if isinstance(value.get("payload_identity"), dict)
+            else None,
         )
 
 
@@ -601,6 +592,7 @@ class ProcessSupervisor:
 
     def spawn(self, argv: Sequence[str], **kwargs: Any) -> ManagedProcess:
         job = None
+        metadata_path: Path | None = None
         supervision_id = uuid.uuid4().hex
         if os.name == "nt":
             flags = int(kwargs.pop("creationflags", 0))
@@ -608,18 +600,25 @@ class ProcessSupervisor:
                 flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
                 flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
                 job = _WindowsJob(_windows_job_name(supervision_id))
-            elif self.mode is LifetimeMode.ADOPTABLE:
+            elif self.mode in {LifetimeMode.ADOPTABLE, LifetimeMode.DETACHED}:
                 # A detached helper is the durable Job-handle owner.  The
                 # dispatcher may exit or restart without closing the payload
                 # Job; a replacement validates and adopts the helper token.
-                helper_argv = [sys.executable, "-m", "spec_runtime.process_supervisor", "--adoptable-helper", "--", *argv]
+                metadata_path = Path(kwargs.get("cwd") or os.getcwd()) / f".spec-supervisor-{supervision_id}.json"
+                helper_argv = [
+                    sys.executable,
+                    "-m",
+                    "spec_runtime.process_supervisor",
+                    "--durable-helper",
+                    str(metadata_path),
+                    "--",
+                    *argv,
+                ]
                 argv = helper_argv
                 flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
                 flags |= getattr(subprocess, "DETACHED_PROCESS", 0x8)
             else:
                 flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
-                if self.mode is LifetimeMode.DETACHED:
-                    flags |= getattr(subprocess, "DETACHED_PROCESS", 0x8)
             kwargs["creationflags"] = flags
         else:
             kwargs["start_new_session"] = True
@@ -637,7 +636,22 @@ class ProcessSupervisor:
             owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())
             owner = owner or ProcessIdentity(os.getpid(), "unavailable")
             pgid = 0 if is_test_double else os.getpgid(process.pid) if os.name == "posix" else 0
-            token = SupervisionToken(self.mode, identity, owner.pid, owner.started_at, supervision_id, pgid)
+            payload_identity = identity
+            if metadata_path is not None and not is_test_double:
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline and not metadata_path.exists():
+                    if process.poll() is not None:
+                        raise RuntimeError("Durable process supervisor exited before publishing payload identity")
+                    time.sleep(0.02)
+                try:
+                    payload_identity = ProcessIdentity.from_dict(json.loads(metadata_path.read_text(encoding="utf-8")))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("Durable process supervisor did not publish payload identity") from exc
+                finally:
+                    metadata_path.unlink(missing_ok=True)
+            token = SupervisionToken(
+                self.mode, identity, owner.pid, owner.started_at, supervision_id, pgid, payload_identity
+            )
             if is_test_double:
                 setattr(process, "token", token)
                 return process  # type: ignore[return-value]
@@ -656,6 +670,7 @@ class ProcessSupervisor:
     async def spawn_async(self, argv: Sequence[str], **kwargs: Any) -> ManagedAsyncProcess:
         """Async counterpart with the same platform-owned launch policy."""
         job = None
+        metadata_path: Path | None = None
         supervision_id = uuid.uuid4().hex
         if os.name == "nt":
             flags = int(kwargs.pop("creationflags", 0))
@@ -663,10 +678,17 @@ class ProcessSupervisor:
             if self.mode is LifetimeMode.RUN_OWNED:
                 flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
                 job = _WindowsJob(_windows_job_name(supervision_id))
-            elif self.mode is LifetimeMode.ADOPTABLE:
-                argv = [sys.executable, "-m", "spec_runtime.process_supervisor", "--adoptable-helper", "--", *argv]
-                flags |= getattr(subprocess, "DETACHED_PROCESS", 0x8)
-            elif self.mode is LifetimeMode.DETACHED:
+            elif self.mode in {LifetimeMode.ADOPTABLE, LifetimeMode.DETACHED}:
+                metadata_path = Path(kwargs.get("cwd") or os.getcwd()) / f".spec-supervisor-{supervision_id}.json"
+                argv = [
+                    sys.executable,
+                    "-m",
+                    "spec_runtime.process_supervisor",
+                    "--durable-helper",
+                    str(metadata_path),
+                    "--",
+                    *argv,
+                ]
                 flags |= getattr(subprocess, "DETACHED_PROCESS", 0x8)
             kwargs["creationflags"] = flags
         else:
@@ -692,7 +714,22 @@ class ProcessSupervisor:
             owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())
             owner = owner or ProcessIdentity(os.getpid(), "unavailable")
             pgid = 0 if is_test_double else os.getpgid(process.pid) if os.name == "posix" else 0
-            token = SupervisionToken(self.mode, identity, owner.pid, owner.started_at, supervision_id, pgid)
+            payload_identity = identity
+            if metadata_path is not None and not is_test_double:
+                deadline = time.monotonic() + 10.0
+                while time.monotonic() < deadline and not metadata_path.exists():
+                    if process.returncode is not None:
+                        raise RuntimeError("Durable process supervisor exited before publishing payload identity")
+                    await asyncio.sleep(0.02)
+                try:
+                    payload_identity = ProcessIdentity.from_dict(json.loads(metadata_path.read_text(encoding="utf-8")))
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    raise RuntimeError("Durable process supervisor did not publish payload identity") from exc
+                finally:
+                    metadata_path.unlink(missing_ok=True)
+            token = SupervisionToken(
+                self.mode, identity, owner.pid, owner.started_at, supervision_id, pgid, payload_identity
+            )
             managed = ManagedAsyncProcess(process, token, job)
             if job is not None:
                 _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
@@ -723,7 +760,7 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
         return False
     if job is None and os.name == "nt":
         job = _LIVE_WINDOWS_JOBS.get((token.identity.pid, token.identity.started_at))
-    tree = _windows_tree_identities(token.identity.pid)
+    tree = _windows_tree_identities(token.payload.pid)
     try:
         if os.name == "posix":
             os.killpg(token.pgid or token.identity.pid, signal.SIGTERM)
@@ -748,8 +785,8 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
         elif job is not None:
             job.terminate()
         else:
-            # Detached services have no live Job handle; identity validation
-            # still makes direct termination safe, but descendants are outside scope.
+            # Durable modes target the helper that owns the payload Job. Its
+            # exit closes the only durable Job handle and kills the full tree.
             os.kill(token.identity.pid, signal.SIGTERM)
     except (OSError, ValueError):
         if reopened_job is not None:
@@ -768,20 +805,22 @@ def adopt(token: SupervisionToken) -> SupervisionToken:
     if not identity_matches(token.identity):
         raise ProcessLookupError(token.identity.pid)
     owner = inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable")
-    _claim_adoption(token, owner)
-    adopted = SupervisionToken(token.mode, token.identity, owner.pid, owner.started_at, token.token, token.pgid)
+    adopted = SupervisionToken(
+        token.mode, token.identity, owner.pid, owner.started_at, token.token, token.pgid, token.payload_identity
+    )
     return adopted
 
 
-def _adoptable_helper(argv: Sequence[str]) -> int:
-    """Own one Windows Job for the full lifetime of an adoptable payload."""
+def _durable_helper(metadata_path: Path, argv: Sequence[str]) -> int:
+    """Own one Windows Job for the full lifetime of a durable payload."""
     with ProcessSupervisor(LifetimeMode.RUN_OWNED) as supervisor:
         child = supervisor.spawn(argv)
+        metadata_path.write_text(json.dumps(child.token.identity.to_dict()), encoding="utf-8")
         return int(child.wait())
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised by native Windows tests
-    marker = "--adoptable-helper"
+    marker = "--durable-helper"
     if marker in sys.argv:
         separator = sys.argv.index("--")
-        raise SystemExit(_adoptable_helper(sys.argv[separator + 1 :]))
+        raise SystemExit(_durable_helper(Path(sys.argv[sys.argv.index(marker) + 1]), sys.argv[separator + 1 :]))
