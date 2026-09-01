@@ -1909,7 +1909,7 @@ class TestBackendAvailability:
         with (
             patch("spec_runtime.web.bridge_claude._sdk_available", return_value=True),
             patch(
-                "spec_runtime.agent_adapter.claude_sandbox_unavailability_reason",
+                "spec_runtime.agent_adapter.host_agent_unavailability_reason",
                 return_value="missing socat",
             ),
             patch("spec_runtime.web.bridge_codex._codex_available", return_value=False),

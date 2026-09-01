@@ -75,6 +75,9 @@ spec_runtime = ["templates/*.md", "templates/*.json", "examples/*.toml", "web/st
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "host_agent_preflight: exercise the real host provider availability policy",
+]
 
 [tool.ruff]
 target-version = "py311"

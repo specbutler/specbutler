@@ -64,11 +64,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from . import review_feedback, worktree_process_registry
 from .agent_adapter import (
     AgentAdapter,
+    HostAgentUnavailableError,
     _codex_linux_sandbox_overrides,
     _render_codex_mcp_toml,
     claude_isolated_home,
     codex_isolated_home,
     get_agent_adapter,
+    require_host_agent_available,
 )
 from .command_runtime import CommandSpec, CommandVariants
 from .config import load_spec_runtime_config
@@ -10063,6 +10065,7 @@ def _maybe_run_block_debugger(
         # a failed debugger must not erase the only useful recovery artifact.
         _clear_block_debugger_artifacts(artifact_paths, keep_diagnosis=True)
         try:
+            require_host_agent_available(debugger_agent)
             context_path, head_sha, worktree_status = _write_block_debugger_context(
                 run,
                 repo_root,
@@ -10217,7 +10220,13 @@ def _maybe_run_block_debugger(
             diagnosis.first_failed_test_nodeid = _diagnosis_first_failed_test_nodeid(repo_root, run)
             diagnosis.save(repo_root, run.run_id)
             _record_block_debugger_phase_audit(repo_root, run, result_status="passed")
-        except (ValueError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        except (
+            HostAgentUnavailableError,
+            ValueError,
+            FileNotFoundError,
+            OSError,
+            subprocess.TimeoutExpired,
+        ) as exc:
             run.last_error = original_last_error
             _record_nonfatal_warning(
                 run,
@@ -13064,6 +13073,21 @@ def _backend_uses_provider_sandbox_config(backend: ExecutionBackend) -> bool:
     return backend.__class__.__name__ == "WorktreeExecutionBackend"
 
 
+def _backend_launches_agent_on_host(backend: ExecutionBackend) -> bool:
+    """Return whether the provider CLI itself executes on the current host."""
+    identity = getattr(backend, "identity", None)
+    return getattr(identity, "backend", "") != "container"
+
+
+def _require_agent_available_for_backend(
+    agent_name: str,
+    backend: ExecutionBackend,
+) -> None:
+    """Apply host provider policy unless a Linux container runs the agent."""
+    if _backend_launches_agent_on_host(backend):
+        require_host_agent_available(agent_name)
+
+
 def _read_slug_from_spec(spec_path: Path) -> str:
     """Read a task slug from frontmatter `id:` or a legacy `slug:` line."""
     if not spec_path.exists():
@@ -13361,6 +13385,12 @@ def phase_scoping(run: RunState, repo_root: Path) -> str:
     if spec_file.exists():
         logger.info("%s already exists, skipping scoping.", spec_file)
         return "passed"
+
+    try:
+        require_host_agent_available(run.agent)
+    except HostAgentUnavailableError as exc:
+        run.last_error = str(exc)
+        return "failed"
 
     if not sys.stdin.isatty():
         run.last_error = "Task scoping requires an interactive terminal."
@@ -14084,8 +14114,9 @@ def _prepare_implement_launch_plan(
     reason: str,
     use_stream_json: bool,
 ) -> ImplementLaunchPlan:
-    setup_manifest = _run_implement_setup_command(run, worktree_path)
     backend = _resolve_execution_backend()
+    _require_agent_available_for_backend(run.agent, backend)
+    setup_manifest = _run_implement_setup_command(run, worktree_path)
     adapter = get_agent_adapter(run.agent)
     setup_mcp_servers = None
     if adapter.capabilities.supports_mcp:
@@ -14840,6 +14871,12 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
     # First statement in the phase, ahead of every early return below, so a
     # prelaunch failure is never judged on the previous attempt's agent report.
     run.implement_agent_reported_failure = False
+    backend = _resolve_execution_backend()
+    try:
+        _require_agent_available_for_backend(run.agent, backend)
+    except HostAgentUnavailableError as exc:
+        run.last_error = str(exc)
+        return "failed"
     workspace = _resolve_workspace_handle(run, repo_root)
     worktree_path = workspace.path
     # Clone/container backends materialize their checkout outside the legacy
@@ -14866,7 +14903,6 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
     attempt_bundle = _build_implement_attempt_context(run, repo_root)
     reason = attempt_bundle.reason
     ctx = attempt_bundle.context
-    backend = _resolve_execution_backend()
     try:
         workspace = _restore_container_workspace_for_retry(workspace, backend, ctx)
     except ValueError as exc:
@@ -14937,7 +14973,11 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
             return "failed"
 
     # Probe Claude CLI for stream-json support (graceful fallback)
-    use_stream_json = run.agent == "claude" and _claude_supports_stream_json()
+    use_stream_json = (
+        run.agent == "claude"
+        and _backend_launches_agent_on_host(backend)
+        and _claude_supports_stream_json()
+    )
     logger.info(
         "Launching %s in %s (run_id=%s, attempt=%d)",
         run.agent,
@@ -15168,6 +15208,12 @@ def _attempt_no_handshake_recovery(
     ctx: ImplementContext,
     use_stream_json: bool,
 ) -> str | None:
+    backend = _resolve_execution_backend()
+    try:
+        _require_agent_available_for_backend(run.agent, backend)
+    except HostAgentUnavailableError as exc:
+        run.last_error = str(exc)
+        return "failed"
     if run.agent == "claude":
         credentials_error = _claude_credentials_preflight_error()
         if credentials_error:
@@ -15181,7 +15227,7 @@ def _attempt_no_handshake_recovery(
     # attempt. Remove mutable aliases from the failed launch before starting
     # it; immutable attempt/launch histories remain available for diagnosis.
     _discard_prelaunch_completion_artifacts(repo_root, worktree_path, run.run_id)
-    _seed_recovery_commit_excludes(worktree_path, _resolve_execution_backend())
+    _seed_recovery_commit_excludes(worktree_path, backend)
     recovery_ctx = ImplementContext(
         implement_reason="recovery",
         objective=ctx.objective,
@@ -15214,7 +15260,6 @@ def _attempt_no_handshake_recovery(
         recovery_env = _build_implement_agent_env(run, worktree_path)
         recovery_env_redactions: tuple[str, ...] = ()
         setup_manifest = _run_implement_setup_command(run, worktree_path)
-        backend = _resolve_execution_backend()
         adapter = get_agent_adapter(run.agent)
         setup_mcp_servers = None
         if adapter.capabilities.supports_mcp:
@@ -18892,6 +18937,7 @@ def _run_local_review(
     artifact_paths = _local_review_artifact_paths(repo_root, run.run_id)
     _clear_local_review_artifacts(artifact_paths)
     review_agent = _effective_review_agent(run)
+    require_host_agent_available(review_agent)
     reasoning_effort = (
         LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT if run.review_changes == 0 else LOCAL_REVIEW_REASONING_EFFORT
     )
@@ -19099,6 +19145,11 @@ def _phase_review_local(
     expected_base_sha: str,
 ) -> str:
     review_agent = _effective_review_agent(run)
+    try:
+        require_host_agent_available(review_agent)
+    except HostAgentUnavailableError as exc:
+        run.last_error = str(exc)
+        return "failed"
     if not shutil.which(review_agent):
         run.last_error = (
             f"Review agent '{review_agent}' not found on PATH. Install it or configure a different agent in .spec.toml."
@@ -21677,6 +21728,11 @@ def cmd_spec(args: argparse.Namespace) -> int:
     if agent not in VALID_AGENTS:
         print(f"Error: AGENT must be one of {VALID_AGENTS}", file=sys.stderr)
         return 1
+    try:
+        require_host_agent_available(agent)
+    except HostAgentUnavailableError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     if raw_spec_id and not SPEC_ID_RE.fullmatch(raw_spec_id):
         print(
             "Error: SPEC must be a lowercase slug matching `[a-z0-9][a-z0-9-]*`.",
@@ -21857,6 +21913,11 @@ def cmd_input(args: argparse.Namespace) -> int:
 
     requested_agent = getattr(args, "agent", None)
     agent = requested_agent or run.agent or SPEC_RUNTIME_CONFIG.agents.default
+    try:
+        require_host_agent_available(agent)
+    except HostAgentUnavailableError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     # Build context for the interactive prompt
     spec_file = worktree_path / _spec_path_for_run(run)
@@ -22058,6 +22119,14 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 1
     if review_agent not in VALID_AGENTS:
         print(f"Error: REVIEW_AGENT must be one of {VALID_AGENTS}", file=sys.stderr)
+        return 1
+
+    # Task scoping is an interactive host launch even when implementation is
+    # configured to use the Linux container backend.
+    try:
+        require_host_agent_available(agent)
+    except HostAgentUnavailableError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     try:

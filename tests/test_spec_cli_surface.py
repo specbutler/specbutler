@@ -22,9 +22,12 @@ from spec_runtime.agent_adapter import (
     AgentAdapter,
     ClaudeAgent,
     CodexAgent,
+    HostAgentUnavailableError,
     _codex_git_metadata_dirs,
     get_agent_adapter,
+    host_agent_unavailability_reason,
     register_agent_adapter,
+    require_host_agent_available,
 )
 from spec_runtime.config import SpecConfigNotFoundError
 from spec_runtime.forge import (
@@ -370,6 +373,20 @@ class TestForgeFactory:
 
 
 class TestClaudeAgent:
+    def test_native_windows_host_launch_fails_closed_with_alternatives(self):
+        reason = host_agent_unavailability_reason("claude", platform="win32")
+
+        assert "not supported" in reason
+        assert "Codex" in reason
+        assert "WSL2" in reason
+        assert "Linux container" in reason
+        with pytest.raises(HostAgentUnavailableError, match="WSL2"):
+            require_host_agent_available("claude", platform="win32")
+
+    def test_codex_is_not_subject_to_claude_host_sandbox_policy(self):
+        assert host_agent_unavailability_reason("codex", platform="win32") == ""
+        require_host_agent_available("codex", platform="win32")
+
     def test_name(self):
         assert ClaudeAgent().name == "claude"
 

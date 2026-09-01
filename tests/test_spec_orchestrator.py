@@ -35,6 +35,10 @@ from spec_runtime import execution_backend as eb
 from spec_runtime import orchestrator as orch
 from spec_runtime import spec_merge_tags as merge_tags
 from spec_runtime import worktree_process_registry as process_registry
+from spec_runtime.agent_adapter import (
+    HostAgentUnavailableError,
+    host_agent_unavailability_reason,
+)
 from spec_runtime.command_runtime import CommandVariants
 from spec_runtime.config import CoordinationConfig, VerifyGateConfig
 from spec_runtime.control_plane import save_run_lease
@@ -47,6 +51,22 @@ from spec_runtime.review_bootstrap import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _make_host_agent_availability_hermetic(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Do not make lifecycle unit tests depend on the pytest host sandbox.
+
+    Tests marked ``host_agent_preflight`` exercise the production policy
+    explicitly. Every other orchestrator test uses fake provider processes and
+    should remain portable across Linux, macOS, and native Windows runners.
+    """
+    if request.node.get_closest_marker("host_agent_preflight") is not None:
+        return
+    monkeypatch.setattr(orch, "require_host_agent_available", lambda _agent: None)
 
 
 # ---------------------------------------------------------------------------
@@ -33298,6 +33318,318 @@ class TestContainerOutboxCompletionResult:
         result = orch._load_container_outbox_completion_result(worktree, "run-1")
 
         assert result is not None
+
+
+@pytest.mark.host_agent_preflight
+class TestHostClaudeLaunchPreflight:
+    @staticmethod
+    def _windows_error() -> HostAgentUnavailableError:
+        return HostAgentUnavailableError(
+            host_agent_unavailability_reason("claude", platform="win32")
+        )
+
+    @staticmethod
+    def _backend(name: str):
+        return SimpleNamespace(
+            identity=eb.BackendIdentity(
+                backend=name,
+                safety_mode="strict",
+                workspace_root="",
+            )
+        )
+
+    def test_native_worktree_implement_fails_before_launch_reservation(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="windows-claude-20260901T000000",
+            spec_id="windows-claude",
+            branch="code/windows-claude--token",
+            agent="claude",
+        )
+        worktree = repo / ".worktrees" / "windows-claude"
+        worktree.mkdir(parents=True)
+        workspace = eb.WorkspaceHandle(
+            path=worktree,
+            outbox_path=worktree / ".spec-outbox",
+            branch=run.branch,
+        )
+        bundle = orch.ImplementAttemptContextBundle(
+            reason="initial",
+            context=orch.ImplementContext(run_id=run.run_id),
+        )
+
+        with (
+            patch.object(orch, "_resolve_workspace_handle", return_value=workspace),
+            patch.object(orch, "_ensure_required_intake_before_implement", return_value="passed"),
+            patch.object(orch, "_sync_reused_branch_before_implement", return_value="passed"),
+            patch.object(orch, "_build_implement_attempt_context", return_value=bundle),
+            patch.object(orch, "_resolve_execution_backend", return_value=self._backend("worktree")),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_reserve_implement_launch") as reserve,
+            patch.object(orch, "_launch_implement_attempt") as launch,
+        ):
+            status = orch.phase_implement(run, repo)
+
+        assert status == "failed"
+        assert "WSL2" in run.last_error
+        assert run.implement_launches == 0
+        reserve.assert_not_called()
+        launch.assert_not_called()
+
+    def test_spec_authoring_fails_before_worktree_or_agent_launch(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        args = argparse.Namespace(
+            agent="claude",
+            base="origin/master",
+            spec="windows-authoring",
+            label="",
+        )
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_prepare_spec_authoring_worktree") as prepare,
+            patch.object(orch.subprocess, "run") as launch,
+        ):
+            status = orch.cmd_spec(args)
+
+        assert status == 1
+        assert "WSL2" in capsys.readouterr().err
+        prepare.assert_not_called()
+        launch.assert_not_called()
+
+    def test_task_fails_before_run_creation_or_agent_launch(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        args = argparse.Namespace(
+            agent="claude",
+            review_agent="codex",
+            base="origin/master",
+            retry_cap=None,
+        )
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_create_task_run") as create_run,
+            patch.object(orch, "run_full_workflow") as workflow,
+        ):
+            status = orch.cmd_task(args)
+
+        assert status == 1
+        assert "Codex for native execution" in capsys.readouterr().err
+        create_run.assert_not_called()
+        workflow.assert_not_called()
+
+    def test_task_scoping_phase_fails_before_agent_launch(
+        self,
+        repo: Path,
+    ) -> None:
+        worktree = repo / ".worktrees" / "windows-scoping"
+        worktree.mkdir(parents=True)
+        run = orch.RunState(
+            run_id="windows-scoping-20260901T000000",
+            spec_id="windows-scoping",
+            branch="task/windows-scoping--token",
+            worktree_path=str(worktree),
+            run_mode="task",
+            agent="claude",
+        )
+
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_write_sandbox_config") as write_config,
+            patch.object(orch.subprocess, "run") as launch,
+        ):
+            status = orch.phase_scoping(run, repo)
+
+        assert status == "failed"
+        assert "WSL2" in run.last_error
+        write_config.assert_not_called()
+        launch.assert_not_called()
+
+    def test_input_fails_before_interactive_agent_launch(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        worktree = repo / ".worktrees" / "windows-input"
+        worktree.mkdir(parents=True)
+        run = orch.RunState(
+            run_id="windows-input-20260901T000000",
+            spec_id="windows-input",
+            branch="code/windows-input--token",
+            worktree_path=str(worktree),
+            phase="implement",
+            status="waiting-for-input",
+            agent="claude",
+        )
+        run.save(repo)
+        orch.OperatorRequest(
+            kind="agent_question",
+            prompt="Choose a format",
+            status="pending",
+        ).save(repo, run.run_id)
+        args = argparse.Namespace(spec=run.spec_id, agent=None)
+
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch.subprocess, "run") as launch,
+        ):
+            status = orch.cmd_input(args)
+
+        assert status == 1
+        assert "Linux container" in capsys.readouterr().err
+        assert not any(
+            call.args and call.args[0] and call.args[0][0] == "claude"
+            for call in launch.call_args_list
+        )
+
+    def test_container_implementation_does_not_apply_host_claude_policy(self) -> None:
+        with patch.object(orch, "require_host_agent_available") as require:
+            orch._require_agent_available_for_backend(
+                "claude",
+                self._backend("container"),
+            )
+
+        require.assert_not_called()
+
+    def test_recovery_fails_before_reserving_another_launch(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="windows-recovery-20260901T000000",
+            spec_id="windows-recovery",
+            branch="code/windows-recovery--token",
+            agent="claude",
+        )
+        worktree = repo / ".worktrees" / "windows-recovery"
+        worktree.mkdir(parents=True)
+        context = orch.ImplementContext(run_id=run.run_id)
+
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=self._backend("worktree")),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_reserve_implement_launch") as reserve,
+            patch.object(orch, "_launch_implement_attempt") as launch,
+        ):
+            status = orch._attempt_no_handshake_recovery(
+                run,
+                repo_root=repo,
+                worktree_path=worktree,
+                ctx=context,
+                use_stream_json=False,
+            )
+
+        assert status == "failed"
+        assert "WSL2" in run.last_error
+        reserve.assert_not_called()
+        launch.assert_not_called()
+
+    def test_local_review_fails_before_cli_discovery_or_subprocess(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="windows-review-20260901T000000",
+            spec_id="windows-review",
+            branch="code/windows-review--token",
+            agent="codex",
+            review_agent="claude",
+        )
+        with (
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch.shutil, "which") as which,
+            patch.object(orch, "_run_local_review") as review,
+        ):
+            status = orch._phase_review_local(
+                run,
+                repo,
+                pr_data={"number": 7},
+                expected_head_sha="head",
+                expected_base_sha="base",
+            )
+
+        assert status == "failed"
+        assert "Linux container" in run.last_error
+        which.assert_not_called()
+        review.assert_not_called()
+
+    def test_block_debugger_fails_before_context_or_agent_process(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="windows-debugger-20260901T000000",
+            spec_id="windows-debugger",
+            branch="code/windows-debugger--token",
+            phase="verify",
+            status="blocked",
+            agent="codex",
+            review_agent="claude",
+            last_error="verify failed",
+        )
+        run.save(repo)
+        with (
+            patch.object(orch, "_compute_blocker_signature", return_value="new-signature"),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_write_block_debugger_context") as write_context,
+            patch.object(orch, "_run_local_review_subprocess") as launch,
+        ):
+            diagnosis = orch._maybe_run_block_debugger(
+                run,
+                repo,
+                source_phase="verify",
+            )
+
+        assert diagnosis is None
+        write_context.assert_not_called()
+        launch.assert_not_called()
+        assert any(
+            "WSL2" in warning.get("detail", "")
+            for warning in run.nonfatal_warnings
+        )
 
 
 class TestCodexIsolatedHomeRequiresAuthCopy:

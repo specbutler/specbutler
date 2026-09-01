@@ -315,11 +315,11 @@ def _available_backends(repo_root: Path | None = None) -> dict[str, bool]:
     codex_ok = False
 
     try:
-        from spec_runtime.agent_adapter import claude_sandbox_unavailability_reason
+        from spec_runtime.agent_adapter import host_agent_unavailability_reason
 
         from .bridge_claude import _sdk_available
 
-        claude_ok = _sdk_available() and not claude_sandbox_unavailability_reason()
+        claude_ok = _sdk_available() and not host_agent_unavailability_reason("claude")
     except Exception:
         pass
 
@@ -348,7 +348,7 @@ def _available_backends(repo_root: Path | None = None) -> dict[str, bool]:
 def _backend_unavailability_reason(agent: str, repo_root: Path) -> str:
     """Explain a known provider preflight failure without starting a process."""
     if agent == "claude":
-        from spec_runtime.agent_adapter import claude_sandbox_unavailability_reason
+        from spec_runtime.agent_adapter import host_agent_unavailability_reason
 
         from .bridge_claude import _sdk_available
 
@@ -357,7 +357,7 @@ def _backend_unavailability_reason(agent: str, repo_root: Path) -> str:
                 "Claude backend unavailable — install the `web` extra and "
                 "authenticate Claude Code."
             )
-        reason = claude_sandbox_unavailability_reason()
+        reason = host_agent_unavailability_reason("claude")
         if reason:
             return reason
     elif agent == "codex":

@@ -30,6 +30,10 @@ _logger = logging.getLogger(__name__)
 _BARE_TOML_KEY_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
+class HostAgentUnavailableError(RuntimeError):
+    """Raised before an agent whose host isolation is unavailable is launched."""
+
+
 def claude_sandbox_unavailability_reason(
     *,
     platform: str | None = None,
@@ -59,8 +63,43 @@ def claude_sandbox_unavailability_reason(
         return ""
     return (
         f"Claude's host sandbox is not supported on platform {active_platform!r}. "
-        "Use WSL2, macOS, or the container execution backend."
+        "Use Codex for native execution, run Claude under WSL2 or macOS, or "
+        "use the Linux container execution backend for implementation."
     )
+
+
+def host_agent_unavailability_reason(
+    agent_name: str,
+    *,
+    platform: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> str:
+    """Return why *agent_name* cannot be launched directly on this host.
+
+    This is the common policy boundary for every host-side provider launch.
+    Container implementation workers deliberately do not call it because the
+    provider process runs in their Linux environment; authoring, local review,
+    block debugging, and local chat always run on the host.
+    """
+    if agent_name.strip().lower() == "claude":
+        return claude_sandbox_unavailability_reason(platform=platform, which=which)
+    return ""
+
+
+def require_host_agent_available(
+    agent_name: str,
+    *,
+    platform: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> None:
+    """Fail closed before starting an unavailable host-side provider."""
+    reason = host_agent_unavailability_reason(
+        agent_name,
+        platform=platform,
+        which=which,
+    )
+    if reason:
+        raise HostAgentUnavailableError(reason)
 
 
 def _toml_quote(s: str) -> str:

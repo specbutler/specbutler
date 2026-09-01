@@ -29,6 +29,11 @@ from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, St
 
 from spec_runtime import autopilot
 from spec_runtime import orchestrator as orch
+from spec_runtime.agent_adapter import (
+    HostAgentUnavailableError,
+    host_agent_unavailability_reason,
+    require_host_agent_available,
+)
 from spec_runtime.autopilot_tui.dashboard import (  # noqa: F401 — re-exported for backwards compat
     SPEC_RUNTIME_CONFIG,
     VISIBLE_DASHBOARD_RUN_STATUSES,
@@ -378,7 +383,7 @@ def _default_agent(repo_root: Path, spec_id: str, *, fallback_agent: str = "") -
 
 
 def _available_chat_agents(repo_root: Path) -> tuple[str, ...]:
-    """Return configured chat agents whose CLI is available on this host."""
+    """Return configured chat agents whose CLI and host isolation are available."""
     config = load_repo_spec_runtime_config(repo_root)
     configured = tuple(
         agent for agent in config.agents.allowed if agent in {"claude", "codex"}
@@ -387,7 +392,11 @@ def _available_chat_agents(repo_root: Path) -> tuple[str, ...]:
     return tuple(
         agent
         for agent in ordered
-        if agent in configured and shutil.which(agent) is not None
+        if (
+            agent in configured
+            and shutil.which(agent) is not None
+            and not host_agent_unavailability_reason(agent)
+        )
     )
 
 
@@ -1004,6 +1013,10 @@ class CliChatProvider:
                 raise RuntimeError(f"Codex CLI is not installed: {exc}") from exc
 
     def _stream_claude_output(self, prompt: str):
+        try:
+            require_host_agent_available("claude")
+        except HostAgentUnavailableError as exc:
+            raise RuntimeError(str(exc)) from exc
         command = [
             "claude",
             "-p",
