@@ -17392,9 +17392,11 @@ class TestLocalReviewHelpers:
             writable_temp_dir=scratch_dir,
         )
 
-        assert cmd[0:5] == ["codex", "exec", "--ephemeral", "-s", "read-only"]
+        assert cmd[0:5] == ["codex", "exec", "--ephemeral", "-s", "workspace-write"]
         assert "--output-schema" in cmd
-        assert cmd[cmd.index("--add-dir") + 1] == str(scratch_dir)
+        assert cmd[cmd.index("-C") + 1] == str(scratch_dir)
+        assert "--skip-git-repo-check" in cmd
+        assert "--add-dir" not in cmd
         assert "review this change" in cmd
 
     def test_build_local_review_command_works_with_claude(
@@ -18535,14 +18537,19 @@ class TestLocalReviewPhase:
             assert repo_root == repo
             assert cmd[0] == "codex"
             assert cwd == review_worktree
-            scratch_dir = Path(cmd[cmd.index("--add-dir") + 1])
+            scratch_dir = Path(cmd[cmd.index("-C") + 1])
             observed_scratch.append(scratch_dir)
             assert scratch_dir.is_dir()
             assert scratch_dir != review_worktree
+            assert cmd[cmd.index("-s") + 1] == "workspace-write"
+            assert "--skip-git-repo-check" in cmd
+            assert "--add-dir" not in cmd
             assert env["TMPDIR"] == str(scratch_dir)
             assert env["TMP"] == str(scratch_dir)
             assert env["TEMP"] == str(scratch_dir)
             assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+            assert str(review_worktree) in cmd[-1]
+            assert str(scratch_dir) in cmd[-1]
             (scratch_dir / "pytest-probe").write_text("writable\n")
             output_idx = cmd.index("-o")
             Path(cmd[output_idx + 1]).write_text(

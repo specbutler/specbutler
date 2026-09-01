@@ -19262,6 +19262,21 @@ def _review_env_prompt_note(
     )
 
 
+def _codex_review_sandbox_prompt_note(
+    review_worktree: Path,
+    scratch_dir: Path,
+) -> str:
+    """Describe the inverted Codex review sandbox without granting source writes."""
+    return (
+        "\n\nCodex review sandbox layout: your shell starts in the dedicated "
+        f"writable scratch directory `{scratch_dir}`. The PR checkout is read-only "
+        f"at `{review_worktree}`. Run repository commands after changing to that "
+        "checkout (or use `git -C <checkout> ...`); standard temporary-directory "
+        "environment variables continue to point at the writable scratch directory. "
+        "Do not copy the checkout into scratch or modify its files."
+    )
+
+
 def _run_local_review(
     run: RunState,
     repo_root: Path,
@@ -19350,8 +19365,13 @@ def _run_local_review(
         # not enough if the agent's shell resets PATH). Recorded to the prompt
         # artifact so the effective prompt is reproducible.
         env_note = _review_env_prompt_note(review_worktree)
-        if env_note:
-            prompt = f"{prompt}{env_note}"
+        sandbox_note = (
+            _codex_review_sandbox_prompt_note(review_worktree, review_scratch_dir)
+            if agent.name == "codex"
+            else ""
+        )
+        if env_note or sandbox_note:
+            prompt = f"{prompt}{env_note}{sandbox_note}"
             artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
         if agent.capabilities.supports_mcp:
             # The reviewer subprocess is launched on the host via

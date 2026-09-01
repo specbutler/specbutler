@@ -634,7 +634,7 @@ class TestCodexAgent:
         assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "workspace-write"
         assert "features.use_legacy_landlock=true" not in cmd
 
-    def test_build_review_command_uses_codex_default_linux_sandbox(self, tmp_path):
+    def test_build_review_command_uses_scratch_as_only_writable_root(self, tmp_path):
         agent = CodexAgent()
         scratch_dir = tmp_path / "review-scratch"
         cmd = agent.build_review_command(
@@ -642,9 +642,20 @@ class TestCodexAgent:
             output_path=tmp_path / "review.json",
             writable_temp_dir=scratch_dir,
         )
-        assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "read-only"
-        assert cmd[cmd.index("--add-dir") + 1] == str(scratch_dir)
+        assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "workspace-write"
+        assert cmd[cmd.index("-C") + 1] == str(scratch_dir)
+        assert "--skip-git-repo-check" in cmd
+        assert "--add-dir" not in cmd
         assert "features.use_legacy_landlock=true" not in cmd
+
+    def test_build_review_command_without_scratch_remains_read_only(self, tmp_path):
+        cmd = CodexAgent().build_review_command(
+            prompt="Review the work",
+            output_path=tmp_path / "review.json",
+        )
+
+        assert cmd[cmd.index("-s") + 1] == "read-only"
+        assert "-C" not in cmd
 
     def test_build_implement_command_keeps_default_sandbox(self, tmp_path):
         agent = CodexAgent()

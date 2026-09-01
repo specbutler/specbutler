@@ -651,14 +651,23 @@ class CodexAgent:
             "codex",
             "exec",
             "--ephemeral",
-            "-s",
-            "read-only",
         ]
+        if writable_temp_dir is None:
+            cmd += ["-s", "read-only"]
+        else:
+            # Codex accepts --add-dir with read-only but does not project that
+            # directory into the effective writable sandbox. Invert the
+            # workspace instead: start in disposable scratch under
+            # workspace-write, while the PR checkout remains an external,
+            # readable-but-unwritable directory named in the review prompt.
+            cmd += [
+                "-s",
+                "workspace-write",
+                "-C",
+                str(writable_temp_dir),
+                "--skip-git-repo-check",
+            ]
         cmd += _codex_linux_sandbox_overrides()
-        if writable_temp_dir is not None:
-            # Keep the checkout read-only while allowing test runners to use
-            # one disposable scratch root for temporary files.
-            cmd += ["--add-dir", str(writable_temp_dir)]
         if schema_path:
             cmd += ["--output-schema", str(schema_path)]
         cmd += ["-o", str(output_path), prompt]
