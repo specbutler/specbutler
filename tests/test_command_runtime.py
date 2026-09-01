@@ -40,6 +40,26 @@ def test_windows_override_precedes_portable_argv() -> None:
     assert variants.select(windows=True).value == ("python", "win.py")
 
 
+def test_windows_launch_anchors_relative_executable_to_command_cwd(
+    tmp_path: Path,
+) -> None:
+    command = CommandSpec("argv", (".venv/Scripts/python.exe", "-m", "pytest"))
+
+    with command.launch_argv(cwd=tmp_path, windows=True) as argv:
+        assert argv == [
+            str((tmp_path / ".venv" / "Scripts" / "python.exe").resolve()),
+            "-m",
+            "pytest",
+        ]
+
+
+def test_windows_launch_leaves_path_lookup_executable_unchanged(tmp_path: Path) -> None:
+    command = CommandSpec("argv", ("python", "-m", "pytest"))
+
+    with command.launch_argv(cwd=tmp_path, windows=True) as argv:
+        assert argv == ["python", "-m", "pytest"]
+
+
 def test_named_command_uses_matching_named_argv_keys() -> None:
     variants = parse_command_variants(
         {"install_argv": ["python", "install.py"], "install_argv_windows": ["py", "install.py"]},

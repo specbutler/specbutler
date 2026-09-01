@@ -115,7 +115,17 @@ class CommandSpec:
         """
         use_windows = os.name == "nt" if windows is None else windows
         if self.mode != "script" or self.shell != "cmd" or not use_windows:
-            yield self.argv(which=which, windows=windows, arguments=arguments)
+            argv = self.argv(which=which, windows=windows, arguments=arguments)
+            if use_windows and self.mode == "argv" and argv:
+                executable = Path(argv[0])
+                if not executable.is_absolute() and (
+                    "/" in argv[0] or "\\" in argv[0]
+                ):
+                    # CreateProcess does not use Popen(cwd=...) when resolving
+                    # an executable path. Anchor explicit relative paths to
+                    # the command cwd; bare names still use PATH normally.
+                    argv[0] = str((cwd / executable).resolve())
+            yield argv
             return
         if arguments:
             # Keep the targeted configuration error from argv().
