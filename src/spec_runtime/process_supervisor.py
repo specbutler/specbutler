@@ -98,16 +98,26 @@ class SupervisionToken:
     token: str
     pgid: int = 0
     payload_identity: ProcessIdentity | None = None
+    version: int = 2
+    job_name: str = ""
+    control_relpath: str = ""
+    control_nonce: str = ""
 
     def __post_init__(self) -> None:
         if self.payload_identity is None:
             object.__setattr__(self, "payload_identity", self.identity)
+        if self.version >= 2 and not self.control_relpath:
+            object.__setattr__(self, "control_relpath", f"controls/{self.token}/control.json")
+        if self.version >= 2 and not self.control_nonce:
+            object.__setattr__(self, "control_nonce", uuid.uuid4().hex)
 
     def to_dict(self) -> dict[str, object]:
         result = asdict(self)
         result["mode"] = self.mode.value
         result["supervisor_identity"] = result["identity"]
         result["payload_identity"] = asdict(self.payload)
+        result["supervision_id"] = self.token
+        result["keeper_identity"] = result["identity"]
         return result
 
     @property
@@ -116,18 +126,26 @@ class SupervisionToken:
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> SupervisionToken:
+        version = int(value.get("version", 1))
+        if os.name == "nt" and version < 2:
+            raise ValueError("legacy Windows supervision tokens are not safe to use")
+        keeper_value = value.get("keeper_identity") or value.get("supervisor_identity") or value.get("identity")
+        if not isinstance(keeper_value, dict):
+            raise ValueError("supervision token has no keeper identity")
         return cls(
             mode=LifetimeMode(str(value["mode"])),
-            identity=ProcessIdentity.from_dict(
-                dict(value.get("supervisor_identity", value["identity"]))  # type: ignore[arg-type]
-            ),
+            identity=ProcessIdentity.from_dict(keeper_value),
             owner_pid=int(value.get("owner_pid", 0)),
             owner_started_at=str(value.get("owner_started_at", "")),
-            token=str(value.get("token", "")),
+            token=str(value.get("supervision_id", value.get("token", ""))),
             pgid=int(value.get("pgid", 0)),
             payload_identity=ProcessIdentity.from_dict(dict(value["payload_identity"]))
             if isinstance(value.get("payload_identity"), dict)
             else None,
+            version=version,
+            job_name=str(value.get("job_name", "")),
+            control_relpath=str(value.get("control_relpath", "")),
+            control_nonce=str(value.get("control_nonce", "")),
         )
 
 
@@ -637,6 +655,7 @@ class ProcessSupervisor:
             owner = owner or ProcessIdentity(os.getpid(), "unavailable")
             pgid = 0 if is_test_double else os.getpgid(process.pid) if os.name == "posix" else 0
             payload_identity = identity
+            helper_token: SupervisionToken | None = None
             if metadata_path is not None and not is_test_double:
                 deadline = time.monotonic() + 10.0
                 while time.monotonic() < deadline and not metadata_path.exists():
@@ -644,13 +663,24 @@ class ProcessSupervisor:
                         raise RuntimeError("Durable process supervisor exited before publishing payload identity")
                     time.sleep(0.02)
                 try:
-                    payload_identity = ProcessIdentity.from_dict(json.loads(metadata_path.read_text(encoding="utf-8")))
+                    helper_token = SupervisionToken.from_dict(json.loads(metadata_path.read_text(encoding="utf-8")))
+                    payload_identity = helper_token.payload
                 except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     raise RuntimeError("Durable process supervisor did not publish payload identity") from exc
                 finally:
                     metadata_path.unlink(missing_ok=True)
+            job_name = _windows_job_name(supervision_id) if job is not None else ""
+            if helper_token is not None:
+                job_name = helper_token.job_name
             token = SupervisionToken(
-                self.mode, identity, owner.pid, owner.started_at, supervision_id, pgid, payload_identity
+                self.mode,
+                identity,
+                owner.pid,
+                owner.started_at,
+                supervision_id,
+                pgid,
+                payload_identity,
+                job_name=job_name,
             )
             if is_test_double:
                 setattr(process, "token", token)
@@ -715,6 +745,7 @@ class ProcessSupervisor:
             owner = owner or ProcessIdentity(os.getpid(), "unavailable")
             pgid = 0 if is_test_double else os.getpgid(process.pid) if os.name == "posix" else 0
             payload_identity = identity
+            helper_token: SupervisionToken | None = None
             if metadata_path is not None and not is_test_double:
                 deadline = time.monotonic() + 10.0
                 while time.monotonic() < deadline and not metadata_path.exists():
@@ -722,13 +753,24 @@ class ProcessSupervisor:
                         raise RuntimeError("Durable process supervisor exited before publishing payload identity")
                     await asyncio.sleep(0.02)
                 try:
-                    payload_identity = ProcessIdentity.from_dict(json.loads(metadata_path.read_text(encoding="utf-8")))
+                    helper_token = SupervisionToken.from_dict(json.loads(metadata_path.read_text(encoding="utf-8")))
+                    payload_identity = helper_token.payload
                 except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     raise RuntimeError("Durable process supervisor did not publish payload identity") from exc
                 finally:
                     metadata_path.unlink(missing_ok=True)
+            job_name = _windows_job_name(supervision_id) if job is not None else ""
+            if helper_token is not None:
+                job_name = helper_token.job_name
             token = SupervisionToken(
-                self.mode, identity, owner.pid, owner.started_at, supervision_id, pgid, payload_identity
+                self.mode,
+                identity,
+                owner.pid,
+                owner.started_at,
+                supervision_id,
+                pgid,
+                payload_identity,
+                job_name=job_name,
             )
             managed = ManagedAsyncProcess(process, token, job)
             if job is not None:
@@ -776,18 +818,20 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
     if not identity_matches(token.identity):
         return _wait_for_identities_exit(tree) if tree else True
     reopened_job = None
-    if os.name == "nt" and job is None and token.mode is LifetimeMode.RUN_OWNED:
-        reopened_job = _WindowsJob.open(_windows_job_name(token.token))
+    if os.name == "nt" and job is None:
+        reopened_job = _WindowsJob.open(token.job_name or _windows_job_name(token.token))
         job = reopened_job
+        if job is None:
+            # A live payload with no reopenable ownership primitive must never
+            # degrade to signaling a PID (including the helper PID).
+            return False
     try:
         if os.name == "posix":
             os.killpg(token.pgid or token.identity.pid, signal.SIGKILL)
         elif job is not None:
             job.terminate()
         else:
-            # Durable modes target the helper that owns the payload Job. Its
-            # exit closes the only durable Job handle and kills the full tree.
-            os.kill(token.identity.pid, signal.SIGTERM)
+            return False
     except (OSError, ValueError):
         if reopened_job is not None:
             reopened_job.close()
@@ -815,7 +859,9 @@ def _durable_helper(metadata_path: Path, argv: Sequence[str]) -> int:
     """Own one Windows Job for the full lifetime of a durable payload."""
     with ProcessSupervisor(LifetimeMode.RUN_OWNED) as supervisor:
         child = supervisor.spawn(argv)
-        metadata_path.write_text(json.dumps(child.token.identity.to_dict()), encoding="utf-8")
+        from spec_runtime.platform_fs import atomic_write_text
+
+        atomic_write_text(metadata_path, json.dumps(child.token.to_dict()))
         return int(child.wait())
 
 

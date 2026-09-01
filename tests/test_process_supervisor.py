@@ -28,6 +28,9 @@ def test_token_round_trip_preserves_reopenable_identity() -> None:
     identity = ProcessIdentity(42, "created", "python.exe", "python child.py")
     token = SupervisionToken(LifetimeMode.ADOPTABLE, identity, 7, "owner", "token", 9)
     assert SupervisionToken.from_dict(token.to_dict()) == token
+    assert token.version == 2
+    assert token.control_relpath.endswith("/control.json")
+    assert token.control_nonce
 
 
 def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -57,6 +60,24 @@ def test_token_distinguishes_supervisor_and_payload_identity() -> None:
     restored = SupervisionToken.from_dict(token.to_dict())
     assert restored.identity == helper
     assert restored.payload == payload
+
+
+def test_token_persists_explicit_job_name() -> None:
+    keeper = ProcessIdentity(41, "helper")
+    payload = ProcessIdentity(42, "payload")
+    token = SupervisionToken(
+        LifetimeMode.DETACHED,
+        keeper,
+        7,
+        "owner",
+        "supervision-id",
+        payload_identity=payload,
+        job_name=r"Local\SpecButler-payload-job",
+    )
+    restored = SupervisionToken.from_dict(token.to_dict())
+    assert restored.identity == keeper
+    assert restored.payload == payload
+    assert restored.job_name == token.job_name
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")

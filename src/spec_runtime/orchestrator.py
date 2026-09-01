@@ -16004,10 +16004,6 @@ def _terminate_agent_process(proc: subprocess.Popen[str]) -> None:
     pid = getattr(proc, "pid", None)
     if os.name != "posix" and pid is not None:
         token = getattr(proc, "token", None)
-        if token is None:
-            identity = inspect_process(pid)
-            if identity is not None:
-                token = SupervisionToken(LifetimeMode.RUN_OWNED, identity, os.getpid(), "", f"agent-{pid}")
         if token is not None:
             terminate_supervised(token, grace_seconds=AGENT_TERMINATE_TIMEOUT_SECONDS)
             try:
@@ -16015,6 +16011,8 @@ def _terminate_agent_process(proc: subprocess.Popen[str]) -> None:
             except subprocess.TimeoutExpired:
                 logger.error("Agent process %s did not terminate after hard termination", pid)
             return
+        logger.error("Refusing PID-only termination of unsupervised Windows agent process %s", pid)
+        return
     terminated = False
     if pid is not None:
         try:
