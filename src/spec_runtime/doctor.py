@@ -628,34 +628,53 @@ def _windows_command_checks(
     which: ExecutableResolver,
 ) -> list[DoctorCheck]:
     """Validate exactly the typed command variants native Windows will run."""
-    configured: list[tuple[str, CommandSpec | None, str]] = [
-        ("bootstrap command", config.bootstrap_install.select(windows=True), "[bootstrap]"),
+    configured: list[tuple[str, CommandSpec | None, str, str]] = [
+        (
+            "bootstrap command", config.bootstrap_install.select(windows=True),
+            "[bootstrap]", "install_",
+        ),
+        (
+            "implement setup command", config.implement.setup.select(windows=True),
+            "[implement]", "setup_",
+        ),
+        (
+            "implement teardown command", config.implement.teardown.select(windows=True),
+            "[implement]", "teardown_",
+        ),
     ]
     configured.extend(
         (
             f"verify command ({gate.name})",
             gate.command_variants.select(windows=True),
             f"[[verify.gates]] name={gate.name!r}",
+            "",
         )
         for gate in config.verify_gates
     )
     checks: list[DoctorCheck] = []
-    for name, command, location in configured:
+    for name, command, location, key_prefix in configured:
         if command is None:
             if name == "bootstrap command":
                 checks.append(_ok(name, "not configured (optional)"))
             continue
-        if command.mode == "script" and command.shell == "sh" and looks_posix_script(str(command.value)):
+        if command.mode == "script" and command.shell == "sh":
+            detail = (
+                "only a clearly POSIX shell command is configured, which native Windows will not rewrite"
+                if looks_posix_script(str(command.value))
+                else "a POSIX shell command is selected, which native Windows will not execute"
+            )
             checks.append(
                 _error(
                     name,
-                    "only a POSIX shell command is configured, which native Windows will not rewrite",
-                    f"Add `{location}` argv_windows, or command_windows with shell_windows set to powershell, pwsh, or cmd.",
+                    detail,
+                    f"Add `{key_prefix}argv_windows` to `{location}`, or add "
+                    f"`{key_prefix}command_windows` with `{key_prefix}shell_windows` "
+                    "set to powershell, pwsh, or cmd.",
                 )
             )
             continue
         try:
-            argv = command.argv(which=which)
+            argv = command.argv(which=which, windows=True)
         except FileNotFoundError as exc:
             checks.append(_error(name, str(exc), f"Install the declared shell or update `{location}`."))
             continue

@@ -28,24 +28,46 @@ class CommandSpec:
     shell: ShellName | None = None
     source: str = ""
 
-    def argv(self, *, which: Callable[[str], str | None] = shutil.which) -> list[str]:
+    def argv(
+        self,
+        *,
+        which: Callable[[str], str | None] = shutil.which,
+        windows: bool | None = None,
+        arguments: tuple[str, ...] = (),
+    ) -> list[str]:
         if self.mode == "argv":
-            return list(self.value) if isinstance(self.value, tuple) else [self.value]
+            base = list(self.value) if isinstance(self.value, tuple) else [self.value]
+            return [*base, *arguments]
         script = str(self.value)
         shell = self.shell or "sh"
         if shell == "sh":
-            return ["sh", "-c", script]
+            use_windows = os.name == "nt" if windows is None else windows
+            if use_windows:
+                raise FileNotFoundError(
+                    "POSIX shell command cannot run on native Windows; configure an argv_windows "
+                    "variant, or command_windows with shell_windows set to powershell, pwsh, or cmd"
+                )
+            # sh -c assigns the first word after the script to $0.  Reserve it
+            # so caller-supplied hook metadata starts at $1 as documented.
+            return (
+                ["sh", "-c", script, "spec-command", *arguments]
+                if arguments
+                else ["sh", "-c", script]
+            )
         if shell == "cmd":
-            return ["cmd.exe", "/d", "/s", "/c", script]
+            return ["cmd.exe", "/d", "/s", "/c", script, *arguments]
         executable = "powershell.exe" if shell == "powershell" else "pwsh"
         resolved = which(executable)
         if resolved is None:
             raise FileNotFoundError(f"declared shell {shell!r} is not installed")
-        return [resolved, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]
+        return [
+            resolved, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script,
+            *arguments,
+        ]
 
     def display(self, *, windows: bool | None = None) -> str:
-        argv = [_redact(item) for item in self.argv(which=lambda name: name)]
         use_windows = os.name == "nt" if windows is None else windows
+        argv = _redact_argv(self.argv(which=lambda name: name, windows=use_windows))
         return subprocess.list2cmdline(argv) if use_windows else shlex.join(argv)
 
 
@@ -74,7 +96,12 @@ class CommandVariants:
             if self.argv_value:
                 return CommandSpec("argv", self.argv_value, source=self.source)
             if self.command:
-                return CommandSpec("script", self.command, self.shell or "sh", self.source)
+                if self.shell or looks_posix_script(self.command):
+                    return CommandSpec("script", self.command, self.shell or "sh", self.source)
+                # Preserve the established native-Windows behavior for simple
+                # legacy command strings: launch their tokenized argv directly.
+                # Shell syntax is never translated and is rejected by argv().
+                return CommandSpec("argv", tuple(shlex.split(self.command)), source=self.source)
             return None
         if self.argv_value:
             return CommandSpec("argv", self.argv_value, source=self.source)
@@ -88,12 +115,15 @@ def parse_command_variants(
 ) -> CommandVariants:
     """Parse and validate the common command variant vocabulary."""
     argv_key = "argv" if command_key == "command" else f"{command_key.removesuffix('_command')}_argv"
+    shell_key = "shell" if command_key == "command" else f"{command_key.removesuffix('_command')}_shell"
     command = _string(payload.get(command_key), f"{source}.{command_key}")
     windows_command = _string(payload.get(f"{command_key}_windows"), f"{source}.{command_key}_windows")
     argv_value = _argv(payload.get(argv_key), f"{source}.{argv_key}")
     windows_argv = _argv(payload.get(f"{argv_key}_windows"), f"{source}.{argv_key}_windows")
-    shell = _shell(payload.get("shell"), f"{source}.shell")
-    windows_shell = _shell(payload.get("shell_windows"), f"{source}.shell_windows")
+    shell = _shell(payload.get(shell_key), f"{source}.{shell_key}")
+    windows_shell = _shell(
+        payload.get(f"{shell_key}_windows"), f"{source}.{shell_key}_windows"
+    )
     if command and argv_value:
         raise CommandConfigurationError(f"{source} cannot set both {command_key} and {argv_key}")
     if windows_command and windows_argv:
@@ -101,20 +131,22 @@ def parse_command_variants(
             f"{source} cannot set both {command_key}_windows and {argv_key}_windows"
         )
     if shell and not command:
-        raise CommandConfigurationError(f"{source}.shell requires {command_key}")
+        raise CommandConfigurationError(f"{source}.{shell_key} requires {command_key}")
     if windows_shell and not windows_command:
         raise CommandConfigurationError(
-            f"{source}.shell_windows requires {command_key}_windows"
+            f"{source}.{shell_key}_windows requires {command_key}_windows"
         )
     if windows_command and not windows_shell:
         raise CommandConfigurationError(
-            f"{source}.{command_key}_windows requires shell_windows; "
+            f"{source}.{command_key}_windows requires {shell_key}_windows; "
             "select powershell, pwsh, or cmd"
         )
     if shell in ("powershell", "pwsh", "cmd"):
-        raise CommandConfigurationError(f"{source}.shell={shell!r} is Windows-only; use shell_windows")
+        raise CommandConfigurationError(
+            f"{source}.{shell_key}={shell!r} is Windows-only; use {shell_key}_windows"
+        )
     if windows_shell == "sh":
-        raise CommandConfigurationError(f"{source}.shell_windows cannot select POSIX sh")
+        raise CommandConfigurationError(f"{source}.{shell_key}_windows cannot select POSIX sh")
     return CommandVariants(
         command, windows_command, argv_value, windows_argv, shell, windows_shell, source
     )
@@ -170,3 +202,34 @@ def _shell(value: object, location: str) -> ShellName | None:
 def _redact(value: str) -> str:
     value = re.sub(r"(?i)(token|password|secret|api[_-]?key)=([^\s]+)", r"\1=***", value)
     return re.sub(r"(?i)^(--?(?:token|password|secret|api[_-]?key))(.*)$", r"\1***", value)
+
+
+_SENSITIVE_OPTION = re.compile(
+    r"^--?([A-Za-z0-9][A-Za-z0-9_.-]*)$"
+)
+
+
+def _sensitive_option(name: str) -> bool:
+    normalized = re.sub(r"[-_.]", "", name).lower()
+    return any(
+        marker in normalized
+        for marker in ("token", "password", "passwd", "secret", "apikey")
+    )
+
+
+def _redact_argv(argv: list[str]) -> list[str]:
+    """Redact both attached and split values of credential-bearing options."""
+    redacted: list[str] = []
+    hide_next = False
+    for item in argv:
+        if hide_next:
+            redacted.append("***")
+            hide_next = False
+            continue
+        match = _SENSITIVE_OPTION.fullmatch(item)
+        if match and _sensitive_option(match.group(1)):
+            redacted.append(item)
+            hide_next = True
+            continue
+        redacted.append(_redact(item))
+    return redacted

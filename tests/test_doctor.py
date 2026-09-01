@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from spec_runtime import cli, doctor
+from spec_runtime.config import load_repo_spec_runtime_config
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -133,6 +134,57 @@ class _Runner:
 
 def _checks_by_name(report: doctor.DoctorReport) -> dict[str, doctor.DoctorCheck]:
     return {check.name: check for check in report.checks}
+
+
+def test_windows_command_checks_enumerate_bootstrap_hooks_and_all_gates(
+    tmp_path: Path,
+) -> None:
+    config_text = _config_text().replace(
+        "[execution]",
+        """[implement]
+setup_command_windows = "Write-Output setup"
+setup_shell_windows = "powershell"
+teardown_command_windows = "Write-Output teardown"
+teardown_shell_windows = "pwsh"
+
+[execution]""",
+    )
+    repo = _make_repo(tmp_path, config_text)
+    config = load_repo_spec_runtime_config(repo, require=True)
+
+    checks = doctor._windows_command_checks(repo, config, _resolver())
+    by_name = {check.name: check for check in checks}
+
+    assert set(by_name) == {
+        "bootstrap command",
+        "implement setup command",
+        "implement teardown command",
+        "verify command (test)",
+    }
+    assert by_name["implement setup command"].status == "error"
+    assert "powershell" in by_name["implement setup command"].detail
+    assert by_name["implement teardown command"].status == "error"
+    assert "pwsh" in by_name["implement teardown command"].detail
+
+
+def test_windows_command_checks_target_posix_hook_migration(tmp_path: Path) -> None:
+    config_text = _config_text().replace(
+        "[execution]",
+        """[implement]
+setup_command = "./scripts/setup.sh && export READY=1"
+setup_shell = "sh"
+
+[execution]""",
+    )
+    repo = _make_repo(tmp_path, config_text)
+    config = load_repo_spec_runtime_config(repo, require=True)
+
+    checks = doctor._windows_command_checks(repo, config, _resolver())
+    setup = next(check for check in checks if check.name == "implement setup command")
+
+    assert setup.status == "error"
+    assert "clearly POSIX" in setup.detail
+    assert "setup" in " ".join(setup.remediation)
 
 
 def test_doctor_happy_path_has_no_blockers_or_warnings(tmp_path: Path) -> None:

@@ -32741,6 +32741,10 @@ class TestMakeTreeReadonlyExclude:
 class TestUserMcpServersForPassthrough:
     """Read user MCP configs and apply [mcp].allow_from_user filtering."""
 
+    @pytest.fixture(autouse=True)
+    def _use_fixture_home(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+
     def test_codex_passthrough_returns_named_servers(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):

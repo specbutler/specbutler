@@ -2496,7 +2496,11 @@ def _run_implement_setup_command(
     # raise past ``phase_implement``. Surfacing it as an ``ImplementSetupFailure``
     # lets the agent launch with diagnostics instead of aborting the phase.
     try:
-        split_command = selected.argv() if typed and selected is not None else shlex.split(command)
+        split_command = (
+            selected.argv(arguments=tuple(args))
+            if typed and selected is not None
+            else [*shlex.split(command), *args]
+        )
     except ValueError as exc:
         # ``shlex.split`` failed (e.g. unclosed quote), so we cannot rely on
         # proper tokenization. Fall back to argv-aware best-effort redaction
@@ -2521,7 +2525,7 @@ def _run_implement_setup_command(
             launch_error=True,
         )
         return ImplementSetupManifest(failure=failure)
-    setup_cmd = [*split_command, *args]
+    setup_cmd = split_command
     # Redact argv before joining: ``setup_command`` argv may carry DSNs,
     # tokens, or API-key flags. Redacting the post-``shlex.join`` string
     # leaves trailing secret tails when an arg with spaces was quoted
@@ -2916,10 +2920,11 @@ def _run_implement_teardown_command(run: RunState, worktree_path: Path) -> None:
     typed = selected is not None and (
         selected.mode == "argv" or variants.shell or variants.windows_command
     )
-    teardown_cmd = [
-        *(selected.argv() if typed and selected is not None else shlex.split(command)),
-        *args,
-    ]
+    teardown_cmd = (
+        selected.argv(arguments=tuple(args))
+        if typed and selected is not None
+        else [*shlex.split(command), *args]
+    )
     backend = _resolve_execution_backend()
     try:
         result = backend.run_command(
@@ -2934,7 +2939,7 @@ def _run_implement_teardown_command(run: RunState, worktree_path: Path) -> None:
         logger.warning(
             "Implement teardown command failed for %s: could not start %s: %s",
             run.run_id,
-            shlex.join(teardown_cmd),
+            shlex.join(_redact_argv(teardown_cmd)),
             exc,
         )
         return
