@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -39,6 +40,7 @@ REQUIRED_FILES = {
     "register-job.ps1",
     "runtime_proof.py",
     "toolchain.json.example",
+    "watch-conpty.cs",
 }
 
 
@@ -91,6 +93,22 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "autopilot-adopted-state.json" in proof
     assert "adoption_generation -ne 1" in proof
     assert "blocked_dependent_dispatch_count = 0" in proof
+    assert "watch-conpty.cs" in proof
+    assert "watch-interactive-result.json" in proof
+    assert "runtime.watch-conpty-chat" in proof
+    assert "'/platform:x64'" in proof
+    watch_harness = (LAB_ROOT / "watch-conpty.cs").read_text(encoding="utf-8")
+    for native_boundary in (
+        "CreatePseudoConsole",
+        "PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE",
+        "STARTF_USESTDHANDLES",
+        "venv-python--isolated-module",
+        "watch-interactive-failed-transcript.log",
+        "WaitForProviderExit",
+        'inputWriter.Write("q")',
+        "KILL_ON_JOB_CLOSE",
+    ):
+        assert native_boundary in watch_harness
     assert "Set-EvidenceClaim" in proof
     assert "Proof must run with a non-elevated user token" in proof
     register_job = (LAB_ROOT / "register-job.ps1").read_text(encoding="utf-8")
@@ -312,6 +330,93 @@ def test_windows_local_acceptance_requires_executed_unskipped_tests(tmp_path: Pa
     secret_log = tmp_path / "powershell.log"
     secret_log.write_text(f"token={secret}\n", encoding="utf-16")
     assert module._count_secret_occurrences(tmp_path, {secret}) == 1
+
+
+def test_windows_local_acceptance_requires_real_retained_conpty_watch(
+    tmp_path: Path,
+) -> None:
+    path = LAB_ROOT / "local_acceptance.py"
+    spec = importlib.util.spec_from_file_location("windows_watch_acceptance", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    revision = "a" * 40
+    wheel_scripts = tmp_path / "wheel" / "Scripts"
+    wheel_scripts.mkdir(parents=True)
+    executable = wheel_scripts / "spec.exe"
+    executable.write_bytes(b"installed wheel launcher")
+    transcript = tmp_path / "watch-interactive-transcript.log"
+    marker = "SPEC_WATCH_CODEX_" + "b" * 16
+    transcript.write_text(
+        f"Specs Queue auto-root-a needs-input phase=implement branch=code/example "
+        f"auto-root-a chat  agent=codex {marker}",
+        encoding="utf-8",
+    )
+    result = tmp_path / "watch-interactive-result.json"
+    payload = {
+        "status": "passed",
+        "source_revision": revision,
+        "platform": "win32",
+        "pseudoconsole": "ConPTY",
+        "installed_artifact": True,
+        "launch_boundary": "venv-python--isolated-module",
+        "spec_executable": str(executable),
+        "interactive_desktop": True,
+        "session_id": 1,
+        "terminal_columns": 180,
+        "terminal_rows": 50,
+        "dashboard_observed": True,
+        "selected_spec": "auto-root-a",
+        "live_status_observed": "needs-input",
+        "detail_observed": True,
+        "chat_screen_observed": True,
+        "chat_provider": "codex",
+        "codex_provider_process_observed": True,
+        "provider_identity": {
+            "pid": 1234,
+            "start_time_utc_ticks": 638900000000000000,
+            "name": "codex.exe",
+        },
+        "expected_marker": marker,
+        "observed_marker": marker,
+        "marker_matched": True,
+        "quit_key": "q",
+        "root_exit_code": 0,
+        "provider_processes_remaining": 0,
+        "dispatcher_processes_remaining": 0,
+        "owned_processes_remaining": 0,
+        "observed_descendant_count": 2,
+        "transcript_file": transcript.name,
+        "transcript_sha256": hashlib.sha256(transcript.read_bytes()).hexdigest(),
+    }
+    result.write_text(json.dumps(payload), encoding="utf-8")
+
+    validated = module.validate_interactive_watch_evidence(
+        result,
+        revision=revision,
+        expected_spec_executable=executable,
+    )
+    assert validated["expected_marker"] == marker
+
+    payload["marker_matched"] = False
+    result.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(module.EvidenceError, match="marker_matched"):
+        module.validate_interactive_watch_evidence(
+            result,
+            revision=revision,
+            expected_spec_executable=executable,
+        )
+
+    payload["marker_matched"] = True
+    payload["transcript_sha256"] = "0" * 64
+    result.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(module.EvidenceError, match="hash does not match"):
+        module.validate_interactive_watch_evidence(
+            result,
+            revision=revision,
+            expected_spec_executable=executable,
+        )
 
 
 def test_windows_local_acceptance_covers_every_local_manifest_result() -> None:

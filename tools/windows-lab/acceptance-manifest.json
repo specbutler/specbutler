@@ -230,7 +230,20 @@
         {"id": "web.6.process", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/portable_process_inspection", "expected": true},
         {"id": "web.6.memory", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/portable_memory_inspection", "expected": true},
         {"id": "web.6.degradation", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/terminal_degradation", "expected": "explicit"},
-        {"id": "web.6.dispatcher", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/dispatcher_crashed", "expected": false}
+        {"id": "web.6.dispatcher", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/dispatcher_crashed", "expected": false},
+        {"id": "web.6.conpty", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/pseudoconsole", "expected": "ConPTY"},
+        {"id": "web.6.installed", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/installed_artifact", "expected": true},
+        {"id": "web.6.launch", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/launch_boundary", "expected": "venv-python--isolated-module"},
+        {"id": "web.6.interactive", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/interactive_desktop", "expected": true},
+        {"id": "web.6.dashboard", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/dashboard_observed", "expected": true},
+        {"id": "web.6.detail", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/detail_observed", "expected": true},
+        {"id": "web.6.chat-screen", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/chat_screen_observed", "expected": true},
+        {"id": "web.6.provider", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/chat_provider", "expected": "codex"},
+        {"id": "web.6.marker", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/real_codex_marker_matched", "expected": true},
+        {"id": "web.6.quit", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/quit_key", "expected": "q"},
+        {"id": "web.6.provider-cleanup", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/provider_processes_remaining", "expected": 0},
+        {"id": "web.6.dispatcher-cleanup", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/dispatcher_processes_remaining", "expected": 0},
+        {"id": "web.6.owned-cleanup", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/owned_processes_remaining", "expected": 0}
       ]
     },
     {

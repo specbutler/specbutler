@@ -92,7 +92,13 @@ The proof:
    provider double, crashes the dispatcher while both implementation processes
    are live, proves a replacement adopts each exact child once without launching
    the blocked dependent, then exercises `spec auto stop` graceful draining;
-8. retains the exact staged Git revision and sanitized logs under
+8. compiles the checked-in Win32 harness and launches the installed wheel's
+   isolated `spec_runtime.cli watch` module through its own venv interpreter
+   and the native ConPTY API in the logged-on desktop
+   session, observes the dashboard, live status, selected-run detail, and chat
+   screen, obtains a retained marker from a real Codex child, exits through the
+   `q` binding, and verifies every exact provider/owned process identity is gone;
+9. retains the exact staged Git revision and sanitized logs under
    `tools/windows-lab/artifacts/<run-name>/`, then evaluates every one of the
    26 acceptance criteria in the three Windows specs against the checked-in
    evidence contract. The command fails before claiming completion if the
@@ -101,8 +107,9 @@ The proof:
 
 Before the controller audit, `local_acceptance.py` parses the two JUnit reports
 and requires exact, unskipped test names for each local claim. It also validates
-the real lifecycle and web result fields and actively probes executable
-discovery, Windows path behavior, non-interactive watch, wheel/sdist imports,
+the real lifecycle, web, and interactive watch result fields and actively probes
+executable discovery, Windows path behavior, the retained ConPTY transcript and
+Codex process identity, wheel/sdist imports,
 `pip check`, warning-free `spec doctor`, documentation, and credential cleanup.
 It writes each machine-readable local result only after that result's complete
 prerequisite set passes. The host controller adds its own result only after the

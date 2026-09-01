@@ -849,6 +849,62 @@ Set-EvidenceClaim `
     -Evidence @('autopilot-result.json', 'autopilot-adopted-state.json') `
     -Detail 'The reusable Windows 11 lab forced dispatcher death and proved durable native adoption and graceful stop with real subprocesses.'
 
+$watchHarness = Join-Path $runRoot 'watch-conpty.exe'
+Invoke-LoggedNative -FilePath $csc -Arguments @(
+    '/nologo',
+    '/target:exe',
+    '/platform:x64',
+    "/out:$watchHarness",
+    (Join-Path $sourceRoot 'tools\windows-lab\watch-conpty.cs')
+) -LogName 'watch-conpty-build.log'
+$watchNonce = $sourceRevision.Substring(0, 16)
+$watchSpecId = @(
+    Invoke-NativeOutput -FilePath $wheelPython -Arguments @(
+        '-I',
+        '-c',
+        'import pathlib,sys; from spec_runtime.autopilot_tui.dashboard import load_dashboard_snapshot; rows=load_dashboard_snapshot(pathlib.Path(sys.argv[1])).rows; print(rows[0].spec_id if rows else "")',
+        $fixtureRoot
+    )
+) -join ''
+$watchSpecId = $watchSpecId.Trim()
+if ($watchSpecId -notin @('auto-root-a', 'auto-root-b')) {
+    throw "Interactive spec watch proof found no live autopilot row: $watchSpecId"
+}
+Invoke-LoggedNative -FilePath $watchHarness -Arguments @(
+    $spec,
+    $fixtureRoot,
+    $evidenceRoot,
+    $sourceRevision,
+    $watchSpecId,
+    $watchNonce
+) -LogName 'watch-conpty-proof.log'
+$watchInteractive = Get-Content `
+    -LiteralPath (Join-Path $evidenceRoot 'watch-interactive-result.json') `
+    -Raw | ConvertFrom-Json
+if (
+    $watchInteractive.status -ne 'passed' `
+    -or $watchInteractive.source_revision -ne $sourceRevision `
+    -or $watchInteractive.pseudoconsole -ne 'ConPTY' `
+    -or $watchInteractive.chat_provider -ne 'codex' `
+    -or -not $watchInteractive.marker_matched `
+    -or $watchInteractive.quit_key -ne 'q' `
+    -or $watchInteractive.root_exit_code -ne 0 `
+    -or $watchInteractive.provider_processes_remaining -ne 0 `
+    -or $watchInteractive.dispatcher_processes_remaining -ne 0 `
+    -or $watchInteractive.owned_processes_remaining -ne 0
+) {
+    throw 'Interactive native Windows spec watch proof contradicted a required invariant'
+}
+Set-EvidenceClaim `
+    -Id 'runtime.watch-conpty-chat' `
+    -Evidence @(
+        'watch-interactive-result.json',
+        'watch-interactive-transcript.log',
+        'watch-conpty-build.log',
+        'watch-conpty-proof.log'
+    ) `
+    -Detail 'The installed wheel module rendered dashboard, live status, detail, and per-spec chat through ConPTY; a real Codex child returned the retained marker, q exited cleanly, and every exact owned process identity was gone.'
+
 $operatorCodexHome = $env:CODEX_HOME
 if (-not $operatorCodexHome) {
     $operatorCodexHome = Join-Path $env:USERPROFILE '.codex'
@@ -879,11 +935,13 @@ Set-EvidenceClaim `
         'test-coverage-result.json',
         'web-action-result.json',
         'watch-result.json',
+        'watch-interactive-result.json',
+        'watch-interactive-transcript.log',
         'web-integration-result.json',
         'documentation-audit-result.json',
         'package-release-result.json'
     ) `
-    -Detail 'Field-level local acceptance artifacts were emitted only after exact native tests, real runtime evidence, and direct Windows path, package, watch, documentation, and secret probes passed.'
+    -Detail 'Field-level local acceptance artifacts were emitted only after exact native tests, real runtime evidence, and direct Windows path, package, interactive ConPTY watch/chat, documentation, and secret probes passed.'
 
 $result = [ordered]@{
     status = 'evidence-collected'
@@ -909,6 +967,7 @@ $result = [ordered]@{
     autopilot_dependency_dispatch = 'passed'
     autopilot_restart_adoption = 'passed'
     autopilot_stop = 'passed'
+    interactive_conpty_watch_chat = 'passed'
     local_acceptance = 'passed'
     evidence_claims = $evidenceClaims
 }

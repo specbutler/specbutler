@@ -11,7 +11,9 @@ No result file is written until every prerequisite for that result has passed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -198,6 +200,97 @@ def _require_fields(path: Path, expected: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def validate_interactive_watch_evidence(
+    path: Path,
+    *,
+    revision: str,
+    expected_spec_executable: Path,
+) -> dict[str, Any]:
+    """Validate retained proof from the real Windows pseudoconsole session."""
+    payload = _require_fields(
+        path,
+        {
+            "status": "passed",
+            "source_revision": revision,
+            "platform": "win32",
+            "pseudoconsole": "ConPTY",
+            "installed_artifact": True,
+            "launch_boundary": "venv-python--isolated-module",
+            "interactive_desktop": True,
+            "dashboard_observed": True,
+            "detail_observed": True,
+            "chat_screen_observed": True,
+            "chat_provider": "codex",
+            "codex_provider_process_observed": True,
+            "marker_matched": True,
+            "quit_key": "q",
+            "root_exit_code": 0,
+            "provider_processes_remaining": 0,
+            "dispatcher_processes_remaining": 0,
+            "owned_processes_remaining": 0,
+        },
+    )
+    if not isinstance(payload.get("session_id"), int) or payload["session_id"] <= 0:
+        raise EvidenceError("interactive spec watch has no desktop session id")
+    if payload.get("terminal_columns", 0) < 80 or payload.get("terminal_rows", 0) < 24:
+        raise EvidenceError("interactive spec watch pseudoconsole was too small")
+    selected_spec = payload.get("selected_spec")
+    if not isinstance(selected_spec, str) or not re.fullmatch(r"auto-root-[ab]", selected_spec):
+        raise EvidenceError("interactive spec watch did not select a real autopilot run")
+    if payload.get("live_status_observed") not in {
+        "needs-input", "running", "waiting", "blocked", "failed", "stale", "passed", "pending",
+    }:
+        raise EvidenceError("interactive spec watch did not retain a recognized live status")
+
+    executable = Path(str(payload.get("spec_executable", ""))).resolve()
+    if executable != expected_spec_executable.resolve() or executable.name.casefold() != "spec.exe":
+        raise EvidenceError(
+            "interactive spec watch did not launch the installed wheel executable: "
+            f"{executable}"
+        )
+    expected_marker = payload.get("expected_marker")
+    observed_marker = payload.get("observed_marker")
+    if (
+        not isinstance(expected_marker, str)
+        or not re.fullmatch(r"SPEC_WATCH_CODEX_[0-9a-f]{12,64}", expected_marker)
+        or observed_marker != expected_marker
+    ):
+        raise EvidenceError("interactive spec watch retained no matching real Codex marker")
+
+    provider_identity = payload.get("provider_identity")
+    if not isinstance(provider_identity, dict):
+        raise EvidenceError("interactive spec watch retained no Codex process identity")
+    if (
+        not isinstance(provider_identity.get("pid"), int)
+        or provider_identity["pid"] <= 0
+        or not isinstance(provider_identity.get("start_time_utc_ticks"), int)
+        or provider_identity["start_time_utc_ticks"] <= 0
+        or not str(provider_identity.get("name", "")).casefold().startswith("codex")
+    ):
+        raise EvidenceError("interactive spec watch retained an invalid Codex process identity")
+    if not isinstance(payload.get("observed_descendant_count"), int) or payload["observed_descendant_count"] < 1:
+        raise EvidenceError("interactive spec watch observed no owned descendant processes")
+
+    transcript_name = str(payload.get("transcript_file", ""))
+    if Path(transcript_name).name != transcript_name or transcript_name != "watch-interactive-transcript.log":
+        raise EvidenceError("interactive spec watch transcript path is unsafe or unexpected")
+    transcript_path = path.parent / transcript_name
+    try:
+        transcript = transcript_path.read_bytes()
+    except OSError as exc:
+        raise EvidenceError(f"interactive spec watch transcript is unavailable: {exc}") from exc
+    digest = hashlib.sha256(transcript).hexdigest()
+    if payload.get("transcript_sha256") != digest:
+        raise EvidenceError("interactive spec watch transcript hash does not match")
+    decoded = transcript.decode("utf-8", errors="replace")
+    for retained in ("Specs", "Queue", "phase=", "agent=codex", expected_marker):
+        if retained not in decoded:
+            raise EvidenceError(
+                f"interactive spec watch transcript omitted retained observation: {retained}"
+            )
+    return payload
+
+
 def _run(argv: list[str], *, cwd: Path, log: Path) -> str:
     completed = subprocess.run(
         argv,
@@ -354,6 +447,11 @@ def produce(args: argparse.Namespace) -> None:
             "cancelled_descendants_remaining": 0,
         },
     )
+    interactive_watch = validate_interactive_watch_evidence(
+        evidence_root / "watch-interactive-result.json",
+        revision=revision,
+        expected_spec_executable=args.wheel_python.parent / "spec.exe",
+    )
 
     git = shutil.which("git.exe") or shutil.which("git")
     gh = shutil.which("gh.exe") or shutil.which("gh")
@@ -425,14 +523,6 @@ def produce(args: argparse.Namespace) -> None:
     ).lower()
     if "0 blocker(s)" not in doctor_output or "0 warning(s)" not in doctor_output:
         raise EvidenceError("documented Windows fixture did not pass doctor without warnings")
-    watch_output = _run(
-        [str(args.wheel_python), "-I", "-m", "spec_runtime.cli", "watch", "--repo-root", str(fixture_root)],
-        cwd=fixture_root,
-        log=evidence_root / "watch-noninteractive.log",
-    )
-    if not watch_output.strip():
-        raise EvidenceError("non-interactive watch produced no explicit terminal output")
-
     secrets = _secret_values(args.operator_codex_home / "auth.json")
     auth_remnants = list(fixture_root.rglob("auth.json"))
     review_workspaces = [
@@ -573,9 +663,36 @@ def produce(args: argparse.Namespace) -> None:
     _write_result(
         evidence_root,
         "watch-result.json",
-        {"status": "passed", "source_revision": revision, "chat": "passed", "portable_process_inspection": True, "portable_memory_inspection": True, "terminal_degradation": "explicit", "dispatcher_crashed": False},
+        {
+            "status": "passed",
+            "source_revision": revision,
+            "chat": "passed",
+            "portable_process_inspection": True,
+            "portable_memory_inspection": True,
+            "terminal_degradation": "explicit",
+            "dispatcher_crashed": False,
+            "pseudoconsole": interactive_watch["pseudoconsole"],
+            "installed_artifact": interactive_watch["installed_artifact"],
+            "launch_boundary": interactive_watch["launch_boundary"],
+            "interactive_desktop": interactive_watch["interactive_desktop"],
+            "dashboard_observed": interactive_watch["dashboard_observed"],
+            "selected_spec": interactive_watch["selected_spec"],
+            "live_status_observed": interactive_watch["live_status_observed"],
+            "detail_observed": interactive_watch["detail_observed"],
+            "chat_screen_observed": interactive_watch["chat_screen_observed"],
+            "chat_provider": interactive_watch["chat_provider"],
+            "real_codex_marker_matched": interactive_watch["marker_matched"],
+            "quit_key": interactive_watch["quit_key"],
+            "provider_processes_remaining": interactive_watch["provider_processes_remaining"],
+            "dispatcher_processes_remaining": interactive_watch["dispatcher_processes_remaining"],
+            "owned_processes_remaining": interactive_watch["owned_processes_remaining"],
+        },
         tests_by_artifact["watch-result.json"],
-        probes={"noninteractive_output_bytes": len(watch_output.encode("utf-8"))},
+        probes={
+            "interactive_evidence": "watch-interactive-result.json",
+            "transcript_sha256": interactive_watch["transcript_sha256"],
+            "provider_identity": interactive_watch["provider_identity"],
+        },
     )
     _write_result(
         evidence_root,
