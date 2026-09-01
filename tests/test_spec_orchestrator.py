@@ -87,6 +87,26 @@ def _run_make_dry_run(*args: str, cwd: Path) -> str:
     return result.stdout
 
 
+def _managed_process_double(
+    *,
+    pid: int = 4321,
+    started_at: str = "Mon Mar 17 12:00:00 2026",
+    command: str = "spec implement",
+    mode: LifetimeMode = LifetimeMode.ADOPTABLE,
+) -> SimpleNamespace:
+    identity = ProcessIdentity(pid=pid, started_at=started_at, command=command)
+    return SimpleNamespace(
+        pid=identity.pid,
+        token=SupervisionToken(
+            mode,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "test-supervision-id",
+        ),
+    )
+
+
 def _create_annotated_merge_tag(
     cwd: Path,
     *,
@@ -5435,6 +5455,7 @@ class TestReviewWorktreeBootstrap:
         assert "ANTHROPIC_API_KEY" not in dumped_env
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in dumped_env
 
+    @pytest.mark.skipif(os.name != "posix", reason="exercises the legacy POSIX shell path")
     def test_legacy_posix_bootstrap_preserves_login_shell_launch(self, tmp_path: Path):
         worktree = tmp_path / "review-worktree"
         worktree.mkdir()
@@ -5466,11 +5487,7 @@ class TestReviewWorktreeBootstrap:
             )
 
         assert warning == ""
-        assert captured["argv"] == (
-            [sys.executable, "-c", "print('ok')"]
-            if os.name == "nt"
-            else ["sh", "-lc", "echo ok"]
-        )
+        assert captured["argv"] == ["sh", "-lc", "echo ok"]
 
     def test_bootstrap_cannot_read_real_home_credentials(self, tmp_path: Path):
         """Stripping named credential env vars is not enough on its own: build
@@ -7570,6 +7587,7 @@ class TestSpecAutopilot:
             default=True,
         ) == ["macos", "slack", "ntfy:team"]
 
+    @pytest.mark.skipif(os.name == "nt", reason="exercises Unix sysconf and macOS vm_stat fallbacks")
     def test_available_memory_bytes_falls_back_to_vm_stat(self, monkeypatch: pytest.MonkeyPatch):
         from spec_runtime import process_supervisor
 
@@ -7998,36 +8016,32 @@ class TestSpecAutopilot:
         captured_out = capsys.readouterr()
         assert "reconciled stale shutdown" in captured_out.out
 
-    def test_start_candidate_launches_spec_implement_in_new_session(
+    def test_start_candidate_launches_spec_implement_as_adoptable_process(
         self,
         repo: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        popen_kwargs: dict[str, object] = {}
+        spawn_kwargs: dict[str, object] = {}
+        supervisor_init: dict[str, object] = {}
 
-        class DummyProcess:
-            pid = 4321
+        class FakeSupervisor:
+            def __init__(self, lifetime_mode, *, supervision_id=None):  # noqa: ANN001
+                supervisor_init["lifetime_mode"] = lifetime_mode
+                supervisor_init["supervision_id"] = supervision_id
 
-        def fake_popen(command, **kwargs):  # noqa: ANN001
-            popen_kwargs["command"] = command
-            popen_kwargs.update(kwargs)
-            return DummyProcess()
+            def spawn(self, command, **kwargs):  # noqa: ANN001
+                spawn_kwargs["command"] = command
+                spawn_kwargs.update(kwargs)
+                return _managed_process_double(
+                    command="spec implement --spec my-feature",
+                )
 
         monkeypatch.setattr(
             autopilot,
             "autopilot_runs_root",
             lambda _repo_root: repo / ".spec-state" / "autopilot" / "runs",
         )
-        monkeypatch.setattr(autopilot.subprocess, "Popen", fake_popen)
-        monkeypatch.setattr(
-            autopilot,
-            "read_process_identity",
-            lambda pid: autopilot.ProcessIdentity(
-                pid=pid,
-                started_at="Mon Mar 17 12:00:00 2026",
-                command="spec implement --spec my-feature",
-            ),
-        )
+        monkeypatch.setattr(autopilot, "ProcessSupervisor", FakeSupervisor)
 
         candidate = autopilot.DispatchCandidate(
             spec_id="my-feature",
@@ -8042,7 +8056,11 @@ class TestSpecAutopilot:
 
         active = autopilot.start_candidate(repo, candidate)
 
-        assert popen_kwargs["command"] == [
+        assert supervisor_init == {
+            "lifetime_mode": LifetimeMode.ADOPTABLE,
+            "supervision_id": None,
+        }
+        assert spawn_kwargs["command"] == [
             "spec",
             "implement",
             "--spec",
@@ -8052,12 +8070,11 @@ class TestSpecAutopilot:
             "--run",
             "my-feature-20260317T000000",
         ]
-        assert popen_kwargs["cwd"] == repo
-        assert popen_kwargs["start_new_session"] is True
+        assert spawn_kwargs["cwd"] == repo
         assert active.pid == 4321
         assert active.process_started_at == "Mon Mar 17 12:00:00 2026"
-        assert popen_kwargs["stdin"] == autopilot.subprocess.DEVNULL
-        assert popen_kwargs["stderr"] == autopilot.subprocess.STDOUT
+        assert spawn_kwargs["stdin"] == autopilot.subprocess.DEVNULL
+        assert spawn_kwargs["stderr"] == autopilot.subprocess.STDOUT
 
     def test_start_candidate_injects_spec_actor_autopilot(
         self,
@@ -8066,29 +8083,17 @@ class TestSpecAutopilot:
     ):
         popen_kwargs: dict[str, object] = {}
 
-        class DummyProcess:
-            pid = 4321
-
-        def fake_popen(command, **kwargs):  # noqa: ANN001
+        def fake_spawn(_supervisor, command, **kwargs):  # noqa: ANN001
             popen_kwargs["command"] = command
             popen_kwargs.update(kwargs)
-            return DummyProcess()
+            return _managed_process_double(command="spec implement --spec s")
 
         monkeypatch.setattr(
             autopilot,
             "autopilot_runs_root",
             lambda _repo_root: repo / ".spec-state" / "autopilot" / "runs",
         )
-        monkeypatch.setattr(autopilot.subprocess, "Popen", fake_popen)
-        monkeypatch.setattr(
-            autopilot,
-            "read_process_identity",
-            lambda pid: autopilot.ProcessIdentity(
-                pid=pid,
-                started_at="Mon Mar 17 12:00:00 2026",
-                command="make code SPEC=s",
-            ),
-        )
+        monkeypatch.setattr(autopilot.ProcessSupervisor, "spawn", fake_spawn)
 
         candidate = autopilot.DispatchCandidate(
             spec_id="s",
@@ -8110,22 +8115,19 @@ class TestSpecAutopilot:
         repo: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        class DummyProcess:
-            pid = 4321
-
         monkeypatch.setattr(
             autopilot,
             "autopilot_runs_root",
             lambda _repo_root: repo / ".spec-state" / "autopilot" / "runs",
         )
-        monkeypatch.setattr(autopilot.subprocess, "Popen", lambda *_args, **_kwargs: DummyProcess())
         monkeypatch.setattr(
-            autopilot,
-            "read_process_identity",
-            lambda pid: autopilot.ProcessIdentity(
-                pid=pid,
-                started_at="Mon Mar 17 12:00:00 2026",
-                command="spec implement --spec my-feature --run my-feature-20260317T000000",
+            autopilot.ProcessSupervisor,
+            "spawn",
+            lambda *_args, **_kwargs: _managed_process_double(
+                command=(
+                    "spec implement --spec my-feature "
+                    "--run my-feature-20260317T000000"
+                ),
             ),
         )
 
@@ -15314,7 +15316,7 @@ class TestVerifyPreflightMerge:
     def test_test_gate_diagnostic_command_uses_worktree_venv_python(self, repo: Path):
         worktree = repo / ".worktrees" / "my-feature"
         assert orch._test_gate_diagnostic_command(worktree) == [
-            str(worktree / ".venv" / "bin" / "python"),
+            str(orch._worktree_venv_python(worktree)),
             *orch.TEST_GATE_DIAGNOSTIC_ARGS,
         ]
 
@@ -16477,7 +16479,9 @@ class TestVerifyTestEnvironment:
                 assert env["SIM_DATABASE_URL"] == database_url
                 assert env["SIM_TEST_DATABASE_URL"] == database_url
                 assert env["VIRTUAL_ENV"] == str(worktree / ".venv")
-                assert env["PATH"].split(os.pathsep)[0] == str(worktree / ".venv" / "bin")
+                assert env["PATH"].split(os.pathsep)[0] == str(
+                    orch._worktree_venv_python(worktree).parent
+                )
 
         assert commands == [
             [str(postgres_script), "status"],
@@ -17185,7 +17189,7 @@ class TestLocalReviewHelpers:
             reasoning_effort=orch.LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT,
         )
 
-        assert cmd[0] == "codex"
+        assert cmd[0:5] == ["codex", "exec", "--ephemeral", "-s", "read-only"]
         assert "--output-schema" in cmd
         assert "review this change" in cmd
 
@@ -17358,6 +17362,10 @@ class TestLocalReviewHelpers:
         assert payload["stderr_tail"] == "partial stderr"
         assert "timed out after 45s; terminating process group" in caplog.text
 
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="uses POSIX chmod as a hermetic stand-in for the Codex read-only sandbox",
+    )
     def test_local_review_isolation_blocks_push_and_impl_worktree_writes(
         self,
         repo: Path,
@@ -32808,8 +32816,11 @@ class TestClaudeIsolatedHome:
         copied = json.loads((home / ".claude" / ".credentials.json").read_text())
         assert copied["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-access"
         assert "refreshToken" not in copied["claudeAiOauth"]
-        mode = (home / ".claude" / ".credentials.json").stat().st_mode & 0o777
-        assert mode == 0o600
+        credentials_path = home / ".claude" / ".credentials.json"
+        assert credentials_path.is_file()
+        assert not credentials_path.is_symlink()
+        if os.name == "posix":
+            assert credentials_path.stat().st_mode & 0o777 == 0o600
 
     def test_write_claude_isolated_home_replaces_planted_credentials_symlink(
         self, tmp_path: Path
