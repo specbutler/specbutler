@@ -29327,6 +29327,75 @@ class TestBaseOverride:
 
 
 class TestSpecAuthoring:
+    def test_windows_codex_authoring_passes_host_gh_token_without_profile_access(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        forge = MagicMock()
+        forge.get_auth_token.return_value = "native-authoring-token"
+
+        with (
+            patch.object(orch.sys, "platform", "win32"),
+            patch.object(orch, "_forge", return_value=forge),
+        ):
+            env = orch._windows_codex_authoring_env("codex")
+
+        assert env is not None
+        assert env["GH_TOKEN"] == "native-authoring-token"
+        assert "GH_TOKEN" not in os.environ
+        forge.get_auth_token.assert_called_once_with()
+
+    def test_windows_codex_authoring_preserves_explicit_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("GH_TOKEN", "explicit-token")
+        forge = MagicMock()
+
+        with (
+            patch.object(orch.sys, "platform", "win32"),
+            patch.object(orch, "_forge", return_value=forge),
+        ):
+            env = orch._windows_codex_authoring_env("codex")
+
+        assert env is not None
+        assert env["GH_TOKEN"] == "explicit-token"
+        forge.get_auth_token.assert_not_called()
+
+    def test_windows_codex_authoring_missing_token_fails_before_worktree(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        args = argparse.Namespace(
+            agent="codex",
+            base="origin/master",
+            spec="windows-authoring",
+            label="",
+        )
+        forge = MagicMock()
+        forge.get_auth_token.return_value = ""
+
+        with (
+            patch.object(orch.sys, "platform", "win32"),
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.object(orch, "_forge", return_value=forge),
+            patch.object(orch, "_prepare_spec_authoring_worktree") as prepare,
+            patch.object(orch.subprocess, "run") as launch,
+        ):
+            status = orch.cmd_spec(args)
+
+        assert status == 1
+        assert "gh auth token" in capsys.readouterr().err
+        prepare.assert_not_called()
+        launch.assert_not_called()
+
     def test_prepare_spec_authoring_worktree_ignores_prefix_matches(self, repo: Path):
         worktree = repo / ".worktrees" / "spec-foo"
         unrelated_worktree = repo / ".worktrees" / "spec-foo-bar"

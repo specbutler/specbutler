@@ -5919,6 +5919,40 @@ def _build_spec_authoring_command(
     return adapter.build_authoring_command(**authoring_kwargs)
 
 
+def _windows_codex_authoring_env(agent: str) -> dict[str, str] | None:
+    """Return an environment that lets sandboxed Windows Codex use ``gh``.
+
+    The native Codex sandbox intentionally cannot read the operator's roaming
+    profile, which includes GitHub CLI's ``hosts.yml``. Spec authoring is
+    nevertheless required to push its branch and open a PR. Resolve the
+    already-authenticated host token before entering the sandbox and pass it
+    only in the child environment. This avoids granting the agent writable
+    access to the operator's GitHub CLI configuration and leaves no copied
+    credential file in the authoring worktree.
+
+    Other platforms and agents keep normal environment inheritance.
+    """
+    if sys.platform != "win32" or agent != "codex":
+        return None
+
+    env = os.environ.copy()
+    if env.get("GH_TOKEN", "").strip() or env.get("GITHUB_TOKEN", "").strip():
+        return env
+
+    try:
+        token = _forge().get_auth_token().strip()
+    except (FileNotFoundError, OSError, RuntimeError):
+        token = ""
+    if not token:
+        raise RuntimeError(
+            "Native Windows Codex authoring could not obtain a GitHub token "
+            "without exposing the operator's GitHub CLI profile to the sandbox. "
+            "Run `gh auth login`, verify `gh auth token` succeeds, then retry."
+        )
+    env["GH_TOKEN"] = token
+    return env
+
+
 def _print_spec_authoring_summary(
     repo_root: Path,
     spec_id: str,
@@ -21746,6 +21780,12 @@ def cmd_spec(args: argparse.Namespace) -> int:
         )
         return 1
 
+    try:
+        authoring_env = _windows_codex_authoring_env(agent)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
     spec_id = raw_spec_id or None
 
     try:
@@ -21772,7 +21812,10 @@ def cmd_spec(args: argparse.Namespace) -> int:
     print(f"{'Resuming' if resumed else 'Launching'} spec authoring in {worktree_path}")
 
     try:
-        completed = subprocess.run(author_cmd, cwd=worktree_path)
+        launch_kwargs: dict[str, object] = {"cwd": worktree_path}
+        if authoring_env is not None:
+            launch_kwargs["env"] = authoring_env
+        completed = subprocess.run(author_cmd, **launch_kwargs)
     except FileNotFoundError as exc:
         print(f"Error: Agent binary not found: {exc}", file=sys.stderr)
         return 1
