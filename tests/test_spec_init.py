@@ -376,6 +376,27 @@ class TestDetectVerifyGates:
 
 
 class TestDetectInstallCommand:
+    def test_make_project_preserves_make_install(self, tmp_path):
+        (tmp_path / "Makefile").write_text("install:\n\ttrue\n")
+
+        assert _detect_install_command(tmp_path) == "make install"
+
+    @pytest.mark.parametrize(
+        ("lockfile", "expected"),
+        [("package-lock.json", "npm ci"), (None, "npm install")],
+    )
+    def test_node_project_preserves_native_package_command(
+        self,
+        tmp_path,
+        lockfile,
+        expected,
+    ):
+        (tmp_path / "package.json").write_text("{}\n")
+        if lockfile:
+            (tmp_path / lockfile).write_text("{}\n")
+
+        assert _detect_install_command(tmp_path) == expected
+
     @pytest.mark.parametrize("marker", ["pyproject.toml", "setup.py"])
     def test_python_project_uses_per_worktree_virtualenv(self, tmp_path, marker):
         (tmp_path / marker).write_text("\n")
@@ -540,7 +561,14 @@ class TestGenerateSpecToml:
         assert parsed["bootstrap"]["install_command"] == 'bash -lc "pip install -e ."'
         assert parsed["verify"]["gates"][0]["command"] == 'bash -lc "pytest -q"'
 
-    def test_generated_windows_bootstrap_roundtrips_through_config_loader(self, tmp_path: Path):
+    @pytest.mark.parametrize("install_command", ["make install", "npm ci", "npm install"])
+    def test_generic_bootstrap_is_not_replaced_by_python_on_windows(
+        self,
+        tmp_path: Path,
+        install_command: str,
+    ):
+        import tomllib
+
         from spec_runtime.config import load_repo_spec_runtime_config
 
         content = _generate_spec_toml(
@@ -549,15 +577,16 @@ class TestGenerateSpecToml:
             review_default="claude",
             allowed_agents=["claude"],
             gates=[],
-            install_command="python -m pip install -e .",
+            install_command=install_command,
         )
         (tmp_path / ".spec.toml").write_text(content)
 
+        parsed = tomllib.loads(content)
+        assert parsed["bootstrap"] == {"install_command": install_command}
         config = load_repo_spec_runtime_config(tmp_path, require=True)
         selected = config.bootstrap_install.select(windows=True)
         assert selected is not None
-        assert selected.shell == "powershell"
-        assert r".\.venv\Scripts\python.exe" in str(selected.value)
+        assert selected.argv(windows=True) == install_command.split()
 
     def test_generated_python_commands_preserve_windows_dev_install_and_gates(
         self,

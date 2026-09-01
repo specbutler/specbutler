@@ -335,18 +335,15 @@ def _generate_spec_toml(
     ]
     if install_command:
         lines.append(f'install_command = "{_toml_escape(install_command)}"')
-        windows_install_command = (
-            install_command.replace(" && ", "; ", 1).replace(
+        if install_command.startswith("python -m venv .venv && .venv/bin/python "):
+            windows_install_command = install_command.replace(" && ", "; ", 1).replace(
                 ".venv/bin/python",
                 r".\.venv\Scripts\python.exe",
             )
-            if install_command.startswith("python -m venv .venv && .venv/bin/python ")
-            else r"python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -e ."
-        )
-        lines.append(
-            f'install_command_windows = "{_toml_escape(windows_install_command)}"'
-        )
-        lines.append('install_shell_windows = "powershell"')
+            lines.append(
+                f'install_command_windows = "{_toml_escape(windows_install_command)}"'
+            )
+            lines.append('install_shell_windows = "powershell"')
     else:
         lines.append(
             '# install_command = "python -m venv .venv && '
