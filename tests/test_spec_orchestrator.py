@@ -18417,12 +18417,16 @@ class TestLocalReviewPhase:
         assert env["PATH"].split(os.pathsep)[0] == venv_bin
         assert env["VIRTUAL_ENV"] == str(review_worktree / ".venv")
 
-    @pytest.mark.parametrize("venv_present", [True, False])
+    @pytest.mark.parametrize(
+        ("venv_present", "bootstrap_warning"),
+        [(True, ""), (False, ""), (True, "bootstrap failed")],
+    )
     def test_run_local_review_tells_reviewer_how_to_run_bootstrapped_venv(
         self,
         repo: Path,
         tmp_path: Path,
         venv_present: bool,
+        bootstrap_warning: str,
     ):
         """When bootstrap produced a venv, the reviewer prompt must point at it by
         absolute path — PATH injection alone is not enough because the agent's
@@ -18448,7 +18452,7 @@ class TestLocalReviewPhase:
             }
         )
 
-        captured: dict[str, list[str]] = {}
+        captured: dict[str, object] = {}
 
         @contextmanager
         def fake_review_worktree(repo_root: Path, *, head_sha: str, branch=None):  # noqa: ARG001
@@ -18459,17 +18463,22 @@ class TestLocalReviewPhase:
             cmd: list[str],
             *,
             cwd: Path,  # noqa: ARG001
-            env: dict[str, str],  # noqa: ARG001
+            env: dict[str, str],
             timeout: int,  # noqa: ARG001
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             captured["cmd"] = cmd
+            captured["env"] = env
             return subprocess.CompletedProcess(cmd, 0, raw_review_json, "")
 
         with (
             patch.object(orch, "_run_local_review_subprocess", side_effect=mock_review_exec),
             patch.object(orch, "_render_local_review_prompt", return_value="prompt"),
-            patch.object(orch, "_bootstrap_review_worktree", return_value=""),
+            patch.object(
+                orch,
+                "_bootstrap_review_worktree",
+                return_value=bootstrap_warning,
+            ),
             patch.object(orch, "_temporary_review_worktree", side_effect=fake_review_worktree),
         ):
             review_result, _ = orch._run_local_review(
@@ -18483,16 +18492,26 @@ class TestLocalReviewPhase:
             )
 
         assert review_result.status == "approved"
-        prompt_arg = captured["cmd"][-1]
+        captured_cmd = captured["cmd"]
+        assert isinstance(captured_cmd, list)
+        prompt_arg = captured_cmd[-1]
         expected_pytest_command = (
             r".venv\Scripts\python.exe -m pytest"
             if os.name == "nt"
             else ".venv/bin/pytest"
         )
-        if venv_present:
+        if venv_present and not bootstrap_warning:
             assert expected_pytest_command in prompt_arg
         else:
             assert expected_pytest_command not in prompt_arg
+        captured_env = captured["env"]
+        assert isinstance(captured_env, dict)
+        venv_bin = str(orch._worktree_venv_executable_dir(review_worktree))
+        if bootstrap_warning:
+            assert captured_env["PATH"].split(os.pathsep)[0] != venv_bin
+            assert "VIRTUAL_ENV" not in captured_env
+        else:
+            assert captured_env["PATH"].split(os.pathsep)[0] == venv_bin
 
     def test_windows_review_prompt_uses_scripts_python(self, tmp_path: Path):
         review_worktree = tmp_path / "review"

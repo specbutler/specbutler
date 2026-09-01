@@ -19395,7 +19395,11 @@ def _run_local_review(
         # there and how to invoke it by absolute path (PATH injection alone is
         # not enough if the agent's shell resets PATH). Recorded to the prompt
         # artifact so the effective prompt is reproducible.
-        env_note = _review_env_prompt_note(review_worktree)
+        # A failed installer can leave a partial ``.venv`` behind. Do not
+        # advertise it or put it ahead of the operator's working toolchain:
+        # doing so turns the promised diff-only fallback into a broken
+        # environment where even an already-installed pytest disappears.
+        env_note = "" if bootstrap_warning else _review_env_prompt_note(review_worktree)
         sandbox_note = (
             _codex_review_sandbox_prompt_note(review_worktree, review_scratch_dir)
             if agent.name == "codex"
@@ -19440,8 +19444,11 @@ def _run_local_review(
         # Put the review worktree's venv on the reviewer's PATH so bootstrap
         # actually pays off: the reviewer can run bare ``pytest`` / ``ruff``
         # against the installed project instead of falling back to diff-only.
-        # A missing ``.venv/bin`` (bootstrap skipped or failed) is harmless.
-        _inject_worktree_venv_into_env(review_env, review_worktree)
+        # A missing ``.venv/bin`` after a skipped bootstrap is harmless, but a
+        # partial environment left by a failed bootstrap must not shadow the
+        # operator's working PATH.
+        if not bootstrap_warning:
+            _inject_worktree_venv_into_env(review_env, review_worktree)
         if review_codex_home is not None:
             review_env = _subprocess_env_with_codex_home(review_env, review_codex_home)
         try:
