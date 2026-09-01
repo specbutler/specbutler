@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import bisect
 import ctypes
 import json
 import os
@@ -32,7 +33,8 @@ _REAL_POPEN_TYPE = subprocess.Popen
 _CONTROL_RECONCILE_LIMIT = 256
 _ORPHAN_LOCK_MIN_AGE_SECONDS = 3600.0
 _CONTROL_STATE_RECONCILE_LOCK = threading.Lock()
-_RECONCILED_CONTROL_ROOTS: set[Path] = set()
+_CONTROL_RECONCILE_CURSOR_FILENAME = "reconcile-cursor.json"
+_CONTROL_RECONCILE_CURSOR_LOCK_FILENAME = "reconcile-cursor.lock"
 _VM_STAT_PAGE_SIZE_RE = re.compile(r"page size of (?P<bytes>\d+) bytes", re.IGNORECASE)
 _VM_STAT_RECLAIMABLE_KEYS = frozenset(
     {
@@ -248,7 +250,17 @@ class SupervisionToken:
                 raise ValueError(f"V2 supervision token is missing {', '.join(missing)}")
             supervision_id = str(value["supervision_id"])
             expected_job_name = _windows_job_name(supervision_id)
-            if value["job_name"] != expected_job_name:
+            legacy_posix_job_name = f"Local\\SpecButler-{supervision_id}"
+            accepted_job_names = {expected_job_name}
+            if sys.platform != "win32":
+                # V2 tokens minted before native Windows support used the
+                # session-local spelling on every platform.  POSIX never
+                # opens the Job name, so retaining that persisted spelling is
+                # state compatibility, not an ownership relaxation.  Windows
+                # must remain strict: a Local Job cannot be reopened across
+                # logon sessions and is not the canonical ownership boundary.
+                accepted_job_names.add(legacy_posix_job_name)
+            if value["job_name"] not in accepted_job_names:
                 raise ValueError("V2 supervision token has a noncanonical Job name")
             expected_control_relpath = f"controls/{supervision_id}/control.json"
             if value["control_relpath"] != expected_control_relpath:
@@ -954,10 +966,6 @@ def _retire_durable_records(metadata_path: Path, token: SupervisionToken) -> boo
                 control_path.parent.rmdir()
             except OSError:
                 pass
-            try:
-                metadata_path.parent.rmdir()
-            except OSError:
-                pass
         return removed
     except BaseException:
         return False
@@ -1026,11 +1034,13 @@ def _remove_empty_control_artifacts(control_path: Path, metadata_path: Path) -> 
         control_path.with_suffix(".lock").unlink(missing_ok=True)
     except OSError:
         pass
-    for directory in (control_path.parent, metadata_path.parent):
-        try:
-            directory.rmdir()
-        except OSError:
-            pass
+    # The per-ID control directory is unique to this boundary. ``metadata/``
+    # is shared by every publisher, so removing it can race atomic_write_text
+    # between its parent mkdir and temporary-file creation.
+    try:
+        control_path.parent.rmdir()
+    except OSError:
+        pass
 
 
 def _reconcile_control_record(control_path: Path, supervision_id: str) -> bool:
@@ -1173,14 +1183,71 @@ def _reconcile_lock_only_directory(directory: Path, supervision_id: str) -> bool
     return not lock_path.exists()
 
 
-def _oldest_paths(paths: Sequence[Path]) -> list[Path]:
-    def modified(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return float("inf")
+def _read_control_reconcile_cursor(cursor_path: Path) -> str:
+    try:
+        payload = json.loads(cursor_path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict) or payload.get("schema") != 1:
+        return ""
+    after = payload.get("after")
+    return after if isinstance(after, str) else ""
 
-    return sorted(paths, key=modified)
+
+def _write_control_reconcile_cursor(cursor_path: Path, after: str) -> None:
+    atomic_write_text(
+        cursor_path,
+        json.dumps({"schema": 1, "after": after}, sort_keys=True) + "\n",
+    )
+
+
+def _control_reconcile_entries(
+    controls_root: Path,
+    metadata_root: Path,
+) -> list[tuple[str, str, Path]]:
+    """Return stable control/metadata entries for one circular scan.
+
+    The entry key is persisted rather than an array offset so deletions do not
+    reset progress.  A single ordered namespace also prevents a large control
+    directory from consuming every batch before metadata is ever considered.
+    """
+    entries: list[tuple[str, str, Path]] = []
+    try:
+        if controls_root.is_symlink():
+            raise OSError("control directory is a symlink")
+        entries.extend(
+            (f"{path.name}/1-control", "control", path)
+            for path in controls_root.iterdir()
+            if path.is_dir() and not path.is_symlink()
+        )
+    except OSError:
+        pass
+    try:
+        if metadata_root.is_symlink():
+            raise OSError("metadata directory is a symlink")
+        entries.extend(
+            (f"{path.stem}/0-metadata", "metadata", path)
+            for path in metadata_root.glob("*.json")
+            if path.is_file() and not path.is_symlink()
+        )
+    except OSError:
+        pass
+    return sorted(entries, key=lambda entry: entry[0])
+
+
+def _control_reconcile_batch(
+    entries: Sequence[tuple[str, str, Path]],
+    *,
+    after: str,
+    limit: int,
+) -> list[tuple[str, str, Path]]:
+    """Select at most *limit* entries after *after*, wrapping once."""
+    if not entries or limit <= 0:
+        return []
+    keys = [entry[0] for entry in entries]
+    start = bisect.bisect_right(keys, after)
+    ordered = [*entries[start:], *entries[:start]]
+    return ordered[:limit]
 
 
 def reconcile_stale_control_state(*, limit: int = _CONTROL_RECONCILE_LIMIT) -> int:
@@ -1195,71 +1262,53 @@ def reconcile_stale_control_state(*, limit: int = _CONTROL_RECONCILE_LIMIT) -> i
     root = _control_root()
     controls_root = root / "controls"
     metadata_root = root / "metadata"
+    cursor_path = root / _CONTROL_RECONCILE_CURSOR_FILENAME
+    cursor_lock_path = root / _CONTROL_RECONCILE_CURSOR_LOCK_FILENAME
     retired = 0
-    considered = 0
-    seen: set[str] = set()
-
+    cursor_lock = FileLock(cursor_lock_path, blocking=False)
     try:
-        if controls_root.is_symlink():
-            raise OSError("control directory is a symlink")
-        control_directories = _oldest_paths(
-            [path for path in controls_root.iterdir() if path.is_dir() and not path.is_symlink()]
+        if root.is_symlink() or cursor_path.is_symlink() or cursor_lock_path.is_symlink():
+            return 0
+        if not cursor_lock.acquire():
+            return 0
+        entries = _control_reconcile_entries(controls_root, metadata_root)
+        batch = _control_reconcile_batch(
+            entries,
+            after=_read_control_reconcile_cursor(cursor_path),
+            limit=limit,
         )
-    except OSError:
-        control_directories = []
-    for directory in control_directories:
-        if considered >= limit:
-            break
-        considered += 1
-        supervision_id = directory.name
-        control_path = directory / "control.json"
-        if control_path.is_symlink() or not control_path.is_file():
-            if not (metadata_root / f"{supervision_id}.json").exists():
-                retired += int(_reconcile_lock_only_directory(directory, supervision_id))
-            continue
-        seen.add(supervision_id)
-        try:
-            if _control_path(f"controls/{supervision_id}/control.json") != control_path.resolve():
+        for _key, kind, path in batch:
+            supervision_id = path.name if kind == "control" else path.stem
+            try:
+                if kind == "control":
+                    control_path = path / "control.json"
+                    if control_path.is_symlink() or not control_path.is_file():
+                        if not (metadata_root / f"{supervision_id}.json").exists():
+                            retired += int(_reconcile_lock_only_directory(path, supervision_id))
+                        continue
+                    if _control_path(f"controls/{supervision_id}/control.json") != control_path.resolve():
+                        continue
+                    retired += int(_reconcile_control_record(control_path, supervision_id))
+                else:
+                    if durable_metadata_path(supervision_id).resolve() != path.resolve():
+                        continue
+                    retired += int(_reconcile_orphan_metadata(path, supervision_id))
+            except (OSError, ValueError):
                 continue
-            retired += int(_reconcile_control_record(control_path, supervision_id))
-        except (OSError, ValueError):
-            continue
-
-    if considered >= limit:
+        if batch:
+            _write_control_reconcile_cursor(cursor_path, batch[-1][0])
+    except OSError:
         return retired
-    try:
-        if metadata_root.is_symlink():
-            raise OSError("metadata directory is a symlink")
-        metadata_files = _oldest_paths(
-            [path for path in metadata_root.glob("*.json") if path.is_file() and not path.is_symlink()]
-        )
-    except OSError:
-        metadata_files = []
-    for metadata_path in metadata_files:
-        if considered >= limit:
-            break
-        supervision_id = metadata_path.stem
-        if supervision_id in seen:
-            continue
-        considered += 1
-        try:
-            if durable_metadata_path(supervision_id).resolve() != metadata_path.resolve():
-                continue
-            retired += int(_reconcile_orphan_metadata(metadata_path, supervision_id))
-        except (OSError, ValueError):
-            continue
+    finally:
+        cursor_lock.release()
     return retired
 
 
 def _ensure_control_state_reconciled() -> None:
-    """Run bounded reconciliation once per resolved state root in this process."""
+    """Run one bounded reconciliation batch before each Windows launch."""
     try:
-        root = _control_root().resolve()
         with _CONTROL_STATE_RECONCILE_LOCK:
-            if root in _RECONCILED_CONTROL_ROOTS:
-                return
             reconcile_stale_control_state()
-            _RECONCILED_CONTROL_ROOTS.add(root)
     except BaseException:
         # Housekeeping must never make a process launch unavailable.
         pass

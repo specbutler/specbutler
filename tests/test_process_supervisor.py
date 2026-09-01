@@ -60,6 +60,44 @@ def test_legacy_v1_posix_token_remains_deserializable() -> None:
     assert SupervisionToken.from_dict(token.to_dict()) == token
 
 
+@pytest.mark.skipif(os.name != "posix", reason="pre-upgrade V2 token was minted on POSIX")
+def test_legacy_v2_posix_local_job_token_remains_deserializable() -> None:
+    identity = ProcessIdentity(42, "created", "/usr/bin/python", "python child.py")
+    payload = SupervisionToken(
+        LifetimeMode.DETACHED,
+        identity,
+        7,
+        "owner",
+        "legacy-posix-v2",
+        payload_identity=identity,
+    ).to_dict()
+    payload["job_name"] = r"Local\SpecButler-legacy-posix-v2"
+
+    restored = SupervisionToken.from_dict(payload)
+
+    assert restored.version == 2
+    assert restored.job_name == r"Local\SpecButler-legacy-posix-v2"
+
+
+def test_v2_token_parser_rejects_local_job_name_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = ProcessIdentity(42, "created", "python.exe", "python child.py")
+    payload = SupervisionToken(
+        LifetimeMode.DETACHED,
+        identity,
+        7,
+        "owner",
+        "windows-global-only",
+        payload_identity=identity,
+    ).to_dict()
+    payload["job_name"] = r"Local\SpecButler-windows-global-only"
+    monkeypatch.setattr(process_supervisor.sys, "platform", "win32")
+
+    with pytest.raises(ValueError, match="noncanonical Job name"):
+        SupervisionToken.from_dict(payload)
+
+
 @pytest.mark.parametrize(
     "missing",
     ["supervision_id", "job_name", "keeper_identity", "payload_identity", "control_relpath", "control_nonce"],
@@ -77,7 +115,7 @@ def test_v2_token_parser_does_not_mint_missing_security_fields(missing: str) -> 
     ("field", "value", "message"),
     [
         ("version", 3, "unsupported supervision token version"),
-        ("job_name", r"Local\SpecButler-strict-token", "noncanonical Job name"),
+        ("job_name", r"Session\SpecButler-strict-token", "noncanonical Job name"),
         ("control_relpath", "controls/other/control.json", "noncanonical control path"),
     ],
 )
@@ -131,7 +169,7 @@ def _write_reconcilable_boundary(
     control_path = root / token.control_relpath
     metadata_path = root / "metadata" / f"{supervision_id}.json"
     control_path.parent.mkdir(parents=True)
-    metadata_path.parent.mkdir(parents=True)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
     control_path.write_text(
         json.dumps(
             {
@@ -174,6 +212,7 @@ def test_reconcile_stale_control_state_removes_authenticated_dead_records(
     assert not control_path.exists()
     assert not control_path.with_suffix(".lock").exists()
     assert not metadata_path.exists()
+    assert metadata_path.parent.is_dir()
     assert not process_supervisor._durable_publication_ack_path(metadata_path).exists()
     assert token.token == "dead-boundary"
 
@@ -332,6 +371,66 @@ def test_reconcile_stale_control_state_removes_authenticated_orphan_metadata(
     assert not metadata_path.exists()
     assert not process_supervisor._durable_publication_ack_path(metadata_path).exists()
     assert not control_path.with_suffix(".lock").exists()
+
+
+def test_reconciliation_never_removes_shared_metadata_directory(tmp_path: Path) -> None:
+    control_path = tmp_path / "controls" / "finished" / "control.json"
+    metadata_path = tmp_path / "metadata" / "finished.json"
+    control_path.parent.mkdir(parents=True)
+    metadata_path.parent.mkdir(parents=True)
+
+    process_supervisor._remove_empty_control_artifacts(control_path, metadata_path)
+
+    assert not control_path.parent.exists()
+    # Publishers create atomic-write temporary files in this shared directory.
+    # Its lifetime cannot depend on a different boundary finishing cleanup.
+    assert metadata_path.parent.is_dir()
+
+
+def test_reconcile_cursor_advances_past_full_retained_batch_for_later_launches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    controls_root = root / "controls"
+    retained_count = process_supervisor._CONTROL_RECONCILE_LIMIT + 1
+    for index in range(retained_count):
+        retained = controls_root / f"a-retained-{index:03d}"
+        retained.mkdir(parents=True)
+        (retained / "control.json").write_text("{}", encoding="utf-8")
+
+    _control_token, control_path, control_metadata = _write_reconcilable_boundary(
+        root,
+        "z-reclaimable-control",
+    )
+    _metadata_token, metadata_control, orphan_metadata = _write_reconcilable_boundary(
+        root,
+        "z-reclaimable-metadata",
+    )
+    metadata_control.unlink()
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setattr(
+        process_supervisor,
+        "_windows_job_definitively_absent",
+        lambda _name: True,
+    )
+
+    process_supervisor._ensure_control_state_reconciled()
+
+    assert control_path.exists()
+    assert control_metadata.exists()
+    assert orphan_metadata.exists()
+    cursor_path = root / process_supervisor._CONTROL_RECONCILE_CURSOR_FILENAME
+    assert json.loads(cursor_path.read_text(encoding="utf-8"))["after"] == "a-retained-255/1-control"
+
+    process_supervisor._ensure_control_state_reconciled()
+
+    assert not control_path.exists()
+    assert not control_metadata.exists()
+    assert not orphan_metadata.exists()
+    assert not metadata_control.parent.exists()
+    assert all((controls_root / f"a-retained-{index:03d}").is_dir() for index in range(retained_count))
 
 
 def test_current_process_retirement_requires_exact_claim(
@@ -1012,6 +1111,7 @@ def test_durable_helper_retires_only_matching_authenticated_records(
 
     assert process_supervisor._retire_durable_records(metadata_path, token)
     assert not metadata_path.exists()
+    assert metadata_path.parent.is_dir()
     assert not (tmp_path / token.control_relpath).exists()
     assert not process_supervisor._durable_publication_ack_path(metadata_path).exists()
     assert not (tmp_path / token.control_relpath).with_suffix(".lock").exists()
