@@ -115,6 +115,8 @@ def _free_port() -> int:
 
 def _write_fake_cli_tools(fake_bin: Path, python: Path) -> None:
     """Install deterministic model/forge doubles at the external CLI boundary."""
+    from pip._vendor.distlib.scripts import ScriptMaker
+
     fake_bin.mkdir()
     (fake_bin / "fake-gh.py").write_text(
         """import json, sys
@@ -137,26 +139,74 @@ raise SystemExit(0)
         f'@echo off\r\n"{python}" -I "%~dp0fake-gh.py" %*\r\n',
         encoding="utf-8",
     )
-    (fake_bin / "codex.cmd").write_text(
-        """@echo off
-if "%1"=="exec" if "%2"=="--help" (
-  echo codex exec --json --output-schema
-  exit /b 0
-)
-if not exist ".fixture-agent-needs-input" (
-  echo waiting>".fixture-agent-needs-input"
-  "%SPEC_FIXTURE_PYTHON%" -I -m spec_runtime.cli report --status needs-input --summary "Choose fixture behavior A or B"
-  exit /b %ERRORLEVEL%
-)
-echo resolved>"windows-resolution.txt"
-git add .fixture-agent-needs-input windows-resolution.txt
-git -c user.name="Windows CI" -c user.email="windows-ci@example.invalid" commit -m "Resolve Windows fixture input"
-if errorlevel 1 exit /b %ERRORLEVEL%
-"%SPEC_FIXTURE_PYTHON%" -I -m spec_runtime.cli report --status ok --summary "Selected fixture behavior A"
-exit /b %ERRORLEVEL%
-""".replace("\n", "\r\n"),
+    (fake_bin / "fixture_codex.py").write_text(
+        """import os
+import pathlib
+import subprocess
+import sys
+
+def main():
+    if sys.argv[1:3] == ["exec", "--help"]:
+        print("codex exec --json --output-schema")
+        return 0
+    marker = pathlib.Path(".fixture-agent-needs-input")
+    python = os.environ["SPEC_FIXTURE_PYTHON"]
+    if not marker.exists():
+        marker.write_text("waiting")
+        return subprocess.run([
+            python, "-I", "-m", "spec_runtime.cli", "report",
+            "--status", "needs-input", "--summary", "Choose fixture behavior A or B",
+        ]).returncode
+    pathlib.Path("windows-resolution.txt").write_text("resolved")
+    added = subprocess.run(["git", "add", str(marker), "windows-resolution.txt"])
+    if added.returncode:
+        return added.returncode
+    committed = subprocess.run([
+        "git", "-c", "user.name=Windows CI",
+        "-c", "user.email=windows-ci@example.invalid",
+        "commit", "-m", "Resolve Windows fixture input",
+    ])
+    if committed.returncode:
+        return committed.returncode
+    return subprocess.run([
+        python, "-I", "-m", "spec_runtime.cli", "report",
+        "--status", "ok", "--summary", "Selected fixture behavior A",
+    ]).returncode
+""",
         encoding="utf-8",
     )
+    maker = ScriptMaker(None, str(fake_bin))
+    maker.executable = str(python)
+    maker.variants = {""}
+    generated = maker.make("codex = fixture_codex:main")
+    assert generated
+
+
+def _write_fake_spec_launcher(fake_bin: Path, python: Path) -> None:
+    from pip._vendor.distlib.scripts import ScriptMaker
+
+    (fake_bin / "fixture_spec.py").write_text(
+        """import json
+import os
+import pathlib
+import time
+
+def main():
+    marker = pathlib.Path(os.environ["SPEC_FIXTURE_AUTO_MARKER"])
+    count = 0
+    if marker.exists():
+        count = int(json.loads(marker.read_text()).get("launch_count", 0))
+    marker.write_text(json.dumps({"pid": os.getpid(), "launch_count": count + 1}))
+    while True:
+        time.sleep(0.2)
+""",
+        encoding="utf-8",
+    )
+    maker = ScriptMaker(None, str(fake_bin))
+    maker.executable = str(python)
+    maker.variants = {""}
+    generated = maker.make("spec = fixture_spec:main")
+    assert generated
 
 
 def _wait_for_http(url: str, token: str, process: subprocess.Popen[str] | None = None) -> None:
@@ -679,6 +729,9 @@ def test_installed_artifact_cli_matrix(tmp_path: Path) -> None:
         {
             "CODEX_HOME": str(operator_codex_home),
             "PATH": os.pathsep.join([str(fake_bin), env.get("PATH", "")]),
+            # Used only by generated native fake-provider launchers. Product
+            # CLI subprocesses use -I and cannot import from this directory.
+            "PYTHONPATH": str(fake_bin),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
             "SPEC_FIXTURE_PYTHON": sys.executable,
@@ -1005,22 +1058,7 @@ description: Exercise installed Windows autopilot supervision
     _git(repo, "push", "origin", "main")
 
     auto_marker = tmp_path / "autopilot-child.json"
-    (fake_bin / "fake-spec-implement.py").write_text(
-        """import json, os, pathlib, time
-marker = pathlib.Path(os.environ["SPEC_FIXTURE_AUTO_MARKER"])
-count = 0
-if marker.exists():
-    count = int(json.loads(marker.read_text()).get("launch_count", 0))
-marker.write_text(json.dumps({"pid": os.getpid(), "launch_count": count + 1}))
-while True:
-    time.sleep(0.2)
-""",
-        encoding="utf-8",
-    )
-    (fake_bin / "spec.cmd").write_text(
-        f'@echo off\r\n"{sys.executable}" -I "%~dp0fake-spec-implement.py"\r\n',
-        encoding="utf-8",
-    )
+    _write_fake_spec_launcher(fake_bin, Path(sys.executable))
     auto_env = env.copy()
     auto_env["PYTHONUNBUFFERED"] = "1"
     auto_env["SPEC_FIXTURE_AUTO_MARKER"] = str(auto_marker)
