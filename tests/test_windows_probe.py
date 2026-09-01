@@ -73,37 +73,90 @@ def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
         register_process,
     )
 
-    grandchild = "import time; time.sleep(30)"
-    child = f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{grandchild!r}]); time.sleep(30)"
-    parent_code = f"import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',{child!r}]); time.sleep(30)"
+    child_pid_path = tmp_path / "child.pid"
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+    grandchild_code = "import time; time.sleep(30)"
+    child_code = (
+        "import os,subprocess,sys,time; "
+        "grandchild=subprocess.Popen([sys.executable,'-c',sys.argv[3]]); "
+        "open(sys.argv[1],'w').write(str(os.getpid())); "
+        "open(sys.argv[2],'w').write(str(grandchild.pid)); "
+        "time.sleep(30)"
+    )
+    parent_code = (
+        "import subprocess,sys,time; "
+        "subprocess.Popen([sys.executable,'-c',sys.argv[3],sys.argv[1],sys.argv[2],sys.argv[4]]); "
+        "time.sleep(30)"
+    )
     popen_options = (
         {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
         if sys.platform == "win32"
         else {"start_new_session": True}
     )
-    parent = subprocess.Popen([sys.executable, "-c", parent_code], **popen_options)
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            parent_code,
+            str(child_pid_path),
+            str(grandchild_pid_path),
+            child_code,
+            grandchild_code,
+        ],
+        **popen_options,
+    )
+    pids = [parent.pid]
+    identities = []
     try:
-        time.sleep(1)
-        identity = read_process_identity(parent.pid)
-        assert identity is not None
+        deadline = time.monotonic() + 10
+        while not (child_pid_path.exists() and grandchild_pid_path.exists()):
+            assert parent.poll() is None, "parent exited before creating its descendants"
+            assert time.monotonic() < deadline, "timed out waiting for descendant PIDs"
+            time.sleep(0.1)
+
+        pids = [parent.pid, int(child_pid_path.read_text()), int(grandchild_pid_path.read_text())]
+        identities = [read_process_identity(pid) for pid in pids]
+        assert all(identity is not None for identity in identities)
+        parent_identity = identities[0]
+        assert parent_identity is not None
         register_process(
             tmp_path,
             tmp_path / "worktree",
             name="process-tree",
             kind="probe",
             pid=parent.pid,
-            started_at=identity.started_at,
+            started_at=parent_identity.started_at,
             termination_scope="pgid",
             pgid=parent.pid,
         )
         report = reap_registered_processes(tmp_path, tmp_path / "worktree")
         assert not report.surviving
         parent.wait(timeout=10)
-        assert not is_process_alive(parent.pid, identity.started_at)
+        survivors = [
+            identity.pid
+            for identity in identities
+            if identity is not None and is_process_alive(identity.pid, identity.started_at)
+        ]
+        assert not survivors, f"process-tree descendants survived reap: {survivors}"
     finally:
+        identities_by_pid = {
+            identity.pid: identity for identity in identities if identity is not None
+        }
+        for pid in reversed(pids):
+            identity = identities_by_pid.get(pid)
+            if identity is not None and not is_process_alive(pid, identity.started_at):
+                continue
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    check=False,
+                    capture_output=True,
+                )
+            else:
+                subprocess.run(["kill", "-KILL", str(pid)], check=False)
         if parent.poll() is None:
             parent.kill()
-            parent.wait(timeout=10)
+        parent.wait(timeout=10)
 
 
 def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
