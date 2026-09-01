@@ -436,6 +436,128 @@ def test_payload_promotion_converges_after_death_between_atomic_writes(
     assert promote_payload_identity(token, candidate).payload == candidate
 
 
+def test_durable_helper_retires_only_matching_authenticated_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keeper = inspect_process(os.getpid())
+    assert keeper is not None
+    payload = ProcessIdentity(42, "payload", "python.exe")
+    token = SupervisionToken(
+        LifetimeMode.DETACHED,
+        keeper,
+        7,
+        "owner",
+        "retire-matching-records",
+        payload_identity=payload,
+    )
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path))
+    _write_promotion_state(tmp_path, token)
+    metadata_path = process_supervisor.durable_metadata_path(token.token)
+    process_supervisor._acknowledge_durable_publication(metadata_path, token)
+
+    assert process_supervisor._retire_durable_records(metadata_path, token)
+    assert not metadata_path.exists()
+    assert not (tmp_path / token.control_relpath).exists()
+    assert not process_supervisor._durable_publication_ack_path(metadata_path).exists()
+    assert not (tmp_path / token.control_relpath).with_suffix(".lock").exists()
+
+
+def test_durable_helper_refuses_to_retire_mismatched_control_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    keeper = inspect_process(os.getpid())
+    assert keeper is not None
+    token = SupervisionToken(
+        LifetimeMode.ADOPTABLE,
+        keeper,
+        7,
+        "owner",
+        "retire-mismatch",
+        payload_identity=ProcessIdentity(42, "payload", "python.exe"),
+    )
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path))
+    _write_promotion_state(tmp_path, token)
+    control_path = tmp_path / token.control_relpath
+    control = json.loads(control_path.read_text(encoding="utf-8"))
+    control["nonce"] = "different-owner"
+    control_path.write_text(json.dumps(control), encoding="utf-8")
+    metadata_path = process_supervisor.durable_metadata_path(token.token)
+
+    assert not process_supervisor._retire_durable_records(metadata_path, token)
+    assert metadata_path.exists()
+    assert control_path.exists()
+
+
+def test_durable_helper_cleanup_never_masks_payload_baseexception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class PayloadAbort(BaseException):
+        pass
+
+    keeper = ProcessIdentity(41, "keeper", "python.exe")
+    payload = ProcessIdentity(42, "payload", "python.exe")
+    child_token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        payload,
+        7,
+        "owner",
+        "helper-baseexception",
+    )
+
+    class Child:
+        token = child_token
+
+        def owned_tree_active(self) -> bool:
+            return False
+
+        def wait(self) -> int:
+            raise PayloadAbort
+
+    class Supervisor:
+        def __enter__(self) -> Supervisor:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def spawn(self, _argv: object) -> Child:
+            return Child()
+
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        process_supervisor,
+        "ProcessSupervisor",
+        lambda *_args, **_kwargs: Supervisor(),
+    )
+    monkeypatch.setattr(
+        process_supervisor,
+        "_stabilize_windows_payload_identity",
+        lambda _child: payload,
+    )
+    monkeypatch.setattr(process_supervisor, "inspect_process", lambda _pid: keeper)
+    monkeypatch.setattr(
+        process_supervisor,
+        "_await_durable_publication",
+        lambda *_args: (_ for _ in ()).throw(ValueError("ack cleanup failed")),
+    )
+    monkeypatch.setattr(
+        process_supervisor,
+        "_retire_durable_records",
+        lambda *_args: (_ for _ in ()).throw(ValueError("record cleanup failed")),
+    )
+
+    with pytest.raises(PayloadAbort):
+        process_supervisor._durable_helper(
+            process_supervisor.durable_metadata_path(child_token.token),
+            child_token.token,
+            LifetimeMode.DETACHED,
+            child_token.control_relpath,
+            child_token.control_nonce,
+            ProcessIdentity(7, "publisher"),
+            [sys.executable, "-c", "pass"],
+        )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")
 @pytest.mark.parametrize("action", ["normal", "stop", "owner-close"])
 def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: str) -> None:
@@ -785,6 +907,56 @@ def _spawn_windows_durable_payload(
     identity = inspect_process(int(marker.read_text(encoding="utf-8")))
     assert identity is not None
     return managed, identity
+
+
+def _assert_durable_records_removed(token: SupervisionToken) -> None:
+    metadata_path = process_supervisor.durable_metadata_path(token.token)
+    control_path = Path(os.environ["SPEC_PROCESS_CONTROL_ROOT"]) / token.control_relpath
+    deadline = time.monotonic() + 10
+    while (metadata_path.exists() or control_path.exists()) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not metadata_path.exists()
+    assert not control_path.exists()
+    assert not process_supervisor._durable_publication_ack_path(metadata_path).exists()
+    assert not control_path.with_suffix(".lock").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows durable cleanup integration")
+def test_windows_fast_exit_durable_helper_publishes_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+    supervision_id = f"fast-exit-{uuid.uuid4().hex}"
+
+    managed = ProcessSupervisor(
+        LifetimeMode.DETACHED,
+        supervision_id=supervision_id,
+    ).spawn([sys.executable, "-c", "pass"])
+
+    assert managed.token.token == supervision_id
+    assert managed.wait(timeout=10) == 0
+    _assert_durable_records_removed(managed.token)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows durable cleanup integration")
+@pytest.mark.parametrize("mode", [LifetimeMode.DETACHED, LifetimeMode.ADOPTABLE])
+def test_windows_completed_durable_helper_retires_authenticated_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: LifetimeMode
+) -> None:
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+    supervision_id = f"cleanup-{mode.value}-{uuid.uuid4().hex}"
+    managed = ProcessSupervisor(mode, supervision_id=supervision_id).spawn(
+        [sys.executable, "-c", "import time; time.sleep(1)"]
+    )
+    metadata_path = process_supervisor.durable_metadata_path(supervision_id)
+    control_path = Path(os.environ["SPEC_PROCESS_CONTROL_ROOT"]) / managed.token.control_relpath
+
+    assert metadata_path.exists()
+    assert control_path.exists()
+    if mode is LifetimeMode.ADOPTABLE:
+        adopt(managed.token)
+    assert managed.wait(timeout=10) == 0
+    _assert_durable_records_removed(managed.token)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows payload promotion integration")

@@ -58,6 +58,10 @@ def durable_metadata_path(supervision_id: str) -> Path:
     return _control_root() / "metadata" / f"{supervision_id}.json"
 
 
+def _durable_publication_ack_path(metadata_path: Path) -> Path:
+    return metadata_path.with_suffix(metadata_path.suffix + ".ack")
+
+
 def _kernel32() -> Any:
     """Return kernel32 with pointer-width-safe declarations."""
     from ctypes import wintypes
@@ -658,6 +662,123 @@ def _abort_windows_job(job: _WindowsJob | None) -> None:
         pass
 
 
+def _load_durable_publication(
+    metadata_path: Path,
+    *,
+    supervision_id: str,
+    control_nonce: str,
+    mode: LifetimeMode,
+) -> SupervisionToken | None:
+    """Read only the token published by this exact helper launch."""
+    try:
+        token = SupervisionToken.from_dict(json.loads(metadata_path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    if (
+        token.token != supervision_id
+        or token.control_nonce != control_nonce
+        or token.mode is not mode
+        or not identity_matches(token.identity)
+    ):
+        return None
+    return token
+
+
+def _acknowledge_durable_publication(metadata_path: Path, token: SupervisionToken) -> None:
+    """Tell a fast-exiting helper that the launcher retained its token."""
+    payload = {
+        "schema": 1,
+        "supervision_id": token.token,
+        "nonce": token.control_nonce,
+        "keeper_identity": token.identity.to_dict(),
+    }
+    atomic_write_text(
+        _durable_publication_ack_path(metadata_path),
+        json.dumps(payload, sort_keys=True),
+    )
+
+
+def _durable_publication_acknowledged(metadata_path: Path, token: SupervisionToken) -> bool:
+    try:
+        payload = json.loads(
+            _durable_publication_ack_path(metadata_path).read_text(encoding="utf-8")
+        )
+    except (OSError, TypeError, json.JSONDecodeError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("schema") == 1
+        and payload.get("supervision_id") == token.token
+        and payload.get("nonce") == token.control_nonce
+        and payload.get("keeper_identity") == token.identity.to_dict()
+    )
+
+
+def _await_durable_publication(
+    metadata_path: Path,
+    token: SupervisionToken,
+    publisher: ProcessIdentity,
+) -> None:
+    """Retain the handshake until its live publisher has consumed it."""
+    while identity_matches(publisher):
+        if _durable_publication_acknowledged(metadata_path, token):
+            return
+        time.sleep(0.02)
+
+
+def _retire_durable_records(metadata_path: Path, token: SupervisionToken) -> bool:
+    """Remove only this helper's authenticated records after its Job is empty."""
+    try:
+        if token.identity.pid != os.getpid() or not identity_matches(token.identity):
+            return False
+        if metadata_path.resolve() != durable_metadata_path(token.token).resolve():
+            return False
+        control_path = _control_path(token.control_relpath)
+        lock_path = control_path.with_suffix(".lock")
+        removed = False
+        with FileLock(lock_path):
+            try:
+                persisted = SupervisionToken.from_dict(
+                    json.loads(metadata_path.read_text(encoding="utf-8"))
+                )
+                state = json.loads(control_path.read_text(encoding="utf-8"))
+                payload_value = state.get("payload_identity")
+                if not isinstance(payload_value, dict):
+                    return False
+                ProcessIdentity.from_dict(payload_value)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                return False
+            if (
+                persisted.token != token.token
+                or persisted.mode is not token.mode
+                or persisted.identity != token.identity
+                or persisted.job_name != token.job_name
+                or persisted.control_relpath != token.control_relpath
+                or persisted.control_nonce != token.control_nonce
+                or not isinstance(state, dict)
+                or state.get("schema") != 2
+                or state.get("supervision_id") != token.token
+                or state.get("nonce") != token.control_nonce
+                or state.get("keeper_identity") != token.identity.to_dict()
+            ):
+                return False
+            # Retire authorization before its discovery record. A crash
+            # between these unlinks therefore leaves a fail-closed token.
+            control_path.unlink(missing_ok=True)
+            metadata_path.unlink(missing_ok=True)
+            removed = True
+        if removed:
+            _durable_publication_ack_path(metadata_path).unlink(missing_ok=True)
+            lock_path.unlink(missing_ok=True)
+            try:
+                control_path.parent.rmdir()
+            except OSError:
+                pass
+        return removed
+    except BaseException:
+        return False
+
+
 def claim_current_process(supervision_id: str) -> SupervisionToken:
     """Put the current Windows orchestrator in a retained kill-on-close Job."""
     if os.name != "nt":
@@ -982,6 +1103,7 @@ class ProcessSupervisor:
     def spawn(self, argv: Sequence[str], **kwargs: Any) -> ManagedProcess:
         job = None
         metadata_path: Path | None = None
+        publisher_identity: ProcessIdentity | None = None
         supervision_id = self._supervision_id or uuid.uuid4().hex
         control_relpath = f"controls/{supervision_id}/control.json"
         control_nonce = uuid.uuid4().hex
@@ -996,6 +1118,9 @@ class ProcessSupervisor:
                 # dispatcher may exit or restart without closing the payload
                 # Job; a replacement validates and adopts the helper token.
                 metadata_path = durable_metadata_path(supervision_id)
+                publisher_identity = inspect_process(os.getpid())
+                if publisher_identity is None:
+                    raise RuntimeError("Could not inspect durable token publisher identity")
                 helper_argv = [
                     sys.executable,
                     "-m",
@@ -1006,6 +1131,7 @@ class ProcessSupervisor:
                     self.mode.value,
                     control_relpath,
                     control_nonce,
+                    json.dumps(publisher_identity.to_dict(), separators=(",", ":")),
                     "--",
                     *argv,
                 ]
@@ -1036,7 +1162,11 @@ class ProcessSupervisor:
             )
             if identity is None:
                 raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
-            owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())
+            owner = (
+                ProcessIdentity(os.getpid(), "test-double")
+                if is_test_double
+                else publisher_identity or inspect_process(os.getpid())
+            )
             owner = owner or ProcessIdentity(os.getpid(), "unavailable")
             pgid = (
                 0
@@ -1051,15 +1181,22 @@ class ProcessSupervisor:
             helper_token: SupervisionToken | None = None
             if metadata_path is not None and not is_test_double:
                 deadline = time.monotonic() + 10.0
-                while time.monotonic() < deadline and not metadata_path.exists():
+                while time.monotonic() < deadline:
+                    helper_token = _load_durable_publication(
+                        metadata_path,
+                        supervision_id=supervision_id,
+                        control_nonce=control_nonce,
+                        mode=self.mode,
+                    )
+                    if helper_token is not None:
+                        break
                     if process.poll() is not None:
                         raise RuntimeError("Durable process supervisor exited before publishing payload identity")
                     time.sleep(0.02)
-                try:
-                    helper_token = SupervisionToken.from_dict(json.loads(metadata_path.read_text(encoding="utf-8")))
-                    payload_identity = helper_token.payload
-                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                    raise RuntimeError("Durable process supervisor did not publish payload identity") from exc
+                if helper_token is None:
+                    raise RuntimeError("Durable process supervisor did not publish payload identity")
+                _acknowledge_durable_publication(metadata_path, helper_token)
+                payload_identity = helper_token.payload
             job_name = _windows_job_name(supervision_id) if job is not None else ""
             if helper_token is not None:
                 job_name = helper_token.job_name
@@ -1103,6 +1240,7 @@ class ProcessSupervisor:
         """Async counterpart with the same platform-owned launch policy."""
         job = None
         metadata_path: Path | None = None
+        publisher_identity: ProcessIdentity | None = None
         supervision_id = self._supervision_id or uuid.uuid4().hex
         control_relpath = f"controls/{supervision_id}/control.json"
         control_nonce = uuid.uuid4().hex
@@ -1114,6 +1252,9 @@ class ProcessSupervisor:
                 job = _WindowsJob(_windows_job_name(supervision_id))
             elif self.mode in {LifetimeMode.ADOPTABLE, LifetimeMode.DETACHED}:
                 metadata_path = durable_metadata_path(supervision_id)
+                publisher_identity = inspect_process(os.getpid())
+                if publisher_identity is None:
+                    raise RuntimeError("Could not inspect durable token publisher identity")
                 argv = [
                     sys.executable,
                     "-m",
@@ -1124,6 +1265,7 @@ class ProcessSupervisor:
                     self.mode.value,
                     control_relpath,
                     control_nonce,
+                    json.dumps(publisher_identity.to_dict(), separators=(",", ":")),
                     "--",
                     *argv,
                 ]
@@ -1157,7 +1299,11 @@ class ProcessSupervisor:
             )
             if identity is None:
                 raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
-            owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())
+            owner = (
+                ProcessIdentity(os.getpid(), "test-double")
+                if is_test_double
+                else publisher_identity or inspect_process(os.getpid())
+            )
             owner = owner or ProcessIdentity(os.getpid(), "unavailable")
             pgid = (
                 0
@@ -1172,15 +1318,22 @@ class ProcessSupervisor:
             helper_token: SupervisionToken | None = None
             if metadata_path is not None and not is_test_double:
                 deadline = time.monotonic() + 10.0
-                while time.monotonic() < deadline and not metadata_path.exists():
+                while time.monotonic() < deadline:
+                    helper_token = _load_durable_publication(
+                        metadata_path,
+                        supervision_id=supervision_id,
+                        control_nonce=control_nonce,
+                        mode=self.mode,
+                    )
+                    if helper_token is not None:
+                        break
                     if process.returncode is not None:
                         raise RuntimeError("Durable process supervisor exited before publishing payload identity")
                     await asyncio.sleep(0.02)
-                try:
-                    helper_token = SupervisionToken.from_dict(json.loads(metadata_path.read_text(encoding="utf-8")))
-                    payload_identity = helper_token.payload
-                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                    raise RuntimeError("Durable process supervisor did not publish payload identity") from exc
+                if helper_token is None:
+                    raise RuntimeError("Durable process supervisor did not publish payload identity")
+                _acknowledge_durable_publication(metadata_path, helper_token)
+                payload_identity = helper_token.payload
             job_name = _windows_job_name(supervision_id) if job is not None else ""
             if helper_token is not None:
                 job_name = helper_token.job_name
@@ -1528,68 +1681,85 @@ def _durable_helper(
     mode: LifetimeMode,
     control_relpath: str,
     control_nonce: str,
+    publisher_identity: ProcessIdentity,
     argv: Sequence[str],
 ) -> int:
     """Own one Windows Job for the full lifetime of a durable payload."""
-    with ProcessSupervisor(LifetimeMode.RUN_OWNED, supervision_id=supervision_id) as supervisor:
-        child = supervisor.spawn(argv)
-        payload = _stabilize_windows_payload_identity(child)
-        keeper = inspect_process(os.getpid())
-        if keeper is None:
-            raise RuntimeError("Could not inspect durable supervisor identity")
-        token = SupervisionToken(
-            mode,
-            keeper,
-            0,
-            "",
-            supervision_id,
-            payload_identity=payload,
-            job_name=child.token.job_name,
-            control_relpath=control_relpath,
-            control_nonce=control_nonce,
-        )
-        control_path = _control_path(token.control_relpath)
-        state = {
-            "schema": 2,
-            "supervision_id": token.token,
-            "nonce": token.control_nonce,
-            "keeper_identity": token.identity.to_dict(),
-            "payload_identity": token.payload.to_dict(),
-            "adopted_by": None,
-            "adoption_generation": 0,
-        }
-        with FileLock(control_path.with_suffix(".lock")):
-            atomic_write_text(control_path, json.dumps(state, sort_keys=True))
-        atomic_write_text(metadata_path, json.dumps(token.to_dict()))
-        # A Windows launcher shim may exit while its real interpreter remains
-        # an active Job member. The helper owns the Job, not just Popen.pid, so
-        # it must stay alive until the kernel says the entire Job is empty.
-        while child.owned_tree_active():
-            request_id = ""
+    token: SupervisionToken | None = None
+    try:
+        with ProcessSupervisor(LifetimeMode.RUN_OWNED, supervision_id=supervision_id) as supervisor:
+            child = supervisor.spawn(argv)
+            payload = _stabilize_windows_payload_identity(child)
+            keeper = inspect_process(os.getpid())
+            if keeper is None:
+                raise RuntimeError("Could not inspect durable supervisor identity")
+            token = SupervisionToken(
+                mode,
+                keeper,
+                0,
+                "",
+                supervision_id,
+                payload_identity=payload,
+                job_name=child.token.job_name,
+                control_relpath=control_relpath,
+                control_nonce=control_nonce,
+            )
+            control_path = _control_path(token.control_relpath)
+            state = {
+                "schema": 2,
+                "supervision_id": token.token,
+                "nonce": token.control_nonce,
+                "keeper_identity": token.identity.to_dict(),
+                "payload_identity": token.payload.to_dict(),
+                "adopted_by": None,
+                "adoption_generation": 0,
+            }
             with FileLock(control_path.with_suffix(".lock")):
-                try:
-                    current = json.loads(control_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError, TypeError):
-                    current = {}
-                request = current.get("request")
-                if (
-                    isinstance(request, dict)
-                    and request.get("operation") == "stop"
-                    and request.get("nonce") == control_nonce
-                    and isinstance(request.get("id"), str)
-                    and request.get("id")
-                ):
-                    request_id = str(request["id"])
-            if request_id:
-                child.terminate(grace_seconds=float(request.get("grace_seconds", 0.0) or 0.0))
-                child.wait()
+                atomic_write_text(control_path, json.dumps(state, sort_keys=True))
+            atomic_write_text(metadata_path, json.dumps(token.to_dict()))
+            # A Windows launcher shim may exit while its real interpreter remains
+            # an active Job member. The helper owns the Job, not just Popen.pid, so
+            # it must stay alive until the kernel says the entire Job is empty.
+            while child.owned_tree_active():
+                request_id = ""
                 with FileLock(control_path.with_suffix(".lock")):
-                    current["ack"] = request_id
-                    current["request"] = None
-                    atomic_write_text(control_path, json.dumps(current, sort_keys=True))
-                return int(child.returncode)
-            time.sleep(0.05)
-        return int(child.wait())
+                    try:
+                        current = json.loads(control_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError, TypeError):
+                        current = {}
+                    request = current.get("request")
+                    if (
+                        isinstance(request, dict)
+                        and request.get("operation") == "stop"
+                        and request.get("nonce") == control_nonce
+                        and isinstance(request.get("id"), str)
+                        and request.get("id")
+                    ):
+                        request_id = str(request["id"])
+                if request_id:
+                    child.terminate(grace_seconds=float(request.get("grace_seconds", 0.0) or 0.0))
+                    child.wait()
+                    with FileLock(control_path.with_suffix(".lock")):
+                        current["ack"] = request_id
+                        current["request"] = None
+                        atomic_write_text(control_path, json.dumps(current, sort_keys=True))
+                    return int(child.returncode)
+                time.sleep(0.05)
+            return int(child.wait())
+    finally:
+        if token is not None:
+            # The helper never removes publication before the exact launching
+            # process has retained it (or that publisher is provably gone).
+            # Cleanup is best effort so it cannot replace the payload result or
+            # a BaseException already unwinding through this helper.
+            try:
+                _await_durable_publication(metadata_path, token, publisher_identity)
+            except BaseException:
+                pass
+            try:
+                _retire_durable_records(metadata_path, token)
+            except BaseException:
+                pass
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised by native Windows tests
@@ -1604,6 +1774,7 @@ if __name__ == "__main__":  # pragma: no cover - exercised by native Windows tes
                 LifetimeMode(sys.argv[marker_index + 3]),
                 sys.argv[marker_index + 4],
                 sys.argv[marker_index + 5],
+                ProcessIdentity.from_dict(json.loads(sys.argv[marker_index + 6])),
                 sys.argv[separator + 1 :],
             )
         )
