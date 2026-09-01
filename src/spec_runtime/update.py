@@ -7,6 +7,9 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from importlib import metadata
@@ -772,29 +775,123 @@ def _background_refresh_entry(repo_root: Path, cache_path: Path, lock_path: Path
         _release_refresh_lock(lock_path)
 
 
+def _refresh_supervision_token_path(lock_path: Path) -> Path:
+    return lock_path.with_suffix(lock_path.suffix + ".supervision.json")
+
+
+def _matching_refresh_supervision_token(
+    token_path: Path,
+    supervision_id: str,
+) -> bool:
+    """Validate the domain token before a refresh consumes or removes it."""
+    from .process_supervisor import SupervisionToken
+
+    try:
+        payload = json.loads(token_path.read_text(encoding="utf-8"))
+        token = SupervisionToken.from_dict(payload)
+    except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return token.token == supervision_id
+
+
+def _await_refresh_supervision_token(
+    token_path: Path,
+    supervision_id: str,
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """Wait until the launcher has durably published this refresh identity.
+
+    A detached payload can otherwise finish before ``spawn()`` returns and the
+    launcher writes its domain token, leaving a stale token after completion.
+    The random supervision id ties the handshake to this exact launch.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if _matching_refresh_supervision_token(token_path, supervision_id):
+            return True
+        time.sleep(0.02)
+    return _matching_refresh_supervision_token(token_path, supervision_id)
+
+
+def _remove_refresh_supervision_token(
+    token_path: Path,
+    supervision_id: str,
+) -> None:
+    """Remove only the token belonging to the completing refresh."""
+    if not _matching_refresh_supervision_token(token_path, supervision_id):
+        return
+    try:
+        token_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        LOGGER.debug("Failed to remove update refresh supervision token %s", token_path, exc_info=True)
+
+
+def _background_supervised_refresh_entry(
+    repo_root: Path,
+    cache_path: Path,
+    lock_path: Path,
+    token_path: Path,
+    supervision_id: str,
+) -> None:
+    """Run a refresh only after its durable domain identity is visible."""
+    try:
+        # Failure to observe the token means the launcher crashed before
+        # publication. The refresh remains safe to perform, but there is no
+        # domain token to retire afterward.
+        _await_refresh_supervision_token(token_path, supervision_id)
+        _background_refresh_entry(repo_root, cache_path, lock_path)
+    finally:
+        _remove_refresh_supervision_token(token_path, supervision_id)
+
+
 def _start_refresh_subprocess(repo_root: Path, cache_path: Path, lock_path: Path) -> None:
     """Launch a detached subprocess to refresh the update cache.
 
     The subprocess survives parent process exit so short-lived CLI
     commands do not kill the refresh mid-write.
     """
+    supervision_id = f"update-refresh-{uuid.uuid4().hex}"
+    token_path = _refresh_supervision_token_path(lock_path)
     script = (
         "import sys; from pathlib import Path; "
-        "from spec_runtime.update import _background_refresh_entry; "
-        "_background_refresh_entry(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))"
+        "from spec_runtime.update import _background_supervised_refresh_entry; "
+        "_background_supervised_refresh_entry("
+        "Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), "
+        "Path(sys.argv[4]), sys.argv[5])"
     )
     from .platform_fs import atomic_write_text
     from .process_supervisor import LifetimeMode, ProcessSupervisor
 
-    managed = ProcessSupervisor(LifetimeMode.DETACHED).spawn(
-        [sys.executable, "-I", "-c", script, str(repo_root), str(cache_path), str(lock_path)],
+    managed = ProcessSupervisor(
+        LifetimeMode.DETACHED,
+        supervision_id=supervision_id,
+    ).spawn(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            script,
+            str(repo_root),
+            str(cache_path),
+            str(lock_path),
+            str(token_path),
+            supervision_id,
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
-        cwd="/",
+        cwd=tempfile.gettempdir(),
     )
-    token_path = lock_path.with_suffix(lock_path.suffix + ".supervision.json")
-    atomic_write_text(token_path, json.dumps(managed.token.to_dict(), sort_keys=True) + "\n")
+    try:
+        atomic_write_text(token_path, json.dumps(managed.token.to_dict(), sort_keys=True) + "\n")
+    except BaseException:
+        # Publication is the recovery/control handoff. Do not leave an
+        # undiscoverable detached refresh running when it fails.
+        managed.terminate(grace_seconds=0)
+        raise
 
 
 def _spawn_cache_refresh(repo_root: Path, config: SpecRuntimeConfig) -> None:
@@ -934,9 +1031,12 @@ def cmd_update(_args: Any) -> int:
         latest_version,
     )
     print(_display_command(upgrade_command))
-    # Run from a safe cwd (/) so repo-local modules (e.g. pip.py) cannot
-    # shadow real packages via sys.path including ".".
-    completed = subprocess.run(upgrade_command, check=False, cwd="/")
+    # Run from a fresh, platform-valid cwd so repo-local modules (e.g. pip.py)
+    # and project configuration cannot influence the installer. ``/`` is not
+    # a portable Windows working directory and can resolve to an unwritable
+    # drive root for an ordinary user.
+    with tempfile.TemporaryDirectory(prefix="specbutler-update-") as safe_cwd:
+        completed = subprocess.run(upgrade_command, check=False, cwd=safe_cwd)
     if completed.returncode == 0:
         try:
             installed_version = metadata.version(PACKAGE_NAME)

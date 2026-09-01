@@ -4610,6 +4610,22 @@ def _run_local_review_subprocess(
                 )
         raise
     finally:
+        # Native Windows cannot symlink the operator's Codex auth into an
+        # isolated home without extra privileges, so local review/debugger
+        # launches temporarily copy it into their disposable checkout. Remove
+        # that credential at the process boundary instead of relying on the
+        # later best-effort worktree cleanup. Never touch an inherited operator
+        # CODEX_HOME that is outside this exact review checkout.
+        configured_codex_home = str(env.get("CODEX_HOME", "")).strip()
+        if configured_codex_home:
+            try:
+                expected_codex_home = codex_isolated_home(cwd).resolve()
+                actual_codex_home = Path(configured_codex_home).resolve()
+            except OSError:
+                pass
+            else:
+                if actual_codex_home == expected_codex_home:
+                    _remove_codex_isolated_auth(cwd)
         _prune_registered_worktree_processes(repo_root, cwd)
 
 
@@ -21835,10 +21851,16 @@ def cmd_spec(args: argparse.Namespace) -> int:
 
     print(f"{'Resuming' if resumed else 'Launching'} spec authoring in {worktree_path}")
 
-    authoring_gh_config_dir = _isolate_windows_codex_authoring_gh_config(
-        authoring_env,
-        _common_state_root(repo_root),
-    )
+    authoring_gh_config_dir = None
+    if authoring_env is not None:
+        # Resolving the common state root shells out to Git. Keep that extra
+        # dependency inside the native-Windows Codex path that actually needs
+        # the disposable GitHub CLI profile; normal POSIX authoring should not
+        # do Windows-only setup before launching its agent.
+        authoring_gh_config_dir = _isolate_windows_codex_authoring_gh_config(
+            authoring_env,
+            _common_state_root(repo_root),
+        )
     try:
         launch_kwargs: dict[str, object] = {"cwd": worktree_path}
         if authoring_env is not None:

@@ -17491,6 +17491,59 @@ class TestLocalReviewHelpers:
         assert payload["stderr_tail"] == "partial stderr"
         assert "timed out after 45s; terminating process group" in caplog.text
 
+    def test_run_local_review_subprocess_removes_checkout_codex_auth_on_launch_failure(
+        self,
+        repo: Path,
+        tmp_path: Path,
+    ):
+        worktree = tmp_path / "review"
+        codex_home = worktree / ".spec-codex-home"
+        codex_home.mkdir(parents=True)
+        auth_path = codex_home / "auth.json"
+        auth_path.write_text('{"token":"secret"}', encoding="utf-8")
+
+        with (
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=OSError("launch failed")),
+            patch.object(orch, "_prune_registered_worktree_processes"),
+            pytest.raises(OSError, match="launch failed"),
+        ):
+            orch._run_local_review_subprocess(
+                repo,
+                ["codex", "exec", "review prompt"],
+                cwd=worktree,
+                env={"CODEX_HOME": str(codex_home)},
+                timeout=45,
+            )
+
+        assert not auth_path.exists()
+
+    def test_run_local_review_subprocess_never_removes_inherited_operator_codex_auth(
+        self,
+        repo: Path,
+        tmp_path: Path,
+    ):
+        worktree = tmp_path / "review"
+        worktree.mkdir()
+        operator_home = tmp_path / "operator-codex-home"
+        operator_home.mkdir()
+        auth_path = operator_home / "auth.json"
+        auth_path.write_text('{"token":"operator-secret"}', encoding="utf-8")
+
+        with (
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=OSError("launch failed")),
+            patch.object(orch, "_prune_registered_worktree_processes"),
+            pytest.raises(OSError, match="launch failed"),
+        ):
+            orch._run_local_review_subprocess(
+                repo,
+                ["custom-reviewer"],
+                cwd=worktree,
+                env={"CODEX_HOME": str(operator_home)},
+                timeout=45,
+            )
+
+        assert auth_path.read_text(encoding="utf-8") == '{"token":"operator-secret"}'
+
     @pytest.mark.skipif(
         os.name != "posix",
         reason="uses POSIX chmod as a hermetic stand-in for the Codex read-only sandbox",

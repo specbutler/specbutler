@@ -4,16 +4,25 @@ import json
 import shlex
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime, timedelta
 from email.message import Message
-from unittest.mock import patch
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from spec_runtime.config import SpecPathConfig, SpecRuntimeConfig, UpdateConfig, load_spec_runtime_config
+from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
 from spec_runtime.update import (
     InstallInfo,
     UpdateCacheEntry,
+    _background_supervised_refresh_entry,
     _check_template_drift,
     _git_requirement_url,
+    _remove_refresh_supervision_token,
+    _start_refresh_subprocess,
     _upgrade_command_for_latest_release,
     cache_is_fresh,
     cmd_update,
@@ -807,6 +816,85 @@ def test_refresh_update_cache_persists_failed_check_timestamp(tmp_path):
     )
 
 
+def _refresh_token(supervision_id: str) -> SupervisionToken:
+    identity = ProcessIdentity(123, "created", "python")
+    return SupervisionToken(
+        LifetimeMode.DETACHED,
+        identity,
+        identity.pid,
+        identity.started_at,
+        supervision_id,
+    )
+
+
+def test_background_supervised_refresh_retires_domain_token_and_lock(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    cache_path = tmp_path / "state" / "update-check.json"
+    lock_path = tmp_path / "state" / "update-check.lock"
+    token_path = tmp_path / "state" / "update-check.lock.supervision.json"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_text("{}", encoding="utf-8")
+    supervision_id = "update-refresh-test"
+    token_path.write_text(
+        json.dumps(_refresh_token(supervision_id).to_dict()),
+        encoding="utf-8",
+    )
+
+    install_info = InstallInfo(method="editable", current_version="0.3.1")
+    with (
+        patch("spec_runtime.update.detect_installation", return_value=install_info),
+        patch("spec_runtime.update.resolve_repo_slug", return_value=None),
+    ):
+        _background_supervised_refresh_entry(
+            repo_root,
+            cache_path,
+            lock_path,
+            token_path,
+            supervision_id,
+        )
+
+    assert read_update_cache(cache_path) is not None
+    assert not lock_path.exists()
+    assert not token_path.exists()
+
+
+def test_refresh_completion_preserves_replacement_supervision_token(tmp_path):
+    token_path = tmp_path / "update-check.lock.supervision.json"
+    replacement = _refresh_token("replacement-refresh")
+    token_path.write_text(json.dumps(replacement.to_dict()), encoding="utf-8")
+
+    _remove_refresh_supervision_token(token_path, "completed-refresh")
+
+    assert json.loads(token_path.read_text(encoding="utf-8"))["supervision_id"] == "replacement-refresh"
+
+
+def test_start_refresh_uses_platform_temp_cwd_and_stops_if_token_publication_fails(tmp_path):
+    supervision_id = "update-refresh-fixed"
+    managed = MagicMock()
+    managed.token = _refresh_token(supervision_id)
+    supervisor = MagicMock()
+    supervisor.spawn.return_value = managed
+
+    with (
+        patch("spec_runtime.update.uuid.uuid4", return_value=SimpleNamespace(hex="fixed")),
+        patch("spec_runtime.process_supervisor.ProcessSupervisor", return_value=supervisor) as factory,
+        patch("spec_runtime.platform_fs.atomic_write_text", side_effect=OSError("disk full")),
+        pytest.raises(OSError, match="disk full"),
+    ):
+        _start_refresh_subprocess(
+            tmp_path / "repo",
+            tmp_path / "update-check.json",
+            tmp_path / "update-check.lock",
+        )
+
+    assert factory.call_args.kwargs["supervision_id"] == supervision_id
+    spawn_kwargs = supervisor.spawn.call_args.kwargs
+    assert Path(spawn_kwargs["cwd"]).resolve() == Path(tempfile.gettempdir()).resolve()
+    assert supervisor.spawn.call_args.args[0][-1] == supervision_id
+    managed.terminate.assert_called_once_with(grace_seconds=0)
+
+
 def test_cmd_update_reports_already_latest(tmp_path, capsys):
     install_info = InstallInfo(
         method="git",
@@ -897,7 +985,13 @@ def test_cmd_update_runs_upgrade_and_reports_new_version(tmp_path, capsys):
     output = capsys.readouterr().out
     assert f"{shlex.quote(sys.executable)} -m pip install --upgrade" in output
     assert "Updated Spec Butler from v0.2.0 to v0.2.5" in output
-    run_mock.assert_called_once_with(install_info.upgrade_command, check=False, cwd="/")
+    run_mock.assert_called_once()
+    assert run_mock.call_args.args == (install_info.upgrade_command,)
+    assert run_mock.call_args.kwargs["check"] is False
+    safe_cwd = Path(run_mock.call_args.kwargs["cwd"])
+    assert safe_cwd.name.startswith("specbutler-update-")
+    assert safe_cwd != Path("/")
+    assert not safe_cwd.exists()
 
 
 def test_cmd_update_reports_installed_version_after_successful_upgrade(tmp_path, capsys):

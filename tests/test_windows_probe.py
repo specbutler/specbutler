@@ -7,6 +7,7 @@ porting failures until the owning Windows-support specs land.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import socket
 import subprocess
@@ -30,6 +31,23 @@ def _clean_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("SPEC_CONFIG", None)
     return env
+
+
+def _wait_for_path(path: Path, process: subprocess.Popen[object], *, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        assert process.poll() is None, f"process exited before creating {path}"
+        assert time.monotonic() < deadline, f"timed out waiting for {path}"
+        time.sleep(0.05)
+
+
+def _wait_for_identity_exit(identity: object, *, timeout: float = 10.0) -> None:
+    from spec_runtime.process_supervisor import identity_matches
+
+    deadline = time.monotonic() + timeout
+    while identity_matches(identity) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not identity_matches(identity), f"process identity remained live: {identity}"
 
 
 def test_lifecycle_module_imports() -> None:
@@ -154,6 +172,201 @@ def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
         if parent.poll() is None:
             parent.kill()
         parent.wait(timeout=10)
+
+
+def test_spec_stop_terminates_owned_tree_without_touching_unrelated_process(tmp_path: Path) -> None:
+    """Exercise the persisted ``spec stop`` boundary in separate real processes."""
+    from spec_runtime.orchestrator import RunState, stop_run
+    from spec_runtime.process_supervisor import identity_matches, inspect_process
+
+    repo = tmp_path / "Repo stop snow-雪"
+    repo.mkdir()
+    ready_path = tmp_path / "stop-ready.json"
+    target_script = tmp_path / "stop-target.py"
+    target_script.write_text(
+        "import json,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "from spec_runtime.orchestrator import (OrchestratorTerminationRequested,RunState,"
+        "_ensure_orchestrator_process_group,_orchestrator_sigterm_guard)\n"
+        "repo,ready=Path(sys.argv[1]),Path(sys.argv[2])\n"
+        "run=RunState(run_id='windows-stop-run',spec_id='windows-stop',"
+        "branch='code/windows-stop--native',phase='implement',status='running')\n"
+        "with _orchestrator_sigterm_guard(run,repo):\n"
+        " _ensure_orchestrator_process_group(run,repo)\n"
+        " child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+        " ready.write_text(json.dumps({'pid':__import__('os').getpid(),'child':child.pid}),encoding='utf-8')\n"
+        " try:\n"
+        "  while True: time.sleep(0.05)\n"
+        " except OrchestratorTerminationRequested:\n"
+        "  pass\n",
+        encoding="utf-8",
+    )
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    target = subprocess.Popen(
+        [sys.executable, str(target_script), str(repo), str(ready_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    unrelated_identity = inspect_process(unrelated.pid)
+    assert unrelated_identity is not None
+    child_identity = None
+    target_identity = None
+    try:
+        _wait_for_path(ready_path, target)
+        ready = json.loads(ready_path.read_text(encoding="utf-8"))
+        target_identity = inspect_process(int(ready["pid"]))
+        child_identity = inspect_process(int(ready["child"]))
+        assert target_identity is not None
+        assert child_identity is not None
+
+        stopped = stop_run("windows-stop", repo_root=repo)
+
+        assert stopped.status == "failed"
+        assert stopped.last_error == "stopped by user"
+        target.wait(timeout=10)
+        _wait_for_identity_exit(target_identity)
+        _wait_for_identity_exit(child_identity)
+        assert identity_matches(unrelated_identity)
+        assert RunState.load(repo, "windows-stop-run").status == "failed"
+    finally:
+        if target.poll() is None:
+            target.kill()
+        try:
+            target.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        if unrelated.poll() is None:
+            unrelated.terminate()
+        unrelated.wait(timeout=10)
+
+
+def test_local_review_timeout_reaps_tree_without_touching_unrelated_process(tmp_path: Path) -> None:
+    """The reviewer timeout path must terminate its real Windows Job only."""
+    from spec_runtime import orchestrator as orch
+    from spec_runtime.process_supervisor import identity_matches, inspect_process
+
+    repo = tmp_path / "review-state"
+    review_worktree = tmp_path / "review checkout"
+    review_worktree.mkdir()
+    ready_path = tmp_path / "review-ready.json"
+    script = tmp_path / "review-tree.py"
+    script.write_text(
+        "import json,os,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'])\n"
+        "Path(sys.argv[1]).write_text(json.dumps({'pid':os.getpid(),'child':child.pid}),encoding='utf-8')\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    unrelated_identity = inspect_process(unrelated.pid)
+    assert unrelated_identity is not None
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            orch._run_local_review_subprocess(
+                repo,
+                [sys.executable, str(script), str(ready_path)],
+                cwd=review_worktree,
+                env=_clean_subprocess_env(),
+                timeout=2,
+            )
+
+        assert ready_path.exists()
+        ready = json.loads(ready_path.read_text(encoding="utf-8"))
+        reviewer_identity = inspect_process(int(ready["pid"]))
+        child_identity = inspect_process(int(ready["child"]))
+        # Both processes should already be gone. Reconstructing exact creation
+        # identities is impossible after exit, so their absence is authoritative.
+        assert reviewer_identity is None
+        assert child_identity is None
+        assert identity_matches(unrelated_identity)
+    finally:
+        if unrelated.poll() is None:
+            unrelated.terminate()
+        unrelated.wait(timeout=10)
+
+
+def test_cleanup_reaps_registered_helper_and_preserves_unrelated_process(tmp_path: Path) -> None:
+    """Exercise cleanup against a real Unicode worktree and real Job token."""
+    from spec_runtime import orchestrator as orch
+    from spec_runtime import worktree_process_registry as registry
+    from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor, identity_matches, inspect_process
+
+    repo = tmp_path / "Repo cleanup snow-雪"
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Windows Probe",
+            "-c",
+            "user.email=probe@example.invalid",
+            "commit",
+            "-m",
+            "base",
+        ],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    branch = "code/windows-cleanup--native"
+    worktree = repo / ".worktrees" / "cleanup space-雪"
+    worktree.parent.mkdir()
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(worktree), "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+
+    helper = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "import time; time.sleep(60)"]
+    )
+    unrelated = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    unrelated_identity = inspect_process(unrelated.pid)
+    assert unrelated_identity is not None
+    registry.register_process(
+        repo / ".spec-state",
+        worktree,
+        name="native-helper",
+        kind="probe",
+        pid=helper.token.payload.pid,
+        started_at=helper.token.payload.started_at,
+        termination_scope="supervision",
+        supervision_token=helper.token,
+    )
+    run = orch.RunState(
+        run_id="windows-cleanup-run",
+        spec_id="windows-cleanup",
+        branch=branch,
+        worktree_path=str(worktree),
+    )
+    try:
+        assert orch.phase_cleanup(run, repo) == "passed"
+        helper.wait(timeout=10)
+        assert not identity_matches(helper.token.payload)
+        assert identity_matches(unrelated_identity)
+        assert not worktree.exists()
+        branch_check = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=repo,
+            check=False,
+        )
+        assert branch_check.returncode == 1
+        assert registry.list_registered_worktrees(repo / ".spec-state") == []
+    finally:
+        if helper.poll() is None:
+            helper.kill()
+        try:
+            helper.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        if unrelated.poll() is None:
+            unrelated.terminate()
+        unrelated.wait(timeout=10)
 
 
 def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
