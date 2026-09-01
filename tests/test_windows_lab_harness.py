@@ -461,6 +461,8 @@ def test_windows_lab_templates_render_only_into_ignored_state() -> None:
     assert '"$STATE_ROOT/unattend/bootstrap.ps1"' in controller
     assert 'chmod 0600 "$STATE_ROOT/unattend/Autounattend.xml"' in controller
     assert "refusing to generate a password that would not match the guest" in controller
+    assert "stat -c '%u:%a:%s'" in controller
+    assert "stat -f '%u:%Lp:%z'" in controller
     for guest_state in (
         '"$STATE_ROOT/unattend.iso"',
         '"$STATE_ROOT/disk/run.qcow2"',
@@ -534,6 +536,71 @@ def test_windows_lab_proof_validates_private_credential_before_mutation(
 
     assert result.returncode == 1
     assert "private lab credential" in result.stderr
+    assert overlay.read_bytes() == b"do-not-reset"
+
+
+def test_windows_lab_credential_preflight_falls_back_to_bsd_stat(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("the host controller is a Bash program")
+    bash = shutil.which("bash")
+    assert bash
+    state = tmp_path / "state"
+    secret_dir = state / "secrets"
+    disk_dir = state / "disk"
+    fake_bin = tmp_path / "bin"
+    secret_dir.mkdir(parents=True)
+    disk_dir.mkdir()
+    fake_bin.mkdir()
+    password = secret_dir / "admin-password"
+    password.write_text("bad!" + ("a" * 32) + "\n", encoding="ascii")
+    password.chmod(0o600)
+    overlay = disk_dir / "run.qcow2"
+    overlay.write_bytes(b"do-not-reset")
+    fake_stat = fake_bin / "stat"
+    fake_stat.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "if sys.argv[1] == '-c':\n"
+        "    raise SystemExit(1)\n"
+        "if sys.argv[1:3] != ['-f', '%u:%Lp:%z']:\n"
+        "    raise SystemExit(2)\n"
+        "item = os.stat(sys.argv[-1])\n"
+        "print(f'{item.st_uid}:{item.st_mode & 0o777:o}:{item.st_size}')\n",
+        encoding="utf-8",
+    )
+    fake_stat.chmod(0o755)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    config = tmp_path / "lab.env"
+    config.write_text(
+        "WINDOWS_ISO=/tmp/not-used.iso\n"
+        f"WINDOWS_ISO_SHA256={'0' * 64}\n"
+        "WINDOWS_IMAGE_INDEX=1\n"
+        "LAB_BASELINE=toolchain\n"
+        "LAB_GITHUB_OWNER=example\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [bash, str(LAB_ROOT / "labctl"), "proof"],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": os.pathsep.join((str(fake_bin), os.environ.get("PATH", ""))),
+            "SPEC_WINDOWS_LAB_STATE_ROOT": str(state),
+            "SPEC_WINDOWS_LAB_CONFIG": str(config),
+            "SPEC_WINDOWS_TOOLCHAIN_CONFIG": str(tmp_path / "toolchain.json"),
+            "SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT": str(evidence),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert result.returncode == 1
+    assert "does not use the generated format" in result.stderr
     assert overlay.read_bytes() == b"do-not-reset"
 
 

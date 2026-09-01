@@ -302,8 +302,13 @@ require_admin_password_state() {
     local password_file="$STATE_ROOT/secrets/admin-password" metadata password
     test -f "$password_file" && test ! -L "$password_file" && test -r "$password_file" && test -s "$password_file" || \
         die "private lab credential is missing or unreadable: $password_file; restore the original credential or recreate the lab"
-    metadata="$(stat -c '%u:%a:%s' -- "$password_file")" || \
+    if metadata="$(stat -c '%u:%a:%s' -- "$password_file" 2>/dev/null)"; then
+        :
+    elif metadata="$(stat -f '%u:%Lp:%z' "$password_file" 2>/dev/null)"; then
+        :
+    else
         die "could not inspect private lab credential metadata: $password_file"
+    fi
     test "$metadata" = "$(id -u):600:37" || \
         die "private lab credential must be owned by the current user, mode 0600, and use the generated format: $password_file"
     IFS= read -r password < "$password_file" || \
