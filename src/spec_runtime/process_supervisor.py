@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import os
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -22,7 +24,29 @@ from pathlib import Path
 from typing import Any, Sequence
 
 _REAL_POPEN_TYPE = subprocess.Popen
-_ADOPTED_TOKENS: set[str] = set()
+
+def _adoption_claim_path(token: SupervisionToken) -> Path:
+    """Return the durable claim for one logical ownership transition."""
+    transition = f"{token.token}\0{token.owner_pid}\0{token.owner_started_at}"
+    digest = hashlib.sha256(transition.encode("utf-8")).hexdigest()
+    return Path(tempfile.gettempdir()) / "spec-runtime-adoptions" / f"{digest}.claim"
+
+
+def _claim_adoption(token: SupervisionToken, owner: ProcessIdentity) -> None:
+    """Atomically arbitrate adoption across independent dispatcher processes."""
+    path = _adoption_claim_path(token)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise ValueError("Supervision token ownership transition was already adopted") from exc
+    try:
+        payload = f"{owner.pid}\n{owner.started_at}\n"
+        os.write(fd, payload.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _kernel32() -> Any:
@@ -686,13 +710,11 @@ def adopt(token: SupervisionToken) -> SupervisionToken:
     """Validate a durable adoptable token and transfer logical ownership once."""
     if token.mode is not LifetimeMode.ADOPTABLE:
         raise ValueError("Only adoptable tokens may be adopted")
-    if token.token in _ADOPTED_TOKENS:
-        raise ValueError("Supervision token was already adopted by this owner")
     if not identity_matches(token.identity):
         raise ProcessLookupError(token.identity.pid)
     owner = inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable")
+    _claim_adoption(token, owner)
     adopted = SupervisionToken(token.mode, token.identity, owner.pid, owner.started_at, token.token, token.pgid)
-    _ADOPTED_TOKENS.add(token.token)
     return adopted
 
 

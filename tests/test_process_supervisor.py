@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
+import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -36,7 +39,9 @@ def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -
     assert identity_matches(expected) is False
 
 
-def test_adoptable_token_transfers_only_once_per_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_adoptable_token_transfers_only_once_per_owner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     identity = ProcessIdentity(42, "created", "python.exe")
     token = SupervisionToken(LifetimeMode.ADOPTABLE, identity, 7, "owner", "unique-adoption-token")
     monkeypatch.setattr("spec_runtime.process_supervisor.identity_matches", lambda _identity: True)
@@ -44,9 +49,31 @@ def test_adoptable_token_transfers_only_once_per_owner(monkeypatch: pytest.Monke
         "spec_runtime.process_supervisor.inspect_process",
         lambda pid: ProcessIdentity(pid, "new-owner", sys.executable),
     )
+    monkeypatch.setattr("spec_runtime.process_supervisor.tempfile.gettempdir", lambda: str(tmp_path))
     assert adopt(token).owner_pid == os.getpid()
     with pytest.raises(ValueError, match="already adopted"):
         adopt(token)
+
+
+def test_adoption_claim_is_exclusive_across_processes(tmp_path: Path) -> None:
+    """Two replacement dispatchers cannot claim the same owner transition."""
+    token_file = tmp_path / "token.json"
+    token = SupervisionToken(
+        LifetimeMode.ADOPTABLE,
+        inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable"),
+        7,
+        "concurrent-owner",
+        f"concurrent-{uuid.uuid4().hex}",
+    )
+    token_file.write_text(json.dumps(token.to_dict()), encoding="utf-8")
+    script = (
+        "import json,sys; from pathlib import Path; "
+        "from spec_runtime.process_supervisor import SupervisionToken,adopt; "
+        "adopt(SupervisionToken.from_dict(json.loads(Path(sys.argv[1]).read_text())))"
+    )
+    processes = [subprocess.Popen([sys.executable, "-c", script, str(token_file)]) for _ in range(2)]
+    returncodes = sorted(process.wait(timeout=10) for process in processes)
+    assert returncodes == [0, 1]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")
@@ -171,3 +198,34 @@ def test_windows_detached_workflows_survive_launcher_and_stop_by_identity(tmp_pa
     while identity_matches(token.identity) and time.monotonic() < deadline:
         time.sleep(0.05)
     assert not identity_matches(token.identity)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows background web integration")
+def test_windows_background_web_server_survives_launcher_and_stops_by_token(tmp_path: Path) -> None:
+    """Exercise the real web start/status/stop lifecycle, including its persisted token."""
+    pytest.importorskip("uvicorn")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = int(listener.getsockname()[1])
+    launch = (
+        "import sys; from pathlib import Path; "
+        "from spec_runtime.web.server import run_server; "
+        "raise SystemExit(run_server(Path(sys.argv[1]),port=int(sys.argv[2]),background=True))"
+    )
+    subprocess.run([sys.executable, "-c", launch, str(tmp_path), str(port)], check=True, timeout=20)
+    token_path = tmp_path / ".spec-state" / "web" / "server.supervision.json"
+    token = SupervisionToken.from_dict(json.loads(token_path.read_text(encoding="utf-8")))
+    try:
+        assert identity_matches(token.identity)
+        from spec_runtime.web.server import is_server_running, stop_server
+
+        assert is_server_running(tmp_path) == (True, token.identity.pid)
+        assert stop_server(tmp_path) == 0
+        deadline = time.monotonic() + 10
+        while identity_matches(token.identity) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not identity_matches(token.identity)
+        assert not token_path.exists()
+    finally:
+        if identity_matches(token.identity):
+            terminate(token, grace_seconds=0.1)

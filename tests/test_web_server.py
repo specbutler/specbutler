@@ -176,6 +176,32 @@ class TestServerLifecycle:
             remove_pid(tmp_path)
             assert not pid_path.exists()
 
+    def test_windows_background_persists_token_and_cleans_failed_start(self, tmp_path, capsys):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+
+        token = SupervisionToken(
+            LifetimeMode.DETACHED, ProcessIdentity(123, "created"), 1, "owner", "web-token"
+        )
+        managed = MagicMock(token=token)
+        supervisor = MagicMock()
+        supervisor.spawn.return_value = managed
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
+            patch("spec_runtime.web.server.load_or_create_token", return_value="auth"),
+            patch("spec_runtime.web.server.os.name", "nt"),
+            patch("socket.create_connection", side_effect=OSError("free")),
+            patch("spec_runtime.process_supervisor.ProcessSupervisor", return_value=supervisor),
+            patch("spec_runtime.web.server.write_supervision_token") as write_token,
+            patch("spec_runtime.web.server._wait_for_port", return_value=False),
+            patch("spec_runtime.web.server.remove_pid") as remove_pid,
+        ):
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path, background=True) == 1
+        write_token.assert_called_once_with(tmp_path, token)
+        managed.terminate.assert_called_once_with(grace_seconds=0.5)
+        remove_pid.assert_called_once_with(tmp_path)
+
     def test_is_server_running_false_when_no_pid(self, tmp_path):
         with patch("spec_runtime.web.server._pid_path", return_value=tmp_path / "nonexistent"):
             from spec_runtime.web.server import is_server_running

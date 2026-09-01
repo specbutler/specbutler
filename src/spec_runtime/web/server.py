@@ -202,6 +202,35 @@ def _port_path(repo_root: Path) -> Path:
     return _web_state_dir(repo_root) / "server.port"
 
 
+def _supervision_path(repo_root: Path) -> Path:
+    return _web_state_dir(repo_root) / "server.supervision.json"
+
+
+def write_supervision_token(repo_root: Path, token: object) -> None:
+    import json
+
+    from spec_runtime.platform_fs import atomic_write_text
+    from spec_runtime.process_supervisor import SupervisionToken
+
+    if not isinstance(token, SupervisionToken):
+        raise TypeError("expected SupervisionToken")
+    path = _supervision_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(token.to_dict(), sort_keys=True) + "\n")
+
+
+def read_supervision_token(repo_root: Path) -> object | None:
+    import json
+
+    from spec_runtime.process_supervisor import SupervisionToken
+
+    try:
+        payload = json.loads(_supervision_path(repo_root).read_text(encoding="utf-8"))
+        return SupervisionToken.from_dict(payload)
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+
+
 def _read_process_started_at(pid: int) -> str:
     """Best-effort process start time via ``ps``. Returns '' on failure."""
     try:
@@ -254,9 +283,18 @@ def remove_pid(repo_root: Path) -> None:
     port_p = _port_path(repo_root)
     if port_p.exists():
         port_p.unlink(missing_ok=True)
+    _supervision_path(repo_root).unlink(missing_ok=True)
 
 
 def is_server_running(repo_root: Path) -> tuple[bool, int | None]:
+    from spec_runtime.process_supervisor import SupervisionToken, identity_matches
+
+    supervision_token = read_supervision_token(repo_root)
+    if isinstance(supervision_token, SupervisionToken):
+        if identity_matches(supervision_token.identity):
+            return True, supervision_token.identity.pid
+        remove_pid(repo_root)
+        return False, None
     pid, stored_started_at = read_pid(repo_root)
     if pid is None:
         return False, None
@@ -458,7 +496,7 @@ def run_server(
             if verbose:
                 command.append("--verbose")
             try:
-                ProcessSupervisor(LifetimeMode.DETACHED).spawn(
+                managed = ProcessSupervisor(LifetimeMode.DETACHED).spawn(
                     command,
                     cwd=repo_root,
                     stdin=subprocess.DEVNULL,
@@ -466,9 +504,12 @@ def run_server(
                     stderr=subprocess.STDOUT,
                     env=os.environ.copy(),
                 )
+                write_supervision_token(repo_root, managed.token)
             finally:
                 log_handle.close()
             if not _wait_for_port(host, port):
+                managed.terminate(grace_seconds=0.5)
+                remove_pid(repo_root)
                 print("spec web failed to start (see server.log).", file=sys.stderr)
                 return 1
             print(f"spec web running on http://{probe_host}:{port}", file=sys.stderr)
@@ -615,10 +656,16 @@ def stop_server(repo_root: Path) -> int:
     if not running or pid is None:
         print("spec web is not running.", file=sys.stderr)
         return 1
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
+    from spec_runtime.process_supervisor import SupervisionToken, terminate
+
+    supervision_token = read_supervision_token(repo_root)
+    if isinstance(supervision_token, SupervisionToken):
+        terminate(supervision_token)
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
     remove_pid(repo_root)
     print(f"spec web stopped (pid {pid}).", file=sys.stderr)
     return 0
