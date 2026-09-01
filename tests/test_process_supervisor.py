@@ -76,6 +76,81 @@ def test_identity_matches_still_rejects_different_executables(
     assert not identity_matches(expected)
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_identity_matches_accepts_darwin_framework_python_exec_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    reverse: bool,
+) -> None:
+    framework = tmp_path / "Library" / "Frameworks" / "Python.framework" / "Versions" / "3.12"
+    stub = framework / "bin" / "python"
+    app = framework / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    stub.parent.mkdir(parents=True)
+    app.parent.mkdir(parents=True)
+    stub.write_text("stub", encoding="utf-8")
+    app.write_text("app", encoding="utf-8")
+    venv_launcher = tmp_path / "venv" / "bin" / "python"
+    venv_launcher.parent.mkdir(parents=True)
+    venv_launcher.symlink_to(stub)
+    expected_executable, live_executable = (
+        (str(app), str(venv_launcher)) if reverse else (str(venv_launcher), str(app))
+    )
+    expected = ProcessIdentity(42, "created", expected_executable)
+    monkeypatch.setattr(process_supervisor.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        process_supervisor,
+        "inspect_process",
+        lambda _pid: ProcessIdentity(42, "created", live_executable),
+    )
+
+    assert identity_matches(expected)
+
+
+def test_identity_matches_rejects_darwin_framework_transition_across_versions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    framework = tmp_path / "Library" / "Frameworks" / "Python.framework" / "Versions"
+    stub = framework / "3.12" / "bin" / "python"
+    app = framework / "3.13" / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    stub.parent.mkdir(parents=True)
+    app.parent.mkdir(parents=True)
+    stub.write_text("stub", encoding="utf-8")
+    app.write_text("app", encoding="utf-8")
+    expected = ProcessIdentity(42, "created", str(stub))
+    monkeypatch.setattr(process_supervisor.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        process_supervisor,
+        "inspect_process",
+        lambda _pid: ProcessIdentity(42, "created", str(app)),
+    )
+
+    assert not identity_matches(expected)
+
+
+def test_identity_matches_rejects_darwin_framework_transition_across_roots(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first" / "Python.framework" / "Versions" / "3.12"
+    second = tmp_path / "second" / "Python.framework" / "Versions" / "3.12"
+    stub = first / "bin" / "python"
+    app = second / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    stub.parent.mkdir(parents=True)
+    app.parent.mkdir(parents=True)
+    stub.write_text("stub", encoding="utf-8")
+    app.write_text("app", encoding="utf-8")
+    expected = ProcessIdentity(42, "created", str(stub))
+    monkeypatch.setattr(process_supervisor.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        process_supervisor,
+        "inspect_process",
+        lambda _pid: ProcessIdentity(42, "created", str(app)),
+    )
+
+    assert not identity_matches(expected)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX launch invariant")
 def test_posix_spawn_records_session_group_without_post_launch_getpgid(
     monkeypatch: pytest.MonkeyPatch,
@@ -547,13 +622,24 @@ def test_detached_durable_token_publication_is_opt_in(
 ) -> None:
     monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
     supervision_id = f"published-{uuid.uuid4().hex}"
+    ready = tmp_path / "payload-ready"
+    payload = (
+        "from pathlib import Path; import time; "
+        f"Path({str(ready)!r}).write_text('ready', encoding='utf-8'); "
+        "time.sleep(30)"
+    )
     managed = ProcessSupervisor(
         LifetimeMode.DETACHED,
         supervision_id=supervision_id,
         publish_durable_token=True,
-    ).spawn([sys.executable, "-c", "import time; time.sleep(30)"])
+    ).spawn([sys.executable, "-c", payload])
     metadata_path = process_supervisor.durable_metadata_path(supervision_id)
+    terminated_via_persisted_token = False
     try:
+        deadline = time.monotonic() + 5
+        while not ready.is_file() and managed.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.is_file(), "detached payload did not reach post-exec readiness"
         published = SupervisionToken.from_dict(
             json.loads(metadata_path.read_text(encoding="utf-8"))
         )
@@ -568,9 +654,14 @@ def test_detached_durable_token_publication_is_opt_in(
             assert published.owner_pid == 0
             assert published.owner_started_at == ""
         assert identity_matches(published.identity)
+        if os.name == "posix":
+            assert terminate(published, grace_seconds=0.1)
+            managed.wait(timeout=5)
+            terminated_via_persisted_token = True
     finally:
-        managed.terminate(grace_seconds=0.1)
-        managed.wait(timeout=5)
+        if not terminated_via_persisted_token:
+            managed.terminate(grace_seconds=0.1)
+            managed.wait(timeout=5)
         metadata_path.unlink(missing_ok=True)
 
 

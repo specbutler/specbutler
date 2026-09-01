@@ -361,6 +361,57 @@ def inspect_process(pid: int) -> ProcessIdentity | None:
     return _windows_identity(pid) if os.name == "nt" else _posix_identity(pid)
 
 
+def _darwin_framework_python_role(executable: str) -> tuple[Path, str] | None:
+    """Identify the two executables in a versioned macOS Python framework.
+
+    Python.org framework builds launch through ``Versions/X.Y/bin/python*``.
+    That stub then execs the distinct executable inside ``Python.app`` without
+    changing PID or process start time.  Resolve a venv symlink first so the
+    same transition is recognized when Spec itself runs from a virtualenv.
+    """
+    path = Path(executable)
+    candidates = [path]
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        pass
+    else:
+        if resolved != path:
+            candidates.insert(0, resolved)
+
+    app_suffix = ("Resources", "Python.app", "Contents", "MacOS", "Python")
+    for candidate in candidates:
+        parts = candidate.parts
+        for index, part in enumerate(parts):
+            if part != "Python.framework":
+                continue
+            if index + 2 >= len(parts) or parts[index + 1] != "Versions":
+                continue
+            version_root = Path(*parts[: index + 3])
+            suffix = parts[index + 3 :]
+            if len(suffix) == 2 and suffix[0] == "bin" and suffix[1].lower().startswith("python"):
+                return version_root, "stub"
+            if suffix == app_suffix:
+                return version_root, "app"
+    return None
+
+
+def _darwin_framework_python_exec_transition_matches(
+    expected_executable: str,
+    live_executable: str,
+) -> bool:
+    if sys.platform != "darwin":
+        return False
+    expected = _darwin_framework_python_role(expected_executable)
+    live = _darwin_framework_python_role(live_executable)
+    if expected is None or live is None or {expected[1], live[1]} != {"stub", "app"}:
+        return False
+    try:
+        return os.path.samefile(expected[0], live[0])
+    except OSError:
+        return expected[0].resolve(strict=False) == live[0].resolve(strict=False)
+
+
 def identity_matches(expected: ProcessIdentity) -> bool:
     live = inspect_process(expected.pid)
     if live is None or not expected.started_at or live.started_at != expected.started_at:
@@ -368,15 +419,20 @@ def identity_matches(expected: ProcessIdentity) -> bool:
     if not expected.executable or not live.executable:
         return True
     try:
-        # Darwin's ``ps command`` can expose either the framework launcher or
-        # its resolved Python executable at different points in interpreter
-        # startup.  They are the same file and therefore the same process
-        # identity boundary; lexical Path equality incorrectly rejects it.
-        return os.path.samefile(live.executable, expected.executable)
+        # Ordinary executable aliases resolve to the same file.  CPython's
+        # Darwin framework stub and app runtime are distinct files joined by
+        # an in-place exec, so that narrower transition is handled below.
+        if os.path.samefile(live.executable, expected.executable):
+            return True
     except OSError:
-        return Path(live.executable).resolve(strict=False) == Path(
+        if Path(live.executable).resolve(strict=False) == Path(
             expected.executable
-        ).resolve(strict=False)
+        ).resolve(strict=False):
+            return True
+    return _darwin_framework_python_exec_transition_matches(
+        expected.executable,
+        live.executable,
+    )
 
 
 def list_live_process_group_members(pgid: int) -> list[int] | None:
