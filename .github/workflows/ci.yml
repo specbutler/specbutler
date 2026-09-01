@@ -95,6 +95,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -125,6 +127,8 @@ jobs:
         python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
@@ -138,6 +142,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -184,13 +190,12 @@ jobs:
           "$RUNNER_TEMP/gitleaks" git --config .gitleaks.toml --redact --no-banner --timeout 120 .
           "$RUNNER_TEMP/gitleaks" dir --config .gitleaks.toml --redact --no-banner --timeout 120 .
 
-  windows-probe:
-    name: windows-probe
+  windows-package:
+    name: windows-package
     needs: [skip-check]
     if: needs.skip-check.outputs.is_version_bump != 'true'
     runs-on: windows-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
+    timeout-minutes: 20
     steps:
       - name: Checkout with deterministic line endings
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -199,20 +204,88 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Build wheel
+      - name: Build wheel and source distribution
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          python -m pip install build 2>&1 | Tee-Object artifacts/build.log
+          python -m pip install build twine 2>&1 | Tee-Object artifacts/build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m build --wheel 2>&1 | Tee-Object -Append artifacts/build.log
-          exit $LASTEXITCODE
-      - name: Install wheel with all test surfaces
+          python -m build --wheel --sdist 2>&1 | Tee-Object -Append artifacts/build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m twine check dist/* 2>&1 | Tee-Object -Append artifacts/build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $wheels = @(Get-ChildItem dist/*.whl)
+          $sdists = @(Get-ChildItem dist/*.tar.gz)
+          if ($wheels.Count -ne 1 -or $sdists.Count -ne 1) {
+            throw "Expected exactly one wheel and one source distribution"
+          }
+      - name: Upload Windows-built release distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-release-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload Windows package logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-package-logs
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows-probe:
+    name: windows-probe (${{ matrix.python-version }}, ${{ matrix.distribution }})
+    needs: [skip-check, windows-package]
+    if: >-
+      needs.skip-check.outputs.is_version_bump != 'true' &&
+      needs.windows-package.result == 'success'
+    runs-on: windows-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-version: "3.11"
+            distribution: wheel
+            full_suite: true
+          - python-version: "3.12"
+            distribution: wheel
+            full_suite: true
+          - python-version: "3.13"
+            distribution: wheel
+            full_suite: true
+          - python-version: "3.12"
+            distribution: sdist
+            full_suite: false
+    steps:
+      - name: Checkout test suite without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Download Windows-built release distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-release-distributions
+          path: release-dist
+      - name: Install release distribution with all test surfaces
         shell: pwsh
+        env:
+          DISTRIBUTION: ${{ matrix.distribution }}
         run: |
-          $wheel = (Get-ChildItem dist/*.whl | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $pattern = if ($env:DISTRIBUTION -eq "wheel") { "*.whl" } else { "*.tar.gz" }
+          $packages = @(Get-ChildItem (Join-Path "release-dist" $pattern))
+          if ($packages.Count -ne 1) {
+            throw "Expected exactly one $env:DISTRIBUTION distribution, found $($packages.Count)"
+          }
           python -m venv "$env:RUNNER_TEMP/spec-windows-probe"
-          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pip install "$wheel[dev,web,tui]" 2>&1 | Tee-Object artifacts/install.log
+          $requirement = "$($packages[0].FullName)[dev,web,tui]"
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pip install $requirement 2>&1 | Tee-Object artifacts/install.log
           exit $LASTEXITCODE
       - name: Check installed dependencies
         shell: pwsh
@@ -228,6 +301,24 @@ jobs:
         shell: pwsh
         run: |
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/spec.exe" --help 2>&1 | Tee-Object artifacts/spec-help.log
+          exit $LASTEXITCODE
+      - name: Verify imports resolve outside the checkout
+        shell: pwsh
+        run: |
+          @'
+          import os
+          from pathlib import Path
+          import spec_runtime
+
+          checkout = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
+          imported = Path(spec_runtime.__file__).resolve()
+          try:
+              imported.relative_to(checkout)
+          except ValueError:
+              print(f"PASS installed artifact: {imported}")
+          else:
+              raise SystemExit(f"FAIL imported checkout source instead of installed artifact: {imported}")
+          '@ | & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" - 2>&1 | Tee-Object artifacts/provenance.log
           exit $LASTEXITCODE
       - name: Import every shipped module
         shell: pwsh
@@ -253,24 +344,24 @@ jobs:
           '@ | & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" - 2>&1 | Tee-Object artifacts/imports.log
           exit $LASTEXITCODE
       - name: Run lint
+        if: ${{ matrix.full_suite }}
         shell: pwsh
         run: |
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m ruff check . 2>&1 | Tee-Object artifacts/lint.log
           exit $LASTEXITCODE
-      - name: Collect tests
-        shell: pwsh
-        run: |
-          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest --collect-only tests 2>&1 | Tee-Object artifacts/collect.log
-          exit $LASTEXITCODE
       - name: Run full portable test suite
+        if: ${{ matrix.full_suite }}
         shell: pwsh
         run: |
-          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest tests -v --ignore=tests/test_windows_probe.py 2>&1 | Tee-Object artifacts/full-suite.log
+          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests -v --ignore=tests/test_windows_probe.py 2>&1 | Tee-Object artifacts/full-suite.log
           exit $LASTEXITCODE
       - name: Run Windows integration probes
+        if: ${{ matrix.full_suite }}
         shell: pwsh
         run: |
-          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest tests/test_windows_probe.py -v 2>&1 | Tee-Object artifacts/focused.log
+          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests/test_windows_probe.py -v 2>&1 | Tee-Object artifacts/focused.log
           exit $LASTEXITCODE
       - name: Summarize Windows gate
         if: ${{ always() }}
@@ -279,16 +370,18 @@ jobs:
           @"
           ## Windows product gate
 
-          Build, installation, lint, the portable test suite, and Windows integrations
-          are required checks. Logs are uploaded even when a gate fails.
+          Python ${{ matrix.python-version }} / ${{ matrix.distribution }}: installation,
+          dependency checks, CLI and import smoke tests are required. Wheel jobs also
+          require lint, the portable test suite, and native Windows integrations.
           "@ >> $env:GITHUB_STEP_SUMMARY
       - name: Upload Windows probe logs
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: windows-probe-logs
+          name: windows-probe-${{ matrix.python-version }}-${{ matrix.distribution }}-logs
           path: artifacts/
           if-no-files-found: warn
+          retention-days: 14
 
   ci:
     name: ci
@@ -300,6 +393,7 @@ jobs:
       - test
       - package
       - security
+      - windows-package
       - windows-probe
     steps:
       - name: Enforce required job results
@@ -309,6 +403,7 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
+          WINDOWS_PACKAGE_RESULT: ${{ needs.windows-package.result }}
           WINDOWS_RESULT: ${{ needs.windows-probe.result }}
         run: |
           echo "is_version_bump=$IS_VERSION_BUMP"
@@ -316,6 +411,7 @@ jobs:
           echo "test=$TEST_RESULT"
           echo "package=$PACKAGE_RESULT"
           echo "security=$SECURITY_RESULT"
+          echo "windows-package=$WINDOWS_PACKAGE_RESULT"
           echo "windows-probe=$WINDOWS_RESULT"
           if [ "$IS_VERSION_BUMP" = "true" ]; then
             echo "Version bump PR — skipping product checks."
@@ -325,6 +421,7 @@ jobs:
              [ "$TEST_RESULT" != "success" ] || \
              [ "$PACKAGE_RESULT" != "success" ] || \
              [ "$SECURITY_RESULT" != "success" ] || \
+             [ "$WINDOWS_PACKAGE_RESULT" != "success" ] || \
              [ "$WINDOWS_RESULT" != "success" ]; then
             echo "One or more required jobs did not succeed."
             exit 1
