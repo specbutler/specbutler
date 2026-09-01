@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -436,6 +437,47 @@ def run_server(
                 return 1
         except OSError:
             pass  # Good — port is free
+
+        if os.name == "nt":
+            from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+
+            state_dir = _web_state_dir(repo_root)
+            state_dir.mkdir(parents=True, exist_ok=True)
+            log_handle = open(state_dir / "server.log", "a", encoding="utf-8")  # noqa: SIM115
+            command = [
+                sys.executable,
+                "-m",
+                "spec_runtime.cli",
+                "web",
+                "start",
+                "--host",
+                host,
+                "--port",
+                str(port),
+            ]
+            if verbose:
+                command.append("--verbose")
+            try:
+                ProcessSupervisor(LifetimeMode.DETACHED).spawn(
+                    command,
+                    cwd=repo_root,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    env=os.environ.copy(),
+                )
+            finally:
+                log_handle.close()
+            if not _wait_for_port(host, port):
+                print("spec web failed to start (see server.log).", file=sys.stderr)
+                return 1
+            print(f"spec web running on http://{probe_host}:{port}", file=sys.stderr)
+            print(f"Authenticated URL: {auth_url}", file=sys.stderr)
+            if open_browser:
+                import webbrowser
+
+                webbrowser.open(auth_url)
+            return 0
 
         pid = os.fork()
         if pid > 0:

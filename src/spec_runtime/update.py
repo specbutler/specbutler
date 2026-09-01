@@ -787,9 +787,10 @@ def _start_refresh_subprocess(repo_root: Path, cache_path: Path, lock_path: Path
         "from spec_runtime.update import _background_refresh_entry; "
         "_background_refresh_entry(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))"
     )
-    subprocess.Popen(
+    from .process_supervisor import LifetimeMode, ProcessSupervisor
+
+    ProcessSupervisor(LifetimeMode.DETACHED).spawn(
         [sys.executable, "-I", "-c", script, str(repo_root), str(cache_path), str(lock_path)],
-        start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,

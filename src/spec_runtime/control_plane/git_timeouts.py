@@ -13,6 +13,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+
 DEFAULT_GIT_FETCH_TIMEOUT_SECONDS = 60.0
 
 
@@ -94,26 +96,23 @@ def _run_fetch_process_group(
     tears down ssh/git-upload-pack children too instead of orphaning them.
     """
     del capture_output, check  # always captured; caller inspects returncode
-    import os
-    import signal
-
-    proc = subprocess.Popen(
+    supervisor = ProcessSupervisor(LifetimeMode.RUN_OWNED)
+    managed = supervisor.spawn(
         list(command),
         cwd=cwd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=text,
-        start_new_session=True,
     )
+    proc = managed.process
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            proc.kill()
+        managed.terminate(grace_seconds=0)
         stdout, stderr = proc.communicate()
         raise subprocess.TimeoutExpired(list(command), timeout, output=stdout, stderr=stderr)
+    finally:
+        managed.close()
     return subprocess.CompletedProcess(list(command), proc.returncode, stdout, stderr)
 
 

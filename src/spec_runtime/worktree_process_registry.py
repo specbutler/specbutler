@@ -5,20 +5,14 @@ import json
 import os
 import re
 import signal
-import subprocess
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .process_supervisor import ProcessIdentity, inspect_process
+
 PROCESS_TERMINATION_TIMEOUT_SECONDS = 5.0
-
-
-@dataclass(frozen=True)
-class ProcessIdentity:
-    pid: int
-    started_at: str
-    command: str
 
 
 @dataclass(frozen=True)
@@ -83,34 +77,7 @@ def _write_json_file_atomically(path: Path, payload: dict) -> None:
 
 
 def read_process_identity(pid: int) -> ProcessIdentity | None:
-    if pid <= 0:
-        return None
-    try:
-        result = subprocess.run(
-            ["ps", "-ww", "-o", "pid=", "-o", "lstart=", "-o", "command=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    line = next((item.strip() for item in result.stdout.splitlines() if item.strip()), "")
-    if not line:
-        return None
-    parts = line.split(None, 6)
-    if len(parts) != 7:
-        return None
-    try:
-        live_pid = int(parts[0])
-    except ValueError:
-        return None
-    return ProcessIdentity(
-        pid=live_pid,
-        started_at=" ".join(parts[1:6]),
-        command=parts[6].strip(),
-    )
+    return inspect_process(pid)
 
 
 def is_process_alive(pid: int, expected_started_at: str = "") -> bool:
