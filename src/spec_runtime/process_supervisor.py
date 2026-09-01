@@ -631,8 +631,14 @@ class ManagedProcess:
         self.process = process
         self.token = token
         self._job = job
+        self._close_lock = threading.Lock()
 
     def terminate(self, grace_seconds: float = 5.0) -> None:
+        if os.name == "nt" and self._job is not None and identity_matches(self.token.identity):
+            try:
+                self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            except (OSError, ValueError):
+                pass
         terminate(self.token, grace_seconds=grace_seconds, job=self._job)
 
     def kill(self) -> None:
@@ -648,6 +654,12 @@ class ManagedProcess:
         A timeout deliberately retains the handle so the caller can kill the
         tree and call communicate again, matching subprocess.run semantics.
         """
+        # On Windows a descendant can inherit stdout/stderr and outlive the
+        # Popen leader. Popen.communicate then waits for EOF forever even
+        # though the leader has exited. Close the run-owned Job as soon as the
+        # leader exits so inherited pipe handles cannot outlive ownership.
+        if os.name == "nt" and self._job is not None:
+            threading.Thread(target=self._close_job_after_leader, daemon=True).start()
         try:
             result = self.process.communicate(input=input, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -659,6 +671,10 @@ class ManagedProcess:
         self.close()
         return result
 
+    def _close_job_after_leader(self) -> None:
+        self.process.wait()
+        self.close()
+
     def wait(self, timeout: float | None = None) -> int:
         tree = _windows_tree_identities(self.token.identity.pid)
         returncode = int(self.process.wait(timeout=timeout))
@@ -667,12 +683,14 @@ class ManagedProcess:
         return returncode
 
     def close(self) -> None:
-        if self._job is not None:
+        with self._close_lock:
+            if self._job is None:
+                return
             tree = _windows_tree_identities(self.token.identity.pid)
             self._job.close()
             _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
             self._job = None
-            _wait_for_identities_exit(tree)
+        _wait_for_identities_exit(tree)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.process, name)
@@ -853,6 +871,11 @@ class ProcessSupervisor:
             if helper_token is not None:
                 job_name = helper_token.job_name
                 supervision_id = helper_token.token
+                # Windows app-execution aliases and venv launchers may be
+                # transient shims. The durable helper publishes the real
+                # keeper identity after the shim has resolved; that identity,
+                # not Popen.pid, is the reopenable ownership boundary.
+                identity = helper_token.identity
             token = SupervisionToken(
                 self.mode,
                 identity,
@@ -950,6 +973,7 @@ class ProcessSupervisor:
             if helper_token is not None:
                 job_name = helper_token.job_name
                 supervision_id = helper_token.token
+                identity = helper_token.identity
             token = SupervisionToken(
                 self.mode,
                 identity,
@@ -1164,7 +1188,7 @@ def _durable_helper(
                 ):
                     request_id = str(request["id"])
             if request_id:
-                child.kill()
+                child.terminate(grace_seconds=float(request.get("grace_seconds", 0.0) or 0.0))
                 child.wait()
                 with FileLock(control_path.with_suffix(".lock")):
                     current["ack"] = request_id

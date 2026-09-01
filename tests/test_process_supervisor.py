@@ -21,6 +21,7 @@ from spec_runtime.process_supervisor import (
     adopt,
     identity_matches,
     inspect_process,
+    run,
     terminate,
 )
 
@@ -202,7 +203,7 @@ def test_durable_metadata_path_is_independent_of_payload_cwd(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")
-@pytest.mark.parametrize("action", ["normal", "timeout", "stop", "owner-close"])
+@pytest.mark.parametrize("action", ["normal", "stop", "owner-close"])
 def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: str) -> None:
     """Exercise real descendants; no process API is mocked in this test."""
     pid_file = tmp_path / "pids.json"
@@ -230,6 +231,117 @@ def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: 
     for level in range(3):
         pid = int(Path(f"{pid_file}-{level}").read_text(encoding="utf-8"))
         assert inspect_process(pid) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows timeout integration")
+def test_windows_run_timeout_kills_parent_child_grandchild_tree(tmp_path: Path) -> None:
+    pid_file = tmp_path / "timeout-pids"
+    script = tmp_path / "timeout-tree.py"
+    script.write_text(
+        "import os,subprocess,sys,time\n"
+        "level=int(sys.argv[1]); path=sys.argv[2]\n"
+        "open(path+'-'+str(level),'w').write(str(os.getpid()))\n"
+        "child=None if level == 2 else subprocess.Popen([sys.executable,__file__,str(level+1),path])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(subprocess.TimeoutExpired):
+        run([sys.executable, str(script), "0", str(pid_file)], timeout=1, capture_output=True)
+    for level in range(3):
+        path = Path(f"{pid_file}-{level}")
+        assert path.exists()
+        assert inspect_process(int(path.read_text(encoding="utf-8"))) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows owner death integration")
+def test_windows_external_owner_death_closes_job_and_kills_tree(tmp_path: Path) -> None:
+    pid_file = tmp_path / "owner-death-pids"
+    tree = tmp_path / "owner-death-tree.py"
+    tree.write_text(
+        "import os,subprocess,sys,time\n"
+        "level=int(sys.argv[1]); path=sys.argv[2]\n"
+        "open(path+'-'+str(level),'w').write(str(os.getpid()))\n"
+        "child=None if level == 2 else subprocess.Popen([sys.executable,__file__,str(level+1),path])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    launcher = tmp_path / "owner.py"
+    launcher.write_text(
+        "import os,sys,time\n"
+        "from pathlib import Path\n"
+        "from spec_runtime.process_supervisor import LifetimeMode,ProcessSupervisor\n"
+        "ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn([sys.executable,sys.argv[1],'0',sys.argv[2]])\n"
+        "paths=[Path(sys.argv[2]+'-'+str(i)) for i in range(3)]\n"
+        "while not all(path.exists() for path in paths): time.sleep(.05)\n"
+        "os._exit(17)\n",
+        encoding="utf-8",
+    )
+    completed = subprocess.run([sys.executable, str(launcher), str(tree), str(pid_file)], check=False, timeout=10)
+    assert completed.returncode == 17
+    deadline = time.monotonic() + 10
+    identities = [int(Path(f"{pid_file}-{level}").read_text(encoding="utf-8")) for level in range(3)]
+    while any(inspect_process(pid) is not None for pid in identities) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert all(inspect_process(pid) is None for pid in identities)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows graceful cancellation integration")
+def test_windows_stop_attempts_graceful_break_before_job_termination(tmp_path: Path) -> None:
+    marker = tmp_path / "graceful"
+    ready = tmp_path / "ready"
+    code = (
+        "import signal,sys,time; from pathlib import Path; "
+        "signal.signal(signal.SIGBREAK,lambda *_:(Path(sys.argv[1]).write_text('graceful'),sys.exit(0))); "
+        "Path(sys.argv[2]).write_text('ready'); "
+        "time.sleep(30)"
+    )
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", code, str(marker), str(ready)]
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert ready.exists()
+    managed.terminate(grace_seconds=3)
+    managed.wait(timeout=10)
+    assert marker.read_text(encoding="utf-8") == "graceful"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows stale identity integration")
+def test_windows_rejects_stale_identity_without_signaling_live_process() -> None:
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "import time; time.sleep(30)"]
+    )
+    stale = SupervisionToken(
+        managed.token.mode,
+        ProcessIdentity(managed.token.identity.pid, "recycled", managed.token.identity.executable),
+        managed.token.owner_pid,
+        managed.token.owner_started_at,
+        managed.token.token,
+        payload_identity=managed.token.payload,
+    )
+    try:
+        assert terminate(stale, grace_seconds=0) is False
+        assert identity_matches(managed.token.identity)
+    finally:
+        managed.kill()
+        managed.wait(timeout=10)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows inherited pipe integration")
+@pytest.mark.parametrize("timeout", [None, 2])
+def test_windows_capture_closes_pipe_inherited_by_descendant(tmp_path: Path, timeout: float | None) -> None:
+    script = tmp_path / "inherited-pipe.py"
+    script.write_text(
+        "import subprocess,sys\n"
+        "subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])\n"
+        "print('leader-exited')\n",
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    completed = run([sys.executable, str(script)], capture_output=True, text=True, timeout=timeout)
+    assert completed.stdout.strip() == "leader-exited"
+    assert time.monotonic() - started < 6
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows async Job Object integration")
