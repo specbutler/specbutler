@@ -193,12 +193,14 @@ import time
 
 def main():
     marker = pathlib.Path(os.environ["SPEC_FIXTURE_AUTO_MARKER"])
+    release = pathlib.Path(os.environ["SPEC_FIXTURE_AUTO_RELEASE"])
     count = 0
     if marker.exists():
         count = int(json.loads(marker.read_text()).get("launch_count", 0))
     marker.write_text(json.dumps({"pid": os.getpid(), "launch_count": count + 1}))
-    while True:
+    while not release.exists():
         time.sleep(0.2)
+    return 0
 """,
         encoding="utf-8",
     )
@@ -1062,10 +1064,12 @@ description: Exercise installed Windows autopilot supervision
     _git(repo, "push", "origin", "main")
 
     auto_marker = tmp_path / "autopilot-child.json"
+    auto_release = tmp_path / "autopilot-child.release"
     _write_fake_spec_launcher(fake_bin, Path(sys.executable))
     auto_env = env.copy()
     auto_env["PYTHONUNBUFFERED"] = "1"
     auto_env["SPEC_FIXTURE_AUTO_MARKER"] = str(auto_marker)
+    auto_env["SPEC_FIXTURE_AUTO_RELEASE"] = str(auto_release)
     auto_command = [
         sys.executable,
         "-I",
@@ -1143,16 +1147,42 @@ description: Exercise installed Windows autopilot supervision
             detail="autopilot child adoption",
         )
         assert json.loads(auto_marker.read_text(encoding="utf-8"))["launch_count"] == 1
-        stopped = _cli(
-            repo,
+        stop_command = [
+            sys.executable,
+            "-I",
+            "-m",
+            "spec_runtime.cli",
             "auto",
             "stop",
             "--repo-root",
             str(repo),
+        ]
+        stopper = subprocess.Popen(
+            stop_command,
+            cwd=repo,
             env=auto_env,
-            timeout=30,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
         )
-        assert "acknowledged shutdown" in (stopped.stdout + stopped.stderr)
+        shutdown_path = repo / ".spec-state" / "autopilot" / "shutdown.json"
+
+        def graceful_stop_was_requested() -> bool:
+            try:
+                return json.loads(shutdown_path.read_text(encoding="utf-8"))["phase"] == "graceful"
+            except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+                return False
+
+        _wait_until(
+            graceful_stop_was_requested,
+            timeout=10,
+            detail="autopilot graceful shutdown request",
+        )
+        auto_release.touch()
+        stopped_stdout, stopped_stderr = stopper.communicate(timeout=15)
+        assert stopper.returncode == 0, stopped_stdout + stopped_stderr
+        assert "acknowledged shutdown" in (stopped_stdout + stopped_stderr)
         second_dispatcher.wait(timeout=15)
     finally:
         if second_dispatcher.poll() is None:
