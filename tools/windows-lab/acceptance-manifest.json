@@ -1,0 +1,364 @@
+{
+  "schema_version": 1,
+  "specs": [
+    {
+      "id": "windows-native-lifecycle",
+      "path": "specs/windows-native-lifecycle.md",
+      "criteria_count": 10
+    },
+    {
+      "id": "windows-web-autopilot",
+      "path": "specs/windows-web-autopilot.md",
+      "criteria_count": 8
+    },
+    {
+      "id": "windows-ci-e2e-release",
+      "path": "specs/windows-ci-e2e-release.md",
+      "criteria_count": 8
+    }
+  ],
+  "criteria": [
+    {
+      "id": "windows-native-lifecycle.1",
+      "spec_id": "windows-native-lifecycle",
+      "number": 1,
+      "text": "`spec create`, `spec task`, `spec implement`, `spec phase`, `spec report`, `spec input`, `spec status`, `spec stop`, `spec clean`, `spec gc`, and foreground `spec update` operate in a native Windows repository using the worktree backend and platform-valid Git paths.",
+      "checks": [
+        {"id": "native.1.matrix-status", "op": "json_equals", "artifact": "native-command-matrix-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.1.matrix-revision", "op": "json_equals", "artifact": "native-command-matrix-result.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "native.1.commands", "op": "json_equals", "artifact": "native-command-matrix-result.json", "pointer": "/commands", "expected": ["create", "task", "implement", "phase", "report", "input", "status", "stop", "clean", "gc", "update"]},
+        {"id": "native.1.backend", "op": "json_equals", "artifact": "native-command-matrix-result.json", "pointer": "/backend", "expected": "worktree"}
+      ]
+    },
+    {
+      "id": "windows-native-lifecycle.2",
+      "spec_id": "windows-native-lifecycle",
+      "number": 2,
+      "text": "A real Codex implementation run creates an isolated worktree, bootstraps it, edits and commits a fixture change, passes gates, performs review, opens and merges a pull request on a disposable GitHub repository, records provenance, and cleans up without manual repair.",
+      "checks": [
+        {"id": "native.2.status", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.2.revision", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "native.2.provider", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/provider", "expected": "codex"},
+        {"id": "native.2.merged", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/pull_request_merged", "expected": true},
+        {"id": "native.2.provenance", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/provenance_tag_present", "expected": true},
+        {"id": "native.2.review", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/review_decision", "expected": "approved"},
+        {"id": "native.2.review-bootstrap", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/review_bootstrap_warning_present", "expected": false},
+        {"id": "native.2.cleanup", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/implementation_workspaces_remaining", "expected": 0},
+        {"id": "native.2.review-evidence", "op": "json_equals", "artifact": "review-decision.json", "pointer": "/status", "expected": "approved"},
+        {"id": "native.2.log", "op": "artifact_nonempty", "artifact": "real-codex-lifecycle.log"}
+      ]
+    },
+    {
+      "id": "windows-native-lifecycle.3",
+      "spec_id": "windows-native-lifecycle",
+      "number": 3,
+      "text": "Stop, timeout, failed gate, review retry, resume after orchestrator restart, stale state, merge-conflict recovery, and `needs-input` followed by `spec input` resolution are exercised on Windows. Owned subprocesses are gone afterward and unrelated processes are untouched.",
+      "checks": [
+        {"id": "native.3.status", "op": "json_equals", "artifact": "lifecycle-fault-matrix-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.3.revision", "op": "json_equals", "artifact": "lifecycle-fault-matrix-result.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "native.3.scenarios", "op": "json_equals", "artifact": "lifecycle-fault-matrix-result.json", "pointer": "/scenarios", "expected": ["stop", "timeout", "failed-gate", "review-retry", "orchestrator-restart", "stale-state", "merge-conflict", "needs-input"]},
+        {"id": "native.3.owned-gone", "op": "json_equals", "artifact": "lifecycle-fault-matrix-result.json", "pointer": "/owned_processes_remaining", "expected": 0},
+        {"id": "native.3.unrelated", "op": "json_equals", "artifact": "lifecycle-fault-matrix-result.json", "pointer": "/unrelated_process_preserved", "expected": true}
+      ]
+    },
+    {
+      "id": "windows-native-lifecycle.4",
+      "spec_id": "windows-native-lifecycle",
+      "number": 4,
+      "text": "Codex home/config/auth isolation works without requiring symlink privileges or Developer Mode. Secrets are copied or referenced with least privilege and are absent from logs, commits, review workspaces, and cleanup remnants.",
+      "checks": [
+        {"id": "native.4.status", "op": "json_equals", "artifact": "isolation-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.4.no-symlinks", "op": "json_equals", "artifact": "isolation-result.json", "pointer": "/requires_symlink_privilege", "expected": false},
+        {"id": "native.4.no-developer-mode", "op": "json_equals", "artifact": "isolation-result.json", "pointer": "/requires_developer_mode", "expected": false},
+        {"id": "native.4.secret-locations", "op": "json_equals", "artifact": "isolation-result.json", "pointer": "/secret_occurrences", "expected": {"cleanup_remnants": 0, "commits": 0, "logs": 0, "review_workspaces": 0}}
+      ]
+    },
+    {
+      "id": "windows-native-lifecycle.5",
+      "spec_id": "windows-native-lifecycle",
+      "number": 5,
+      "text": "Git and GitHub CLI discovery works from normal Windows installations. Commands tolerate drive-letter paths, backslashes, spaces, Unicode, CRLF output, and case-insensitive filesystem behavior.",
+      "checks": [
+        {"id": "native.5.status", "op": "json_equals", "artifact": "windows-path-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.5.discovery", "op": "json_equals", "artifact": "windows-path-result.json", "pointer": "/discovery", "expected": {"gh": true, "git": true}},
+        {"id": "native.5.path-cases", "op": "json_equals", "artifact": "windows-path-result.json", "pointer": "/cases", "expected": {"backslashes": true, "case_insensitive": true, "crlf": true, "drive_letter": true, "spaces": true, "unicode_non_cp1252": true}}
+      ]
+    },
+    {
+      "id": "windows-native-lifecycle.6",
+      "spec_id": "windows-native-lifecycle",
+      "number": 6,
+      "text": "Security-sensitive reviewer/block-debugger paths use an isolation mechanism that is proven on Windows or fail closed with an actionable explanation. POSIX `chmod` or read-only file attributes are not presented as a security boundary.",
+      "checks": [
+        {"id": "native.6.status", "op": "json_equals", "artifact": "review-isolation-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.6.reviewer", "op": "json_in", "artifact": "review-isolation-result.json", "pointer": "/reviewer", "expected": ["isolated", "failed_closed"]},
+        {"id": "native.6.block-debugger", "op": "json_in", "artifact": "review-isolation-result.json", "pointer": "/block_debugger", "expected": ["isolated", "failed_closed"]},
+        {"id": "native.6.no-file-mode-boundary", "op": "json_equals", "artifact": "review-isolation-result.json", "pointer": "/file_attributes_claimed_as_boundary", "expected": false},
+        {"id": "native.6.actionable", "op": "json_equals", "artifact": "review-isolation-result.json", "pointer": "/failures_actionable", "expected": true}
+      ]
+    },
+    {
+      "id": "windows-native-lifecycle.7",
+      "spec_id": "windows-native-lifecycle",
+      "number": 7,
+      "text": "Native Claude execution remains explicitly unavailable while its required host sandbox is unsupported; selection fails before launch with documented alternatives and does not weaken sandbox policy.",
+      "checks": [
+        {"id": "native.7.status", "op": "json_equals", "artifact": "native-claude-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.7.prelaunch", "op": "json_equals", "artifact": "native-claude-result.json", "pointer": "/failed_before_launch", "expected": true},
+        {"id": "native.7.provider-starts", "op": "json_equals", "artifact": "native-claude-result.json", "pointer": "/provider_processes_started", "expected": 0},
+        {"id": "native.7.alternatives", "op": "json_at_least", "artifact": "native-claude-result.json", "pointer": "/documented_alternatives", "expected": 1},
+        {"id": "native.7.policy", "op": "json_equals", "artifact": "native-claude-result.json", "pointer": "/sandbox_policy_weakened", "expected": false}
+      ]
+    },
+    {
+      "id": "windows-native-lifecycle.8",
+      "spec_id": "windows-native-lifecycle",
+      "number": 8,
+      "text": "Foreground update checks and applies through the documented safety gates. The background refresh mode uses the detached lifetime from `windows-process-supervision`, survives CLI exit, records durable identity, and leaves no stale process or state after completion.",
+      "checks": [
+        {"id": "native.8.status", "op": "json_equals", "artifact": "update-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.8.foreground", "op": "json_equals", "artifact": "update-result.json", "pointer": "/foreground_applied", "expected": true},
+        {"id": "native.8.background-survived", "op": "json_equals", "artifact": "update-result.json", "pointer": "/background_survived_cli_exit", "expected": true},
+        {"id": "native.8.identity", "op": "json_equals", "artifact": "update-result.json", "pointer": "/durable_identity_recorded", "expected": true},
+        {"id": "native.8.cleanup", "op": "json_equals", "artifact": "update-result.json", "pointer": "/remaining_processes_and_state", "expected": 0}
+      ]
+    },
+    {
+      "id": "windows-native-lifecycle.9",
+      "spec_id": "windows-native-lifecycle",
+      "number": 9,
+      "text": "Hermetic Windows integration tests cover the lifecycle without model, network, or real-forge dependencies, and a separately marked real-provider proof test covers the end-to-end Codex path.",
+      "checks": [
+        {"id": "native.9.status", "op": "json_equals", "artifact": "test-coverage-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.9.hermetic", "op": "json_equals", "artifact": "test-coverage-result.json", "pointer": "/hermetic_lifecycle", "expected": true},
+        {"id": "native.9.real-mark", "op": "json_equals", "artifact": "test-coverage-result.json", "pointer": "/real_provider_separately_marked", "expected": true},
+        {"id": "native.9.real-e2e", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/status", "expected": "passed"}
+      ]
+    },
+    {
+      "id": "windows-native-lifecycle.10",
+      "spec_id": "windows-native-lifecycle",
+      "number": 10,
+      "text": "Linux/macOS lifecycle behavior and state compatibility remain unchanged.",
+      "checks": [
+        {"id": "native.10.status", "op": "json_equals", "artifact": "cross-platform-lifecycle-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "native.10.linux", "op": "json_equals", "artifact": "cross-platform-lifecycle-result.json", "pointer": "/linux", "expected": "passed"},
+        {"id": "native.10.macos", "op": "json_equals", "artifact": "cross-platform-lifecycle-result.json", "pointer": "/macos", "expected": "passed"},
+        {"id": "native.10.state", "op": "json_equals", "artifact": "cross-platform-lifecycle-result.json", "pointer": "/state_compatibility", "expected": "passed"}
+      ]
+    },
+    {
+      "id": "windows-web-autopilot.1",
+      "spec_id": "windows-web-autopilot",
+      "number": 1,
+      "text": "`spec web` starts in foreground and background modes on Windows, serves the authenticated application, reaches readiness deterministically, and stops without leaving server or action subprocesses alive.",
+      "checks": [
+        {"id": "web.1.status", "op": "json_equals", "artifact": "web-lifecycle-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "web.1.foreground", "op": "json_equals", "artifact": "web-lifecycle-result.json", "pointer": "/foreground", "expected": "passed"},
+        {"id": "web.1.background", "op": "json_equals", "artifact": "web-lifecycle-result.json", "pointer": "/background", "expected": "passed"},
+        {"id": "web.1.auth", "op": "json_equals", "artifact": "web-lifecycle-result.json", "pointer": "/authenticated_readiness", "expected": true},
+        {"id": "web.1.cleanup", "op": "json_equals", "artifact": "web-lifecycle-result.json", "pointer": "/remaining_server_and_action_processes", "expected": 0}
+      ]
+    },
+    {
+      "id": "windows-web-autopilot.2",
+      "spec_id": "windows-web-autopilot",
+      "number": 2,
+      "text": "Real Codex web chat is tested through the running HTTP/WebSocket interface for at least three turns. The second and third responses demonstrably depend on facts supplied only in earlier turns, refresh/reconnect preserves the intended session, separate chats do not leak context, and cancellation leaves no child process.",
+      "checks": [
+        {"id": "web.2.status", "op": "json_equals", "artifact": "web-chat-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "web.2.provider", "op": "json_equals", "artifact": "web-chat-result.json", "pointer": "/backend", "expected": "codex"},
+        {"id": "web.2.turns", "op": "json_at_least", "artifact": "web-chat-result.json", "pointer": "/dependent_turns", "expected": 3},
+        {"id": "web.2.turn2", "op": "json_equals", "artifact": "web-chat-result.json", "pointer": "/turn_2_retained_turn_1", "expected": true},
+        {"id": "web.2.turn3", "op": "json_equals", "artifact": "web-chat-result.json", "pointer": "/turn_3_retained_turns_1_and_2", "expected": true},
+        {"id": "web.2.reconnect", "op": "json_equals", "artifact": "web-chat-result.json", "pointer": "/reconnect_endpoint_exercised", "expected": true},
+        {"id": "web.2.isolation", "op": "json_equals", "artifact": "web-chat-result.json", "pointer": "/concurrent_sessions_isolated", "expected": true},
+        {"id": "web.2.cancellation", "op": "json_equals", "artifact": "web-chat-result.json", "pointer": "/cancelled_descendants_remaining", "expected": 0}
+      ]
+    },
+    {
+      "id": "windows-web-autopilot.3",
+      "spec_id": "windows-web-autopilot",
+      "number": 3,
+      "text": "Claude chat remains available where the existing supported isolation/runtime is present. On native Windows it is hidden or disabled with a precise explanation rather than launched without its sandbox; Linux regression tests exercise a real multi-turn Claude session when credentials are available.",
+      "checks": [
+        {"id": "web.3.native", "op": "json_equals", "artifact": "native-claude-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "web.3.linux-status", "op": "json_equals", "artifact": "linux-claude-web-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "web.3.linux-revision", "op": "json_equals", "artifact": "linux-claude-web-result.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "web.3.linux-provider", "op": "json_equals", "artifact": "linux-claude-web-result.json", "pointer": "/backend", "expected": "claude"},
+        {"id": "web.3.linux-turns", "op": "json_at_least", "artifact": "linux-claude-web-result.json", "pointer": "/dependent_turns", "expected": 3}
+      ]
+    },
+    {
+      "id": "windows-web-autopilot.4",
+      "spec_id": "windows-web-autopilot",
+      "number": 4,
+      "text": "Web lifecycle actions invoke the same runtime and process-supervision paths as the CLI and report structured failures rather than POSIX tracebacks.",
+      "checks": [
+        {"id": "web.4.status", "op": "json_equals", "artifact": "web-action-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "web.4.runtime", "op": "json_equals", "artifact": "web-action-result.json", "pointer": "/shared_runtime", "expected": true},
+        {"id": "web.4.supervision", "op": "json_equals", "artifact": "web-action-result.json", "pointer": "/shared_process_supervision", "expected": true},
+        {"id": "web.4.errors", "op": "json_equals", "artifact": "web-action-result.json", "pointer": "/structured_failure", "expected": true},
+        {"id": "web.4.tracebacks", "op": "json_equals", "artifact": "web-action-result.json", "pointer": "/posix_tracebacks", "expected": 0}
+      ]
+    },
+    {
+      "id": "windows-web-autopilot.5",
+      "spec_id": "windows-web-autopilot",
+      "number": 5,
+      "text": "`spec auto run` dispatches multiple dependency-ready specs on Windows up to the configured concurrency and never dispatches blocked dependents. After a forced dispatcher restart it reopens or transfers each durable supervision token, adopts every live implementation child exactly once, and neither terminates nor duplicates it; `spec auto stop` drains/terminates according to its documented contract.",
+      "checks": [
+        {"id": "web.5.status", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "web.5.concurrency", "op": "json_at_least", "artifact": "autopilot-result.json", "pointer": "/concurrency", "expected": 2},
+        {"id": "web.5.ready", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/dispatched_specs", "expected": ["auto-root-a", "auto-root-b"]},
+        {"id": "web.5.blocked", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/blocked_dependent_dispatch_count", "expected": 0},
+        {"id": "web.5.launches", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/launches_per_spec", "expected": 1},
+        {"id": "web.5.adopt-a", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/adoption_generation/auto-root-a", "expected": 1},
+        {"id": "web.5.adopt-b", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/adoption_generation/auto-root-b", "expected": 1},
+        {"id": "web.5.stop", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/graceful_auto_stop", "expected": true},
+        {"id": "web.5.cleanup", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/remaining_agent_processes", "expected": 0}
+      ]
+    },
+    {
+      "id": "windows-web-autopilot.6",
+      "spec_id": "windows-web-autopilot",
+      "number": 6,
+      "text": "`spec watch` and its chat surface run on Windows with portable process and memory inspection. Terminal limitations degrade explicitly without crashing the dispatcher.",
+      "checks": [
+        {"id": "web.6.status", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "web.6.chat", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/chat", "expected": "passed"},
+        {"id": "web.6.process", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/portable_process_inspection", "expected": true},
+        {"id": "web.6.memory", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/portable_memory_inspection", "expected": true},
+        {"id": "web.6.degradation", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/terminal_degradation", "expected": "explicit"},
+        {"id": "web.6.dispatcher", "op": "json_equals", "artifact": "watch-result.json", "pointer": "/dispatcher_crashed", "expected": false}
+      ]
+    },
+    {
+      "id": "windows-web-autopilot.7",
+      "spec_id": "windows-web-autopilot",
+      "number": 7,
+      "text": "Windows integration tests use real subprocesses and a real listening server; browser/API tests cover authentication, reconnect, concurrent chats, context, cancellation, background start/stop, and stale server identity.",
+      "checks": [
+        {"id": "web.7.status", "op": "json_equals", "artifact": "web-integration-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "web.7.real", "op": "json_equals", "artifact": "web-integration-result.json", "pointer": "/real_subprocesses_and_listener", "expected": true},
+        {"id": "web.7.cases", "op": "json_equals", "artifact": "web-integration-result.json", "pointer": "/cases", "expected": ["authentication", "reconnect", "concurrent-chats", "context", "cancellation", "foreground-start-stop", "background-start-stop", "stale-server-identity"]}
+      ]
+    },
+    {
+      "id": "windows-web-autopilot.8",
+      "spec_id": "windows-web-autopilot",
+      "number": 8,
+      "text": "Existing Linux web, chat, autopilot, and TUI tests remain green.",
+      "checks": [
+        {"id": "web.8.status", "op": "json_equals", "artifact": "cross-platform-web-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "web.8.web", "op": "json_equals", "artifact": "cross-platform-web-result.json", "pointer": "/web", "expected": "passed"},
+        {"id": "web.8.chat", "op": "json_equals", "artifact": "cross-platform-web-result.json", "pointer": "/chat", "expected": "passed"},
+        {"id": "web.8.autopilot", "op": "json_equals", "artifact": "cross-platform-web-result.json", "pointer": "/autopilot", "expected": "passed"},
+        {"id": "web.8.tui", "op": "json_equals", "artifact": "cross-platform-web-result.json", "pointer": "/tui", "expected": "passed"}
+      ]
+    },
+    {
+      "id": "windows-ci-e2e-release.1",
+      "spec_id": "windows-ci-e2e-release",
+      "number": 1,
+      "text": "GitHub Actions installs the built wheel on a supported Windows runner and runs lint plus the full portable test suite on supported Python versions. Windows- specific integration tests are not skipped merely because CI is Windows Server.",
+      "checks": [
+        {"id": "release.1.status", "op": "json_equals", "artifact": "hosted-windows-ci-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.1.revision", "op": "json_equals", "artifact": "hosted-windows-ci-result.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "release.1.wheel", "op": "json_equals", "artifact": "hosted-windows-ci-result.json", "pointer": "/wheel_installed", "expected": true},
+        {"id": "release.1.lint", "op": "json_equals", "artifact": "hosted-windows-ci-result.json", "pointer": "/lint", "expected": "passed"},
+        {"id": "release.1.suite", "op": "json_equals", "artifact": "hosted-windows-ci-result.json", "pointer": "/portable_suite", "expected": "passed"},
+        {"id": "release.1.versions", "op": "json_at_least", "artifact": "hosted-windows-ci-result.json", "pointer": "/supported_python_versions_tested", "expected": 2},
+        {"id": "release.1.integration", "op": "json_equals", "artifact": "hosted-windows-ci-result.json", "pointer": "/windows_integration_skipped_for_server", "expected": false}
+      ]
+    },
+    {
+      "id": "windows-ci-e2e-release.2",
+      "spec_id": "windows-ci-e2e-release",
+      "number": 2,
+      "text": "CI smoke tests create a repository whose path contains spaces and Unicode, run `init`, `doctor`, `list`, `show`, `status`, `input`, foreground/background `update`, lifecycle fixture flows including `needs-input` resolution, web foreground/background, autopilot dispatch/adoption/stop, and cleanup from the wheel.",
+      "checks": [
+        {"id": "release.2.status", "op": "json_equals", "artifact": "hosted-windows-smoke-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.2.revision", "op": "json_equals", "artifact": "hosted-windows-smoke-result.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "release.2.path", "op": "json_equals", "artifact": "hosted-windows-smoke-result.json", "pointer": "/path_has_spaces_and_unicode", "expected": true},
+        {"id": "release.2.commands", "op": "json_equals", "artifact": "hosted-windows-smoke-result.json", "pointer": "/commands", "expected": ["init", "doctor", "list", "show", "status", "input", "update-foreground", "update-background", "needs-input", "web-foreground", "web-background", "auto-dispatch", "auto-adopt", "auto-stop", "cleanup"]},
+        {"id": "release.2.wheel", "op": "json_equals", "artifact": "hosted-windows-smoke-result.json", "pointer": "/installed_artifact", "expected": "wheel"}
+      ]
+    },
+    {
+      "id": "windows-ci-e2e-release.3",
+      "spec_id": "windows-ci-e2e-release",
+      "number": 3,
+      "text": "A checked-in, secret-free Windows-lab harness documents and automates creation, reset, source sync, command execution, log/artifact retrieval, and snapshotting for the local KVM-backed Windows 11 evaluation VM. Machine-specific credentials and disk images stay outside Git.",
+      "checks": [
+        {"id": "release.3.status", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.3.checked-in", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/checked_in_secret_free", "expected": true},
+        {"id": "release.3.operations", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/operations", "expected": ["create", "reset", "source-sync", "exec", "collect", "snapshot"]},
+        {"id": "release.3.private-state", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/machine_state_outside_git", "expected": true}
+      ]
+    },
+    {
+      "id": "windows-ci-e2e-release.4",
+      "spec_id": "windows-ci-e2e-release",
+      "number": 4,
+      "text": "The local Windows 11 proof run installs the release candidate wheel and executes a real Codex lifecycle, real multi-turn web chat, cancellation/timeout tree cleanup, autopilot dependency dispatch, restart recovery, and a real disposable GitHub PR/merge. Logs and machine-readable results are retained as release evidence with secrets redacted.",
+      "checks": [
+        {"id": "release.4.lifecycle", "op": "json_equals", "artifact": "lifecycle-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.4.chat", "op": "json_equals", "artifact": "web-chat-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.4.timeout", "op": "json_equals", "artifact": "timeout-tree-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.4.timeout-clean", "op": "json_equals", "artifact": "timeout-tree-result.json", "pointer": "/processes_remaining", "expected": []},
+        {"id": "release.4.autopilot", "op": "json_equals", "artifact": "autopilot-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.4.redaction", "op": "json_equals", "artifact": "_redaction-report.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.4.secrets", "op": "json_equals", "artifact": "_redaction-report.json", "pointer": "/recognized_secret_shapes_remaining", "expected": []}
+      ]
+    },
+    {
+      "id": "windows-ci-e2e-release.5",
+      "spec_id": "windows-ci-e2e-release",
+      "number": 5,
+      "text": "Repeating the local proof from a clean VM snapshot requires one documented command (apart from provider/Microsoft authentication when tokens expire) and does not require editing files inside the guest manually.",
+      "checks": [
+        {"id": "release.5.status", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.5.clean", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/clean_snapshot_reset", "expected": true},
+        {"id": "release.5.command", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/proof_command", "expected": "./labctl proof"},
+        {"id": "release.5.manual-edits", "op": "json_equals", "artifact": "lab-controller-result.json", "pointer": "/manual_guest_edits", "expected": false}
+      ]
+    },
+    {
+      "id": "windows-ci-e2e-release.6",
+      "spec_id": "windows-ci-e2e-release",
+      "number": 6,
+      "text": "README, INSTALL, troubleshooting, and support-matrix documentation state exact supported Windows edition/filesystem/backend/agent/shell combinations, known limitations, and setup commands. Claims distinguish native Codex support from Claude and Docker/container alternatives.",
+      "checks": [
+        {"id": "release.6.status", "op": "json_equals", "artifact": "documentation-audit-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.6.revision", "op": "json_equals", "artifact": "documentation-audit-result.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "release.6.surfaces", "op": "json_equals", "artifact": "documentation-audit-result.json", "pointer": "/surfaces", "expected": ["README", "INSTALL", "troubleshooting", "support-matrix"]},
+        {"id": "release.6.tier", "op": "json_equals", "artifact": "documentation-audit-result.json", "pointer": "/exact_supported_tier", "expected": true},
+        {"id": "release.6.distinctions", "op": "json_equals", "artifact": "documentation-audit-result.json", "pointer": "/native_codex_claude_container_distinguished", "expected": true}
+      ]
+    },
+    {
+      "id": "windows-ci-e2e-release.7",
+      "spec_id": "windows-ci-e2e-release",
+      "number": 7,
+      "text": "Windows is added to package classifiers, release verification builds and installs both wheel and source distribution on Windows, and `spec doctor` produces no unexplained warnings in the documented supported configuration.",
+      "checks": [
+        {"id": "release.7.status", "op": "json_equals", "artifact": "package-release-result.json", "pointer": "/status", "expected": "passed"},
+        {"id": "release.7.revision", "op": "json_equals", "artifact": "package-release-result.json", "pointer": "/source_revision", "expected": "${SOURCE_REVISION}"},
+        {"id": "release.7.classifier", "op": "json_equals", "artifact": "package-release-result.json", "pointer": "/windows_classifier", "expected": true},
+        {"id": "release.7.wheel", "op": "json_equals", "artifact": "package-release-result.json", "pointer": "/wheel_install", "expected": "passed"},
+        {"id": "release.7.sdist", "op": "json_equals", "artifact": "package-release-result.json", "pointer": "/sdist_install", "expected": "passed"},
+        {"id": "release.7.doctor", "op": "json_equals", "artifact": "package-release-result.json", "pointer": "/doctor_unexplained_warnings", "expected": 0}
+      ]
+    },
+    {
+      "id": "windows-ci-e2e-release.8",
+      "spec_id": "windows-ci-e2e-release",
+      "number": 8,
+      "text": "A final audit maps every Windows acceptance criterion to current CI or retained VM evidence; missing, skipped, flaky, or indirect evidence blocks the release.",
+      "checks": [
+        {"id": "release.8.all-other-criteria", "op": "all_other_criteria_passed"}
+      ]
+    }
+  ]
+}

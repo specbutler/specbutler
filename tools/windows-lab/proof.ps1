@@ -93,25 +93,34 @@ function Wait-ProcessExit {
     $Process.Refresh()
 }
 
-$criteria = [ordered]@{}
-function Set-Criterion {
+$evidenceClaims = [ordered]@{}
+function Set-EvidenceClaim {
     param(
         [Parameter(Mandatory = $true)] [string] $Id,
         [Parameter(Mandatory = $true)] [string[]] $Evidence,
         [Parameter(Mandatory = $true)] [string] $Detail
     )
-    $script:criteria[$Id] = [ordered]@{
+    $script:evidenceClaims[$Id] = [ordered]@{
         status = 'passed'
         evidence = $Evidence
         detail = $Detail
     }
     Write-Utf8NoBom `
-        -LiteralPath (Join-Path $script:evidenceRoot 'criteria.json') `
-        -Value ($script:criteria | ConvertTo-Json -Depth 8)
+        -LiteralPath (Join-Path $script:evidenceRoot 'evidence-claims.json') `
+        -Value ($script:evidenceClaims | ConvertTo-Json -Depth 8)
 }
 
 $recordedRevision = (Get-Content -LiteralPath (Join-Path $sourceRoot '.lab-source-revision') -Raw).Trim()
 if ($recordedRevision -ne $sourceRevision) { throw 'Staged source revision does not match proof configuration' }
+if ($sourceRevision -notmatch '^[0-9a-f]{40}$') { throw 'Proof source revision must be an exact Git commit SHA' }
+$sourceProvenance = [ordered]@{
+    status = 'passed'
+    configured_revision = $sourceRevision
+    staged_revision = $recordedRevision
+}
+Write-Utf8NoBom `
+    -LiteralPath (Join-Path $evidenceRoot 'source-provenance.json') `
+    -Value ($sourceProvenance | ConvertTo-Json -Depth 4)
 $windowsProduct = (Get-ComputerInfo -Property WindowsProductName).WindowsProductName
 $systemVolume = Get-Volume -DriveLetter C
 if ($windowsProduct -notmatch 'Windows 11') { throw "Proof requires Windows 11, found: $windowsProduct" }
@@ -154,8 +163,8 @@ Invoke-LoggedNative -FilePath $spec -Arguments @('--version') -LogName 'spec-ver
 Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
     '-m', 'pytest', (Join-Path $sourceRoot 'tests'), '-v'
 ) -LogName 'native-tests.log'
-Set-Criterion `
-    -Id 'windows-ci-e2e-release.1' `
+Set-EvidenceClaim `
+    -Id 'runtime.native-suite' `
     -Evidence @('native-tests.log', 'wheel-install.log', 'spec-version.log') `
     -Detail 'The release-candidate wheel and complete candidate test tree ran under native Windows Python 3.12.'
 
@@ -228,7 +237,7 @@ review_default = "codex"
 allowed = ["codex"]
 
 [bootstrap]
-install_command = '$wheelPython -m venv .venv; .venv\Scripts\python.exe -m pip install -e ".[dev]"'
+install_command = '$wheelPython -m venv --system-site-packages .venv; C:\Windows\System32\cmd.exe /d /c "echo $wheelVenv\Lib\site-packages>.venv\Lib\site-packages\spec-proof-parent.pth"; .venv\Scripts\python.exe -m pip install --no-build-isolation --no-deps -e .'
 
 [verify]
 
@@ -285,8 +294,61 @@ $worktreeBranches = @(Invoke-NativeOutput -FilePath 'git.exe' -Arguments @(
     'branch', '--list', 'code/add-numbers--*'
 ))
 if ($worktreeBranches.Count -ne 0) { throw 'Implementation branches remain after lifecycle cleanup' }
-Set-Criterion `
-    -Id 'windows-ci-e2e-release.4.lifecycle' `
+$implementationWorktrees = @(
+    Get-ChildItem -LiteralPath (Join-Path $fixtureRoot '.worktrees') -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like 'code-add-numbers--*' }
+)
+if ($implementationWorktrees.Count -ne 0) { throw 'Implementation workspaces remain after lifecycle cleanup' }
+$provenanceRefs = @(Invoke-NativeOutput -FilePath 'git.exe' -Arguments @(
+    'ls-remote', '--tags', 'origin', 'refs/tags/spec/merged/add-numbers', 'refs/tags/spec/merged/add-numbers^{}'
+))
+if ($provenanceRefs.Count -lt 1) { throw 'Lifecycle merge provenance tag is missing' }
+$reviewDecisions = @(
+    Get-ChildItem `
+        -LiteralPath (Join-Path $fixtureRoot '.spec-state\runs') `
+        -Filter 'review-decision.json' `
+        -File `
+        -Recurse `
+        -ErrorAction SilentlyContinue
+)
+if ($reviewDecisions.Count -ne 1) {
+    throw "Expected one retained local review decision, found $($reviewDecisions.Count)"
+}
+$reviewWarnings = @(
+    Get-ChildItem `
+        -LiteralPath (Join-Path $fixtureRoot '.spec-state\runs') `
+        -Filter 'review-bootstrap-warning.json' `
+        -File `
+        -Recurse `
+        -ErrorAction SilentlyContinue
+)
+if ($reviewWarnings.Count -ne 0) {
+    throw 'Review bootstrap fell back to diff-only; release proof requires a clean isolated bootstrap'
+}
+$reviewDecision = Get-Content -LiteralPath $reviewDecisions[0].FullName -Raw | ConvertFrom-Json
+if ($reviewDecision.status -ne 'approved' -and $reviewDecision.decision -ne 'approved') {
+    throw 'Retained local review decision was not approved'
+}
+Copy-Item `
+    -LiteralPath $reviewDecisions[0].FullName `
+    -Destination (Join-Path $evidenceRoot 'review-decision.json')
+$lifecycleResult = [ordered]@{
+    status = 'passed'
+    source_revision = $sourceRevision
+    provider = 'codex'
+    pull_request_merged = $true
+    merged_pull_request = $merged[0].url
+    provenance_tag_present = $true
+    review_decision = 'approved'
+    review_bootstrap_warning_present = $false
+    implementation_branches_remaining = $worktreeBranches.Count
+    implementation_workspaces_remaining = $implementationWorktrees.Count
+}
+Write-Utf8NoBom `
+    -LiteralPath (Join-Path $evidenceRoot 'lifecycle-result.json') `
+    -Value ($lifecycleResult | ConvertTo-Json -Depth 8)
+Set-EvidenceClaim `
+    -Id 'runtime.real-lifecycle' `
     -Evidence @('real-codex-lifecycle.log', 'fixture-final-test.log', 'result.json') `
     -Detail 'A real Codex implementation, review, disposable GitHub pull request, merge, and cleanup completed.'
 
@@ -360,20 +422,31 @@ try {
 if ($backgroundServerPid -gt 0 -and (Get-Process -Id $backgroundServerPid -ErrorAction SilentlyContinue)) {
     throw "Background web process $backgroundServerPid survived spec web stop"
 }
-Set-Criterion `
-    -Id 'windows-web-autopilot.1' `
+$webLifecycleResult = [ordered]@{
+    status = 'passed'
+    source_revision = $sourceRevision
+    foreground = 'passed'
+    background = 'passed'
+    authenticated_readiness = $true
+    remaining_server_and_action_processes = 0
+}
+Write-Utf8NoBom `
+    -LiteralPath (Join-Path $evidenceRoot 'web-lifecycle-result.json') `
+    -Value ($webLifecycleResult | ConvertTo-Json -Depth 6)
+Set-EvidenceClaim `
+    -Id 'runtime.web-lifecycle' `
     -Evidence @('web-foreground.log', 'web-foreground-stop.log', 'web-start.log', 'web-stop.log') `
     -Detail 'Foreground and durable background web services reached authenticated readiness and stopped with their owned processes gone.'
-Set-Criterion `
-    -Id 'windows-web-autopilot.2' `
+Set-EvidenceClaim `
+    -Id 'runtime.web-chat' `
     -Evidence @('web-chat-result.json', 'web-chat-events.json', 'web-chat-proof.log') `
     -Detail 'Real Codex used three context-dependent turns over HTTP/SSE, reconnect/history, concurrent isolated sessions, and live cancellation without descendants.'
-Set-Criterion `
-    -Id 'windows-web-autopilot.3.native' `
+Set-EvidenceClaim `
+    -Id 'runtime.native-claude-inventory' `
     -Evidence @('web-chat-result.json') `
     -Detail 'The native backend inventory offered Codex and failed closed for Claude.'
-Set-Criterion `
-    -Id 'windows-web-autopilot.7.chat' `
+Set-EvidenceClaim `
+    -Id 'runtime.web-integration-chat' `
     -Evidence @('web-chat-result.json', 'web-chat-events.json') `
     -Detail 'The proof used a real loopback listener, authenticated API requests, streaming reconnect, concurrent provider processes, and cancellation.'
 
@@ -383,8 +456,8 @@ Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
     '--work-root', (Join-Path $runRoot 'timeout-tree'),
     '--evidence-root', $evidenceRoot
 ) -LogName 'timeout-tree.log'
-Set-Criterion `
-    -Id 'windows-ci-e2e-release.4.timeout-cleanup' `
+Set-EvidenceClaim `
+    -Id 'runtime.timeout-cleanup' `
     -Evidence @('timeout-tree-result.json', 'timeout-tree.log') `
     -Detail 'A native parent-child-grandchild process tree exceeded a bounded timeout and every exact process identity was gone afterward.'
 
@@ -697,17 +770,19 @@ try {
     $env:SPEC_AUTOPILOT_PROOF_RELEASE = $oldProofRelease
     $env:SPEC_AUTOPILOT_SPEC_EXE = $oldProofSpec
 }
-Set-Criterion `
-    -Id 'windows-web-autopilot.5' `
+Set-EvidenceClaim `
+    -Id 'runtime.autopilot' `
     -Evidence @('autopilot-result.json', 'autopilot-adopted-state.json', 'autopilot-shutdown-requested-state.json', 'autopilot-first.log', 'autopilot-second.log', 'autopilot-stop.log') `
     -Detail 'Two dependency-ready specs ran concurrently, the blocked dependent never launched, a replacement dispatcher adopted both exact children once, and auto stop drained them.'
-Set-Criterion `
-    -Id 'windows-ci-e2e-release.4.autopilot' `
+Set-EvidenceClaim `
+    -Id 'runtime.autopilot-restart' `
     -Evidence @('autopilot-result.json', 'autopilot-adopted-state.json') `
     -Detail 'The reusable Windows 11 lab forced dispatcher death and proved durable native adoption and graceful stop with real subprocesses.'
 
 $result = [ordered]@{
-    status = 'passed'
+    status = 'evidence-collected'
+    acceptance_status = 'requires-fail-closed-audit'
+    acceptance_manifest = 'tools/windows-lab/acceptance-manifest.json'
     run_name = $runName
     source_revision = $sourceRevision
     windows_edition = $windowsProduct
@@ -728,7 +803,7 @@ $result = [ordered]@{
     autopilot_dependency_dispatch = 'passed'
     autopilot_restart_adoption = 'passed'
     autopilot_stop = 'passed'
-    criteria = $criteria
+    evidence_claims = $evidenceClaims
 }
 $resultJson = $result | ConvertTo-Json -Depth 12
 Write-Utf8NoBom -LiteralPath (Join-Path $evidenceRoot 'result.json') -Value $resultJson

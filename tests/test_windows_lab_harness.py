@@ -18,6 +18,8 @@ WINDOWS_DOC = REPO_ROOT / "docs" / "windows.md"
 
 REQUIRED_FILES = {
     ".gitignore",
+    "acceptance-manifest.json",
+    "audit_acceptance.py",
     "Autounattend.xml.template",
     "autopilot-agent.cs",
     "Dockerfile",
@@ -85,7 +87,7 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "autopilot-adopted-state.json" in proof
     assert "adoption_generation -ne 1" in proof
     assert "blocked_dependent_dispatch_count = 0" in proof
-    assert "Set-Criterion" in proof
+    assert "Set-EvidenceClaim" in proof
 
 
 def test_windows_lab_inputs_are_placeholder_only_and_private_state_is_ignored() -> None:
@@ -232,9 +234,9 @@ def test_windows_runtime_proof_declares_real_runtime_invariants() -> None:
     ):
         assert statement in runtime
     for statement in (
-        "windows-web-autopilot.2",
-        "windows-web-autopilot.5",
-        "windows-ci-e2e-release.4.timeout-cleanup",
+        "runtime.web-chat",
+        "runtime.autopilot",
+        "runtime.timeout-cleanup",
         "Stop-Process -Id $firstDispatcher.Id -Force",
         "spec auto stop",
         "autopilot-result.json",

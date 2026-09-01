@@ -90,8 +90,10 @@ The proof:
    provider double, crashes the dispatcher while both implementation processes
    are live, proves a replacement adopts each exact child once without launching
    the blocked dependent, then exercises `spec auto stop` graceful draining;
-8. writes per-criterion machine-readable results and sanitized logs under
-   `tools/windows-lab/artifacts/<run-name>/`.
+8. retains the exact staged Git revision and sanitized logs under
+   `tools/windows-lab/artifacts/<run-name>/`, then evaluates every one of the
+   26 acceptance criteria in the three Windows specs against the checked-in
+   evidence contract.
 
 The deterministic autopilot provider is intentionally distinct from the real
 Codex evidence: adoption must hold children at a reproducible boundary across a
@@ -123,6 +125,43 @@ SPEC_WINDOWS_TOOLCHAIN_CONFIG=/absolute/path/to/toolchain.json \
 The override is intentionally environment-only: it keeps the reusable disk,
 identity, SSH key, and authentication state outside every source checkout while
 each agent stages the exact commit from its own worktree.
+
+### Fail-closed acceptance audit
+
+`acceptance-manifest.json` is the release evidence contract. It repeats the
+exact text and numbering from all three Windows specs and maps each criterion
+to concrete retained artifacts and machine-evaluated assertions. The auditor
+rejects criterion drift, missing or extra criteria, unsafe artifact paths,
+malformed evidence, and any source revision other than the exact 40-character
+commit staged into the guest.
+
+The authoritative output is `acceptance-audit.json`, not the runtime summary
+in `result.json`. A missing artifact is reported as `unproven`; a present
+artifact that contradicts its assertion is `failed`. Both states produce a
+nonzero exit status, and the final audit criterion is derived from the other
+25 rather than asserted by the proof script. Therefore partial proof runs
+cannot be mistaken for release approval.
+
+The controller must run this audit after collection and redaction; a
+`labctl proof` run is not release-passing unless the resulting
+`acceptance-audit.json` has `status: passed`. To re-audit retained evidence
+manually, check out its recorded source commit and run:
+
+```bash
+revision="$(git rev-parse HEAD)"
+python3 tools/windows-lab/audit_acceptance.py \
+  --manifest tools/windows-lab/acceptance-manifest.json \
+  --source-root . \
+  --evidence-root "tools/windows-lab/artifacts/<run-name>" \
+  --expected-revision "$revision" \
+  --output "tools/windows-lab/artifacts/<run-name>/acceptance-audit.json"
+```
+
+The caller must supply the revision independently from the collected evidence;
+the auditor cross-checks it against both configured and staged revision values
+in `source-provenance.json`. Retain CI result JSON files named by the manifest
+alongside VM artifacts before the final audit. Do not synthesize a passing
+result for unavailable hosted, provider, or platform evidence.
 
 ## Controller commands
 
@@ -156,6 +195,7 @@ shellcheck tools/windows-lab/labctl tools/windows-lab/entrypoint.sh
 bash -n tools/windows-lab/labctl
 sh -n tools/windows-lab/entrypoint.sh
 pytest tests/test_windows_lab_harness.py
+pytest tests/test_windows_acceptance_audit.py
 ```
 
 The real-provider pytest entrypoint is separately marked and skipped unless
