@@ -148,6 +148,10 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "-RunLevel Highest" not in register_job
     provision = (LAB_ROOT / "provision.ps1").read_text(encoding="utf-8")
     assert 'icacls.exe $harnessRoot /grant:r "${account}:(OI)(CI)M" /T /C' in provision
+    assert "-Filter 'codex-code-mode-host-*.exe'" in provision
+    assert "$codexHostAlias = Join-Path $codexRoot 'codex-code-mode-host.exe'" in provision
+    assert "$codexHostSourceHash -ne $codexHostAliasHash" in provision
+    assert "Codex code-mode host is missing from its required canonical path" in proof
     runner = (LAB_ROOT / "job-runner.ps1").read_text(encoding="utf-8")
     assert '$env:TEMP = $temp' in runner
     assert '$env:TMP = $temp' in runner

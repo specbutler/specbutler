@@ -166,6 +166,10 @@ if ($PSVersionTable.PSEdition -ne 'Desktop' -or $PSVersionTable.PSVersion.Major 
 
 $uv = 'C:\Tools\uv\uv.exe'
 $codex = 'C:\Tools\Codex\codex.exe'
+$codexHost = 'C:\Tools\Codex\codex-code-mode-host.exe'
+if (-not (Test-Path -LiteralPath $codexHost -PathType Leaf)) {
+    throw "Codex code-mode host is missing from its required canonical path: $codexHost"
+}
 Invoke-LoggedNative -FilePath $codex -Arguments @('--version') -LogName 'codex-version.log'
 Invoke-LoggedNative -FilePath 'gh.exe' -Arguments @('auth', 'status') -LogName 'gh-auth-status.log'
 

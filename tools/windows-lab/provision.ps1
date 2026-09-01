@@ -61,6 +61,20 @@ Copy-Item -LiteralPath $codexSandbox -Destination (Join-Path $codexRoot 'codex-w
 $codex = Get-ChildItem $codexRoot -Filter 'codex-x86_64-pc-windows-msvc.exe' | Select-Object -First 1
 if (-not $codex) { throw 'the Codex executable was not found in the configured archive' }
 Copy-Item -LiteralPath $codex.FullName -Destination (Join-Path $codexRoot 'codex.exe') -Force
+$codexHost = Get-ChildItem (Join-Path $extractRoot 'codex-host') -Recurse -Filter 'codex-code-mode-host.exe' |
+    Select-Object -First 1
+if (-not $codexHost) {
+    $codexHost = Get-ChildItem (Join-Path $extractRoot 'codex-host') -Recurse -Filter 'codex-code-mode-host-*.exe' |
+        Select-Object -First 1
+}
+if (-not $codexHost) { throw 'the Codex code-mode host executable was not found in the configured archive' }
+$codexHostAlias = Join-Path $codexRoot 'codex-code-mode-host.exe'
+Copy-Item -LiteralPath $codexHost.FullName -Destination $codexHostAlias -Force
+$codexHostSourceHash = (Get-FileHash -LiteralPath $codexHost.FullName -Algorithm SHA256).Hash
+$codexHostAliasHash = (Get-FileHash -LiteralPath $codexHostAlias -Algorithm SHA256).Hash
+if ($codexHostSourceHash -ne $codexHostAliasHash) {
+    throw 'the installed Codex code-mode host does not match the verified archive'
+}
 
 $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $requiredPaths = @(
