@@ -206,7 +206,7 @@ class TestServerLifecycle:
         managed.terminate.assert_called_once_with(grace_seconds=0.5)
         remove_pid.assert_called_once_with(tmp_path)
 
-    def test_windows_recovers_interrupted_background_launch(self, tmp_path):
+    def test_windows_recovers_interrupted_background_launch(self, tmp_path, monkeypatch):
         from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
         from spec_runtime.web.server import (
             _helper_metadata_path,
@@ -217,6 +217,10 @@ class TestServerLifecycle:
             read_supervision_token,
         )
 
+        monkeypatch.setenv(
+            "SPEC_PROCESS_CONTROL_ROOT",
+            str(tmp_path / "process-controls"),
+        )
         supervision_id = "recover-web"
         nonce = "child-authenticated"
         identity = ProcessIdentity(123, "created", "python.exe")
@@ -229,6 +233,7 @@ class TestServerLifecycle:
             payload_identity=ProcessIdentity(124, "payload", "python.exe"),
         )
         helper_path = _helper_metadata_path(tmp_path, supervision_id)
+        helper_path.parent.mkdir(parents=True, exist_ok=True)
         helper_path.write_text(json.dumps(token.to_dict()), encoding="utf-8")
         _write_launch_reservation(
             tmp_path,
@@ -253,9 +258,17 @@ class TestServerLifecycle:
         )
         with (
             patch("spec_runtime.process_supervisor.identity_matches", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.promote_payload_identity",
+                return_value=token,
+            ) as promote_payload,
             patch("spec_runtime.web.server._wait_for_port", return_value=True),
         ):
             assert _recover_launch(tmp_path) == token
+        if os.name == "nt":
+            promote_payload.assert_called_once_with(token, token.payload)
+        else:
+            promote_payload.assert_not_called()
         assert read_supervision_token(tmp_path) == token
         assert not _launch_path(tmp_path).exists()
         assert not helper_path.exists()
@@ -333,8 +346,14 @@ class TestServerLifecycle:
             from spec_runtime.web.server import is_server_running
 
             running, pid = is_server_running(tmp_path)
-            assert running
-            assert pid == os.getpid()
+            if os.name == "nt":
+                # PID files are diagnostic-only on Windows. Without a durable
+                # Job token, trusting one would permit PID-reuse ownership bugs.
+                assert not running
+                assert pid is None
+            else:
+                assert running
+                assert pid == os.getpid()
 
     def test_stop_server_not_running(self, tmp_path, capsys):
         with patch("spec_runtime.web.server._pid_path", return_value=tmp_path / "nonexistent"):
@@ -394,7 +413,10 @@ class TestServerLifecycle:
             rc = server_status(tmp_path)
             assert rc == 0
             captured = capsys.readouterr()
-            assert "port 7700" in captured.out
+            if os.name == "nt":
+                assert "not running" in captured.out
+            else:
+                assert "port 7700" in captured.out
 
     def test_is_server_running_rejects_stale_pid(self, tmp_path):
         """A PID file with a mismatched started_at must not match the live process."""

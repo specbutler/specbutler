@@ -42,14 +42,14 @@ def test_claude_chat_provider_uses_oauth_compatible_safe_argv(
 ) -> None:
     calls: list[list[str]] = []
 
-    def fake_popen(command, **_kwargs):
+    def fake_spawn(_supervisor, command, **_kwargs):
         calls.append(command)
         return _CompletedChatProcess(
             '{"type":"assistant","message":{"content":'
             '[{"type":"text","text":"claude-ok"}]}}\n'
         )
 
-    monkeypatch.setattr(tui_app.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tui_app.ProcessSupervisor, "spawn", fake_spawn)
     provider = tui_app.CliChatProvider(agent="claude", repo_root=tmp_path)
 
     assert list(provider._stream_claude_output("provider prompt")) == ["claude-ok"]
@@ -67,14 +67,14 @@ def test_codex_chat_provider_uses_read_only_ephemeral_argv(
 ) -> None:
     calls: list[list[str]] = []
 
-    def fake_popen(command, **_kwargs):
+    def fake_spawn(_supervisor, command, **_kwargs):
         calls.append(command)
         return _CompletedChatProcess(
             '{"type":"item.completed","item":{"type":"agent_message",'
             '"id":"assistant-1","text":"codex-ok"}}\n'
         )
 
-    monkeypatch.setattr(tui_app.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tui_app.ProcessSupervisor, "spawn", fake_spawn)
     provider = tui_app.CliChatProvider(agent="codex", repo_root=tmp_path)
 
     assert list(provider._stream_codex_output("provider prompt")) == ["codex-ok"]

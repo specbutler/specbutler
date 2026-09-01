@@ -204,41 +204,86 @@ def test_foreground_web_bind_and_authenticated_request(tmp_path: Path) -> None:
     token_path.parent.mkdir(parents=True)
     token_path.write_text(token)
     (tmp_path / ".spec.toml").write_text('[project]\nbase_ref = "main"\n')
-    server = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "spec_runtime.cli",
-            "web",
-            "start",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ],
-        cwd=tmp_path,
-        env=_clean_subprocess_env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    try:
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                request = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/status",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                with urllib.request.urlopen(request, timeout=1) as response:
-                    assert response.status == 200
-                break
-            except (OSError, urllib.error.URLError):
-                if server.poll() is not None or time.monotonic() >= deadline:
-                    stdout, stderr = server.communicate(timeout=1)
-                    raise AssertionError(stdout + stderr)
-                time.sleep(0.1)
-    finally:
-        if server.poll() is None:
-            server.terminate()
-            server.wait(timeout=10)
+    stdout_path = tmp_path / "web-probe.stdout.log"
+    stderr_path = tmp_path / "web-probe.stderr.log"
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout_log,
+        stderr_path.open("w", encoding="utf-8") as stderr_log,
+    ):
+        server = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "spec_runtime.cli",
+                "web",
+                "start",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+            ],
+            cwd=tmp_path,
+            env=_clean_subprocess_env(),
+            stdout=stdout_log,
+            stderr=stderr_log,
+            text=True,
+        )
+
+        def stop_server() -> None:
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=5)
+
+        def diagnostics() -> str:
+            stdout_log.flush()
+            stderr_log.flush()
+            return stdout_path.read_text(errors="replace") + stderr_path.read_text(
+                errors="replace"
+            )
+
+        try:
+            # Importing the full web stack can take noticeably longer on a cold
+            # or memory-constrained Windows runner. Keep the probe bounded while
+            # allowing enough time for the production server to bind.
+            startup_timeout = 30.0
+            deadline = time.monotonic() + startup_timeout
+            last_error: Exception | None = None
+            url = f"http://127.0.0.1:{port}/"
+            while True:
+                try:
+                    request = urllib.request.Request(
+                        url,
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    with urllib.request.urlopen(request, timeout=1) as response:
+                        assert response.status == 200
+                    break
+                except (OSError, urllib.error.URLError) as exc:
+                    last_error = exc
+                    if server.poll() is not None:
+                        raise AssertionError(
+                            "web server exited before accepting an authenticated "
+                            f"request: {last_error}\n{diagnostics()}"
+                        )
+                    if time.monotonic() >= deadline:
+                        stop_server()
+                        raise AssertionError(
+                            "web server did not accept an authenticated request "
+                            f"within {startup_timeout:g} seconds: {last_error}\n"
+                            f"{diagnostics()}"
+                        )
+                    time.sleep(0.1)
+
+            wrong_token_request = urllib.request.Request(
+                url,
+                headers={"Authorization": "Bearer wrong-token"},
+            )
+            with pytest.raises(urllib.error.HTTPError) as auth_error:
+                urllib.request.urlopen(wrong_token_request, timeout=2)
+            assert auth_error.value.code == 401
+        finally:
+            stop_server()
