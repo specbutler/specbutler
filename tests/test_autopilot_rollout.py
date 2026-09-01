@@ -530,6 +530,7 @@ def test_circuit_breaker_backoff_survives_large_failure_counts() -> None:
     assert breaker.failure_count("s") == 5000
 
 
+@pytest.mark.skipif(os.name == "nt", reason="MemAvailable is a non-Windows memory source")
 def test_available_memory_prefers_meminfo_memavailable(tmp_path, monkeypatch):
     """SC_AVPHYS_PAGES excludes reclaimable page cache and throttled a 60GB
     host (53GB available) to concurrency 1; MemAvailable is authoritative."""

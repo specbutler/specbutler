@@ -32167,14 +32167,16 @@ class TestEnsureOrchestratorProcessGroupSigttou:
 
 def test_ensure_orchestrator_process_group_persists_portable_token(repo: Path) -> None:
     identity = ProcessIdentity(4321, "created", "/usr/bin/python", "python orchestrator.py")
+    token_version = 2 if os.name == "nt" else 1
+    expected_pgid = None if os.name == "nt" else identity.pid
     token = SupervisionToken(
         LifetimeMode.RUN_OWNED,
         identity,
         identity.pid,
         identity.started_at,
         "orchestrator-test-run",
-        pgid=4321,
-        version=1,
+        pgid=expected_pgid or 0,
+        version=token_version,
     )
     run = orch.RunState(run_id="test-run", spec_id="test-spec", branch="test-branch")
 
@@ -32182,7 +32184,7 @@ def test_ensure_orchestrator_process_group_persists_portable_token(repo: Path) -
         orch._ensure_orchestrator_process_group(run, repo)
 
     claim.assert_called_once_with("orchestrator-test-run")
-    assert run.pgid == 4321
+    assert run.pgid == expected_pgid
     assert run.process_started_at == "created"
     assert run.supervision_token == token.to_dict()
     persisted = orch.RunState.load(repo, run.run_id)

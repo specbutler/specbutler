@@ -815,9 +815,10 @@ def test_windows_claimed_current_process_token_stops_from_another_process(
     state_path = tmp_path / "claimed-token.json"
     stopped_path = tmp_path / "stopped"
     helper = tmp_path / "claim-current.py"
+    stopper = tmp_path / "stop-claimed.py"
     supervision_id = f"current-{uuid.uuid4().hex}"
     helper.write_text(
-        "import json,signal,sys,time\n"
+        "import json,os,signal,sys,time\n"
         "from pathlib import Path\n"
         "from spec_runtime.process_supervisor import claim_current_process\n"
         "token=claim_current_process(sys.argv[1])\n"
@@ -825,8 +826,17 @@ def test_windows_claimed_current_process_token_stops_from_another_process(
         "    Path(sys.argv[3]).write_text('stopped')\n"
         "    raise SystemExit(0)\n"
         "signal.signal(signal.SIGTERM, stop)\n"
-        "Path(sys.argv[2]).write_text(json.dumps(token.to_dict()))\n"
+        "Path(sys.argv[2]).write_text(json.dumps({'helper_pid':os.getpid(),'token':token.to_dict()}))\n"
         "while True: time.sleep(.05)\n",
+        encoding="utf-8",
+    )
+    stopper.write_text(
+        "import json,sys\n"
+        "from pathlib import Path\n"
+        "from spec_runtime.process_supervisor import SupervisionToken,stop_supervised_process\n"
+        "payload=json.loads(Path(sys.argv[1]).read_text())\n"
+        "token=SupervisionToken.from_dict(payload['token'])\n"
+        "raise SystemExit(0 if stop_supervised_process(token,grace_seconds=3) else 1)\n",
         encoding="utf-8",
     )
     process = subprocess.Popen(  # noqa: S603
@@ -838,18 +848,27 @@ def test_windows_claimed_current_process_token_stops_from_another_process(
         while not state_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert state_path.exists()
-        token = SupervisionToken.from_dict(json.loads(state_path.read_text(encoding="utf-8")))
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        assert payload["helper_pid"] == process.pid
+        token = SupervisionToken.from_dict(payload["token"])
         assert token.version == 2
+        assert token.identity.pid != os.getpid()
         assert token.identity.pid == process.pid
         assert token.job_name
         assert token.control_relpath
 
-        assert process_supervisor.stop_supervised_process(token, grace_seconds=3) is True
+        completed = subprocess.run(  # noqa: S603
+            [sys.executable, str(stopper), str(state_path)],
+            env=os.environ.copy(),
+            check=False,
+            timeout=10,
+        )
+        assert completed.returncode == 0
         process.wait(timeout=10)
         assert stopped_path.read_text(encoding="utf-8") == "stopped"
         assert inspect_process(process.pid) is None
     finally:
-        if process.poll() is None:
+        if process.pid != os.getpid() and process.poll() is None:
             process.kill()
         process.wait(timeout=5)
 
