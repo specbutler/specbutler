@@ -29364,6 +29364,73 @@ class TestSpecAuthoring:
         assert env["GH_TOKEN"] == "explicit-token"
         forge.get_auth_token.assert_not_called()
 
+    def test_windows_codex_authoring_uses_disposable_gh_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        env = {
+            "GH_TOKEN": "native-authoring-token",
+            "GH_CONFIG_DIR": r"C:\\Users\\operator\\AppData\\Roaming\\GitHub CLI",
+        }
+
+        config_dir = orch._isolate_windows_codex_authoring_gh_config(env, tmp_path)
+
+        assert config_dir is not None
+        assert config_dir.is_dir()
+        assert config_dir.parent == tmp_path
+        assert env["GH_CONFIG_DIR"] == str(config_dir)
+        assert env["GH_HOST"] == "github.com"
+        assert list(config_dir.iterdir()) == []
+
+        shutil.rmtree(config_dir)
+
+    def test_windows_codex_authoring_disposable_gh_config_is_cleaned_after_launch(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        worktree_path = repo / ".worktrees" / "spec-windows-authoring"
+        args = argparse.Namespace(
+            agent="codex",
+            base="origin/master",
+            spec="windows-authoring",
+            label="",
+        )
+        monkeypatch.setenv("GH_TOKEN", "native-authoring-token")
+        observed: dict[str, Path] = {}
+
+        def launch(_command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            config_dir = Path(str(env["GH_CONFIG_DIR"]))
+            assert config_dir.is_dir()
+            assert env["GH_HOST"] == "github.com"
+            observed["config_dir"] = config_dir
+            return subprocess.CompletedProcess(["codex"], 130)
+
+        with (
+            patch.object(orch.sys, "platform", "win32"),
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch, "_common_state_root", return_value=repo / ".spec-state"),
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.object(
+                orch,
+                "_prepare_spec_authoring_worktree",
+                return_value=(worktree_path, "spec/windows-authoring", False),
+            ),
+            patch.object(orch, "_write_sandbox_config"),
+            patch.object(
+                orch,
+                "_build_spec_authoring_command",
+                return_value=["codex", "Author spec"],
+            ),
+            patch.object(orch.subprocess, "run", side_effect=launch),
+        ):
+            status = orch.cmd_spec(args)
+
+        assert status == 130
+        assert not observed["config_dir"].exists()
+
     def test_windows_codex_authoring_missing_token_fails_before_worktree(
         self,
         repo: Path,

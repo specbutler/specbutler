@@ -5953,6 +5953,30 @@ def _windows_codex_authoring_env(agent: str) -> dict[str, str] | None:
     return env
 
 
+def _isolate_windows_codex_authoring_gh_config(
+    env: dict[str, str] | None,
+    state_dir: Path,
+) -> Path | None:
+    """Keep sandboxed ``gh`` away from the operator profile on Windows.
+
+    GitHub CLI reads ``hosts.yml`` even when ``GH_TOKEN`` is already present.
+    Codex's restricted Windows token cannot read the roaming profile that owns
+    that file, so merely forwarding the token still makes every ``gh`` command
+    fail. Point the child at a fresh, credential-free config directory under
+    the state root, which authoring already grants to the sandbox. The caller
+    removes the directory as soon as the interactive session exits.
+    """
+    if env is None:
+        return None
+    state_dir.mkdir(parents=True, exist_ok=True)
+    config_dir = Path(
+        tempfile.mkdtemp(prefix="windows-authoring-gh-", dir=state_dir)
+    )
+    env["GH_CONFIG_DIR"] = str(config_dir)
+    env.setdefault("GH_HOST", "github.com")
+    return config_dir
+
+
 def _print_spec_authoring_summary(
     repo_root: Path,
     spec_id: str,
@@ -21811,6 +21835,10 @@ def cmd_spec(args: argparse.Namespace) -> int:
 
     print(f"{'Resuming' if resumed else 'Launching'} spec authoring in {worktree_path}")
 
+    authoring_gh_config_dir = _isolate_windows_codex_authoring_gh_config(
+        authoring_env,
+        _common_state_root(repo_root),
+    )
     try:
         launch_kwargs: dict[str, object] = {"cwd": worktree_path}
         if authoring_env is not None:
@@ -21819,6 +21847,9 @@ def cmd_spec(args: argparse.Namespace) -> int:
     except FileNotFoundError as exc:
         print(f"Error: Agent binary not found: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if authoring_gh_config_dir is not None:
+            shutil.rmtree(authoring_gh_config_dir, ignore_errors=True)
 
     if completed.returncode != 0:
         print(
