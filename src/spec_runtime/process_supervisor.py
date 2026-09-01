@@ -160,6 +160,7 @@ def _control_record_identities(
     if (
         state.get("schema") != 2
         or state.get("supervision_id") != supervision_id
+        or state.get("job_name") != _windows_job_name(supervision_id)
         or not isinstance(nonce, str)
         or not nonce
         or not isinstance(keeper_value, dict)
@@ -927,6 +928,7 @@ def _retire_durable_records(metadata_path: Path, token: SupervisionToken) -> boo
                 not isinstance(state, dict)
                 or state.get("schema") != 2
                 or state.get("supervision_id") != token.token
+                or state.get("job_name") != token.job_name
                 or state.get("nonce") != token.control_nonce
                 or state.get("keeper_identity") != token.identity.to_dict()
             ):
@@ -1372,6 +1374,7 @@ def claim_current_process(supervision_id: str) -> SupervisionToken:
     state = {
         "schema": 2,
         "supervision_id": supervision_id,
+        "job_name": token.job_name,
         "nonce": nonce,
         "keeper_identity": identity.to_dict(),
         "payload_identity": identity.to_dict(),
@@ -2044,6 +2047,7 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
                 if (
                     state.get("schema") != 2
                     or state.get("supervision_id") != token.token
+                    or state.get("job_name") != token.job_name
                     or state.get("nonce") != token.control_nonce
                     or state.get("keeper_identity") != token.identity.to_dict()
                     or not reopened_job.contains(current_payload)
@@ -2346,6 +2350,7 @@ def promote_payload_identity(token: SupervisionToken, candidate: ProcessIdentity
             expected_control = {
                 "schema": 2,
                 "supervision_id": token.token,
+                "job_name": token.job_name,
                 "nonce": token.control_nonce,
                 "keeper_identity": token.identity.to_dict(),
             }
@@ -2427,6 +2432,7 @@ def adopt(token: SupervisionToken) -> SupervisionToken:
         expected = {
             "schema": 2,
             "supervision_id": token.token,
+            "job_name": token.job_name,
             "nonce": token.control_nonce,
             "keeper_identity": token.identity.to_dict(),
             "payload_identity": token.payload.to_dict(),
@@ -2519,6 +2525,7 @@ def _durable_helper(
             state = {
                 "schema": 2,
                 "supervision_id": token.token,
+                "job_name": token.job_name,
                 "nonce": token.control_nonce,
                 "keeper_identity": token.identity.to_dict(),
                 "payload_identity": token.payload.to_dict(),

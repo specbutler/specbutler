@@ -137,6 +137,7 @@ def _write_reconcilable_boundary(
             {
                 "schema": 2,
                 "supervision_id": supervision_id,
+                "job_name": token.job_name,
                 "nonce": nonce,
                 "keeper_identity": keeper.to_dict(),
                 "payload_identity": payload.to_dict(),
@@ -233,6 +234,26 @@ def test_reconcile_stale_control_state_preserves_mismatched_metadata(
     assert not control_path.exists()
     assert metadata_path.exists()
     assert process_supervisor._durable_publication_ack_path(metadata_path).exists()
+
+
+def test_reconcile_stale_control_state_preserves_unmarked_legacy_control(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    _token, control_path, metadata_path = _write_reconcilable_boundary(root, "legacy-boundary")
+    state = json.loads(control_path.read_text(encoding="utf-8"))
+    state.pop("job_name")
+    control_path.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    absent = MagicMock(return_value=True)
+    monkeypatch.setattr(process_supervisor, "_windows_job_definitively_absent", absent)
+
+    assert process_supervisor.reconcile_stale_control_state() == 0
+    assert control_path.exists()
+    assert metadata_path.exists()
+    absent.assert_not_called()
 
 
 def test_reconcile_stale_control_state_revalidates_after_lock(
@@ -334,6 +355,7 @@ def test_current_process_retirement_requires_exact_claim(
     state = {
         "schema": 2,
         "supervision_id": token.token,
+        "job_name": token.job_name,
         "nonce": "newer-claim",
         "keeper_identity": identity.to_dict(),
         "payload_identity": identity.to_dict(),
@@ -631,6 +653,7 @@ def test_adoptable_token_records_new_logical_owner(
             {
                 "schema": 2,
                 "supervision_id": token.token,
+                "job_name": token.job_name,
                 "nonce": token.control_nonce,
                 "keeper_identity": token.identity.to_dict(),
                 "payload_identity": token.payload.to_dict(),
@@ -828,6 +851,7 @@ def _write_promotion_state(tmp_path: Path, token: SupervisionToken) -> None:
             {
                 "schema": 2,
                 "supervision_id": token.token,
+                "job_name": token.job_name,
                 "nonce": token.control_nonce,
                 "keeper_identity": token.identity.to_dict(),
                 "payload_identity": token.payload.to_dict(),
