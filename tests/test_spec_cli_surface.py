@@ -739,6 +739,30 @@ class TestCLIMain:
         assert exc_info.value.code == 0
         mock_config.assert_not_called()
 
+    def test_root_help_lists_init_with_bootstrap_description(self, capsys):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config") as mock_config:
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main(["--help"])
+
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "init" in output
+        assert "Bootstrap a Git repository for spec-driven development" in output
+        mock_config.assert_not_called()
+
+    def test_init_help_uses_canonical_options_without_config(self, capsys):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config") as mock_config:
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main(["init", "--help"])
+
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "--force" in output
+        assert "--yolo" in output
+        mock_config.assert_not_called()
+
     def test_source_id_flag_prints_identity_without_config(self, capsys):
         cli = self._import_cli()
         with (

@@ -826,6 +826,21 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return cmd_init(args)
 
 
+def _configure_init_parser(parser: argparse.ArgumentParser) -> None:
+    """Register the canonical ``spec init`` options on any parser surface."""
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Refresh managed templates while preserving existing .spec.toml",
+    )
+    parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="Use agent-assisted detection for build/test config",
+    )
+
+
 def _emit_startup_update_notice(config: object | None = None) -> None:
     from .config import SpecRuntimeConfig
     from .update import maybe_print_update_notice
@@ -878,18 +893,11 @@ def main(argv: list[str] | None = None) -> int:
     if first_positional == "init":
         if not help_requested:
             _maybe_print_update_notice_for_init()
-        init_parser = argparse.ArgumentParser(prog="spec init")
-        init_parser.add_argument("-v", "--verbose", action="store_true")
-        init_parser.add_argument(
-            "--force",
-            action="store_true",
-            help="Refresh managed templates while preserving existing .spec.toml",
+        init_parser = argparse.ArgumentParser(
+            prog="spec init",
+            description="Bootstrap a Git repository for spec-driven development",
         )
-        init_parser.add_argument(
-            "--yolo",
-            action="store_true",
-            help="Use agent-assisted detection for build/test config",
-        )
+        _configure_init_parser(init_parser)
         init_args = init_parser.parse_args([a for a in effective_argv if a != "init"])
         if init_args.verbose:
             import logging
@@ -971,6 +979,13 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command")
 
     # ----- Primary commands (happy-path) -----
+
+    p_init = subparsers.add_parser(
+        "init",
+        help="Bootstrap a Git repository for spec-driven development",
+        description="Bootstrap a Git repository for spec-driven development",
+    )
+    _configure_init_parser(p_init)
 
     raw_review_default = getattr(config.agents, "review_default", "")
     review_default = raw_review_default.strip() if isinstance(raw_review_default, str) else ""
