@@ -5524,7 +5524,10 @@ class TestReviewWorktreeBootstrap:
                     "GH_TOKEN": "secret",
                     "ANTHROPIC_API_KEY": "sk-secret",
                     "CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret",
-                    "PATH": "/usr/bin",
+                    # Keep the environment deliberately minimal while
+                    # retaining the platform's standard shell search path.
+                    # macOS installs sh in /bin, not /usr/bin.
+                    "PATH": os.defpath,
                 },
                 clear=False,
             ),

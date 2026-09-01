@@ -44,9 +44,9 @@ def test_identity_matches_accepts_executable_aliases(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    executable = tmp_path / "Python"
+    executable = tmp_path / "python-real"
     executable.write_text("binary", encoding="utf-8")
-    alias = tmp_path / "python"
+    alias = tmp_path / "python-alias"
     alias.symlink_to(executable)
     expected = ProcessIdentity(42, "created", str(alias))
     monkeypatch.setattr(
