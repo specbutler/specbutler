@@ -219,8 +219,8 @@ def test_windows_file_lock_migrates_legacy_metadata_natively(tmp_path: Path) -> 
     legacy = b'{"pid": 4321, "command": "spec implement"}\n'
     path.write_bytes(legacy)
     with FileLock(path):
-        assert path.read_bytes() == b"\0" + legacy
         assert json.loads(read_lock_metadata(path))["pid"] == 4321
+    assert path.read_bytes() == b"\0" + legacy
 
 
 def test_remove_tree_repairs_read_only_file(tmp_path: Path) -> None:

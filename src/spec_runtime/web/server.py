@@ -212,6 +212,80 @@ def _ready_path(repo_root: Path) -> Path:
     return _web_state_dir(repo_root) / "server.ready.json"
 
 
+def _launch_path(repo_root: Path) -> Path:
+    return _web_state_dir(repo_root) / "server.launch.json"
+
+
+def _helper_metadata_path(repo_root: Path, supervision_id: str) -> Path:
+    return repo_root / f".spec-supervisor-{supervision_id}.json"
+
+
+def _write_launch_reservation(
+    repo_root: Path,
+    *,
+    supervision_id: str,
+    helper_path: Path,
+    nonce: str,
+    host: str,
+    port: int,
+) -> None:
+    from spec_runtime.platform_fs import atomic_write_text
+
+    payload = {
+        "schema": 1,
+        "state": "launching",
+        "supervision_id": supervision_id,
+        "helper_path": str(helper_path.resolve()),
+        "nonce": nonce,
+        "host": host,
+        "port": port,
+        "listener": f"{host}:{port}",
+    }
+    path = _launch_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _recover_launch(repo_root: Path) -> object | None:
+    """Publish a helper token left behind by an interrupted Windows launcher."""
+    from spec_runtime.process_supervisor import SupervisionToken, identity_matches
+
+    try:
+        reservation = json.loads(_launch_path(repo_root).read_text(encoding="utf-8"))
+        if not isinstance(reservation, dict) or reservation.get("state") != "launching":
+            return None
+        supervision_id = str(reservation["supervision_id"])
+        nonce = str(reservation["nonce"])
+        host = str(reservation["host"])
+        port = int(reservation["port"])
+        listener = f"{host}:{port}"
+        expected_helper = _helper_metadata_path(repo_root, supervision_id).resolve()
+        if Path(str(reservation["helper_path"])).resolve() != expected_helper:
+            return None
+        if reservation.get("listener") != listener or not supervision_id or not nonce:
+            return None
+        token = SupervisionToken.from_dict(json.loads(expected_helper.read_text(encoding="utf-8")))
+        ready = json.loads(_ready_path(repo_root).read_text(encoding="utf-8"))
+        if (
+            token.token != supervision_id
+            or ready.get("nonce") != nonce
+            or ready.get("host") != host
+            or int(ready.get("port", -1)) != port
+            or ready.get("listener") != listener
+            or ready.get("payload_identity") != token.payload.to_dict()
+            or not identity_matches(token.identity)
+            or not identity_matches(token.payload)
+            or not _wait_for_port(host, port, timeout=0.25)
+        ):
+            return None
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+    write_supervision_token(repo_root, token)
+    _launch_path(repo_root).unlink(missing_ok=True)
+    expected_helper.unlink(missing_ok=True)
+    return token
+
+
 def _publish_ready_record(repo_root: Path, *, nonce: str, host: str, port: int) -> None:
     """Authenticate readiness as a record written by the listening child."""
     if not nonce:
@@ -334,12 +408,15 @@ def remove_pid(repo_root: Path) -> None:
         port_p.unlink(missing_ok=True)
     _supervision_path(repo_root).unlink(missing_ok=True)
     _ready_path(repo_root).unlink(missing_ok=True)
+    _launch_path(repo_root).unlink(missing_ok=True)
 
 
 def is_server_running(repo_root: Path) -> tuple[bool, int | None]:
     from spec_runtime.process_supervisor import SupervisionToken, identity_matches
 
     supervision_token = read_supervision_token(repo_root)
+    if supervision_token is None and os.name == "nt":
+        supervision_token = _recover_launch(repo_root)
     if isinstance(supervision_token, SupervisionToken):
         if identity_matches(supervision_token.identity) and identity_matches(supervision_token.payload):
             return True, supervision_token.payload.pid
@@ -535,8 +612,18 @@ def run_server(
 
             state_dir = _web_state_dir(repo_root)
             state_dir.mkdir(parents=True, exist_ok=True)
+            supervision_id = uuid.uuid4().hex
             ready_nonce = uuid.uuid4().hex
+            helper_path = _helper_metadata_path(repo_root, supervision_id)
             _ready_path(repo_root).unlink(missing_ok=True)
+            _write_launch_reservation(
+                repo_root,
+                supervision_id=supervision_id,
+                helper_path=helper_path,
+                nonce=ready_nonce,
+                host=host,
+                port=port,
+            )
             log_handle = open(state_dir / "server.log", "a", encoding="utf-8")  # noqa: SIM115
             command = [
                 sys.executable,
@@ -554,7 +641,10 @@ def run_server(
             try:
                 child_env = os.environ.copy()
                 child_env["SPEC_WEB_READY_NONCE"] = ready_nonce
-                managed = ProcessSupervisor(LifetimeMode.DETACHED).spawn(
+                managed = ProcessSupervisor(
+                    LifetimeMode.DETACHED,
+                    supervision_id=supervision_id,
+                ).spawn(
                     command,
                     cwd=repo_root,
                     stdin=subprocess.DEVNULL,
@@ -566,12 +656,18 @@ def run_server(
                 log_handle.close()
             if not _wait_for_ready_record(repo_root, nonce=ready_nonce, token=managed.token):
                 managed.terminate(grace_seconds=0.5)
-                remove_pid(repo_root)
+                from spec_runtime.process_supervisor import identity_matches
+
+                if not identity_matches(managed.token.identity):
+                    remove_pid(repo_root)
+                    helper_path.unlink(missing_ok=True)
                 print("spec web failed to start (see server.log).", file=sys.stderr)
                 return 1
             # Publish only after readiness. Publishing earlier makes the child
             # observe its own durable token and reject startup as a duplicate.
             write_supervision_token(repo_root, managed.token)
+            _launch_path(repo_root).unlink(missing_ok=True)
+            helper_path.unlink(missing_ok=True)
             print(f"spec web running on http://{probe_host}:{port}", file=sys.stderr)
             print(f"Authenticated URL: {auth_url}", file=sys.stderr)
             if open_browser:

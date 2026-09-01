@@ -2487,6 +2487,13 @@ def run_loop(args: argparse.Namespace) -> int:
     force_shutdown = False
     active = adopt_active_processes(repo_root)
     cleanup_unadopted_container_runs(repo_root, active)
+    # Commit recovered helper tokens to active.json before removing their
+    # ready records. A crash on either side of this atomic write therefore
+    # leaves at least one complete recovery source.
+    write_active_state(repo_root, active)
+    for recovered in active.values():
+        if recovered.ready_path and recovered.supervision_token:
+            Path(recovered.ready_path).unlink(missing_ok=True)
     last_queue_signature: tuple[tuple[str, str, str], ...] = ()
     last_refresh_error = ""
     low_memory_active = False
@@ -2968,6 +2975,8 @@ def run_loop(args: argparse.Namespace) -> int:
                         raise
                     active[candidate.spec_id] = active_run
                     write_active_state(repo_root, active)
+                    if active_run.ready_path and active_run.supervision_token:
+                        Path(active_run.ready_path).unlink(missing_ok=True)
                     detail = f"{candidate.spec_id} agent={candidate.agent} mode={candidate.reason}"
                     if candidate.run_id:
                         detail += f" run={candidate.run_id}"

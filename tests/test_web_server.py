@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import UTC, datetime
@@ -192,15 +193,118 @@ class TestServerLifecycle:
             patch("socket.create_connection", side_effect=OSError("free")),
             patch("spec_runtime.process_supervisor.ProcessSupervisor", return_value=supervisor),
             patch("spec_runtime.web.server.write_supervision_token") as write_token,
-            patch("spec_runtime.web.server._wait_for_port", return_value=False),
+            patch("spec_runtime.web.server._wait_for_ready_record", return_value=False),
+            patch("spec_runtime.process_supervisor.identity_matches", return_value=False),
             patch("spec_runtime.web.server.remove_pid") as remove_pid,
         ):
             from spec_runtime.web.server import run_server
 
             assert run_server(tmp_path, background=True) == 1
-        write_token.assert_called_once_with(tmp_path, token)
+        write_token.assert_not_called()
         managed.terminate.assert_called_once_with(grace_seconds=0.5)
         remove_pid.assert_called_once_with(tmp_path)
+
+    def test_windows_recovers_interrupted_background_launch(self, tmp_path):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import (
+            _helper_metadata_path,
+            _launch_path,
+            _ready_path,
+            _recover_launch,
+            _write_launch_reservation,
+            read_supervision_token,
+        )
+
+        supervision_id = "recover-web"
+        nonce = "child-authenticated"
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.DETACHED,
+            identity,
+            1,
+            "owner",
+            supervision_id,
+            payload_identity=ProcessIdentity(124, "payload", "python.exe"),
+        )
+        helper_path = _helper_metadata_path(tmp_path, supervision_id)
+        helper_path.write_text(json.dumps(token.to_dict()), encoding="utf-8")
+        _write_launch_reservation(
+            tmp_path,
+            supervision_id=supervision_id,
+            helper_path=helper_path,
+            nonce=nonce,
+            host="127.0.0.1",
+            port=7700,
+        )
+        ready_path = _ready_path(tmp_path)
+        ready_path.write_text(
+            json.dumps(
+                {
+                    "nonce": nonce,
+                    "payload_identity": token.payload.to_dict(),
+                    "host": "127.0.0.1",
+                    "port": 7700,
+                    "listener": "127.0.0.1:7700",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with (
+            patch("spec_runtime.process_supervisor.identity_matches", return_value=True),
+            patch("spec_runtime.web.server._wait_for_port", return_value=True),
+        ):
+            assert _recover_launch(tmp_path) == token
+        assert read_supervision_token(tmp_path) == token
+        assert not _launch_path(tmp_path).exists()
+        assert not helper_path.exists()
+
+    @pytest.mark.parametrize("corruption", ["malformed", "wrong-listener", "stale-identity"])
+    def test_windows_recovery_rejects_untrusted_launch_state(self, tmp_path, corruption):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import (
+            _helper_metadata_path,
+            _launch_path,
+            _ready_path,
+            _recover_launch,
+            _write_launch_reservation,
+        )
+
+        supervision_id = "reject-web"
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(LifetimeMode.DETACHED, identity, 1, "owner", supervision_id)
+        helper_path = _helper_metadata_path(tmp_path, supervision_id)
+        helper_path.write_text(json.dumps(token.to_dict()), encoding="utf-8")
+        _write_launch_reservation(
+            tmp_path,
+            supervision_id=supervision_id,
+            helper_path=helper_path,
+            nonce="nonce",
+            host="127.0.0.1",
+            port=7700,
+        )
+        ready = {
+            "nonce": "nonce",
+            "payload_identity": token.payload.to_dict(),
+            "host": "127.0.0.1",
+            "port": 7700,
+            "listener": "127.0.0.1:7700",
+        }
+        _ready_path(tmp_path).write_text(json.dumps(ready), encoding="utf-8")
+        if corruption == "malformed":
+            _launch_path(tmp_path).write_text("not json", encoding="utf-8")
+        elif corruption == "wrong-listener":
+            ready["listener"] = "127.0.0.1:9999"
+            _ready_path(tmp_path).write_text(json.dumps(ready), encoding="utf-8")
+        with (
+            patch(
+                "spec_runtime.process_supervisor.identity_matches",
+                return_value=corruption != "stale-identity",
+            ),
+            patch("spec_runtime.web.server._wait_for_port", return_value=True),
+        ):
+            assert _recover_launch(tmp_path) is None
+        assert _launch_path(tmp_path).exists()
+        assert helper_path.exists()
 
     def test_is_server_running_false_when_no_pid(self, tmp_path):
         with patch("spec_runtime.web.server._pid_path", return_value=tmp_path / "nonexistent"):
@@ -231,6 +335,29 @@ class TestServerLifecycle:
 
             rc = stop_server(tmp_path)
             assert rc == 1
+
+    def test_windows_failed_stop_retains_all_recovery_state(self, tmp_path):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import stop_server
+
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(LifetimeMode.DETACHED, identity, 1, "owner", "failed-stop")
+        state_dir = tmp_path / ".spec-state" / "web"
+        state_dir.mkdir(parents=True)
+        paths = [
+            state_dir / "server.supervision.json",
+            state_dir / "server.launch.json",
+            state_dir / "server.ready.json",
+        ]
+        for path in paths:
+            path.write_text("retained", encoding="utf-8")
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(True, token.payload.pid)),
+            patch("spec_runtime.web.server.read_supervision_token", return_value=token),
+            patch("spec_runtime.process_supervisor.terminate", return_value=False),
+        ):
+            assert stop_server(tmp_path) == 1
+        assert all(path.read_text(encoding="utf-8") == "retained" for path in paths)
 
     def test_server_status_not_running(self, tmp_path, capsys):
         with patch("spec_runtime.web.server._pid_path", return_value=tmp_path / "nonexistent"):
