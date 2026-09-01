@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -10,6 +13,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HELPER = REPO_ROOT / "tools" / "windows-lab" / "trash_retention.py"
+LABCTL = REPO_ROOT / "tools" / "windows-lab" / "labctl"
 
 
 def _load_helper() -> ModuleType:
@@ -29,6 +33,139 @@ def _retired(trash: Path, name: str, *, modified_ns: int) -> Path:
     (tpm / "tpm2-00.permall").write_bytes(b"tpm")
     os.utime(retired, ns=(modified_ns, modified_ns))
     return retired
+
+
+def _controller_retention(
+    tmp_path: Path,
+    docker_state: str,
+    *,
+    action: str = "retention",
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("Bash is unavailable")
+    state_root = tmp_path / "state"
+    trash = state_root / "trash"
+    trash.mkdir(parents=True)
+    older = _retired(trash, "20260901T010101-101", modified_ns=1_000_000_000)
+    newer = _retired(trash, "20260901T020202-202", modified_ns=2_000_000_000)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        """#!/bin/sh
+case "$FAKE_DOCKER_STATE" in
+    query-error) exit 125 ;;
+    absent) exit 0 ;;
+    ambiguous)
+        printf '%s\\n' 'specbutler-windows-lab|exited' 'specbutler-windows-lab|created'
+        ;;
+    *) printf '%s|%s\\n' 'specbutler-windows-lab' "$FAKE_DOCKER_STATE" ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    script = r"""
+source <(awk '/^stage_source\(\)/ { exit } { print }' "$LABCTL_PATH")
+LAB_ROOT="$LAB_ROOT_OVERRIDE"
+STATE_ROOT="$STATE_ROOT_OVERRIDE"
+case "$CONTROLLER_ACTION" in
+    retention) proof_trash_retention 1 apply ;;
+    vm-running)
+        if vm_running; then
+            printf '%s\n' RUNNING
+        else
+            printf '%s\n' INTERPRETED_AS_STOPPED
+        fi
+        ;;
+    *) exit 97 ;;
+esac
+"""
+    env = {
+        **os.environ,
+        "FAKE_DOCKER_STATE": docker_state,
+        "LABCTL_PATH": str(LABCTL),
+        "LAB_ROOT_OVERRIDE": str(LABCTL.parent),
+        "STATE_ROOT_OVERRIDE": str(state_root),
+        "CONTROLLER_ACTION": action,
+        "PATH": os.pathsep.join((str(fake_bin), os.environ.get("PATH", ""))),
+    }
+    completed = subprocess.run(
+        [bash, "-c", script],
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    return completed, older, newer
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Windows VM controller runs on its supported Linux host",
+)
+def test_vm_running_does_not_interpret_query_failure_as_stopped(
+    tmp_path: Path,
+) -> None:
+    completed, older, newer = _controller_retention(
+        tmp_path,
+        "query-error",
+        action="vm-running",
+    )
+
+    assert completed.returncode != 0
+    assert "could not query Docker" in completed.stderr
+    assert "INTERPRETED_AS_STOPPED" not in completed.stdout
+    assert older.is_dir()
+    assert newer.is_dir()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Windows VM controller runs on its supported Linux host",
+)
+@pytest.mark.parametrize(
+    ("docker_state", "error"),
+    [
+        ("query-error", "could not query Docker"),
+        ("ambiguous", "ambiguous Windows VM state"),
+        ("unknown", "unknown Windows VM state"),
+        ("running", "must be stopped"),
+        ("paused", "must be stopped"),
+        ("restarting", "must be stopped"),
+        ("removing", "must be stopped"),
+    ],
+)
+def test_controller_retention_fails_closed_without_mutation(
+    tmp_path: Path,
+    docker_state: str,
+    error: str,
+) -> None:
+    completed, older, newer = _controller_retention(tmp_path, docker_state)
+
+    assert completed.returncode != 0
+    assert error in completed.stderr
+    assert older.is_dir()
+    assert newer.is_dir()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Windows VM controller runs on its supported Linux host",
+)
+@pytest.mark.parametrize("docker_state", ["absent", "created", "exited", "dead"])
+def test_controller_retention_accepts_confirmed_inactive_state(
+    tmp_path: Path,
+    docker_state: str,
+) -> None:
+    completed, older, newer = _controller_retention(tmp_path, docker_state)
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert not older.exists()
+    assert newer.is_dir()
 
 
 def test_retention_dry_run_then_apply_keeps_only_newest_and_never_leaves_root(

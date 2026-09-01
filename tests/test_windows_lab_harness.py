@@ -531,6 +531,7 @@ def test_windows_local_acceptance_covers_every_local_manifest_result() -> None:
         assert artifact in proof or artifact == "package-release-result.json"
     assert "installed-cli-matrix.junit.xml" in proof
     assert "SPEC_WINDOWS_INSTALLED_CLI_MATRIX = '1'" in proof
+    assert "'-o', 'pythonpath=', '--import-mode=importlib'" in proof
     assert "'--wheel', '--sdist'" in proof
     assert "local_acceptance.py" in proof
 

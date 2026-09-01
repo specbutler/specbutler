@@ -289,6 +289,9 @@ def test_ci_windows_job_is_a_required_product_gate_with_diagnostics():
         "tests/test_windows_probe.py::test_installed_artifact_cli_matrix"
         in commands["Run installed-artifact Windows CLI matrix"]
     )
+    assert '-o "pythonpath=" --import-mode=importlib' in commands[
+        "Run installed-artifact Windows CLI matrix"
+    ]
     assert "Remove-Item Env:PYTHONPATH" in commands[
         "Run installed-artifact Windows CLI matrix"
     ]

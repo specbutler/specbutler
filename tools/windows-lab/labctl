@@ -9,6 +9,7 @@ TOOLCHAIN_FILE="${SPEC_WINDOWS_TOOLCHAIN_CONFIG:-$LAB_ROOT/toolchain.json}"
 IDENTITY_FILE="$STATE_ROOT/identity.env"
 CONTAINER_NAME=specbutler-windows-lab
 SSH_OPTIONS=()
+VM_STATE=
 
 die() {
     printf '%s\n' "windows-lab: $*" >&2
@@ -79,14 +80,52 @@ compose() {
         docker compose --project-directory "$LAB_ROOT" -f "$LAB_ROOT/compose.yaml" "$@"
 }
 
+refresh_vm_state() {
+    local output state
+    if ! output="$(
+        docker ps -a \
+            --filter "name=^/${CONTAINER_NAME}$" \
+            --format '{{.Names}}|{{.State}}' \
+            2>/dev/null
+    )"; then
+        die "could not query Docker for the Windows VM state"
+    fi
+    if [ -z "$output" ]; then
+        VM_STATE=absent
+        return
+    fi
+    if [[ "$output" = *$'\n'* || "$output" != "$CONTAINER_NAME|"* ]]; then
+        die "Docker returned an ambiguous Windows VM state"
+    fi
+    state="${output#"$CONTAINER_NAME|"}"
+    case "$state" in
+        created|exited|dead|running|paused|restarting|removing)
+            VM_STATE="$state"
+            ;;
+        *)
+            die "Docker returned an unknown Windows VM state: ${state:-<empty>}"
+            ;;
+    esac
+}
+
 vm_running() {
-    docker inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null | grep -qx true
+    refresh_vm_state
+    case "$VM_STATE" in
+        running|paused|restarting|removing) return 0 ;;
+        absent|created|exited|dead) return 1 ;;
+    esac
+    die "internal error: unclassified Windows VM state"
 }
 
 require_stopped() {
-    if vm_running; then
-        die "the VM must be stopped for this operation"
-    fi
+    refresh_vm_state
+    case "$VM_STATE" in
+        absent|created|exited|dead) return ;;
+        running|paused|restarting|removing)
+            die "the VM must be stopped for this operation (state: $VM_STATE)"
+            ;;
+    esac
+    die "internal error: unclassified Windows VM state"
 }
 
 prepare_ssh_options() {

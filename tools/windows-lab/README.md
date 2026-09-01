@@ -148,8 +148,9 @@ small NVRAM and TPM state. Set the positive integer `LAB_PROOF_TRASH_KEEP` in
 `lab.env` to retain more predecessors. The retention pass derives recency from
 the controller-owned timestamp/PID directory name, validates every direct trash
 child before deleting anything, and fails closed on partial directories,
-unknown entries, symlinks, or nested mounts. Sanitized evidence and raw
-collected logs are outside the overlay trash and are not affected.
+unknown entries, symlinks, nested mounts, or an unavailable or ambiguous Docker
+state query. Sanitized evidence and raw collected logs are outside the overlay
+trash and are not affected.
 
 Provisioning uses the administrative SSH control plane. Interactive proof jobs
 use the logged-on account's filtered, non-elevated token and fail unless they are

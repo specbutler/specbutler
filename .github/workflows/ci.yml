@@ -459,7 +459,7 @@ jobs:
         run: |
           Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force artifacts/ci-evidence | Out-Null
-          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests/test_windows_probe.py::test_installed_artifact_cli_matrix -vv --junitxml artifacts/ci-evidence/installed-cli-matrix.xml 2>&1 | Tee-Object artifacts/installed-cli-matrix.log
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" --import-mode=importlib tests/test_windows_probe.py::test_installed_artifact_cli_matrix -vv --junitxml artifacts/ci-evidence/installed-cli-matrix.xml 2>&1 | Tee-Object artifacts/installed-cli-matrix.log
           exit $LASTEXITCODE
       - name: Record successful Windows probe evidence
         shell: pwsh

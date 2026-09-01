@@ -222,7 +222,7 @@ try {
     $env:SPEC_WINDOWS_INSTALLED_CLI_MATRIX = '1'
     $env:GITHUB_WORKSPACE = $sourceRoot
     Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
-        '-m', 'pytest',
+        '-m', 'pytest', '-o', 'pythonpath=', '--import-mode=importlib',
         (Join-Path $sourceRoot 'tests\test_windows_probe.py::test_installed_artifact_cli_matrix'),
         '-v', '--junitxml', (Join-Path $evidenceRoot 'installed-cli-matrix.junit.xml')
     ) -LogName 'installed-cli-matrix.log'
