@@ -496,7 +496,7 @@ def _gather_repo_context(repo_root: Path) -> str:
     for ci_path in ci_configs:
         try:
             lines = ci_path.read_text().splitlines()[:50]
-            rel = ci_path.relative_to(repo_root)
+            rel = ci_path.relative_to(repo_root).as_posix()
             sections.append(f"--- {rel} ---\n" + "\n".join(lines))
         except OSError:
             pass

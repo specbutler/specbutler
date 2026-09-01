@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1129,6 +1129,28 @@ class TestYoloDetection:
         ctx = _gather_repo_context(tmp_path)
         assert "name: Deploy" in ctx
         assert ".github/workflows/deploy.yaml" in ctx
+
+    def test_gather_repo_context_normalizes_windows_ci_heading(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        (wf / "ci.yml").write_text("name: CI\n")
+        concrete_path = type(tmp_path)
+        real_relative_to = concrete_path.relative_to
+
+        def windows_relative_to(path, other, *args, **kwargs):
+            relative = real_relative_to(path, other, *args, **kwargs)
+            return PureWindowsPath(*relative.parts)
+
+        monkeypatch.setattr(concrete_path, "relative_to", windows_relative_to)
+
+        ctx = _gather_repo_context(tmp_path)
+
+        assert "--- .github/workflows/ci.yml ---" in ctx
+        assert r".github\workflows\ci.yml" not in ctx
 
     def test_gather_repo_context_includes_build_manifests(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text('[tool.ruff]\ntarget-version = "py311"\n')

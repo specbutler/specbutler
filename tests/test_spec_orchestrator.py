@@ -5525,13 +5525,13 @@ class TestReviewWorktreeBootstrap:
         assert elapsed < 15
 
     def test_timeout_kills_whole_process_group_not_just_the_shell(self, tmp_path: Path):
-        """A regression test for a hang: the untrusted install command can fork
-        a background child that outlives the shell and keeps stdout/stderr
-        open. Killing only the ``sh`` process (as a plain
+        """A regression test for a hang: the untrusted install command can spawn
+        a descendant that outlives its parent and keeps stdout/stderr open.
+        Killing only the parent process (as a plain
         ``subprocess.run(..., timeout=...)`` would) leaves that child running
         and can block the caller waiting for the pipes to close. The bootstrap
-        must run the command in its own process group and kill the whole
-        group on timeout so it reliably falls back to diff-only review.
+        must kill the whole process tree on timeout so it reliably falls back
+        to diff-only review.
         """
         worktree = tmp_path / "review-worktree"
         worktree.mkdir()
@@ -5540,9 +5540,33 @@ class TestReviewWorktreeBootstrap:
         # The backgrounded child inherits stdout/stderr (kept open) and, absent
         # a group kill, would keep running/writing long past the timeout.
         install_cmd = f"(sleep 5; touch {marker}) & sleep 30"
+        windows_child = (
+            "import sys, time; "
+            "from pathlib import Path; "
+            "time.sleep(5); "
+            "Path(sys.argv[1]).write_text('alive', encoding='utf-8')"
+        )
+        windows_parent = (
+            "import subprocess, sys, time; "
+            f"child = {windows_child!r}; "
+            "subprocess.Popen([sys.executable, '-c', child, sys.argv[1]]); "
+            "time.sleep(30)"
+        )
 
         with (
-            patch.object(orch, "SPEC_RUNTIME_CONFIG", self._config_with_install(install_cmd)),
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    install_cmd,
+                    windows_argv=(
+                        sys.executable,
+                        "-c",
+                        windows_parent,
+                        str(marker),
+                    ),
+                ),
+            ),
             patch.object(orch, "REVIEW_BOOTSTRAP_TIMEOUT_SECONDS", 0.2),
         ):
             started = time.monotonic()
