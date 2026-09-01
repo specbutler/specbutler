@@ -705,7 +705,8 @@ def test_installed_artifact_cli_matrix(tmp_path: Path) -> None:
     _git(repo, "push", "-u", "origin", "main")
 
     initialized = _cli(repo, "init", env=env)
-    assert "Initialized" in initialized.stdout
+    assert "Created .spec.toml" in initialized.stdout
+    assert (repo / ".spec.toml").is_file()
     doctor = _cli(repo, "doctor", env=env)
     assert "0 error" in doctor.stdout.lower()
 
