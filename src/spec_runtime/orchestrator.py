@@ -21172,7 +21172,11 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
     metadata = _classify_phase_result(run, phase, result_status)
     if result_status == "passed":
         # A successful phase clears any prior failure classification so the
-        # retryable hint / circuit breaker resets on forward progress.
+        # retryable hint / circuit breaker resets on forward progress. The
+        # historical detail remains in per-phase audit records; keeping it in
+        # ``last_error`` makes a fully successful resumed run misleadingly
+        # display a resolved failure as current.
+        run.last_error = ""
         run.last_failure_retryable = None
         run.last_failure_type = ""
         run.last_failure_subtype = ""

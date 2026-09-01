@@ -25711,6 +25711,22 @@ class TestStructuredAuditMetadata:
         assert f"[spec] my-feature: phase merge started (attempt {attempt_label})" in captured.err
         assert f"[spec] my-feature: phase merge passed (attempt {attempt_label})" in captured.err
 
+    def test_run_single_phase_success_clears_resolved_last_error(self, repo: Path):
+        run = orch.RunState(
+            run_id="my-feature-20260101T000019b",
+            spec_id="my-feature",
+            branch="spec/my-feature",
+            last_error="resolved Windows cleanup failure",
+        )
+        run.save(repo)
+
+        with patch.dict(orch.PHASE_HANDLERS, {"cleanup": lambda _run, _root: "passed"}):
+            result = orch.run_single_phase(run, "cleanup", repo)
+
+        assert result == "passed"
+        assert run.last_error == ""
+        assert orch.RunState.load(repo, run.run_id).last_error == ""
+
     def test_run_single_phase_refreshes_lease_heartbeat_during_long_phase(
         self,
         repo: Path,
