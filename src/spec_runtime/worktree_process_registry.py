@@ -30,6 +30,7 @@ class RegisteredProcess:
     termination_scope: str = "pid"
     pgid: int = 0
     registered_at: str = ""
+    supervision_token: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +127,11 @@ def load_registered_processes(state_root: Path, worktree_path: Path) -> list[Reg
                 termination_scope=str(item.get("termination_scope", "pid")).strip() or "pid",
                 pgid=pgid if pgid > 0 else 0,
                 registered_at=str(item.get("registered_at", "")).strip(),
+                supervision_token=(
+                    dict(item["supervision_token"])
+                    if isinstance(item.get("supervision_token"), dict)
+                    else None
+                ),
             )
         )
     return loaded
@@ -164,6 +170,7 @@ def register_process(
     command: str = "",
     termination_scope: str = "pid",
     pgid: int = 0,
+    supervision_token: SupervisionToken | None = None,
 ) -> None:
     if pid <= 0:
         return
@@ -188,6 +195,7 @@ def register_process(
             termination_scope=termination_scope,
             pgid=pgid if pgid > 0 else 0,
             registered_at=_now_iso(),
+            supervision_token=supervision_token.to_dict() if supervision_token is not None else None,
         )
     )
     payload = {
@@ -264,15 +272,22 @@ def reap_registered_processes(
             stale.append(f"{entry.name} pid={entry.pid} already exited")
             continue
 
-        identity = ProcessIdentity(entry.pid, entry.started_at, command=entry.command)
-        token = SupervisionToken(
-            LifetimeMode.RUN_OWNED,
-            identity,
-            os.getpid(),
-            "registry-reaper",
-            f"registry-{entry.pid}-{entry.started_at}",
-            entry.pgid if entry.termination_scope == "pgid" else 0,
-        )
+        if entry.supervision_token is not None:
+            token = SupervisionToken.from_dict(entry.supervision_token)
+        elif os.name == "posix":
+            identity = ProcessIdentity(entry.pid, entry.started_at, command=entry.command)
+            token = SupervisionToken(
+                LifetimeMode.RUN_OWNED,
+                identity,
+                os.getpid(),
+                "registry-reaper",
+                f"registry-{entry.pid}-{entry.started_at}",
+                entry.pgid if entry.termination_scope == "pgid" else 0,
+            )
+        else:
+            surviving.append(f"{entry.name} pid={entry.pid} has no Windows supervision token")
+            still_alive.append(entry)
+            continue
         if terminate(token, grace_seconds=timeout_seconds) and _wait_for_exit(entry, 1.0):
             terminated.append(f"{entry.name} pid={entry.pid} terminated")
             continue

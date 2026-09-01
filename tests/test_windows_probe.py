@@ -66,6 +66,7 @@ def test_cross_process_spec_lock_contention(tmp_path: Path) -> None:
 
 
 def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
+    from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
     from spec_runtime.worktree_process_registry import (
         is_process_alive,
         read_process_identity,
@@ -88,12 +89,7 @@ def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
         "subprocess.Popen([sys.executable,'-c',sys.argv[3],sys.argv[1],sys.argv[2],sys.argv[4]]); "
         "time.sleep(30)"
     )
-    popen_options = (
-        {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
-        if sys.platform == "win32"
-        else {"start_new_session": True}
-    )
-    parent = subprocess.Popen(
+    parent = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
         [
             sys.executable,
             "-c",
@@ -103,7 +99,6 @@ def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
             child_code,
             grandchild_code,
         ],
-        **popen_options,
     )
     pids = [parent.pid]
     identities = []
@@ -128,6 +123,7 @@ def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
             started_at=parent_identity.started_at,
             termination_scope="pgid",
             pgid=parent.pid,
+            supervision_token=parent.token,
         )
         report = reap_registered_processes(tmp_path, tmp_path / "worktree")
         assert not report.surviving

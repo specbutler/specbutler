@@ -34,6 +34,7 @@ def _kernel32() -> Any:
         "OpenProcess": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
         "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
         "GetProcessTimes": ([wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], wintypes.BOOL),
+        "GetExitCodeProcess": ([wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
         "QueryFullProcessImageNameW": ([wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)], wintypes.BOOL),
         "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
         "OpenJobObjectW": ([wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR], wintypes.HANDLE),
@@ -131,6 +132,14 @@ def _windows_identity(pid: int) -> ProcessIdentity | None:
         if not kernel32.GetProcessTimes(
             handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user)
         ):
+            return None
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return None
+        # A process object remains queryable while another process retains a
+        # handle to it.  That does not make the process live: only
+        # STILL_ACTIVE denotes a running process.
+        if exit_code.value != 259:
             return None
         ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
         size = wintypes.DWORD(32768)
@@ -300,6 +309,65 @@ def iter_processes() -> list[ProcessIdentity]:
     return identities
 
 
+def _windows_tree_identities(root_pid: int) -> list[ProcessIdentity]:
+    """Snapshot live descendants before closing or terminating their Job."""
+    if os.name != "nt":
+        return []
+    from ctypes import wintypes
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD),
+            ("usage", wintypes.DWORD),
+            ("pid", wintypes.DWORD),
+            ("default_heap", ctypes.POINTER(ctypes.c_ulong)),
+            ("module_id", wintypes.DWORD),
+            ("threads", wintypes.DWORD),
+            ("parent_pid", wintypes.DWORD),
+            ("priority", ctypes.c_long),
+            ("flags", wintypes.DWORD),
+            ("exe_file", wintypes.WCHAR * 260),
+        ]
+
+    kernel32 = _kernel32()
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)
+    if not snapshot:
+        return []
+    children: dict[int, list[int]] = {}
+    try:
+        entry = ProcessEntry()
+        entry.size = ctypes.sizeof(entry)
+        more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            children.setdefault(int(entry.parent_pid), []).append(int(entry.pid))
+            more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    pending = [root_pid]
+    seen: set[int] = set()
+    identities: list[ProcessIdentity] = []
+    while pending:
+        pid = pending.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        pending.extend(children.get(pid, ()))
+        identity = inspect_process(pid)
+        if identity is not None:
+            identities.append(identity)
+    return identities
+
+
+def _wait_for_identities_exit(identities: Sequence[ProcessIdentity], timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    pending = list(identities)
+    while pending and time.monotonic() < deadline:
+        pending = [identity for identity in pending if identity_matches(identity)]
+        if pending:
+            time.sleep(0.05)
+    return not any(identity_matches(identity) for identity in pending)
+
+
 class _BasicJobLimit(ctypes.Structure):
     _fields_ = [
         ("per_process", ctypes.c_longlong),
@@ -344,6 +412,17 @@ class _WindowsJob:
             self.close()
             raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
 
+    @classmethod
+    def open(cls, name: str) -> _WindowsJob | None:
+        kernel32 = _kernel32()
+        handle = kernel32.OpenJobObjectW(0x8, False, name)  # JOB_OBJECT_TERMINATE
+        if not handle:
+            return None
+        job = cls.__new__(cls)
+        job._kernel32 = kernel32
+        job.handle = handle
+        return job
+
     def assign(self, process_handle: int) -> None:
         if not self._kernel32.AssignProcessToJobObject(self.handle, process_handle):
             raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
@@ -360,6 +439,10 @@ class _WindowsJob:
 _LIVE_WINDOWS_JOBS: dict[tuple[int, str], _WindowsJob] = {}
 
 
+def _windows_job_name(token: str) -> str:
+    return f"Local\\SpecButler-{token}"
+
+
 class ManagedProcess:
     def __init__(self, process: subprocess.Popen[Any], token: SupervisionToken, job: _WindowsJob | None = None):
         self.process = process
@@ -370,15 +453,19 @@ class ManagedProcess:
         terminate(self.token, grace_seconds=grace_seconds, job=self._job)
 
     def wait(self, timeout: float | None = None) -> int:
+        tree = _windows_tree_identities(self.token.identity.pid)
         returncode = int(self.process.wait(timeout=timeout))
         self.close()
+        _wait_for_identities_exit(tree)
         return returncode
 
     def close(self) -> None:
         if self._job is not None:
+            tree = _windows_tree_identities(self.token.identity.pid)
             _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
             self._job.close()
             self._job = None
+            _wait_for_identities_exit(tree)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.process, name)
@@ -402,8 +489,11 @@ class ManagedAsyncProcess:
             self.process.kill()
 
     async def wait(self) -> int:
+        tree = _windows_tree_identities(self.token.identity.pid)
         returncode = int(await self.process.wait())
         self.close()
+        if tree:
+            await asyncio.to_thread(_wait_for_identities_exit, tree)
         return returncode
 
     async def communicate(self, input: bytes | None = None) -> tuple[bytes | None, bytes | None]:
@@ -413,9 +503,11 @@ class ManagedAsyncProcess:
 
     def close(self) -> None:
         if self._job is not None:
+            tree = _windows_tree_identities(self.token.identity.pid)
             _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
             self._job.close()
             self._job = None
+            _wait_for_identities_exit(tree)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.process, name)
@@ -430,12 +522,13 @@ class ProcessSupervisor:
 
     def spawn(self, argv: Sequence[str], **kwargs: Any) -> ManagedProcess:
         job = None
+        supervision_id = uuid.uuid4().hex
         if os.name == "nt":
             flags = int(kwargs.pop("creationflags", 0))
             if self.mode is LifetimeMode.RUN_OWNED:
                 flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
                 flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
-                job = _WindowsJob()
+                job = _WindowsJob(_windows_job_name(supervision_id))
             elif self.mode is LifetimeMode.ADOPTABLE:
                 # A detached helper is the durable Job-handle owner.  The
                 # dispatcher may exit or restart without closing the payload
@@ -465,7 +558,7 @@ class ProcessSupervisor:
             owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())
             owner = owner or ProcessIdentity(os.getpid(), "unavailable")
             pgid = 0 if is_test_double else os.getpgid(process.pid) if os.name == "posix" else 0
-            token = SupervisionToken(self.mode, identity, owner.pid, owner.started_at, uuid.uuid4().hex, pgid)
+            token = SupervisionToken(self.mode, identity, owner.pid, owner.started_at, supervision_id, pgid)
             if is_test_double:
                 setattr(process, "token", token)
                 return process  # type: ignore[return-value]
@@ -484,12 +577,13 @@ class ProcessSupervisor:
     async def spawn_async(self, argv: Sequence[str], **kwargs: Any) -> ManagedAsyncProcess:
         """Async counterpart with the same platform-owned launch policy."""
         job = None
+        supervision_id = uuid.uuid4().hex
         if os.name == "nt":
             flags = int(kwargs.pop("creationflags", 0))
             flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
             if self.mode is LifetimeMode.RUN_OWNED:
                 flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
-                job = _WindowsJob()
+                job = _WindowsJob(_windows_job_name(supervision_id))
             elif self.mode is LifetimeMode.ADOPTABLE:
                 argv = [sys.executable, "-m", "spec_runtime.process_supervisor", "--adoptable-helper", "--", *argv]
                 flags |= getattr(subprocess, "DETACHED_PROCESS", 0x8)
@@ -501,16 +595,25 @@ class ProcessSupervisor:
         process = await asyncio.create_subprocess_exec(*argv, **kwargs)
         try:
             if job is not None:
-                transport_process = process._transport.get_extra_info("subprocess")  # type: ignore[attr-defined]
-                process_handle = int(transport_process._handle)
-                job.assign(process_handle)
-                _resume_windows_process(process_handle)
-            identity = inspect_process(process.pid)
+                if isinstance(process, asyncio.subprocess.Process):
+                    transport_process = process._transport.get_extra_info("subprocess")  # type: ignore[attr-defined]
+                    process_handle = int(transport_process._handle)
+                    job.assign(process_handle)
+                    _resume_windows_process(process_handle)
+                else:
+                    # Explicit compatibility seam for lightweight async test
+                    # doubles. Real Windows asyncio processes must expose the
+                    # transport handle so assignment occurs before resume.
+                    job.close()
+                    job = None
+            is_test_double = not isinstance(process, asyncio.subprocess.Process)
+            identity = ProcessIdentity(process.pid, "test-double") if is_test_double else inspect_process(process.pid)
             if identity is None:
                 raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
-            owner = inspect_process(os.getpid()) or ProcessIdentity(os.getpid(), "unavailable")
-            pgid = os.getpgid(process.pid) if os.name == "posix" else 0
-            token = SupervisionToken(self.mode, identity, owner.pid, owner.started_at, uuid.uuid4().hex, pgid)
+            owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())
+            owner = owner or ProcessIdentity(os.getpid(), "unavailable")
+            pgid = 0 if is_test_double else os.getpgid(process.pid) if os.name == "posix" else 0
+            token = SupervisionToken(self.mode, identity, owner.pid, owner.started_at, supervision_id, pgid)
             managed = ManagedAsyncProcess(process, token, job)
             if job is not None:
                 _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
@@ -541,6 +644,7 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
         return False
     if job is None and os.name == "nt":
         job = _LIVE_WINDOWS_JOBS.get((token.identity.pid, token.identity.started_at))
+    tree = _windows_tree_identities(token.identity.pid)
     try:
         if os.name == "posix":
             os.killpg(token.pgid or token.identity.pid, signal.SIGTERM)
@@ -551,10 +655,14 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
     deadline = time.monotonic() + max(0.0, grace_seconds)
     while time.monotonic() < deadline:
         if not identity_matches(token.identity):
-            return True
+            return _wait_for_identities_exit(tree) if tree else True
         time.sleep(0.05)
     if not identity_matches(token.identity):
-        return True
+        return _wait_for_identities_exit(tree) if tree else True
+    reopened_job = None
+    if os.name == "nt" and job is None and token.mode is LifetimeMode.RUN_OWNED:
+        reopened_job = _WindowsJob.open(_windows_job_name(token.token))
+        job = reopened_job
     try:
         if os.name == "posix":
             os.killpg(token.pgid or token.identity.pid, signal.SIGKILL)
@@ -565,8 +673,13 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
             # still makes direct termination safe, but descendants are outside scope.
             os.kill(token.identity.pid, signal.SIGTERM)
     except (OSError, ValueError):
+        if reopened_job is not None:
+            reopened_job.close()
         return False
-    return True
+    result = _wait_for_identities_exit(tree) if tree else True
+    if reopened_job is not None:
+        reopened_job.close()
+    return result
 
 
 def adopt(token: SupervisionToken) -> SupervisionToken:

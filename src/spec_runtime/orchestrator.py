@@ -109,7 +109,7 @@ from .execution_backend import get_execution_backend as _factory_get_execution_b
 from .forge import GitHubForge, PushResult
 from .git_common import resolve_common_root
 from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
-from .process_supervisor import LifetimeMode, ProcessSupervisor
+from .process_supervisor import LifetimeMode, ProcessSupervisor, SupervisionToken
 from .spec_identity import (
     SPEC_ID_RE,
     authoring_branch_identity,
@@ -6018,6 +6018,7 @@ def _register_worktree_process(
     command: str = "",
     termination_scope: str = "pid",
     pgid: int = 0,
+    supervision_token: SupervisionToken | None = None,
 ) -> None:
     try:
         worktree_process_registry.register_process(
@@ -6030,6 +6031,7 @@ def _register_worktree_process(
             command=command,
             termination_scope=termination_scope,
             pgid=pgid,
+            supervision_token=supervision_token,
         )
     except Exception as exc:  # pragma: no cover - defensive best effort
         logger.warning(
@@ -6043,26 +6045,32 @@ def _register_worktree_process(
 def _register_worktree_process_from_popen(
     repo_root: Path,
     worktree_path: Path,
-    proc: subprocess.Popen[str] | subprocess.Popen[bytes] | None,
+    proc: subprocess.Popen[str] | subprocess.Popen[bytes] | object | None,
     *,
     name: str,
     kind: str,
 ) -> None:
     if proc is None:
         return
-    if type(proc).__module__ != "subprocess":
+    token = getattr(proc, "token", None)
+    if type(proc).__module__ != "subprocess" and token is None:
         return
-    try:
-        identity = read_process_identity(proc.pid)
-    except Exception as exc:  # pragma: no cover - defensive best effort
-        logger.warning(
-            "Could not inspect %s process %s for cleanup registration in %s: %s",
-            name,
-            proc.pid,
-            worktree_path,
-            exc,
-        )
+    if token is not None and token.identity.started_at == "test-double":
         return
+    if token is not None:
+        identity = token.identity
+    else:
+        try:
+            identity = read_process_identity(proc.pid)
+        except Exception as exc:  # pragma: no cover - defensive best effort
+            logger.warning(
+                "Could not inspect %s process %s for cleanup registration in %s: %s",
+                name,
+                proc.pid,
+                worktree_path,
+                exc,
+            )
+            return
     if identity is None:
         logger.warning(
             "Could not register %s process %s for cleanup in %s",
@@ -6081,6 +6089,7 @@ def _register_worktree_process_from_popen(
         command=identity.command,
         termination_scope="pgid",
         pgid=proc.pid if os.name == "posix" else 0,
+        supervision_token=token,
     )
 
 

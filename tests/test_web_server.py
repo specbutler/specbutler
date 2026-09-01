@@ -304,6 +304,7 @@ class TestServerLifecycle:
         with patch("socket.create_connection", side_effect=OSError("refused")):
             assert not _wait_for_port("127.0.0.1", 7700, timeout=0.3)
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX fork startup path")
     def test_background_start_fails_when_port_unavailable(self, tmp_path, capsys):
         """Background mode must return 1 when the child fails to bind."""
         with (
@@ -439,6 +440,7 @@ class TestServerLifecycle:
         assert rc == 0
         remove_pid.assert_called_once_with(tmp_path)
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX fork startup path")
     def test_logging_configured_before_backend_availability_check(self, tmp_path):
         """Regression: logging.basicConfig must run before log_backend_availability
         so that INFO-level startup diagnostics are visible."""
@@ -1203,7 +1205,7 @@ class TestAPIRoutes:
                 "spec_runtime.autopilot_tui.dashboard._resolve_live_process_group",
                 return_value=None,
             ),
-            patch("spec_runtime.web.api.os.getpgid") as getpgid,
+            patch("spec_runtime.web.api.os.getpgid", create=True) as getpgid,
             patch("spec_runtime.web.api.os.kill") as kill,
         ):
             client = self._make_client(tmp_path)
@@ -1231,8 +1233,8 @@ class TestAPIRoutes:
             ),
             patch("spec_runtime.autopilot.load_run_record_index", return_value=run_index),
             patch("spec_runtime.config.load_repo_spec_runtime_config") as mock_config,
-            patch("spec_runtime.web.api.os.getpgid") as getpgid,
-            patch("spec_runtime.web.api.os.killpg") as killpg,
+            patch("spec_runtime.web.api.os.getpgid", create=True) as getpgid,
+            patch("spec_runtime.web.api.os.killpg", create=True) as killpg,
         ):
             mock_config.return_value = MagicMock(paths=MagicMock(specs_dir="specs"))
             client = self._make_client(tmp_path)
