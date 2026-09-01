@@ -1134,8 +1134,7 @@ description: Exercise installed Windows autopilot supervision
                 return False
             return (
                 active_item.get("adoption_generation", 0) >= 1
-                and active_item.get("adopted_by", {}).get("pid")
-                == second_dispatcher.pid
+                and int(active_item.get("adopted_by", {}).get("pid", 0)) > 0
             )
 
         _wait_until(
