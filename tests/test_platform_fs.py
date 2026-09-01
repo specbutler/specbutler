@@ -80,7 +80,8 @@ def test_atomic_write_text_uses_bounded_temp_basename(
     atomic_write_text(path, '{"version": 1}\n')
     atomic_write_text(path, '{"version": 2}\n')
 
-    assert json.loads(path.read_text()) == {"version": 2}
+    read_path = _windows_extended_path(path) if os.name == "nt" else path
+    assert json.loads(read_path.read_text()) == {"version": 2}
     assert len(replaced_from) == 2
     for temporary in replaced_from:
         assert temporary.parent == path.parent

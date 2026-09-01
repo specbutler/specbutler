@@ -94,7 +94,18 @@ def test_identity_matches_accepts_darwin_framework_python_exec_transition(
     app.write_text("app", encoding="utf-8")
     venv_launcher = tmp_path / "venv" / "bin" / "python"
     venv_launcher.parent.mkdir(parents=True)
-    venv_launcher.symlink_to(stub)
+    # Model the venv launcher's resolved target without requiring Windows
+    # Developer Mode or administrator symlink privileges.  The behavior under
+    # test is identity comparison after Path.resolve(), not symlink creation.
+    venv_launcher.write_text("launcher", encoding="utf-8")
+    real_resolve = Path.resolve
+
+    def resolve_framework_alias(path: Path, strict: bool = False) -> Path:
+        if path == venv_launcher:
+            return stub
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_framework_alias)
     expected_executable, live_executable = (
         (str(app), str(venv_launcher)) if reverse else (str(venv_launcher), str(app))
     )
