@@ -684,6 +684,18 @@ def _load_durable_publication(
     return token
 
 
+def _same_durable_owner(candidate: SupervisionToken, token: SupervisionToken) -> bool:
+    """Compare immutable ownership fields while allowing payload promotion."""
+    return bool(
+        candidate.token == token.token
+        and candidate.mode is token.mode
+        and candidate.identity == token.identity
+        and candidate.job_name == token.job_name
+        and candidate.control_relpath == token.control_relpath
+        and candidate.control_nonce == token.control_nonce
+    )
+
+
 def _acknowledge_durable_publication(metadata_path: Path, token: SupervisionToken) -> None:
     """Tell a fast-exiting helper that the launcher retained its token."""
     payload = {
@@ -720,6 +732,16 @@ def _await_durable_publication(
     publisher: ProcessIdentity,
 ) -> None:
     """Retain the handshake until its live publisher has consumed it."""
+    try:
+        published = SupervisionToken.from_dict(
+            json.loads(metadata_path.read_text(encoding="utf-8"))
+        )
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        # Publication never completed, so there is nothing for the launcher
+        # to acknowledge and partial control state can be retired immediately.
+        return
+    if not _same_durable_owner(published, token):
+        return
     while identity_matches(publisher):
         if _durable_publication_acknowledged(metadata_path, token):
             return
@@ -738,9 +760,6 @@ def _retire_durable_records(metadata_path: Path, token: SupervisionToken) -> boo
         removed = False
         with FileLock(lock_path):
             try:
-                persisted = SupervisionToken.from_dict(
-                    json.loads(metadata_path.read_text(encoding="utf-8"))
-                )
                 state = json.loads(control_path.read_text(encoding="utf-8"))
                 payload_value = state.get("payload_identity")
                 if not isinstance(payload_value, dict):
@@ -749,26 +768,29 @@ def _retire_durable_records(metadata_path: Path, token: SupervisionToken) -> boo
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 return False
             if (
-                persisted.token != token.token
-                or persisted.mode is not token.mode
-                or persisted.identity != token.identity
-                or persisted.job_name != token.job_name
-                or persisted.control_relpath != token.control_relpath
-                or persisted.control_nonce != token.control_nonce
-                or not isinstance(state, dict)
+                not isinstance(state, dict)
                 or state.get("schema") != 2
                 or state.get("supervision_id") != token.token
                 or state.get("nonce") != token.control_nonce
                 or state.get("keeper_identity") != token.identity.to_dict()
             ):
                 return False
+            try:
+                persisted = SupervisionToken.from_dict(
+                    json.loads(metadata_path.read_text(encoding="utf-8"))
+                )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                persisted = None
+            metadata_owned = persisted is not None and _same_durable_owner(persisted, token)
             # Retire authorization before its discovery record. A crash
             # between these unlinks therefore leaves a fail-closed token.
             control_path.unlink(missing_ok=True)
-            metadata_path.unlink(missing_ok=True)
+            if metadata_owned:
+                metadata_path.unlink(missing_ok=True)
             removed = True
         if removed:
-            _durable_publication_ack_path(metadata_path).unlink(missing_ok=True)
+            if _durable_publication_acknowledged(metadata_path, token):
+                _durable_publication_ack_path(metadata_path).unlink(missing_ok=True)
             lock_path.unlink(missing_ok=True)
             try:
                 control_path.parent.rmdir()

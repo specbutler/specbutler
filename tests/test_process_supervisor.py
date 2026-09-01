@@ -558,6 +558,84 @@ def test_durable_helper_cleanup_never_masks_payload_baseexception(
         )
 
 
+def test_durable_helper_retires_control_after_metadata_publication_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class PublicationFailure(OSError):
+        pass
+
+    keeper = inspect_process(os.getpid())
+    assert keeper is not None
+    payload = ProcessIdentity(42, "payload", "python.exe")
+    supervision_id = "partial-publication"
+    child_token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        payload,
+        keeper.pid,
+        keeper.started_at,
+        supervision_id,
+    )
+
+    class Child:
+        token = child_token
+        returncode = 0
+
+        def owned_tree_active(self) -> bool:
+            return False
+
+        def wait(self) -> int:
+            return 0
+
+    class Supervisor:
+        def __enter__(self) -> Supervisor:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def spawn(self, _argv: object) -> Child:
+            return Child()
+
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path))
+    metadata_path = process_supervisor.durable_metadata_path(supervision_id)
+    control_relpath = f"controls/{supervision_id}/control.json"
+    control_path = tmp_path / control_relpath
+    control_nonce = "partial-publication-nonce"
+    real_atomic_write = process_supervisor.atomic_write_text
+
+    def fail_metadata_publication(path: Path, content: str) -> None:
+        if path == metadata_path:
+            raise PublicationFailure("metadata publication failed")
+        real_atomic_write(path, content)
+
+    monkeypatch.setattr(
+        process_supervisor,
+        "ProcessSupervisor",
+        lambda *_args, **_kwargs: Supervisor(),
+    )
+    monkeypatch.setattr(
+        process_supervisor,
+        "_stabilize_windows_payload_identity",
+        lambda _child: payload,
+    )
+    monkeypatch.setattr(process_supervisor, "atomic_write_text", fail_metadata_publication)
+
+    with pytest.raises(PublicationFailure):
+        process_supervisor._durable_helper(
+            metadata_path,
+            supervision_id,
+            LifetimeMode.DETACHED,
+            control_relpath,
+            control_nonce,
+            keeper,
+            [sys.executable, "-c", "pass"],
+        )
+
+    assert not metadata_path.exists()
+    assert not control_path.exists()
+    assert not control_path.with_suffix(".lock").exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")
 @pytest.mark.parametrize("action", ["normal", "stop", "owner-close"])
 def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: str) -> None:
