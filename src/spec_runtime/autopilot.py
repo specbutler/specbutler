@@ -75,6 +75,7 @@ from spec_runtime.process_supervisor import (
     ProcessSupervisor,
     SupervisionToken,
     adopt,
+    available_memory_bytes,
     inspect_process,
     iter_processes,
     process_cwd,
@@ -123,14 +124,6 @@ UI_HEURISTIC_RE = re.compile(
     r"\b(react|component|wizard|modal|css|frontend|page|form|ui|ux|layout|responsive)\b",
     re.IGNORECASE,
 )
-VM_STAT_PAGE_SIZE_RE = re.compile(r"page size of (?P<bytes>\d+) bytes", re.IGNORECASE)
-VM_STAT_RECLAIMABLE_KEYS = (
-    "pages free",
-    "pages inactive",
-    "pages speculative",
-)
-
-
 SPEC_RUNTIME_CONFIG = load_spec_runtime_config(require=False)
 
 
@@ -1504,76 +1497,6 @@ def is_retryable_failed_implement_run(run_record: dict) -> bool:
     if retry_cap > 0 and attempts >= retry_cap:
         return False
     return True
-
-
-def _meminfo_available_bytes() -> int | None:
-    """Linux MemAvailable — the kernel's estimate of memory usable by new
-    workloads INCLUDING reclaimable page cache. SC_AVPHYS_PAGES reports only
-    free pages, which on a warm-cache box underreports by an order of
-    magnitude and silently throttled autopilot concurrency to 1 on a 60GB
-    host with 53GB available."""
-    try:
-        with open("/proc/meminfo") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        return int(parts[1]) * 1024
-                    break
-    except OSError:
-        pass
-    return None
-
-
-def available_memory_bytes() -> int | None:
-    meminfo = _meminfo_available_bytes()
-    if meminfo is not None:
-        return meminfo
-
-    def read_sysconf(name: str) -> int | None:
-        try:
-            value = os.sysconf(name)
-        except (AttributeError, OSError, ValueError):
-            return None
-        if not isinstance(value, int) or value < 0:
-            return None
-        return value
-
-    pages = read_sysconf("SC_AVPHYS_PAGES")
-    page_size = read_sysconf("SC_PAGE_SIZE") or read_sysconf("SC_PAGESIZE")
-    if pages is not None and page_size is not None:
-        return pages * page_size
-
-    try:
-        result = subprocess.run(
-            ["vm_stat"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-
-    page_size_match = VM_STAT_PAGE_SIZE_RE.search(result.stdout)
-    if page_size_match is None:
-        return None
-
-    reclaimable_pages = 0
-    for line in result.stdout.splitlines():
-        if ":" not in line:
-            continue
-        key, raw_value = line.split(":", 1)
-        normalized_key = key.strip().lower()
-        if normalized_key not in VM_STAT_RECLAIMABLE_KEYS:
-            continue
-        digits = "".join(ch for ch in raw_value if ch.isdigit())
-        if not digits:
-            continue
-        reclaimable_pages += int(digits)
-
-    return reclaimable_pages * int(page_size_match.group("bytes"))
 
 
 def format_status_line(event: str, detail: str) -> str:

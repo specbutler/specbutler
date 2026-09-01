@@ -87,6 +87,17 @@ def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -
     assert identity_matches(expected) is False
 
 
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX ownership integration")
+def test_legacy_raw_popen_without_owned_group_fails_closed() -> None:
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])  # noqa: S603
+    try:
+        assert process_supervisor.terminate_legacy_popen_tree(process, grace_seconds=0) is False
+        assert process.poll() is None
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
 def test_adoptable_token_records_new_logical_owner(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

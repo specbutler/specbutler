@@ -4922,7 +4922,6 @@ class TestImplementLaunchRoutesThroughBackend:
             popen_kwargs={
                 "cwd": worktree,
                 "env": {"FOO": "bar"},
-                "start_new_session": True,
                 "text": True,
             },
             progress_tracker=None,
@@ -4942,9 +4941,9 @@ class TestImplementLaunchRoutesThroughBackend:
         # would receive duplicate keyword arguments).
         assert "cwd" not in request.popen_kwargs
         assert "env" not in request.popen_kwargs
-        # Supervision-only kwargs (start_new_session, text) must reach the
-        # backend so future transports can honor them when spawning.
-        assert request.popen_kwargs.get("start_new_session") is True
+        # Process ownership is backend policy, not a caller-supplied Popen
+        # option. Transport-neutral stream configuration is still forwarded.
+        assert "start_new_session" not in request.popen_kwargs
         assert request.popen_kwargs.get("text") is True
 
 

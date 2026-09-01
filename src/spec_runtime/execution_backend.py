@@ -39,7 +39,7 @@ from .config import (
     SpecRuntimeConfig,
 )
 from .platform_fs import FileLock, remove_tree
-from .process_supervisor import LifetimeMode, ProcessSupervisor
+from .process_supervisor import LifetimeMode, ManagedProcess, ProcessSupervisor
 from .process_supervisor import run as run_supervised
 
 CONTAINER_WORKER_ENV_DENYLIST = frozenset(
@@ -378,11 +378,11 @@ class CommandResult:
 class AgentRequest:
     """Request to launch an agent in a workspace.
 
-    ``popen_kwargs`` carries any extra keyword arguments the orchestrator
-    needs the backend to forward to ``subprocess.Popen`` (for example
-    ``start_new_session=True``, ``text=True``, or ``stdout=PIPE``). The
-    backend owns the actual process spawn so future backends can swap the
-    transport (Docker exec, remote shell) without the orchestrator caring.
+    ``popen_kwargs`` carries transport-neutral stream configuration the
+    orchestrator needs the backend to forward (for example ``text=True`` or
+    ``stdout=PIPE``). The backend owns process-group and platform launch policy
+    so future backends can swap the transport (Docker exec, remote shell)
+    without the orchestrator caring.
     """
 
     argv: list[str]
@@ -402,7 +402,7 @@ class AgentResult:
     stderr: str = ""
 
 
-AgentMonitor = Callable[["subprocess.Popen[Any]"], int]
+AgentMonitor = Callable[["ManagedProcess | subprocess.Popen[Any]"], int]
 
 
 @dataclass(frozen=True)
@@ -480,8 +480,11 @@ class ExecutionBackend(Protocol):
         is provided the backend starts the process and hands the live
         ``Popen`` to the caller, who supervises completion (process
         registration, progress streaming, idle timeouts) and returns the
-        final exit code. When ``monitor`` is ``None`` the backend runs the
-        command to completion and returns the captured result.
+        final exit code. Built-in backends provide a ``ManagedProcess`` that
+        owns its POSIX group or Windows Job; legacy custom backends may still
+        provide a raw ``Popen`` only when they establish an equivalent owned
+        boundary. When ``monitor`` is ``None`` the backend runs the command to
+        completion and returns the captured result.
         """
         ...
 

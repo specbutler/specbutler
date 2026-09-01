@@ -111,10 +111,13 @@ from .git_common import resolve_common_root
 from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
 from .process_supervisor import (
     LifetimeMode,
+    ManagedProcess,
     ProcessSupervisor,
     SupervisionToken,
     claim_current_process,
     identity_matches,
+    inspect_process,
+    terminate_legacy_popen_tree,
 )
 from .process_supervisor import run as run_supervised
 from .process_supervisor import terminate as terminate_supervised
@@ -4473,19 +4476,14 @@ def _run_local_review_subprocess(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
-        "start_new_session": True,
     }
     proc: subprocess.Popen[str] | None = None
     try:
         proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(cmd, **popen_kwargs)
         process_identity = read_process_identity(proc.pid)
         process_started_at = process_identity.started_at if process_identity is not None else ""
-        pgid = 0
-        if os.name == "posix":
-            try:
-                pgid = os.getpgid(proc.pid)
-            except OSError:
-                pgid = 0
+        token = getattr(proc, "token", None)
+        pgid = int(getattr(token, "pgid", 0) or 0)
         logger.info(
             "Started local review subprocess pid=%s pgid=%s cwd=%s timeout=%ss",
             proc.pid,
@@ -4561,12 +4559,8 @@ def _run_local_review_subprocess(
         )
     except subprocess.TimeoutExpired as exc:
         pid = proc.pid if proc is not None else 0
-        pgid = 0
-        if proc is not None and os.name == "posix":
-            try:
-                pgid = os.getpgid(proc.pid)
-            except OSError:
-                pgid = 0
+        token = getattr(proc, "token", None) if proc is not None else None
+        pgid = int(getattr(token, "pgid", 0) or 0)
         logger.warning(
             "Local review subprocess pid=%s pgid=%s timed out after %ss; terminating process group",
             pid or "n/a",
@@ -6262,31 +6256,13 @@ def _resolve_recorded_process_group(
 def read_process_identity(pid: int) -> ProcessIdentity | None:
     if pid <= 0:
         return None
-    try:
-        result = subprocess.run(
-            ["ps", "-ww", "-o", "pid=", "-o", "lstart=", "-o", "command=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    line = next((item.strip() for item in result.stdout.splitlines() if item.strip()), "")
-    if not line:
-        return None
-    parts = line.split(None, 6)
-    if len(parts) != 7:
-        return None
-    try:
-        live_pid = int(parts[0])
-    except ValueError:
+    identity = inspect_process(pid)
+    if identity is None:
         return None
     return ProcessIdentity(
-        pid=live_pid,
-        started_at=" ".join(parts[1:6]),
-        command=parts[6].strip(),
+        pid=identity.pid,
+        started_at=identity.started_at,
+        command=identity.command,
     )
 
 
@@ -14241,7 +14217,6 @@ def _prepare_implement_launch_plan(
     popen_kwargs: dict[str, object] = {
         "cwd": worktree_path,
         "env": agent_env,
-        "start_new_session": True,
         "text": True,
     }
     progress_tracker: AgentProgressTracker | None = None
@@ -15344,7 +15319,6 @@ def _attempt_no_handshake_recovery(
         popen_kwargs: dict[str, object] = {
             "cwd": worktree_path,
             "env": recovery_env,
-            "start_new_session": True,
             "text": True,
         }
         if run.agent == "claude" and use_stream_json:
@@ -16020,29 +15994,55 @@ def _start_codex_progress_thread(
     return thread
 
 
-def _terminate_agent_process(proc: subprocess.Popen[str]) -> None:
-    """Terminate an agent process group, escalating to SIGKILL if needed."""
+def _terminate_agent_process(proc: subprocess.Popen[str] | ManagedProcess) -> None:
+    """Terminate an owned agent tree, escalating after a bounded wait."""
     pid = getattr(proc, "pid", None)
-    if os.name != "posix" and pid is not None:
-        token = getattr(proc, "token", None)
-        if token is not None:
-            terminate_supervised(token, grace_seconds=AGENT_TERMINATE_TIMEOUT_SECONDS)
-            try:
-                proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                logger.error("Agent process %s did not terminate after hard termination", pid)
-            return
-        logger.error("Refusing PID-only termination of unsupervised Windows agent process %s", pid)
-        return
-    terminated = False
-    if pid is not None:
+    if isinstance(proc, ManagedProcess):
         try:
-            os.killpg(pid, signal.SIGTERM)
-            terminated = True
+            proc.terminate(grace_seconds=AGENT_TERMINATE_TIMEOUT_SECONDS)
         except (OSError, ProcessLookupError, PermissionError):
-            terminated = False
-    if not terminated:
+            pass
+
+        try:
+            proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        try:
+            proc.kill()
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
+
+        try:
+            proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.error("Agent process %s did not terminate after hard termination", pid)
+        return
+
+    try:
+        terminated = terminate_legacy_popen_tree(
+            proc,
+            grace_seconds=AGENT_TERMINATE_TIMEOUT_SECONDS,
+        )
+    except TypeError:
+        # Bounded compatibility for lightweight Popen-like test doubles. Real
+        # custom-backend processes must prove an owned boundary above.
+        terminated = None
+    if terminated is not None:
+        if not terminated:
+            logger.error("Refusing to terminate unowned legacy agent process %s", pid)
+            return
+        try:
+            proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.error("Legacy agent process %s remained after tree termination", pid)
+        return
+
+    try:
         proc.terminate()
+    except (OSError, ProcessLookupError, PermissionError):
+        pass
 
     try:
         proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
@@ -16050,20 +16050,15 @@ def _terminate_agent_process(proc: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         pass
 
-    killed = False
-    if pid is not None:
-        try:
-            os.killpg(pid, signal.SIGKILL)
-            killed = True
-        except (OSError, ProcessLookupError, PermissionError):
-            killed = False
-    if not killed:
+    try:
         proc.kill()
+    except (OSError, ProcessLookupError, PermissionError):
+        pass
 
     try:
         proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        logger.error("Agent process %s did not terminate after SIGKILL", pid)
+        logger.error("Agent process %s did not terminate after hard termination", pid)
 
 
 def _wait_for_agent_exit(

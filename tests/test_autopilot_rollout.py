@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import textwrap
 from pathlib import Path
+
+import pytest
 
 from spec_runtime import autopilot
 from spec_runtime.config import load_spec_runtime_config
 from spec_runtime.execution_backend import WorkspaceHandle
+from spec_runtime.process_supervisor import available_memory_bytes, system_memory_bytes
 
 
 def _write_config(path: Path, body: str) -> Path:
@@ -133,6 +137,36 @@ def test_computed_concurrency_uses_conservative_container_cap(tmp_path: Path) ->
     assert policy.cap == 2
     assert policy.source == "computed"
     assert policy.backend == "container"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows memory integration")
+def test_windows_available_memory_caps_computed_concurrency(tmp_path: Path) -> None:
+    available = available_memory_bytes()
+    total = system_memory_bytes()
+
+    assert available is not None and available > 0
+    assert total is not None and available <= total
+    available_mb = available // (1024 * 1024)
+    config = load_spec_runtime_config(
+        require=True,
+        config_path=_write_config(
+            tmp_path,
+            f"""
+            [autopilot]
+            worktree_memory_mb = {available_mb + 1}
+            """,
+        ),
+    )
+
+    policy = autopilot.compute_autopilot_concurrency(
+        config,
+        explicit=None,
+        host_cpus=64,
+    )
+
+    assert policy.host_memory_mb == available_mb
+    assert policy.memory_mb_per_run == available_mb + 1
+    assert policy.cap == 1
 
 
 def test_explicit_concurrency_is_honored_as_operator_set(tmp_path: Path) -> None:
@@ -497,17 +531,18 @@ def test_circuit_breaker_backoff_survives_large_failure_counts() -> None:
 def test_available_memory_prefers_meminfo_memavailable(tmp_path, monkeypatch):
     """SC_AVPHYS_PAGES excludes reclaimable page cache and throttled a 60GB
     host (53GB available) to concurrency 1; MemAvailable is authoritative."""
-    from spec_runtime import autopilot
+    from spec_runtime import autopilot, process_supervisor
 
-    monkeypatch.setattr(autopilot, "_meminfo_available_bytes", lambda: 54244352 * 1024)
+    monkeypatch.setattr(process_supervisor, "_meminfo_available_bytes", lambda: 54244352 * 1024)
     assert autopilot.available_memory_bytes() == 54244352 * 1024
+    assert autopilot.available_memory_bytes is process_supervisor.available_memory_bytes
 
 
 def test_meminfo_parser_reads_memavailable(tmp_path, monkeypatch):
     import builtins
     import io
 
-    from spec_runtime import autopilot
+    from spec_runtime import process_supervisor
 
     meminfo = "MemTotal:       61454336 kB\nMemFree:         3641344 kB\nMemAvailable:   54244352 kB\n"
     real_open = builtins.open
@@ -518,7 +553,7 @@ def test_meminfo_parser_reads_memavailable(tmp_path, monkeypatch):
         return real_open(path, *a, **kw)
 
     monkeypatch.setattr(builtins, "open", fake_open)
-    assert autopilot._meminfo_available_bytes() == 54244352 * 1024
+    assert process_supervisor._meminfo_available_bytes() == 54244352 * 1024
 
 
 class TestSourceStalenessWatch:

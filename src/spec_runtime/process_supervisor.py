@@ -12,6 +12,7 @@ import asyncio
 import ctypes
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -27,6 +28,14 @@ from typing import Any, Sequence
 from spec_runtime.platform_fs import FileLock, atomic_write_text
 
 _REAL_POPEN_TYPE = subprocess.Popen
+_VM_STAT_PAGE_SIZE_RE = re.compile(r"page size of (?P<bytes>\d+) bytes", re.IGNORECASE)
+_VM_STAT_RECLAIMABLE_KEYS = frozenset(
+    {
+        "pages free",
+        "pages inactive",
+        "pages speculative",
+    }
+)
 
 
 def _control_root() -> Path:
@@ -337,6 +346,60 @@ def system_memory_bytes() -> int | None:
         return None
 
 
+def _meminfo_available_bytes() -> int | None:
+    """Return Linux MemAvailable, including reclaimable page cache."""
+    try:
+        with open("/proc/meminfo") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].isdigit():
+                        return int(parts[1]) * 1024
+                    break
+    except OSError:
+        pass
+    return None
+
+
+def _sysconf_value(name: str) -> int | None:
+    try:
+        value = os.sysconf(name)
+    except (AttributeError, OSError, ValueError):
+        return None
+    return value if isinstance(value, int) and value >= 0 else None
+
+
+def _vm_stat_available_bytes() -> int | None:
+    """Return macOS reclaimable memory from vm_stat output."""
+    try:
+        result = subprocess.run(
+            ["vm_stat"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+
+    page_size_match = _VM_STAT_PAGE_SIZE_RE.search(result.stdout)
+    if page_size_match is None:
+        return None
+
+    reclaimable_pages = 0
+    for line in result.stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        if key.strip().lower() not in _VM_STAT_RECLAIMABLE_KEYS:
+            continue
+        digits = "".join(character for character in raw_value if character.isdigit())
+        if digits:
+            reclaimable_pages += int(digits)
+    return reclaimable_pages * int(page_size_match.group("bytes"))
+
+
 def available_memory_bytes() -> int | None:
     """Return memory available to new work, when the platform exposes it."""
     if os.name == "nt":
@@ -349,17 +412,14 @@ def available_memory_bytes() -> int | None:
         status = MemoryStatus()
         status.length = ctypes.sizeof(status)
         return int(status.avail_phys) if _kernel32().GlobalMemoryStatusEx(ctypes.byref(status)) else None
-    try:
-        with open("/proc/meminfo") as stream:
-            for line in stream:
-                if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) * 1024
-    except (OSError, ValueError, IndexError):
-        pass
-    try:
-        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_AVPHYS_PAGES"))
-    except (ValueError, OSError, AttributeError):
-        return None
+    meminfo = _meminfo_available_bytes()
+    if meminfo is not None:
+        return meminfo
+    pages = _sysconf_value("SC_AVPHYS_PAGES")
+    page_size = _sysconf_value("SC_PAGE_SIZE") or _sysconf_value("SC_PAGESIZE")
+    if pages is not None and page_size is not None:
+        return pages * page_size
+    return _vm_stat_available_bytes()
 
 
 def iter_processes() -> list[ProcessIdentity]:
@@ -1500,6 +1560,49 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
     except (OSError, ValueError):
         return False
     return _wait_for_identities_exit(tree) if tree else True
+
+
+def terminate_legacy_popen_tree(process: subprocess.Popen[Any], *, grace_seconds: float = 5.0) -> bool:
+    """Safely terminate a raw legacy ``Popen`` tree when ownership is provable.
+
+    Custom execution backends historically received ``start_new_session=True``
+    from workflow code and could hand their raw ``Popen`` back to the monitor.
+    The supervisor now owns launch policy, but this bounded compatibility seam
+    preserves those POSIX process-group semantics for a genuine group leader.
+    Windows raw PIDs are not Job capabilities, and a POSIX process in somebody
+    else's group is not an owned tree, so both cases fail closed.
+
+    ``TypeError`` distinguishes lightweight test doubles from genuine Popen
+    instances; callers may retain a narrow Popen-compatible mock fallback.
+    """
+    if not isinstance(process, _REAL_POPEN_TYPE):
+        raise TypeError("legacy process is not a real subprocess.Popen")
+    if process.poll() is not None:
+        return True
+    if os.name != "posix":
+        return False
+
+    identity = inspect_process(process.pid)
+    if identity is None:
+        return process.poll() is not None
+    try:
+        pgid = os.getpgid(process.pid)
+    except (OSError, ProcessLookupError):
+        return process.poll() is not None
+    if pgid != process.pid:
+        return False
+
+    owner = inspect_process(os.getpid())
+    token = SupervisionToken(
+        mode=LifetimeMode.RUN_OWNED,
+        identity=identity,
+        owner_pid=os.getpid(),
+        owner_started_at=owner.started_at if owner is not None else "unavailable",
+        token=uuid.uuid4().hex,
+        pgid=pgid,
+        version=1,
+    )
+    return terminate(token, grace_seconds=grace_seconds)
 
 
 def _same_durable_boundary(left: SupervisionToken, right: SupervisionToken) -> bool:

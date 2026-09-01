@@ -2803,7 +2803,6 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.os, "killpg", side_effect=OSError("no process group")),
             patch.object(
                 orch.subprocess,
                 "Popen",
@@ -3389,6 +3388,7 @@ class TestPhaseImplementHandshake:
         assert isinstance(request, eb.AgentRequest)
         assert request.argv == ["agent", "recover"]
         assert request.cwd == worktree
+        assert "start_new_session" not in request.popen_kwargs
 
     def test_no_handshake_after_recovery_fails_deterministically(self, repo: Path):
         run = self._make_run()
@@ -7488,7 +7488,9 @@ class TestSpecAutopilot:
         ) == ["macos", "slack", "ntfy:team"]
 
     def test_available_memory_bytes_falls_back_to_vm_stat(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(autopilot, "_meminfo_available_bytes", lambda: None)
+        from spec_runtime import process_supervisor
+
+        monkeypatch.setattr(process_supervisor, "_meminfo_available_bytes", lambda: None)
         vm_stat_output = textwrap.dedent("""\
             Mach Virtual Memory Statistics: (page size of 16384 bytes)
             Pages free:                               100.
@@ -7511,10 +7513,11 @@ class TestSpecAutopilot:
             assert check is False
             return subprocess.CompletedProcess(cmd, 0, stdout=vm_stat_output, stderr="")
 
-        monkeypatch.setattr(autopilot.os, "sysconf", fake_sysconf)
-        monkeypatch.setattr(autopilot.subprocess, "run", fake_run)
+        monkeypatch.setattr(process_supervisor.os, "sysconf", fake_sysconf)
+        monkeypatch.setattr(process_supervisor.subprocess, "run", fake_run)
 
         assert autopilot.available_memory_bytes() == (100 + 200 + 25) * 16384
+        assert autopilot.available_memory_bytes is process_supervisor.available_memory_bytes
 
     def test_run_loop_dry_run_refreshes_remote_refs_before_building_queue(
         self,
@@ -14290,6 +14293,7 @@ class TestImplementSetupTeardownHelpers:
         assert plan.agent_env["ANTHROPIC_API_KEY"] == "anthropic-secret"
         assert plan.agent_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
         assert plan.agent_env_redactions == ("anthropic-secret", "oauth-secret")
+        assert "start_new_session" not in plan.popen_kwargs
         assert (worktree / ".spec-claude-home" / ".claude.json").read_text() == (
             '{"oauthAccount":{"uuid":"u"}}'
         )
@@ -17045,6 +17049,7 @@ class TestLocalReviewHelpers:
         class FakeProcess:
             pid = 4321
             returncode = -15
+            token = SimpleNamespace(pgid=4321)
 
             def communicate(self, timeout: int):  # noqa: ARG002
                 return ("partial stdout\n", "partial stderr\n")
@@ -17053,7 +17058,7 @@ class TestLocalReviewHelpers:
 
         with caplog.at_level(logging.INFO, logger=orch.logger.name):
             with (
-                patch.object(orch.subprocess, "Popen", return_value=fake_proc),
+                patch.object(orch.ProcessSupervisor, "spawn", return_value=fake_proc) as spawn_process,
                 patch.object(
                     orch,
                     "read_process_identity",
@@ -17063,7 +17068,6 @@ class TestLocalReviewHelpers:
                         command="codex exec ...",
                     ),
                 ),
-                patch.object(orch.os, "getpgid", return_value=4321),
                 patch.object(orch, "_register_worktree_process_from_popen") as register_process,
                 patch.object(orch, "_prune_registered_worktree_processes") as prune_processes,
             ):
@@ -17077,6 +17081,7 @@ class TestLocalReviewHelpers:
                 )
 
         assert result.returncode == -15
+        assert "start_new_session" not in spawn_process.call_args.kwargs
         register_process.assert_called_once()
         prune_processes.assert_called_once_with(repo, worktree)
         payload = json.loads(artifact_paths["process_debug"].read_text())
@@ -17105,6 +17110,7 @@ class TestLocalReviewHelpers:
         class FakeProcess:
             pid = 9876
             returncode = None
+            token = SimpleNamespace(pgid=9876)
 
             def communicate(self, timeout: int):
                 raise subprocess.TimeoutExpired(
@@ -17121,7 +17127,7 @@ class TestLocalReviewHelpers:
 
         with caplog.at_level(logging.WARNING, logger=orch.logger.name):
             with (
-                patch.object(orch.subprocess, "Popen", return_value=fake_proc),
+                patch.object(orch.ProcessSupervisor, "spawn", return_value=fake_proc) as spawn_process,
                 patch.object(
                     orch,
                     "read_process_identity",
@@ -17131,7 +17137,6 @@ class TestLocalReviewHelpers:
                         command="codex exec ...",
                     ),
                 ),
-                patch.object(orch.os, "getpgid", return_value=9876),
                 patch.object(orch, "_register_worktree_process_from_popen"),
                 patch.object(orch, "_prune_registered_worktree_processes"),
                 patch.object(orch, "_terminate_agent_process", side_effect=mark_terminated) as terminate_process,
@@ -17147,6 +17152,7 @@ class TestLocalReviewHelpers:
                     )
 
         terminate_process.assert_called_once_with(fake_proc)
+        assert "start_new_session" not in spawn_process.call_args.kwargs
         payload = json.loads(artifact_paths["process_debug"].read_text())
         assert payload["pid"] == 9876
         assert payload["pgid"] == 9876
@@ -35399,6 +35405,146 @@ class TestStaleHandshakeGuards:
 
         assert strict is None
         assert compatible is not None
+
+
+def _write_sigterm_tree_script(tmp_path: Path) -> tuple[Path, list[Path], list[Path]]:
+    script = tmp_path / "sigterm-tree.py"
+    ready_paths = [tmp_path / f"ready-{level}" for level in range(2)]
+    term_paths = [tmp_path / f"term-{level}" for level in range(2)]
+    script.write_text(
+        "import signal,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "level=int(sys.argv[1]); root=Path(sys.argv[2])\n"
+        "def stop(*_args):\n"
+        "    (root / f'term-{level}').write_text('SIGTERM')\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "if level == 0:\n"
+        "    subprocess.Popen([sys.executable, __file__, '1', str(root)])\n"
+        "(root / f'ready-{level}').write_text('ready')\n"
+        "while True: time.sleep(.05)\n",
+        encoding="utf-8",
+    )
+    return script, ready_paths, term_paths
+
+
+def _wait_for_test_paths(paths: list[Path], timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not all(path.exists() for path in paths) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert all(path.exists() for path in paths)
+
+
+def test_read_process_identity_delegates_to_portable_boundary() -> None:
+    portable = ProcessIdentity(
+        pid=4321,
+        started_at="2026-08-31T12:34:56Z",
+        executable="python.exe",
+        command="python agent.py",
+    )
+
+    with patch.object(orch, "inspect_process", return_value=portable) as inspect:
+        legacy = orch.read_process_identity(4321)
+
+    inspect.assert_called_once_with(4321)
+    assert legacy == orch.ProcessIdentity(
+        pid=4321,
+        started_at="2026-08-31T12:34:56Z",
+        command="python agent.py",
+    )
+    assert type(legacy) is orch.ProcessIdentity
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX process-group integration")
+def test_terminate_agent_process_managed_posix_group_receives_sigterm(tmp_path: Path) -> None:
+    script, ready_paths, term_paths = _write_sigterm_tree_script(tmp_path)
+    managed = orch.ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, str(script), "0", str(tmp_path)]
+    )
+    try:
+        _wait_for_test_paths(ready_paths)
+        with patch.object(orch, "AGENT_TERMINATE_TIMEOUT_SECONDS", 2):
+            orch._terminate_agent_process(managed)
+        _wait_for_test_paths(term_paths)
+        assert [path.read_text(encoding="utf-8") for path in term_paths] == ["SIGTERM", "SIGTERM"]
+    finally:
+        if managed.poll() is None:
+            managed.kill()
+            managed.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX legacy process-group integration")
+def test_terminate_agent_process_raw_popen_preserves_owned_group_semantics(tmp_path: Path) -> None:
+    script, ready_paths, term_paths = _write_sigterm_tree_script(tmp_path)
+    process = subprocess.Popen(  # noqa: S603
+        [sys.executable, str(script), "0", str(tmp_path)],
+        start_new_session=True,
+    )
+    try:
+        _wait_for_test_paths(ready_paths)
+        with patch.object(orch, "AGENT_TERMINATE_TIMEOUT_SECONDS", 2):
+            orch._terminate_agent_process(process)
+        _wait_for_test_paths(term_paths)
+        assert [path.read_text(encoding="utf-8") for path in term_paths] == ["SIGTERM", "SIGTERM"]
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")
+def test_terminate_agent_process_managed_windows_job_kills_tree(tmp_path: Path) -> None:
+    pid_root = tmp_path / "windows-agent"
+    script = tmp_path / "windows-agent-tree.py"
+    script.write_text(
+        "import os,subprocess,sys,time\n"
+        "level=int(sys.argv[1]); root=sys.argv[2]\n"
+        "open(root+'-'+str(level),'w').write(str(os.getpid()))\n"
+        "if level == 0: subprocess.Popen([sys.executable,__file__,'1',root])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    managed = orch.ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, str(script), "0", str(pid_root)]
+    )
+    pid_paths = [Path(f"{pid_root}-{level}") for level in range(2)]
+    try:
+        _wait_for_test_paths(pid_paths)
+        identities = [int(path.read_text(encoding="utf-8")) for path in pid_paths]
+        with patch.object(orch, "AGENT_TERMINATE_TIMEOUT_SECONDS", 0.1):
+            orch._terminate_agent_process(managed)
+        deadline = time.monotonic() + 10
+        while any(orch.inspect_process(pid) is not None for pid in identities) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert all(orch.inspect_process(pid) is None for pid in identities)
+    finally:
+        if managed.poll() is None:
+            managed.kill()
+            managed.wait(timeout=5)
+
+
+def test_terminate_agent_process_supports_bounded_no_arg_legacy_double() -> None:
+    events: list[object] = []
+
+    class LegacyProcess:
+        pid = 4321
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def wait(self, timeout: float) -> int:
+            events.append(("wait", timeout))
+            if events.count("kill") == 0:
+                raise subprocess.TimeoutExpired("legacy-agent", timeout)
+            return -9
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    with patch.object(orch, "AGENT_TERMINATE_TIMEOUT_SECONDS", 0.25):
+        orch._terminate_agent_process(LegacyProcess())  # type: ignore[arg-type]
+
+    assert events == ["terminate", ("wait", 0.25), "kill", ("wait", 0.25)]
 
 
 class TestStaleDebuggerRequestAutoConsume:
