@@ -6,10 +6,12 @@ helpers and CLI dispatch work even when the ``[web]`` extras are not installed.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -206,6 +208,53 @@ def _supervision_path(repo_root: Path) -> Path:
     return _web_state_dir(repo_root) / "server.supervision.json"
 
 
+def _ready_path(repo_root: Path) -> Path:
+    return _web_state_dir(repo_root) / "server.ready.json"
+
+
+def _publish_ready_record(repo_root: Path, *, nonce: str, host: str, port: int) -> None:
+    """Authenticate readiness as a record written by the listening child."""
+    if not nonce:
+        return
+    from spec_runtime.platform_fs import atomic_write_text
+    from spec_runtime.process_supervisor import inspect_process
+
+    identity = inspect_process(os.getpid())
+    if identity is None:
+        raise RuntimeError("Could not record web payload identity")
+    payload = {
+        "nonce": nonce,
+        "payload_identity": identity.to_dict(),
+        "host": host,
+        "port": port,
+        "listener": f"{host}:{port}",
+    }
+    atomic_write_text(_ready_path(repo_root), json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _wait_for_ready_record(repo_root: Path, *, nonce: str, token: object, timeout: float = 10.0) -> bool:
+    from spec_runtime.process_supervisor import SupervisionToken, identity_matches
+
+    if not isinstance(token, SupervisionToken):
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            payload = json.loads(_ready_path(repo_root).read_text(encoding="utf-8"))
+            if (
+                payload.get("nonce") == nonce
+                and payload.get("payload_identity") == token.payload.to_dict()
+                and identity_matches(token.payload)
+            ):
+                return True
+        except (OSError, TypeError, json.JSONDecodeError):
+            pass
+        if not identity_matches(token.identity):
+            return False
+        time.sleep(0.02)
+    return False
+
+
 def write_supervision_token(repo_root: Path, token: object) -> None:
     import json
 
@@ -284,6 +333,7 @@ def remove_pid(repo_root: Path) -> None:
     if port_p.exists():
         port_p.unlink(missing_ok=True)
     _supervision_path(repo_root).unlink(missing_ok=True)
+    _ready_path(repo_root).unlink(missing_ok=True)
 
 
 def is_server_running(repo_root: Path) -> tuple[bool, int | None]:
@@ -294,6 +344,10 @@ def is_server_running(repo_root: Path) -> tuple[bool, int | None]:
         if identity_matches(supervision_token.identity) and identity_matches(supervision_token.payload):
             return True, supervision_token.payload.pid
         remove_pid(repo_root)
+        return False, None
+    if os.name == "nt":
+        # A PID record is diagnostic only on Windows; without the durable Job
+        # token there is no safe ownership primitive to inspect or signal.
         return False, None
     pid, stored_started_at = read_pid(repo_root)
     if pid is None:
@@ -481,6 +535,8 @@ def run_server(
 
             state_dir = _web_state_dir(repo_root)
             state_dir.mkdir(parents=True, exist_ok=True)
+            ready_nonce = uuid.uuid4().hex
+            _ready_path(repo_root).unlink(missing_ok=True)
             log_handle = open(state_dir / "server.log", "a", encoding="utf-8")  # noqa: SIM115
             command = [
                 sys.executable,
@@ -496,17 +552,19 @@ def run_server(
             if verbose:
                 command.append("--verbose")
             try:
+                child_env = os.environ.copy()
+                child_env["SPEC_WEB_READY_NONCE"] = ready_nonce
                 managed = ProcessSupervisor(LifetimeMode.DETACHED).spawn(
                     command,
                     cwd=repo_root,
                     stdin=subprocess.DEVNULL,
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
-                    env=os.environ.copy(),
+                    env=child_env,
                 )
             finally:
                 log_handle.close()
-            if not _wait_for_port(host, port):
+            if not _wait_for_ready_record(repo_root, nonce=ready_nonce, token=managed.token):
                 managed.terminate(grace_seconds=0.5)
                 remove_pid(repo_root)
                 print("spec web failed to start (see server.log).", file=sys.stderr)
@@ -623,6 +681,12 @@ def run_server(
             async def _startup_then_banner(**kw: object) -> None:
                 await _orig_startup(**kw)
                 if server.started:
+                    _publish_ready_record(
+                        repo_root,
+                        nonce=os.environ.get("SPEC_WEB_READY_NONCE", ""),
+                        host=host,
+                        port=port,
+                    )
                     print(
                         f"spec web running on http://{probe_host}:{port}",
                         file=sys.stderr,
@@ -662,8 +726,19 @@ def stop_server(repo_root: Path) -> int:
 
     supervision_token = read_supervision_token(repo_root)
     if isinstance(supervision_token, SupervisionToken):
-        terminate(supervision_token)
+        if not terminate(supervision_token):
+            print(
+                f"spec web failed to stop owned process tree (pid {pid}); supervision state retained.",
+                file=sys.stderr,
+            )
+            return 1
     else:
+        if os.name == "nt":
+            print(
+                "spec web cannot stop safely because its Windows supervision token is missing.",
+                file=sys.stderr,
+            )
+            return 1
         try:
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):

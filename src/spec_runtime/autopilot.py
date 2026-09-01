@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -481,6 +482,11 @@ class ActiveRunProcess:
     phase: str = "launching"
     process_started_at: str = ""
     supervision_token: dict[str, object] = field(default_factory=dict)
+    launch_state: str = "ready"
+    supervision_id: str = ""
+    ready_path: str = ""
+    adoption_generation: int = 0
+    adopted_by: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -1666,6 +1672,11 @@ def write_active_state(repo_root: Path, active: dict[str, ActiveRunProcess]) -> 
             "log_path": proc.log_path,
             "process_started_at": proc.process_started_at,
             "supervision_token": proc.supervision_token,
+            "launch_state": proc.launch_state,
+            "supervision_id": proc.supervision_id,
+            "ready_path": proc.ready_path,
+            "adoption_generation": proc.adoption_generation,
+            "adopted_by": proc.adopted_by,
         }
         for spec_id, proc in sorted(active.items())
     }
@@ -1711,6 +1722,16 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
         run_id = str(item.get("run_id", "")).strip()
         token_data = item.get("supervision_token", {})
         supervision_token = dict(token_data) if isinstance(token_data, dict) else {}
+        ready_path = str(item.get("ready_path", "")).strip()
+        if not supervision_token and ready_path:
+            try:
+                ready_payload = json.loads(Path(ready_path).read_text(encoding="utf-8"))
+                parsed_ready = SupervisionToken.from_dict(ready_payload)
+                supervision_token = parsed_ready.to_dict()
+                pid = parsed_ready.payload.pid
+                process_started_at = parsed_ready.payload.started_at
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
         if pid <= 0:
             continue
         if not process_started_at:
@@ -1754,6 +1775,11 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
                 phase=str(item.get("phase", "unknown")),
                 process_started_at=process_started_at,
                 supervision_token=supervision_token,
+                launch_state="ready",
+                supervision_id=str(item.get("supervision_id", "")),
+                ready_path=ready_path,
+                adoption_generation=int(item.get("adoption_generation", 0) or 0) + 1,
+                adopted_by={"pid": os.getpid()},
             )
             print(
                 format_status_line(
@@ -1793,6 +1819,11 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
             phase=str(item.get("phase", "unknown")),
             process_started_at=process_started_at,
             supervision_token=supervision_token,
+            launch_state="ready",
+            supervision_id=str(item.get("supervision_id", "")),
+            ready_path=ready_path,
+            adoption_generation=int(item.get("adoption_generation", 0) or 0) + 1,
+            adopted_by={"pid": os.getpid()},
         )
         print(format_status_line("adopt", f"{spec_id} pid={pid} phase={adopted[spec_id].phase}"))
     return adopted
@@ -2075,6 +2106,8 @@ def start_candidate(
     candidate: DispatchCandidate,
     *,
     preallocated_run_id: str = "",
+    supervision_id: str = "",
+    ready_path: str = "",
 ) -> ActiveRunProcess:
     state_root = autopilot_runs_root(repo_root)
     state_root.mkdir(parents=True, exist_ok=True)
@@ -2094,7 +2127,10 @@ def start_candidate(
     child_env["SPEC_ACTOR"] = "autopilot"
     if preallocated_run_id and not candidate.run_id:
         child_env["SPEC_PREALLOCATED_RUN_ID"] = preallocated_run_id
-    process = ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
+    process = ProcessSupervisor(
+        LifetimeMode.ADOPTABLE,
+        supervision_id=supervision_id or None,
+    ).spawn(
         command,
         cwd=repo_root,
         stdin=subprocess.DEVNULL,
@@ -2120,6 +2156,9 @@ def start_candidate(
         run_id=candidate.run_id or preallocated_run_id,
         process_started_at=identity.started_at,
         supervision_token=process.token.to_dict(),
+        launch_state="ready",
+        supervision_id=process.token.token,
+        ready_path=ready_path,
     )
     if proc.run_id:
         write_run_log_alias(repo_root, proc.run_id, proc.log_path)
@@ -2802,7 +2841,53 @@ def run_loop(args: argparse.Namespace) -> int:
                         lease_backoff_until[candidate.spec_id] = time.monotonic() + max(args.poll_interval * 3, 30)
                         print(format_status_line("warning", f"{candidate.spec_id} coordinator unavailable: {exc}"))
                         continue
-                    active_run = start_candidate(repo_root, candidate, preallocated_run_id=leased_run_id)
+                    supervision_id = uuid.uuid4().hex
+                    ready_path = str(repo_root / f".spec-supervisor-{supervision_id}.json")
+                    # Persist the reservation before spawning the durable
+                    # helper. A replacement dispatcher can recover from the
+                    # helper ready record if this process exits at any point
+                    # between spawn and the committed active payload record.
+                    active[candidate.spec_id] = ActiveRunProcess(
+                        spec_id=candidate.spec_id,
+                        agent=candidate.agent,
+                        pid=0,
+                        started_at=now_iso(),
+                        started_monotonic=time.monotonic(),
+                        log_path="",
+                        run_id=candidate.run_id or leased_run_id,
+                        launch_state="launching",
+                        supervision_id=supervision_id,
+                        ready_path=ready_path,
+                    )
+                    write_active_state(repo_root, active)
+                    try:
+                        try:
+                            active_run = start_candidate(
+                                repo_root,
+                                candidate,
+                                preallocated_run_id=leased_run_id,
+                                supervision_id=supervision_id,
+                                ready_path=ready_path,
+                            )
+                        except TypeError as exc:
+                            # Preserve the lightweight monkeypatch seam used by
+                            # older adapters/tests while production launchers
+                            # receive the stable reservation identity.
+                            if "unexpected keyword argument" not in str(exc):
+                                raise
+                            active_run = start_candidate(
+                                repo_root,
+                                candidate,
+                                preallocated_run_id=leased_run_id,
+                            )
+                    except BaseException:
+                        # Leave a reservation with a durable ready record in
+                        # place for restart recovery; remove only if no helper
+                        # ever published ownership.
+                        if not Path(ready_path).exists():
+                            active.pop(candidate.spec_id, None)
+                            write_active_state(repo_root, active)
+                        raise
                     active[candidate.spec_id] = active_run
                     write_active_state(repo_root, active)
                     detail = f"{candidate.spec_id} agent={candidate.agent} mode={candidate.reason}"

@@ -505,11 +505,16 @@ class _WindowsJob:
             raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
 
     def terminate(self, code: int = 1) -> None:
-        self._kernel32.TerminateJobObject(self.handle, code)
+        if not self.handle:
+            return
+        if not self._kernel32.TerminateJobObject(self.handle, code):
+            raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
 
     def close(self) -> None:
         if self.handle:
-            self._kernel32.CloseHandle(self.handle)
+            handle = self.handle
+            if not self._kernel32.CloseHandle(handle):
+                raise OSError(ctypes.get_last_error(), "CloseHandle failed")
             self.handle = None
 
 
@@ -574,13 +579,21 @@ def claim_current_process(supervision_id: str) -> SupervisionToken:
                     isinstance(request, dict)
                     and request.get("operation") == "stop"
                     and request.get("nonce") == nonce
+                    and isinstance(request.get("id"), str)
+                    and request.get("id")
                 ):
-                    # The orchestrator owns its normal cleanup semantics. Give
-                    # it the bounded grace interval, then enforce tree exit.
-                    time.sleep(5.0)
-                    retained = _CURRENT_WINDOWS_JOBS.get(supervision_id)
-                    if retained is not None:
-                        retained.terminate()
+                    # Acknowledge before asking Python's main thread to enter
+                    # its normal SIGTERM cleanup path. The external caller owns
+                    # the requested grace deadline and reopens the Job only as
+                    # a bounded hard fallback if cleanup does not finish.
+                    request_id = str(request["id"])
+                    with FileLock(control_path.with_suffix(".lock")):
+                        latest = json.loads(control_path.read_text(encoding="utf-8"))
+                        if latest.get("request") == request:
+                            latest["ack"] = request_id
+                            latest["state"] = "stopping"
+                            atomic_write_text(control_path, json.dumps(latest, sort_keys=True))
+                    signal.raise_signal(signal.SIGTERM)
                     return
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
@@ -665,8 +678,15 @@ def run(
     try:
         stdout, stderr = managed.communicate(input=input, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        managed.kill()
-        stdout, stderr = managed.communicate()
+        try:
+            managed.kill()
+            stdout, stderr = managed.communicate(timeout=5.0)
+        except (OSError, subprocess.TimeoutExpired):
+            # A failed Job termination must not turn a bounded command into an
+            # unbounded pipe drain. Closing the retained handle is the final
+            # kill-on-close attempt; preserve the original timeout result.
+            managed.close()
+            stdout, stderr = exc.output, exc.stderr
         exc.stdout = stdout
         exc.stderr = stderr
         exc.output = stdout
@@ -706,9 +726,13 @@ class ManagedAsyncProcess:
         try:
             result = await self.process.communicate(input)
         except BaseException:
-            self.kill()
-            await self.process.wait()
-            self.close()
+            try:
+                self.kill()
+                await asyncio.wait_for(self.process.wait(), timeout=5.0)
+            except (OSError, asyncio.TimeoutError):
+                pass
+            finally:
+                self.close()
             raise
         self.close()
         return result
@@ -802,8 +826,6 @@ class ProcessSupervisor:
                     payload_identity = helper_token.payload
                 except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     raise RuntimeError("Durable process supervisor did not publish payload identity") from exc
-                finally:
-                    metadata_path.unlink(missing_ok=True)
             job_name = _windows_job_name(supervision_id) if job is not None else ""
             if helper_token is not None:
                 job_name = helper_token.job_name
@@ -901,8 +923,6 @@ class ProcessSupervisor:
                     payload_identity = helper_token.payload
                 except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                     raise RuntimeError("Durable process supervisor did not publish payload identity") from exc
-                finally:
-                    metadata_path.unlink(missing_ok=True)
             job_name = _windows_job_name(supervision_id) if job is not None else ""
             if helper_token is not None:
                 job_name = helper_token.job_name
@@ -971,7 +991,12 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
                 and state.get("keeper_identity") == token.identity.to_dict()
                 and state.get("payload_identity") == token.payload.to_dict()
             ):
-                state["request"] = {"id": request_id, "operation": "stop", "nonce": token.control_nonce}
+                state["request"] = {
+                    "id": request_id,
+                    "operation": "stop",
+                    "nonce": token.control_nonce,
+                    "grace_seconds": max(0.0, grace_seconds),
+                }
                 atomic_write_text(control_path, json.dumps(state, sort_keys=True))
     deadline = time.monotonic() + max(0.0, grace_seconds)
     while time.monotonic() < deadline:
@@ -1034,9 +1059,17 @@ def adopt(token: SupervisionToken) -> SupervisionToken:
         }
         if any(state.get(key) != value for key, value in expected.items()):
             raise ValueError("adoptable token control record does not match")
-        if state.get("adopted_by") is not None:
-            raise ValueError("adoptable token was already adopted")
+        prior_owner = state.get("adopted_by")
+        if isinstance(prior_owner, dict):
+            try:
+                prior_identity = ProcessIdentity.from_dict(prior_owner)
+            except (TypeError, ValueError):
+                raise ValueError("adoptable token has invalid owner identity") from None
+            if identity_matches(prior_identity):
+                raise ValueError("adoptable token was already adopted")
+        generation = int(state.get("adoption_generation", 0) or 0) + 1
         state["adopted_by"] = owner.to_dict()
+        state["adoption_generation"] = generation
         atomic_write_text(control_path, json.dumps(state, sort_keys=True))
     adopted = SupervisionToken(
         token.mode,
@@ -1086,6 +1119,7 @@ def _durable_helper(
             "keeper_identity": token.identity.to_dict(),
             "payload_identity": token.payload.to_dict(),
             "adopted_by": None,
+            "adoption_generation": 0,
         }
         with FileLock(control_path.with_suffix(".lock")):
             atomic_write_text(control_path, json.dumps(state, sort_keys=True))

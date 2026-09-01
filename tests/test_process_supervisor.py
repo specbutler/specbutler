@@ -82,6 +82,9 @@ def test_adoptable_token_records_new_logical_owner(
         lambda pid: ProcessIdentity(pid, "new-owner", sys.executable),
     )
     assert adopt(token).owner_pid == os.getpid()
+    state = json.loads(control_path.read_text(encoding="utf-8"))
+    assert state["adoption_generation"] == 1
+    assert state["adopted_by"]["pid"] == os.getpid()
     with pytest.raises(ValueError, match="already adopted"):
         adopt(token)
 
@@ -265,7 +268,7 @@ def test_windows_background_web_server_survives_launcher_and_stops_by_token(tmp_
         assert identity_matches(token.identity)
         from spec_runtime.web.server import is_server_running, stop_server
 
-        assert is_server_running(tmp_path) == (True, token.identity.pid)
+        assert is_server_running(tmp_path) == (True, token.payload.pid)
         assert stop_server(tmp_path) == 0
         deadline = time.monotonic() + 10
         while identity_matches(token.identity) and time.monotonic() < deadline:
