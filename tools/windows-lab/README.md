@@ -99,7 +99,8 @@ The proof:
    first instruction runs, observes the dashboard, live status, selected-run
    detail, and chat screen, obtains a retained marker from a real Codex child,
    exits through the `q` binding, and verifies every exact provider/owned process
-   identity drains while the emergency Job backstop remains open and unused;
+   identity drains while the input pipe, ConPTY, and emergency Job backstop all
+   remain open and unused;
 9. retains the exact staged Git revision and sanitized logs under
    `tools/windows-lab/artifacts/<run-name>/`, then evaluates every one of the
    26 acceptance criteria in the three Windows specs against the checked-in

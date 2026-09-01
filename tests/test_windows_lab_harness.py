@@ -120,10 +120,10 @@ def test_windows_lab_has_complete_controller_surface() -> None:
         < main.index("AssignProcessToJobObject")
         < main.index("ResumeThread(")
     )
-    graceful = main[main.index("// q must end the root app") :]
+    graceful = main[main.index("// q must end the complete app tree") :]
     assert (
-        graceful.index("ClosePseudoConsole(pseudoConsole)")
-        < graceful.index("WaitForObservedExit(15, true)")
+        graceful.index("WaitForObservedExit(15, true)")
+        < graceful.index("ClosePseudoConsole(pseudoConsole)")
         < graceful.index("CloseHandle(empty watch Job)")
     )
     emergency = watch_harness[

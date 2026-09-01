@@ -1117,15 +1117,11 @@ public static class WatchConptyProof
             );
             Require(exitCode == 0, "spec watch exited with code " + exitCode);
 
-            // q must end the root app. Normal terminal teardown closes ConPTY,
-            // but the kill-on-close Job stays open throughout the descendant
-            // audit. A success therefore proves that no Job termination was
-            // needed to turn leaked children into an apparent clean result.
+            // q must end the complete app tree without help from any terminal
+            // or ownership teardown. Keep input, ConPTY, and the kill-on-close
+            // Job open throughout the descendant audit so none of those
+            // closures can turn leaked children into an apparent clean result.
             TrackDescendants();
-            inputWriter.Dispose();
-            inputWriter = null;
-            ClosePseudoConsole(pseudoConsole);
-            pseudoConsole = IntPtr.Zero;
             int remaining = WaitForObservedExit(15, true);
             int providerRemaining = CountAliveProviders();
             Require(
@@ -1134,6 +1130,14 @@ public static class WatchConptyProof
                     + DescribeAlive(Observed.Values)
             );
             Require(providerRemaining == 0, "Codex provider process survived q");
+
+            // The exact tree is already empty. Terminal teardown may now close
+            // its input and ConPTY before draining the reader; only then is the
+            // independently empty Job handle released.
+            inputWriter.Dispose();
+            inputWriter = null;
+            ClosePseudoConsole(pseudoConsole);
+            pseudoConsole = IntPtr.Zero;
             if (readerThread != null)
             {
                 Require(

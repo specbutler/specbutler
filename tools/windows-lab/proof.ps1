@@ -909,7 +909,7 @@ Set-EvidenceClaim `
         'watch-conpty-build.log',
         'watch-conpty-proof.log'
     ) `
-    -Detail 'The installed wheel module rendered dashboard, live status, detail, and per-spec chat through ConPTY; its suspended root was assigned to the Job before resume, a real Codex child returned the retained marker, and q drained every exact owned identity without emergency Job termination.'
+    -Detail 'The installed wheel module rendered dashboard, live status, detail, and per-spec chat through ConPTY; its suspended root was assigned to the Job before resume, a real Codex child returned the retained marker, and q drained every exact owned identity before any input, ConPTY, or Job teardown.'
 
 $operatorCodexHome = $env:CODEX_HOME
 if (-not $operatorCodexHome) {
