@@ -827,25 +827,30 @@ class TestCodexBridge:
 
         class _DummyProc:
             def __init__(self):
+                self.pid = 4242
                 self.stdin = _DummyStdin()
                 self.stdout = _HangingStdout()
                 self.stderr = _EmptyStderr()
                 self.returncode = None
+                self.terminated = False
+                self.waited = False
 
             def terminate(self):
-                return None
+                self.terminated = True
 
             def kill(self):
                 return None
 
             async def wait(self):
+                self.waited = True
                 return 0
 
         async def _run():
             session = _CodexSession(cwd="/tmp/test")
+            process = _DummyProc()
 
             async def fake_create_subprocess_exec(*_args, **_kwargs):
-                return _DummyProc()
+                return process
 
             # Only raise TimeoutError on the first wait_for call (the
             # handshake).  Subsequent calls (e.g. inside stop()) use
@@ -872,6 +877,9 @@ class TestCodexBridge:
             ):
                 with pytest.raises(RuntimeError, match="timed out during initialize"):
                     await session.start("system prompt")
+
+            assert process.terminated is True
+            assert process.waited is True
 
         asyncio.run(_run())
 
