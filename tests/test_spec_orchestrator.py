@@ -1266,6 +1266,68 @@ def _make_fake_popen(
     return FakePopen
 
 
+class _FakeManagedProcess:
+    """Managed-process test double that never enters native launch policy."""
+
+    def __init__(self, process: object):
+        self.process = process
+        identity = ProcessIdentity(
+            pid=int(getattr(process, "pid", 43210)),
+            started_at="test-double",
+            executable="test-agent",
+            command="test-agent",
+        )
+        self.token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            os.getpid(),
+            "test-double",
+            f"test-double-{identity.pid}",
+            pgid=identity.pid if os.name == "posix" else 0,
+            version=1 if os.name == "posix" else 2,
+        )
+
+    def terminate(self, grace_seconds: float = 5.0) -> None:
+        del grace_seconds
+        self.process.terminate()
+
+    def kill(self) -> None:
+        self.process.kill()
+
+    def __getattr__(self, name: str):
+        return getattr(self.process, name)
+
+
+def _managed_test_process(process: object) -> _FakeManagedProcess:
+    return _FakeManagedProcess(process)
+
+
+def _make_fake_managed_spawn(
+    returncode: int = 0,
+    captured_env: dict | None = None,
+    captured_proc: dict | None = None,
+    stdout_lines: list[str] | None = None,
+    poll_sequence: list[int | None] | None = None,
+):
+    """Return a ProcessSupervisor.spawn side effect for implement tests."""
+    fake_popen = _make_fake_popen(
+        returncode=returncode,
+        captured_env=captured_env,
+        captured_proc=captured_proc,
+        stdout_lines=stdout_lines,
+        poll_sequence=poll_sequence,
+    )
+
+    def spawn(cmd, cwd=None, env=None, **kwargs):
+        return _managed_test_process(fake_popen(cmd, cwd=cwd, env=env, **kwargs))
+
+    return spawn
+
+
+def _portable_success_command() -> list[str]:
+    return [sys.executable, "-c", "raise SystemExit(0)"]
+
+
 class TestPhaseImplementHandshake:
     @pytest.fixture(autouse=True)
     def _materialize_legacy_result_fixtures_after_prelaunch_clear(
@@ -1322,7 +1384,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -1338,7 +1400,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -1467,7 +1529,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["reviewhead", "reviewhead", "mergehead"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "_review_retry_allows_inferred_success", return_value=False),
@@ -1501,7 +1563,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["reviewhead", "reviewhead", "mergehead"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "_review_retry_allows_inferred_success", return_value=False),
@@ -1541,7 +1603,7 @@ class TestPhaseImplementHandshake:
             **kwargs: object,
         ) -> list[str]:
             captured_kwargs.update(kwargs)
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -1572,7 +1634,7 @@ class TestPhaseImplementHandshake:
             **kwargs: object,
         ) -> list[str]:
             captured_kwargs.update(kwargs)
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -1699,7 +1761,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -1744,7 +1806,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_launch_implement_attempt", side_effect=_launch_and_replace_steering),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
@@ -1771,7 +1833,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "def456"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -1803,7 +1865,7 @@ class TestPhaseImplementHandshake:
                 "_merge_origin_master",
                 return_value=orch.MergeOriginMasterResult(status="success"),
             ) as merge_mock,
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -1826,7 +1888,7 @@ class TestPhaseImplementHandshake:
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
             patch.object(orch, "_fetch_origin_master", return_value="") as fetch_mock,
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -1854,7 +1916,7 @@ class TestPhaseImplementHandshake:
             **_kwargs: object,
         ) -> list[str]:
             captured_retry_context["ctx"] = retry_context
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -1941,7 +2003,7 @@ class TestPhaseImplementHandshake:
             **_kwargs: object,
         ) -> list[str]:
             captured_retry_context["ctx"] = retry_context
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -2023,7 +2085,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen(captured_env=captured_env)),
+            patch.object(
+                orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn(captured_env=captured_env)
+            ),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2097,7 +2161,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2168,7 +2232,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2238,7 +2302,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2315,7 +2379,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2382,7 +2446,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2454,7 +2518,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2525,7 +2589,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2689,7 +2753,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "def456"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -2714,7 +2778,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -2735,7 +2799,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2764,7 +2828,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
             patch.object(orch, "_run_implement_teardown_command", side_effect=fake_teardown),
@@ -2804,9 +2868,9 @@ class TestPhaseImplementHandshake:
                 ),
             ),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(
                     captured_proc=captured_proc,
                     poll_sequence=[None, None, None],
                 ),
@@ -2826,6 +2890,7 @@ class TestPhaseImplementHandshake:
 
         proc = MagicMock(pid=777)
         proc.poll.return_value = None
+        managed = _managed_test_process(proc)
 
         def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None):  # noqa: ANN001, ARG001
             if cmd[:2] == ["git", "log"]:
@@ -2847,7 +2912,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", return_value=proc),
+            patch.object(orch.ProcessSupervisor, "spawn", return_value=managed),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2856,7 +2921,7 @@ class TestPhaseImplementHandshake:
         register_process.assert_called_once_with(
             repo,
             worktree,
-            proc,
+            managed,
             name="agent",
             kind="agent",
         )
@@ -2888,7 +2953,7 @@ class TestPhaseImplementHandshake:
             **kwargs: object,
         ) -> list[str]:
             captured_kwargs.update(kwargs)
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -2970,7 +3035,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3059,7 +3124,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3103,9 +3168,9 @@ class TestPhaseImplementHandshake:
                 ),
             ),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(poll_sequence=[None, None, None, 0]),
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(poll_sequence=[None, None, None, 0]),
             ),
             caplog.at_level("WARNING"),
         ):
@@ -3149,7 +3214,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3166,7 +3231,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "def456"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -3272,7 +3337,7 @@ class TestPhaseImplementHandshake:
             call_order.append("recovery-build" if kwargs.get("retry_context") is not None else "initial-build")
             return ["agent"]
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cwd, env, kwargs
             if len(build_calls) >= 2:
                 orch.ImplementResult(
@@ -3281,7 +3346,7 @@ class TestPhaseImplementHandshake:
                     attempt=run.attempts,
                     launch_number=run.implement_launches,
                 ).save(repo, run.run_id)
-            return _make_fake_popen(returncode=0)(cmd)
+            return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -3302,7 +3367,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3367,8 +3432,8 @@ class TestPhaseImplementHandshake:
                 patch.object(orch, "_write_sandbox_config"),
                 patch.object(orch, "_build_agent_command", return_value=["agent", "recover"]),
                 patch.object(
-                    orch.subprocess,
-                    "Popen",
+                    orch.ProcessSupervisor,
+                    "spawn",
                     side_effect=AssertionError("recovery bypassed execution backend"),
                 ),
             ):
@@ -3404,9 +3469,9 @@ class TestPhaseImplementHandshake:
             build_calls.append(kwargs)
             return ["agent"]
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cwd, env, kwargs
-            return _make_fake_popen(returncode=0)(cmd)
+            return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -3416,7 +3481,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3454,9 +3519,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CODEX_IDLE_TIMEOUT_SECONDS", 0),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(
                     captured_proc=captured_proc,
                     poll_sequence=[None, None, None, None],
                 ),
@@ -3495,9 +3560,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CODEX_IDLE_TIMEOUT_SECONDS", 0),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(poll_sequence=[None, None, None, None]),
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(poll_sequence=[None, None, None, None]),
             ),
         ):
             status = orch.phase_implement(run, repo)
@@ -3535,9 +3600,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CLAUDE_IDLE_TIMEOUT_SECONDS", 0),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(
                     captured_proc=captured_proc,
                     poll_sequence=[None, None, None, None],
                 ),
@@ -3576,9 +3641,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CLAUDE_IDLE_TIMEOUT_SECONDS", 0),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(poll_sequence=[None, None, None, None]),
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(poll_sequence=[None, None, None, None]),
             ),
         ):
             status = orch.phase_implement(run, repo)
@@ -3603,7 +3668,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CLAUDE_IDLE_TIMEOUT_SECONDS", 0),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3659,7 +3724,9 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen(captured_env=captured_env)),
+            patch.object(
+                orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn(captured_env=captured_env)
+            ),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -3726,7 +3793,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3784,7 +3851,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3855,7 +3922,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3900,7 +3967,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             orch.phase_implement(run, repo)
 
@@ -3954,7 +4021,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen(0)),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn(0)),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3975,7 +4042,7 @@ class TestPhaseImplementHandshake:
             calls.append("recovery-build" if kwargs.get("retry_context") is not None else "initial-build")
             return ["agent"]
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cwd, env, kwargs
             if calls.count("recovery-build") == 1:
                 orch.ImplementResult(
@@ -3984,7 +4051,7 @@ class TestPhaseImplementHandshake:
                     attempt=run.attempts,
                     launch_number=run.implement_launches,
                 ).save(repo, run.run_id)
-            return _make_fake_popen(returncode=0)(cmd)
+            return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -4002,7 +4069,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4032,7 +4099,7 @@ class TestPhaseImplementHandshake:
                 )
             return orch.ImplementSetupManifest()
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cmd, cwd, kwargs
             launch_env = dict(env or {})
             popen_envs.append(launch_env)
@@ -4044,7 +4111,7 @@ class TestPhaseImplementHandshake:
                     attempt=run.attempts,
                     launch_number=run.implement_launches,
                 ).save(repo, run.run_id)
-            return _make_fake_popen(returncode=0)(["agent"])
+            return _managed_test_process(_make_fake_popen(returncode=0)(["agent"]))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -4054,7 +4121,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_build_agent_command", return_value=["agent"]),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
             patch.dict(orch.os.environ, {"BASE_ENV": "present"}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -4131,7 +4198,7 @@ class TestPhaseImplementHandshake:
                 recovery_call_index.append(len(captured_kwargs) - 1)
             return ["agent"]
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cwd, kwargs
             captured_envs.append(dict(env or {}))
             if recovery_call_index:
@@ -4141,7 +4208,7 @@ class TestPhaseImplementHandshake:
                     attempt=run.attempts,
                     launch_number=run.implement_launches,
                 ).save(repo, run.run_id)
-            return _make_fake_popen(returncode=0)(cmd)
+            return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -4151,7 +4218,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4205,7 +4272,11 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", side_effect=FileNotFoundError("agent missing")),
+            patch.object(
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=FileNotFoundError("agent missing"),
+            ),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4255,9 +4326,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_validate_codex_exec", return_value=True),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(returncode=0, captured_env=captured_env),
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(returncode=0, captured_env=captured_env),
             ),
             patch.dict(orch.os.environ, {"PATH": "/usr/bin:/bin"}, clear=True),
         ):
@@ -6396,6 +6467,17 @@ class TestDistributedLeaseIntegration:
         )
         monkeypatch.setattr(orch, "LEASE_HEARTBEAT_INTERVAL_SECONDS", 0.05)
         heartbeat_calls = 0
+        termination_grace: list[float] = []
+        original_terminate = process_supervisor.ManagedProcess.terminate
+
+        def track_terminate(
+            managed: process_supervisor.ManagedProcess,
+            grace_seconds: float = 5.0,
+        ) -> None:
+            termination_grace.append(grace_seconds)
+            original_terminate(managed, grace_seconds=grace_seconds)
+
+        monkeypatch.setattr(process_supervisor.ManagedProcess, "terminate", track_terminate)
 
         class FakeClient:
             def heartbeat_lease(self, lease_id, payload):
@@ -6427,6 +6509,7 @@ class TestDistributedLeaseIntegration:
         assert result == "failed"
         assert time.monotonic() - started_at < 5
         assert heartbeat_calls >= 2
+        assert termination_grace == [0]
         assert "owner=machine-b" in run.last_error
 
     def test_autopilot_acquires_candidate_lease_before_launch(self, repo: Path):
@@ -33448,6 +33531,7 @@ class TestLocalReviewCommandAcceptsMcpConfig:
 class TestStopRunDeadProcess:
     """stop_run() should transition to failed when the process is already dead."""
 
+    @pytest.mark.skipif(os.name != "posix", reason="legacy POSIX process-group record")
     def test_dead_process_transitions_to_failed(self, repo: Path, monkeypatch: pytest.MonkeyPatch):
         run = orch.RunState(
             run_id="my-feature-20260101T000000",
@@ -33498,6 +33582,7 @@ class TestStopRunDeadProcess:
         stopped_token = stop_supervised.call_args.args[0]
         assert stopped_token.identity == identity
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX V1 supervision token")
     def test_posix_v1_supervision_token_uses_portable_stop_boundary(
         self, repo: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -33583,6 +33668,7 @@ class TestStopRunDeadProcess:
 
         assert orch.RunState.load(repo, run.run_id).status == "running"
 
+    @pytest.mark.skipif(os.name != "posix", reason="legacy POSIX process-group record")
     def test_dead_process_non_running_state_raises(self, repo: Path, monkeypatch: pytest.MonkeyPatch):
         run = orch.RunState(
             run_id="my-feature-20260101T000000",
@@ -33600,6 +33686,7 @@ class TestStopRunDeadProcess:
         with pytest.raises(RuntimeError, match="No live process"):
             orch.stop_run("my-feature", repo_root=repo)
 
+    @pytest.mark.skipif(os.name != "posix", reason="legacy POSIX process-group record")
     def test_dead_process_does_not_clobber_completed_run(self, repo: Path, monkeypatch: pytest.MonkeyPatch):
         """If the run completes between the snapshot and the lock, don't overwrite."""
         run = orch.RunState(
@@ -33634,6 +33721,7 @@ class TestStopRunDeadProcess:
         assert result.status == "passed"
 
     @pytest.mark.parametrize("reason", ["orphaned leader", "reused leader pid"])
+    @pytest.mark.skipif(os.name != "posix", reason="legacy POSIX process-group record")
     def test_live_group_without_matching_leader_fails_closed(
         self,
         repo: Path,

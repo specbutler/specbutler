@@ -4436,7 +4436,10 @@ def run_subprocess(
     while True:
         failure_message = _active_phase_lease_failure_message()
         if failure_message:
-            proc.terminate()
+            # Losing the distributed lease revokes our authority to keep doing
+            # mutating work. Do not spend the normal graceful-stop window on a
+            # child that must cease immediately; terminate the owned tree now.
+            proc.terminate(grace_seconds=0)
             try:
                 proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:

@@ -862,17 +862,18 @@ def test_windows_claimed_current_process_token_stops_from_another_process(
         [sys.executable, str(helper), supervision_id, str(state_path), str(stopped_path)],
         env=os.environ.copy(),
     )
+    token: SupervisionToken | None = None
     try:
         deadline = time.monotonic() + 10
         while not state_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         assert state_path.exists()
         payload = json.loads(state_path.read_text(encoding="utf-8"))
-        assert payload["helper_pid"] == process.pid
         token = SupervisionToken.from_dict(payload["token"])
+        helper_pid = int(payload["helper_pid"])
         assert token.version == 2
-        assert token.identity.pid != os.getpid()
-        assert token.identity.pid == process.pid
+        assert helper_pid == token.identity.pid
+        assert helper_pid != os.getpid()
         assert token.job_name
         assert token.control_relpath
 
@@ -884,9 +885,16 @@ def test_windows_claimed_current_process_token_stops_from_another_process(
         )
         assert completed.returncode == 0
         process.wait(timeout=10)
+        assert process.returncode is not None
         assert stopped_path.read_text(encoding="utf-8") == "stopped"
-        assert inspect_process(process.pid) is None
+        assert inspect_process(helper_pid) is None
     finally:
+        if (
+            token is not None
+            and token.identity.pid != os.getpid()
+            and inspect_process(token.identity.pid) is not None
+        ):
+            process_supervisor.stop_supervised_process(token, grace_seconds=0)
         if process.pid != os.getpid() and process.poll() is None:
             process.kill()
         process.wait(timeout=5)
