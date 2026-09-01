@@ -1415,8 +1415,23 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
 
     # Model a Windows checkout on Linux: the worktree is fully CRLF-smudged,
     # while the exact committed blob remains LF.
-    labctl.write_bytes(labctl.read_bytes().replace(b"\n", b"\r\n"))
-    verifier.write_bytes(verifier.read_bytes().replace(b"\n", b"\r\n"))
+    labctl.write_bytes(
+        subprocess.check_output(
+            ["git", "--no-replace-objects", "show", f"{revision}:tools/windows-lab/labctl"],
+            cwd=repo,
+        ).replace(b"\n", b"\r\n")
+    )
+    verifier.write_bytes(
+        subprocess.check_output(
+            [
+                "git",
+                "--no-replace-objects",
+                "show",
+                f"{revision}:tools/windows-lab/exact_harness.py",
+            ],
+            cwd=repo,
+        ).replace(b"\n", b"\r\n")
+    )
     assert b"\r\n" in labctl.read_bytes()
 
     output = tmp_path / "exact.json"
