@@ -50,6 +50,14 @@ def _control_path(relpath: str) -> Path:
         raise ValueError("invalid supervision control path")
     return resolved
 
+
+def durable_metadata_path(supervision_id: str) -> Path:
+    """Return the writable, launcher-independent helper handshake path."""
+    if not supervision_id or Path(supervision_id).name != supervision_id:
+        raise ValueError("invalid supervision id")
+    return _control_root() / "metadata" / f"{supervision_id}.json"
+
+
 def _kernel32() -> Any:
     """Return kernel32 with pointer-width-safe declarations."""
     from ctypes import wintypes
@@ -788,7 +796,7 @@ class ProcessSupervisor:
                 # A detached helper is the durable Job-handle owner.  The
                 # dispatcher may exit or restart without closing the payload
                 # Job; a replacement validates and adopts the helper token.
-                metadata_path = Path(kwargs.get("cwd") or os.getcwd()) / f".spec-supervisor-{supervision_id}.json"
+                metadata_path = durable_metadata_path(supervision_id)
                 helper_argv = [
                     sys.executable,
                     "-m",
@@ -886,7 +894,7 @@ class ProcessSupervisor:
                 flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
                 job = _WindowsJob(_windows_job_name(supervision_id))
             elif self.mode in {LifetimeMode.ADOPTABLE, LifetimeMode.DETACHED}:
-                metadata_path = Path(kwargs.get("cwd") or os.getcwd()) / f".spec-supervisor-{supervision_id}.json"
+                metadata_path = durable_metadata_path(supervision_id)
                 argv = [
                     sys.executable,
                     "-m",

@@ -2927,7 +2927,12 @@ def run_loop(args: argparse.Namespace) -> int:
                         print(format_status_line("warning", f"{candidate.spec_id} coordinator unavailable: {exc}"))
                         continue
                     supervision_id = uuid.uuid4().hex
-                    ready_path = str(repo_root / f".spec-supervisor-{supervision_id}.json")
+                    if os.name == "nt":
+                        from spec_runtime.process_supervisor import durable_metadata_path
+
+                        ready_path = str(durable_metadata_path(supervision_id))
+                    else:
+                        ready_path = str(repo_root / f".spec-supervisor-{supervision_id}.json")
                     # Persist the reservation before spawning the durable
                     # helper. A replacement dispatcher can recover from the
                     # helper ready record if this process exits at any point

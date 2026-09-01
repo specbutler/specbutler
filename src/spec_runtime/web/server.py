@@ -217,6 +217,10 @@ def _launch_path(repo_root: Path) -> Path:
 
 
 def _helper_metadata_path(repo_root: Path, supervision_id: str) -> Path:
+    if os.name == "nt":
+        from spec_runtime.process_supervisor import durable_metadata_path
+
+        return durable_metadata_path(supervision_id)
     return repo_root / f".spec-supervisor-{supervision_id}.json"
 
 

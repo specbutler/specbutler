@@ -168,6 +168,39 @@ def test_managed_process_keeps_live_job_registered_when_close_handle_fails(
     assert managed._job is job
 
 
+def test_managed_process_wait_closes_job_after_leader_exit() -> None:
+    events: list[str] = []
+    identity = ProcessIdentity(42, "created")
+    token = SupervisionToken(LifetimeMode.RUN_OWNED, identity, 7, "owner", "normal-wait")
+
+    class Process:
+        def wait(self, timeout: float | None = None) -> int:
+            events.append(f"wait:{timeout}")
+            return 23
+
+    class Job:
+        def close(self) -> None:
+            events.append("close")
+
+    managed = process_supervisor.ManagedProcess(Process(), token, Job())  # type: ignore[arg-type]
+    assert managed.wait(timeout=2.0) == 23
+    assert events == ["wait:2.0", "close"]
+    assert managed._job is None
+
+
+def test_durable_metadata_path_is_independent_of_payload_cwd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    control_root = tmp_path / "writable-controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(control_root))
+    monkeypatch.chdir(tmp_path)
+
+    path = process_supervisor.durable_metadata_path("stable-id")
+
+    assert path == control_root / "metadata" / "stable-id.json"
+    assert path.parent != tmp_path
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")
 @pytest.mark.parametrize("action", ["normal", "timeout", "stop", "owner-close"])
 def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: str) -> None:

@@ -31,6 +31,7 @@ def _token(name: str) -> SupervisionToken:
 
 def _reserve(tmp_path, token: SupervisionToken, nonce: str = "starting") -> None:
     helper_path = _helper_metadata_path(tmp_path, token.token)
+    helper_path.parent.mkdir(parents=True, exist_ok=True)
     helper_path.write_text(json.dumps(token.to_dict()), encoding="utf-8")
     _write_launch_reservation(
         tmp_path,
