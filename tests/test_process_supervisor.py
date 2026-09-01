@@ -204,6 +204,10 @@ def test_windows_detached_workflows_survive_launcher_and_stop_by_identity(tmp_pa
 def test_windows_background_web_server_survives_launcher_and_stops_by_token(tmp_path: Path) -> None:
     """Exercise the real web start/status/stop lifecycle, including its persisted token."""
     pytest.importorskip("uvicorn")
+    config_path = tmp_path / ".spec.toml"
+    config_path.write_text('base_ref = "origin/main"\n', encoding="utf-8")
+    launcher_env = os.environ.copy()
+    launcher_env["SPEC_CONFIG"] = str(config_path)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = int(listener.getsockname()[1])
@@ -212,7 +216,12 @@ def test_windows_background_web_server_survives_launcher_and_stops_by_token(tmp_
         "from spec_runtime.web.server import run_server; "
         "raise SystemExit(run_server(Path(sys.argv[1]),port=int(sys.argv[2]),background=True))"
     )
-    subprocess.run([sys.executable, "-c", launch, str(tmp_path), str(port)], check=True, timeout=20)
+    subprocess.run(
+        [sys.executable, "-c", launch, str(tmp_path), str(port)],
+        check=True,
+        timeout=20,
+        env=launcher_env,
+    )
     token_path = tmp_path / ".spec-state" / "web" / "server.supervision.json"
     token = SupervisionToken.from_dict(json.loads(token_path.read_text(encoding="utf-8")))
     try:
