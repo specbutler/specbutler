@@ -220,6 +220,7 @@ def test_ci_workflow_has_blocking_aggregate_job():
         "skip-check",
         "lint",
         "test",
+        "macos-test",
         "package",
         "security",
         "windows-package",

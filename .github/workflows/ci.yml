@@ -135,6 +135,22 @@ jobs:
       - run: pip install -e ".[dev,tui,web]"
       - run: pytest tests/ -v
 
+  macos-test:
+    name: macos-test
+    needs: [skip-check]
+    if: needs.skip-check.outputs.is_version_bump != 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,tui,web]"
+      - run: pytest tests/ -v
+
   package:
     name: package
     needs: [skip-check]
@@ -405,6 +421,7 @@ jobs:
       - skip-check
       - lint
       - test
+      - macos-test
       - package
       - security
       - windows-package
@@ -415,6 +432,7 @@ jobs:
           IS_VERSION_BUMP: ${{ needs.skip-check.outputs.is_version_bump }}
           LINT_RESULT: ${{ needs.lint.result }}
           TEST_RESULT: ${{ needs.test.result }}
+          MACOS_TEST_RESULT: ${{ needs.macos-test.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           WINDOWS_PACKAGE_RESULT: ${{ needs.windows-package.result }}
@@ -423,6 +441,7 @@ jobs:
           echo "is_version_bump=$IS_VERSION_BUMP"
           echo "lint=$LINT_RESULT"
           echo "test=$TEST_RESULT"
+          echo "macos-test=$MACOS_TEST_RESULT"
           echo "package=$PACKAGE_RESULT"
           echo "security=$SECURITY_RESULT"
           echo "windows-package=$WINDOWS_PACKAGE_RESULT"
@@ -433,6 +452,7 @@ jobs:
           fi
           if [ "$LINT_RESULT" != "success" ] || \
              [ "$TEST_RESULT" != "success" ] || \
+             [ "$MACOS_TEST_RESULT" != "success" ] || \
              [ "$PACKAGE_RESULT" != "success" ] || \
              [ "$SECURITY_RESULT" != "success" ] || \
              [ "$WINDOWS_PACKAGE_RESULT" != "success" ] || \
