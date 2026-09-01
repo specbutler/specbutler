@@ -18647,6 +18647,10 @@ def _bootstrap_review_worktree(
         # review rather than guessing an install command from the tree under
         # review.
         return ""
+    if install_command.mode == "script" and (install_command.shell or "sh") == "sh":
+        # Review bootstrap historically used sh -lc. Keep that established
+        # POSIX behavior while routing the launch through the typed runner.
+        install_command = replace(install_command, login_shell=True)
     install_display = install_command.display()
     if SPEC_RUNTIME_CONFIG.bootstrap_install.select() is None:
         install_display = str(SPEC_RUNTIME_CONFIG.bootstrap_install_command).strip()

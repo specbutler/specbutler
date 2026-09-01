@@ -27,6 +27,7 @@ class CommandSpec:
     value: tuple[str, ...] | str
     shell: ShellName | None = None
     source: str = ""
+    login_shell: bool = False
 
     def argv(
         self,
@@ -49,10 +50,11 @@ class CommandSpec:
                 )
             # sh -c assigns the first word after the script to $0.  Reserve it
             # so caller-supplied hook metadata starts at $1 as documented.
+            shell_option = "-lc" if self.login_shell else "-c"
             return (
-                ["sh", "-c", script, "spec-command", *arguments]
+                ["sh", shell_option, script, "spec-command", *arguments]
                 if arguments
-                else ["sh", "-c", script]
+                else ["sh", shell_option, script]
             )
         if shell == "cmd":
             return ["cmd.exe", "/d", "/s", "/c", script, *arguments]
@@ -67,7 +69,14 @@ class CommandSpec:
 
     def display(self, *, windows: bool | None = None) -> str:
         use_windows = os.name == "nt" if windows is None else windows
-        argv = _redact_argv(self.argv(which=lambda name: name, windows=use_windows))
+        argv = self.argv(which=lambda name: name, windows=use_windows)
+        if self.mode == "script":
+            # The script is one process argument, but contains its own tokens.
+            # Redact it before argv quoting so split-form credentials cannot
+            # escape the argv-level redactor.
+            script_index = argv.index(str(self.value))
+            argv[script_index] = _redact_script(argv[script_index])
+        argv = _redact_argv(argv)
         return subprocess.list2cmdline(argv) if use_windows else shlex.join(argv)
 
 
@@ -202,6 +211,27 @@ def _shell(value: object, location: str) -> ShellName | None:
 def _redact(value: str) -> str:
     value = re.sub(r"(?i)(token|password|secret|api[_-]?key)=([^\s]+)", r"\1=***", value)
     return re.sub(r"(?i)^(--?(?:token|password|secret|api[_-]?key))(.*)$", r"\1***", value)
+
+
+_SPLIT_SECRET = re.compile(
+    r"(?i)(?P<option>--?[A-Za-z0-9][A-Za-z0-9_.-]*)"
+    r"(?P<space>\s+)(?P<value>\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\s;&|]+)"
+)
+
+
+def _redact_script(script: str) -> str:
+    """Redact credential values embedded in explicit shell script text."""
+    script = re.sub(
+        r"(?i)(token|password|passwd|secret|api[_-]?key)=([^\s;&|]+)",
+        r"\1=***",
+        script,
+    )
+    def replace_split(match: re.Match[str]) -> str:
+        option = match.group("option")
+        name = option.lstrip("-")
+        return f"{option}{match.group('space')}***" if _sensitive_option(name) else match.group(0)
+
+    return _SPLIT_SECRET.sub(replace_split, script)
 
 
 _SENSITIVE_OPTION = re.compile(

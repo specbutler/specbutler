@@ -5341,6 +5341,32 @@ class TestReviewWorktreeBootstrap:
         assert "ANTHROPIC_API_KEY" not in dumped_env
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in dumped_env
 
+    def test_legacy_posix_bootstrap_preserves_login_shell_launch(self, tmp_path: Path):
+        worktree = tmp_path / "review-worktree"
+        worktree.mkdir()
+        captured: dict[str, object] = {}
+
+        class Process:
+            returncode = 0
+
+            def communicate(self, timeout: float):
+                return "", ""
+
+        def popen(argv, **kwargs):
+            captured["argv"] = argv
+            return Process()
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", self._config_with_install("echo ok")),
+            patch.object(orch.subprocess, "Popen", side_effect=popen),
+        ):
+            warning = orch._bootstrap_review_worktree(
+                tmp_path / "repo", worktree, warning_path=tmp_path / "warning.json"
+            )
+
+        assert warning == ""
+        assert captured["argv"] == ["sh", "-lc", "echo ok"]
+
     def test_bootstrap_cannot_read_real_home_credentials(self, tmp_path: Path):
         """Stripping named credential env vars is not enough on its own: build
         hooks run as the same OS user and can read credential files straight

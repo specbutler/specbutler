@@ -73,6 +73,30 @@ def test_display_redacts_secret_in_split_option_form(flag: str) -> None:
     assert "***" in display
 
 
+@pytest.mark.parametrize("shell", ["sh", "powershell", "pwsh", "cmd"])
+@pytest.mark.parametrize(
+    "script",
+    [
+        "tool --token supersecret --name visible",
+        'tool --client-secret "secret with spaces" --name visible',
+        "tool --api_key='supersecret' --name visible",
+    ],
+)
+def test_script_display_redacts_embedded_secrets(shell: str, script: str) -> None:
+    display = CommandSpec("script", script, shell).display(
+        windows=shell != "sh"
+    )
+    assert "supersecret" not in display
+    assert "secret with spaces" not in display
+    assert "visible" in display
+    assert "***" in display
+
+
+def test_posix_login_shell_is_explicit() -> None:
+    command = CommandSpec("script", "tool", "sh", login_shell=True)
+    assert command.argv(windows=False) == ["sh", "-lc", "tool"]
+
+
 def test_native_windows_rejects_portable_shell_instead_of_assuming_git_bash() -> None:
     selected = parse_command_variants(
         {"command": "python -m venv .venv && .venv/bin/python -m pip install -e ."},

@@ -325,7 +325,7 @@ def _generate_spec_toml(
             'install_command_windows = "python -m venv .venv; '
             '.\\\\.venv\\\\Scripts\\\\python.exe -m pip install -e ."'
         )
-        lines.append('shell_windows = "powershell"')
+        lines.append('install_shell_windows = "powershell"')
     else:
         lines.append(
             '# install_command = "python -m venv .venv && '
@@ -335,7 +335,7 @@ def _generate_spec_toml(
             '# install_command_windows = "python -m venv .venv; '
             '.\\\\.venv\\\\Scripts\\\\python.exe -m pip install -e ."'
         )
-        lines.append('# shell_windows = "powershell"')
+        lines.append('# install_shell_windows = "powershell"')
 
     lines += [
         "",

@@ -481,6 +481,25 @@ class TestGenerateSpecToml:
         assert parsed["bootstrap"]["install_command"] == 'bash -lc "pip install -e ."'
         assert parsed["verify"]["gates"][0]["command"] == 'bash -lc "pytest -q"'
 
+    def test_generated_windows_bootstrap_roundtrips_through_config_loader(self, tmp_path: Path):
+        from spec_runtime.config import load_repo_spec_runtime_config
+
+        content = _generate_spec_toml(
+            base_ref="origin/main",
+            default_agent="claude",
+            review_default="claude",
+            allowed_agents=["claude"],
+            gates=[],
+            install_command="python -m pip install -e .",
+        )
+        (tmp_path / ".spec.toml").write_text(content)
+
+        config = load_repo_spec_runtime_config(tmp_path, require=True)
+        selected = config.bootstrap_install.select(windows=True)
+        assert selected is not None
+        assert selected.shell == "powershell"
+        assert r".\.venv\Scripts\python.exe" in str(selected.value)
+
     def test_escapes_backslashes_in_commands(self):
         """Backslashes must be escaped for valid TOML (F2)."""
         import tomllib
