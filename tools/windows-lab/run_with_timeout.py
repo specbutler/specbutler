@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 
 KILL_GRACE_SECONDS = 5
@@ -19,21 +20,39 @@ class _ForwardedSignal(Exception):
 
 
 def _signal_group(process: subprocess.Popen[bytes], signum: int) -> None:
-    if process.poll() is not None:
-        return
     try:
         os.killpg(process.pid, signum)
     except ProcessLookupError:
         pass
 
 
-def _stop_group(process: subprocess.Popen[bytes], signum: int) -> None:
-    _signal_group(process, signum)
+def _group_exists(pgid: int) -> bool:
     try:
-        process.wait(timeout=KILL_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        _signal_group(process, signal.SIGKILL)
-        process.wait()
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_group_exit(process: subprocess.Popen[bytes], seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while True:
+        process.poll()
+        if not _group_exists(process.pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _stop_group(process: subprocess.Popen[bytes], signum: int) -> bool:
+    _signal_group(process, signum)
+    if _wait_for_group_exit(process, KILL_GRACE_SECONDS):
+        return True
+    _signal_group(process, signal.SIGKILL)
+    return _wait_for_group_exit(process, KILL_GRACE_SECONDS)
 
 
 def run(seconds: int, command: Sequence[str]) -> int:
@@ -59,10 +78,14 @@ def run(seconds: int, command: Sequence[str]) -> int:
         try:
             return process.wait(timeout=seconds)
         except subprocess.TimeoutExpired:
-            _stop_group(process, signal.SIGTERM)
+            if not _stop_group(process, signal.SIGTERM):
+                print("command process group survived SIGKILL", file=sys.stderr)
+                return 125
             return TIMEOUT_EXIT_CODE
         except _ForwardedSignal as exc:
-            _stop_group(process, exc.signum)
+            if not _stop_group(process, exc.signum):
+                print("command process group survived SIGKILL", file=sys.stderr)
+                return 125
             return 128 + exc.signum
     finally:
         for signum, handler in previous_handlers.items():

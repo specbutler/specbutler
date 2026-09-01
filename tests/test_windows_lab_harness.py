@@ -1261,6 +1261,15 @@ def _load_exact_harness_module():
     return module
 
 
+def _load_host_timeout_module():
+    path = LAB_ROOT / "run_with_timeout.py"
+    spec = importlib.util.spec_from_file_location("windows_host_timeout", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_windows_lab_portable_timeout_terminates_the_command_group(
     tmp_path: Path,
 ) -> None:
@@ -1325,6 +1334,50 @@ def test_windows_lab_portable_timeout_terminates_the_command_group(
     assert (tmp_path / "child-ready").is_file()
     assert (tmp_path / "parent-stopped").read_text(encoding="ascii") == "yes"
     assert (tmp_path / "child-stopped").read_text(encoding="ascii") == "yes"
+
+
+def test_windows_lab_portable_timeout_escalates_for_a_lingering_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix":
+        pytest.skip("the host timeout helper is for POSIX lab controllers")
+    child = tmp_path / "ignoring-child.py"
+    parent = tmp_path / "short-parent.py"
+    child.write_text(
+        "import signal\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "root = Path(sys.argv[1])\n"
+        "def observed(_signum, _frame):\n"
+        "    (root / 'child-saw-term').write_text('yes', encoding='ascii')\n"
+        "signal.signal(signal.SIGTERM, observed)\n"
+        "(root / 'child-ready').write_text('yes', encoding='ascii')\n"
+        "while True:\n"
+        "    time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    parent.write_text(
+        "import os\n"
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "root = Path(sys.argv[1])\n"
+        "def stopped(_signum, _frame):\n"
+        "    os._exit(0)\n"
+        "signal.signal(signal.SIGTERM, stopped)\n"
+        "subprocess.Popen([sys.executable, str(root / 'ignoring-child.py'), str(root)])\n"
+        "while not (root / 'child-ready').exists():\n"
+        "    time.sleep(0.01)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    module = _load_host_timeout_module()
+    monkeypatch.setattr(module, "KILL_GRACE_SECONDS", 0.2)
+    assert module.run(1, [sys.executable, str(parent), str(tmp_path)]) == 124
+    assert (tmp_path / "child-saw-term").read_text(encoding="ascii") == "yes"
 
 
 def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
