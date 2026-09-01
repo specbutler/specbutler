@@ -54,7 +54,7 @@ from spec_runtime.execution_backend import (
     get_execution_backend,
     inspect_container_capacity,
 )
-from spec_runtime.git_common import resolve_common_root, run_git
+from spec_runtime.git_common import resolve_common_root, run_git, subprocess_text_kwargs
 from spec_runtime.orchestrator import (
     BASE_REF,
     BLOCK_DEBUGGER_AUTO_RESUME_LIMIT,
@@ -3000,27 +3000,28 @@ def _is_stale_run(data: dict, state_runs_dir: Path | None = None) -> bool:
 def _merged_pr_for_branch(repo_root: Path, branch: str) -> dict | None:
     """Return merged PR metadata for a branch when GitHub CLI can resolve it."""
     repo_config = load_repo_spec_runtime_config(repo_root)
+    command = [
+        "gh",
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--base",
+        repo_config.pr_base_branch,
+        "--state",
+        "merged",
+        "--json",
+        "number,headRefName,mergeCommit,mergedAt,mergedBy",
+        "--jq",
+        ".[0] // empty",
+    ]
     try:
         result = subprocess.run(
-            [
-                "gh",
-                "pr",
-                "list",
-                "--head",
-                branch,
-                "--base",
-                repo_config.pr_base_branch,
-                "--state",
-                "merged",
-                "--json",
-                "number,headRefName,mergeCommit,mergedAt,mergedBy",
-                "--jq",
-                ".[0] // empty",
-            ],
+            command,
             cwd=repo_root,
             capture_output=True,
-            text=True,
             timeout=15,
+            **subprocess_text_kwargs(command),
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None

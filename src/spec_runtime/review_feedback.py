@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_spec_runtime_config
-from .git_common import git_text_kwargs
+from .git_common import subprocess_text_kwargs
 from .review_gate_sticky_comment import STICKY_MARKER, extract_embedded_review_result
 from .spec_identity import pr_body_uses_local_review
 
@@ -50,7 +50,7 @@ def default_run_subprocess(
         env=merged_env,
         capture_output=True,
         timeout=timeout,
-        **git_text_kwargs(cmd),
+        **subprocess_text_kwargs(cmd),
     )
 
 

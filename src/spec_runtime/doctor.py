@@ -14,7 +14,7 @@ from typing import Literal
 
 from .command_runtime import CommandSpec, looks_posix_script
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config
-from .git_common import git_text_kwargs
+from .git_common import subprocess_text_kwargs
 from .platform import is_unc_path, is_windows
 
 DoctorStatus = Literal["ok", "warning", "error"]
@@ -78,7 +78,7 @@ def _run_command(
             capture_output=True,
             timeout=timeout,
             check=False,
-            **git_text_kwargs(argv),
+            **subprocess_text_kwargs(argv),
         )
     except FileNotFoundError as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))

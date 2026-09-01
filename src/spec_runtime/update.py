@@ -20,7 +20,7 @@ from packaging.version import InvalidVersion, Version
 
 from .config import SpecRuntimeConfig
 from .git_common import resolve_common_root as _resolve_common_root_base
-from .git_common import run_git
+from .git_common import run_git, subprocess_text_kwargs
 from .source_repository import runtime_repository_https_url
 
 LOGGER = logging.getLogger(__name__)
@@ -498,12 +498,13 @@ def _github_token() -> str:
         if value:
             return value
 
+    command = ["gh", "auth", "token"]
     try:
         result = subprocess.run(
-            ["gh", "auth", "token"],
+            command,
             capture_output=True,
-            text=True,
             check=False,
+            **subprocess_text_kwargs(command),
         )
     except OSError:
         return ""

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from spec_runtime.config import load_repo_spec_runtime_config, resolve_specs_root
-from spec_runtime.git_common import git_text_kwargs
+from spec_runtime.git_common import subprocess_text_kwargs
 from spec_runtime.spec_merge_tags import (
     TAG_PREFIX,
     MergeTagProvenance,
@@ -38,7 +38,7 @@ def _run_command(
         command,
         cwd=cwd,
         capture_output=True,
-        **git_text_kwargs(command),
+        **subprocess_text_kwargs(command),
     )
 
 

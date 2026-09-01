@@ -7,6 +7,7 @@ porting failures until the owning Windows-support specs land.
 from __future__ import annotations
 
 import importlib
+import os
 import socket
 import subprocess
 import sys
@@ -156,6 +157,14 @@ def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
 
 
 def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    (fake_bin / "codex.cmd").write_text("@echo off\nexit /b 0\n", encoding="utf-8")
+    subprocess_env = _clean_subprocess_env()
+    subprocess_env["PATH"] = os.pathsep.join(
+        [str(fake_bin), subprocess_env.get("PATH", "")]
+    )
+
     subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
     (tmp_path / "README.md").write_text("probe\n")
     subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True, capture_output=True)
@@ -178,16 +187,19 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
     initialized = subprocess.run(
         [sys.executable, "-m", "spec_runtime.cli", "init"],
         cwd=tmp_path,
-        env=_clean_subprocess_env(),
+        env=subprocess_env,
         text=True,
         capture_output=True,
         check=False,
     )
     assert initialized.returncode == 0, initialized.stdout + initialized.stderr
+    config_text = (tmp_path / ".spec.toml").read_text(encoding="utf-8")
+    assert 'default = "codex"' in config_text
+    assert 'allowed = ["codex"]' in config_text
     doctor = subprocess.run(
         [sys.executable, "-m", "spec_runtime.cli", "doctor"],
         cwd=tmp_path,
-        env=_clean_subprocess_env(),
+        env=subprocess_env,
         text=True,
         capture_output=True,
         check=False,

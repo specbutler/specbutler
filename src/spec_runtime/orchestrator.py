@@ -109,7 +109,7 @@ from .execution_backend import (
 )
 from .execution_backend import get_execution_backend as _factory_get_execution_backend
 from .forge import GitHubForge, PushResult
-from .git_common import git_text_kwargs, resolve_common_root, run_git
+from .git_common import resolve_common_root, run_git, subprocess_text_kwargs
 from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
 from .process_supervisor import (
     LifetimeMode,
@@ -4411,7 +4411,7 @@ def run_subprocess(
             "env": merged_env,
             "capture_output": True,
             "timeout": timeout,
-            **git_text_kwargs(cmd),
+            **subprocess_text_kwargs(cmd),
         }
         if input_text is None:
             kwargs["stdin"] = subprocess.DEVNULL
@@ -4428,7 +4428,7 @@ def run_subprocess(
         "env": merged_env,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        **git_text_kwargs(cmd),
+        **subprocess_text_kwargs(cmd),
     }
     if input_text is None:
         kwargs["stdin"] = subprocess.DEVNULL

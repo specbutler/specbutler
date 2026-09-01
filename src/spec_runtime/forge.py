@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 from .config import load_spec_runtime_config
+from .git_common import subprocess_text_kwargs
 
 AUTO_MERGE_ARM_TIMEOUT_SECONDS = 30
 
@@ -196,7 +197,7 @@ def _default_run_fn(
         cmd,
         cwd=cwd,
         capture_output=True,
-        text=True,
+        **subprocess_text_kwargs(cmd),
         **kwargs,
     )
 

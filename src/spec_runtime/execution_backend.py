@@ -38,7 +38,7 @@ from .config import (
     ExecutionConfig,
     SpecRuntimeConfig,
 )
-from .git_common import git_text_kwargs, run_git
+from .git_common import run_git, subprocess_text_kwargs
 from .platform_fs import FileLock, remove_tree
 from .process_supervisor import LifetimeMode, ManagedProcess, ProcessSupervisor
 from .process_supervisor import run as run_supervised
@@ -1746,7 +1746,7 @@ class ContainerCliRunner:
             timeout=timeout,
             capture_output=True,
             check=False,
-            **git_text_kwargs(argv),
+            **subprocess_text_kwargs(argv),
         )
 
     def popen(

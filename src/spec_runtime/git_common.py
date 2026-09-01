@@ -1,7 +1,8 @@
-"""Shared git helpers for resolving the common root of a repository.
+"""Shared subprocess text boundaries and Git repository helpers.
 
-The common root is the parent directory of the ``.git`` common dir — in a
-worktree layout this is the main checkout, not the worktree itself.
+Git and GitHub CLI share an explicit UTF-8 decoding boundary. The common Git
+root is the parent directory of the ``.git`` common dir — in a worktree layout
+this is the main checkout, not the worktree itself.
 
 All modules that need to resolve the common root should import from here
 instead of duplicating the logic.
@@ -14,26 +15,44 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
+def _command_executable(command: Sequence[str]) -> str:
+    """Return a case-normalized executable basename for *command*."""
+    if not command:
+        return ""
+    return str(command[0]).replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
 def is_git_command(command: Sequence[str]) -> bool:
     """Return whether *command* launches Git, including a resolved git.exe."""
-    if not command:
-        return False
-    executable = str(command[0]).replace("\\", "/").rsplit("/", 1)[-1].casefold()
-    return executable in {"git", "git.exe"}
+    return _command_executable(command) in {"git", "git.exe"}
+
+
+def is_github_cli_command(command: Sequence[str]) -> bool:
+    """Return whether *command* launches GitHub CLI, including a resolved gh.exe."""
+    return _command_executable(command) in {"gh", "gh.exe"}
+
+
+def subprocess_text_kwargs(command: Sequence[str]) -> dict[str, object]:
+    """Return safe text-mode kwargs for command-line tool output.
+
+    Git for Windows and GitHub CLI emit UTF-8 independently of the active
+    Windows ANSI code page. Letting :mod:`subprocess` choose the locale decoder
+    can therefore corrupt paths, JSON, and user-authored text. Replacement on
+    malformed bytes keeps diagnostics available instead of turning an
+    otherwise recoverable command failure into ``UnicodeDecodeError``.
+
+    Other commands retain Python's normal locale behavior.
+    """
+    kwargs: dict[str, object] = {"text": True}
+    if is_git_command(command) or is_github_cli_command(command):
+        kwargs["encoding"] = "utf-8"
+        kwargs["errors"] = "replace"
+    return kwargs
 
 
 def git_text_kwargs(command: Sequence[str]) -> dict[str, object]:
-    """Text-mode subprocess kwargs with Git's documented UTF-8 boundary.
-
-    Git for Windows writes path-bearing stdout as UTF-8 independently of the
-    active Windows ANSI code page. Letting ``subprocess`` choose the locale
-    decoder can therefore turn a real path into a different, mojibake path.
-    Non-Git commands retain Python's normal locale behavior.
-    """
-    kwargs: dict[str, object] = {"text": True}
-    if is_git_command(command):
-        kwargs["encoding"] = "utf-8"
-    return kwargs
+    """Backward-compatible alias for :func:`subprocess_text_kwargs`."""
+    return subprocess_text_kwargs(command)
 
 
 def run_git(
@@ -54,7 +73,7 @@ def run_git(
         timeout=timeout,
         env=env,
         capture_output=capture_output,
-        **git_text_kwargs(command),
+        **subprocess_text_kwargs(command),
     )
 
 
