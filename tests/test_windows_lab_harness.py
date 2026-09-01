@@ -95,6 +95,9 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "-RunLevel Highest" not in register_job
     provision = (LAB_ROOT / "provision.ps1").read_text(encoding="utf-8")
     assert 'icacls.exe $harnessRoot /grant:r "${account}:(OI)(CI)M" /T /C' in provision
+    runner = (LAB_ROOT / "job-runner.ps1").read_text(encoding="utf-8")
+    assert '$env:TEMP = $temp' in runner
+    assert '$env:TMP = $temp' in runner
     assert 'python3 "$LAB_ROOT/audit_acceptance.py"' in controller
     assert '--expected-revision "$revision"' in controller
     assert '--output "$destination/acceptance-audit.json"' in controller

@@ -6654,7 +6654,10 @@ def _persist_pinned_spec(
     _set_pinned_spec_metadata(run, spec_path=spec_path, text=text)
     snapshot_path = _run_spec_snapshot_path(repo_root, run.run_id)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_path.write_text(text, encoding="utf-8")
+    # Preserve the exact logical text, including existing CRLF sequences.
+    # Path.write_text uses platform newline translation and would turn CRLF
+    # input into CRCRLF on Windows, invalidating the pinned revision boundary.
+    atomic_write_text(snapshot_path, text)
 
 
 def _set_pinned_spec_metadata(

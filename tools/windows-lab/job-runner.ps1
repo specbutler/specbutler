@@ -9,7 +9,12 @@ $jobRoot = 'C:\SpecHarness\jobs'
 $script = Join-Path $jobRoot "$JobName.ps1"
 $log = Join-Path $jobRoot "$JobName.log"
 $done = Join-Path $jobRoot "$JobName.done.json"
+$temp = Join-Path $jobRoot "$JobName.temp"
 Remove-Item -LiteralPath $log, $done -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $temp | Out-Null
+$env:TEMP = $temp
+$env:TMP = $temp
 $result = [ordered]@{
     job = $JobName
     status = 'failed'
