@@ -184,12 +184,11 @@ jobs:
           "$RUNNER_TEMP/gitleaks" git --config .gitleaks.toml --redact --no-banner --timeout 120 .
           "$RUNNER_TEMP/gitleaks" dir --config .gitleaks.toml --redact --no-banner --timeout 120 .
 
-  # Promotion condition: remove continue-on-error and add this job to the ci
-  # aggregate needs list only after every diagnostic step below is green.
   windows-probe:
     name: windows-probe
+    needs: [skip-check]
+    if: needs.skip-check.outputs.is_version_bump != 'true'
     runs-on: windows-latest
-    continue-on-error: true
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -217,25 +216,21 @@ jobs:
           exit $LASTEXITCODE
       - name: Check installed dependencies
         shell: pwsh
-        continue-on-error: true
         run: |
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pip check 2>&1 | Tee-Object artifacts/pip-check.log
           exit $LASTEXITCODE
       - name: Probe spec version
         shell: pwsh
-        continue-on-error: true
         run: |
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/spec.exe" --version 2>&1 | Tee-Object artifacts/spec-version.log
           exit $LASTEXITCODE
       - name: Probe spec help
         shell: pwsh
-        continue-on-error: true
         run: |
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/spec.exe" --help 2>&1 | Tee-Object artifacts/spec-help.log
           exit $LASTEXITCODE
       - name: Import every shipped module
         shell: pwsh
-        continue-on-error: true
         run: |
           @'
           import importlib
@@ -257,34 +252,35 @@ jobs:
           raise SystemExit(1 if failures else 0)
           '@ | & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" - 2>&1 | Tee-Object artifacts/imports.log
           exit $LASTEXITCODE
+      - name: Run lint
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m ruff check . 2>&1 | Tee-Object artifacts/lint.log
+          exit $LASTEXITCODE
       - name: Collect tests
         shell: pwsh
-        continue-on-error: true
         run: |
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest --collect-only tests 2>&1 | Tee-Object artifacts/collect.log
           exit $LASTEXITCODE
-      - name: Run focused Windows probes
+      - name: Run full portable test suite
         shell: pwsh
-        continue-on-error: true
+        run: |
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest tests -v --ignore=tests/test_windows_probe.py 2>&1 | Tee-Object artifacts/full-suite.log
+          exit $LASTEXITCODE
+      - name: Run Windows integration probes
+        shell: pwsh
         run: |
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest tests/test_windows_probe.py -v 2>&1 | Tee-Object artifacts/focused.log
           exit $LASTEXITCODE
-      - name: Run full test suite
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest tests -v 2>&1 | Tee-Object artifacts/full-suite.log
-          exit $LASTEXITCODE
-      - name: Summarize probe outcomes
+      - name: Summarize Windows gate
         if: ${{ always() }}
         shell: pwsh
         run: |
           @"
-          ## Windows probe
+          ## Windows product gate
 
-          This job is diagnostic and non-blocking while Windows support is in progress.
-          Promote it only when every probe step is green; then remove `continue-on-error`
-          from the job and add `windows-probe` to the aggregate `ci` job.
+          Build, installation, lint, the portable test suite, and Windows integrations
+          are required checks. Logs are uploaded even when a gate fails.
           "@ >> $env:GITHUB_STEP_SUMMARY
       - name: Upload Windows probe logs
         if: ${{ always() }}
@@ -304,6 +300,7 @@ jobs:
       - test
       - package
       - security
+      - windows-probe
     steps:
       - name: Enforce required job results
         env:
@@ -312,20 +309,23 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           PACKAGE_RESULT: ${{ needs.package.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
+          WINDOWS_RESULT: ${{ needs.windows-probe.result }}
         run: |
           echo "is_version_bump=$IS_VERSION_BUMP"
           echo "lint=$LINT_RESULT"
           echo "test=$TEST_RESULT"
           echo "package=$PACKAGE_RESULT"
           echo "security=$SECURITY_RESULT"
+          echo "windows-probe=$WINDOWS_RESULT"
           if [ "$IS_VERSION_BUMP" = "true" ]; then
-            echo "Version bump PR — skipping lint and test checks."
+            echo "Version bump PR — skipping product checks."
             exit 0
           fi
           if [ "$LINT_RESULT" != "success" ] || \
              [ "$TEST_RESULT" != "success" ] || \
              [ "$PACKAGE_RESULT" != "success" ] || \
-             [ "$SECURITY_RESULT" != "success" ]; then
+             [ "$SECURITY_RESULT" != "success" ] || \
+             [ "$WINDOWS_RESULT" != "success" ]; then
             echo "One or more required jobs did not succeed."
             exit 1
           fi

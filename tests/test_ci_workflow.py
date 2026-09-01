@@ -216,7 +216,14 @@ def test_ci_workflow_has_blocking_aggregate_job():
     jobs = _workflow_jobs()
     ci_job = jobs["ci"]
     assert ci_job["if"] == "${{ always() }}"
-    assert ci_job["needs"] == ["skip-check", "lint", "test", "package", "security"]
+    assert ci_job["needs"] == [
+        "skip-check",
+        "lint",
+        "test",
+        "package",
+        "security",
+        "windows-probe",
+    ]
 
     steps = [step for step in ci_job.get("steps", []) if isinstance(step, dict)]
     enforce_step = next(step for step in steps if step.get("name") == "Enforce required job results")
@@ -225,7 +232,42 @@ def test_ci_workflow_has_blocking_aggregate_job():
     assert "TEST_RESULT" in script
     assert "PACKAGE_RESULT" in script
     assert "SECURITY_RESULT" in script
+    assert "WINDOWS_RESULT" in script
+    assert enforce_step["env"]["WINDOWS_RESULT"] == "${{ needs.windows-probe.result }}"
+    assert '[ "$WINDOWS_RESULT" != "success" ]' in script
     assert "exit 1" in script
+
+
+def test_ci_windows_job_is_a_required_product_gate_with_diagnostics():
+    jobs = _workflow_jobs()
+    windows = jobs["windows-probe"]
+    steps = [step for step in windows["steps"] if isinstance(step, dict)]
+
+    assert "continue-on-error" not in windows
+    assert all("continue-on-error" not in step for step in steps)
+
+    commands = {
+        step.get("name"): str(step.get("run", ""))
+        for step in steps
+        if step.get("name")
+    }
+    assert "python -m build --wheel" in commands["Build wheel"]
+    assert "pip install \"$wheel[dev,web,tui]\"" in commands[
+        "Install wheel with all test surfaces"
+    ]
+    assert "-m ruff check ." in commands["Run lint"]
+    assert "-m pytest tests -v --ignore=tests/test_windows_probe.py" in commands[
+        "Run full portable test suite"
+    ]
+    assert "-m pytest tests/test_windows_probe.py -v" in commands[
+        "Run Windows integration probes"
+    ]
+
+    summary = next(step for step in steps if step.get("name") == "Summarize Windows gate")
+    upload = next(step for step in steps if step.get("name") == "Upload Windows probe logs")
+    assert summary["if"] == "${{ always() }}"
+    assert upload["if"] == "${{ always() }}"
+    assert upload["with"]["path"] == "artifacts/"
 
 
 def test_ci_installs_optional_surfaces_and_smokes_built_wheel():
@@ -299,11 +341,11 @@ def test_gitleaks_allowlist_is_limited_to_audited_fixture_matches():
 # ---------- ci.yml version-bump skip path ----------
 
 
-def test_ci_skip_check_gates_lint_and_test():
-    """lint and test jobs depend on skip-check and are skipped for version bumps."""
+def test_ci_skip_check_gates_product_jobs():
+    """Product jobs depend on skip-check and are skipped for version bumps."""
     jobs = _workflow_jobs()
     assert "skip-check" in jobs
-    for job_name in ("lint", "test", "package", "security"):
+    for job_name in ("lint", "test", "package", "security", "windows-probe"):
         job = jobs[job_name]
         assert "skip-check" in job["needs"]
         condition = str(job["if"])
