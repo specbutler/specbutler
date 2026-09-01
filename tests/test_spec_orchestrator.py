@@ -34621,7 +34621,10 @@ class TestStopRunDeadProcess:
         run.save(repo)
         monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
         monkeypatch.setattr(orch, "os", SimpleNamespace(name="nt"))
-        monkeypatch.setattr(process_supervisor, "os", SimpleNamespace(name="nt"))
+        # Patch the platform decision seam, not the process supervisor's
+        # entire os module. Durable monitor threads may still be using
+        # os.path concurrently while this test runs.
+        monkeypatch.setattr(process_supervisor, "_platform_is_windows", lambda: True)
 
         with pytest.raises(RuntimeError, match="unusable supervision token"):
             orch.stop_run("my-feature", repo_root=repo)

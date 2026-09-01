@@ -570,6 +570,7 @@ def test_detached_durable_token_publication_is_opt_in(
         assert identity_matches(published.identity)
     finally:
         managed.terminate(grace_seconds=0.1)
+        managed.wait(timeout=5)
         metadata_path.unlink(missing_ok=True)
 
 

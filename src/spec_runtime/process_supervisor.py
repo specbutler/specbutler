@@ -45,6 +45,11 @@ _VM_STAT_RECLAIMABLE_KEYS = frozenset(
 )
 
 
+def _platform_is_windows() -> bool:
+    """Return whether native Windows process semantics apply."""
+    return os.name == "nt"
+
+
 def _control_root() -> Path:
     """Return per-user common state shared by launcher, helper, and adopter."""
     configured = os.environ.get("SPEC_PROCESS_CONTROL_ROOT")
@@ -234,7 +239,7 @@ class SupervisionToken:
             raise ValueError("invalid supervision token version") from exc
         if version not in {1, 2}:
             raise ValueError("unsupported supervision token version")
-        if os.name == "nt" and version < 2:
+        if _platform_is_windows() and version < 2:
             raise ValueError("legacy Windows supervision tokens are not safe to use")
         if version >= 2:
             required = (
