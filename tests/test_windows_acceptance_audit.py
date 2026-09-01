@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -10,9 +11,21 @@ LAB_ROOT = REPO_ROOT / "tools" / "windows-lab"
 AUDITOR = LAB_ROOT / "audit_acceptance.py"
 MANIFEST = LAB_ROOT / "acceptance-manifest.json"
 REVISION = "1" * 40
-CURRENT_REVISION = subprocess.check_output(
-    ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True, encoding="utf-8"
-).strip()
+
+
+def _resolve_current_revision(repo_root: Path) -> str:
+    staged_revision = repo_root / ".lab-source-revision"
+    if staged_revision.is_file():
+        revision = staged_revision.read_text(encoding="ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError(f"invalid staged source revision: {revision!r}")
+        return revision
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True, encoding="utf-8"
+    ).strip()
+
+
+CURRENT_REVISION = _resolve_current_revision(REPO_ROOT)
 
 
 def _run_audit(
@@ -121,6 +134,24 @@ def _write_provenance(evidence: Path, *, configured: str, staged: str) -> None:
         json.dumps({"configured_revision": configured, "staged_revision": staged}) + "\n",
         encoding="utf-8",
     )
+
+
+def test_current_revision_uses_valid_staged_marker_without_git(tmp_path: Path) -> None:
+    revision = "a" * 40
+    (tmp_path / ".lab-source-revision").write_text(f"{revision}\n", encoding="ascii")
+
+    assert _resolve_current_revision(tmp_path) == revision
+
+
+def test_current_revision_rejects_malformed_staged_marker(tmp_path: Path) -> None:
+    (tmp_path / ".lab-source-revision").write_text("not-a-commit\n", encoding="ascii")
+
+    try:
+        _resolve_current_revision(tmp_path)
+    except ValueError as exc:
+        assert "invalid staged source revision" in str(exc)
+    else:
+        raise AssertionError("malformed staged revision was accepted")
 
 
 def test_production_manifest_exactly_tracks_all_windows_spec_criteria(tmp_path: Path) -> None:
