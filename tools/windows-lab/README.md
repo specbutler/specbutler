@@ -153,8 +153,10 @@ process tree before evidence collection continues.
 
 Before it stops, resets, prunes, or launches the VM, `labctl proof` resolves the
 requested source commit and requires it to be the controller checkout's exact
-`HEAD`. Every tracked file under `tools/windows-lab/` must be byte-identical and
-the directory must have no tracked or untracked changes. The retained
+`HEAD`. Every tracked file under `tools/windows-lab/` must match its committed
+blob exactly or through one whole-file LF-to-CRLF checkout transform, and the
+directory must have no staged or untracked changes. Mutable Git filters and
+replacement objects are excluded from the proof boundary. The retained
 `exact-harness.json` records a SHA-256 for each verified controller/helper file.
 The controller then materializes those committed blobs into a private snapshot
 and routes VM control, guest staging, redaction, evidence import, and final audit

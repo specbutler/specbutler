@@ -1413,8 +1413,8 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
         text=True,
     ).stdout.strip()
 
-    # Model a Windows checkout on Linux: the worktree is CRLF-smudged, while
-    # Git's clean filter still considers it identical to the committed LF blob.
+    # Model a Windows checkout on Linux: the worktree is fully CRLF-smudged,
+    # while the exact committed blob remains LF.
     labctl.write_bytes(labctl.read_bytes().replace(b"\n", b"\r\n"))
     verifier.write_bytes(verifier.read_bytes().replace(b"\n", b"\r\n"))
     assert b"\r\n" in labctl.read_bytes()
