@@ -156,7 +156,8 @@ Invoke-LoggedNative -FilePath 'gh.exe' -Arguments @('auth', 'status') -LogName '
 
 $sourceVenv = Join-Path $venvRoot 'source'
 $wheelVenv = Join-Path $venvRoot 'wheel'
-Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $sourceVenv, $wheelVenv
+$sdistVenv = Join-Path $venvRoot 'sdist'
+Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $sourceVenv, $wheelVenv, $sdistVenv
 Invoke-LoggedNative -FilePath $uv -Arguments @('venv', $sourceVenv, '--python', '3.12') -LogName 'source-venv.log'
 $sourcePython = Join-Path $sourceVenv 'Scripts\python.exe'
 Invoke-LoggedNative -FilePath $uv -Arguments @(
@@ -166,25 +167,54 @@ Invoke-LoggedNative -FilePath $uv -Arguments @(
 $dist = Join-Path $runRoot 'dist'
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 Invoke-LoggedNative -FilePath $sourcePython -Arguments @(
-    '-m', 'build', '--wheel', '--outdir', $dist, $sourceRoot
-) -LogName 'build-wheel.log'
+    '-m', 'build', '--wheel', '--sdist', '--outdir', $dist, $sourceRoot
+) -LogName 'build-distributions.log'
 $wheel = Get-ChildItem -LiteralPath $dist -Filter '*.whl' | Select-Object -First 1
 if (-not $wheel) { throw 'Release-candidate wheel was not produced' }
+$sdist = Get-ChildItem -LiteralPath $dist -Filter '*.tar.gz' | Select-Object -First 1
+if (-not $sdist) { throw 'Release-candidate source distribution was not produced' }
 
 Invoke-LoggedNative -FilePath $uv -Arguments @('venv', $wheelVenv, '--python', '3.12') -LogName 'wheel-venv.log'
 $wheelPython = Join-Path $wheelVenv 'Scripts\python.exe'
 Invoke-LoggedNative -FilePath $uv -Arguments @(
     'pip', 'install', '--python', $wheelPython, "$($wheel.FullName)[dev,web,tui]"
 ) -LogName 'wheel-install.log'
+$sdistVenvLog = 'sdist-venv.log'
+Invoke-LoggedNative -FilePath $uv -Arguments @('venv', $sdistVenv, '--python', '3.12') -LogName $sdistVenvLog
+$sdistPython = Join-Path $sdistVenv 'Scripts\python.exe'
+Invoke-LoggedNative -FilePath $uv -Arguments @(
+    'pip', 'install', '--python', $sdistPython, "$($sdist.FullName)[dev,web,tui]"
+) -LogName 'sdist-install.log'
 $spec = Join-Path $wheelVenv 'Scripts\spec.exe'
 Invoke-LoggedNative -FilePath $spec -Arguments @('--version') -LogName 'spec-version.log'
-Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
-    '-m', 'pytest', (Join-Path $sourceRoot 'tests'), '-v'
-) -LogName 'native-tests.log'
+$oldSandboxProof = $env:SPEC_TEST_REVIEW_BOOTSTRAP_SANDBOX
+try {
+    $env:SPEC_TEST_REVIEW_BOOTSTRAP_SANDBOX = '1'
+    Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
+        '-m', 'pytest', (Join-Path $sourceRoot 'tests'), '-v',
+        '--junitxml', (Join-Path $evidenceRoot 'native-tests.junit.xml')
+    ) -LogName 'native-tests.log'
+} finally {
+    $env:SPEC_TEST_REVIEW_BOOTSTRAP_SANDBOX = $oldSandboxProof
+}
+$oldInstalledMatrix = $env:SPEC_WINDOWS_INSTALLED_CLI_MATRIX
+$oldGithubWorkspace = $env:GITHUB_WORKSPACE
+try {
+    $env:SPEC_WINDOWS_INSTALLED_CLI_MATRIX = '1'
+    $env:GITHUB_WORKSPACE = $sourceRoot
+    Invoke-LoggedNative -FilePath $wheelPython -Arguments @(
+        '-m', 'pytest',
+        (Join-Path $sourceRoot 'tests\test_windows_probe.py::test_installed_artifact_cli_matrix'),
+        '-v', '--junitxml', (Join-Path $evidenceRoot 'installed-cli-matrix.junit.xml')
+    ) -LogName 'installed-cli-matrix.log'
+} finally {
+    $env:SPEC_WINDOWS_INSTALLED_CLI_MATRIX = $oldInstalledMatrix
+    $env:GITHUB_WORKSPACE = $oldGithubWorkspace
+}
 Set-EvidenceClaim `
     -Id 'runtime.native-suite' `
-    -Evidence @('native-tests.log', 'wheel-install.log', 'spec-version.log') `
-    -Detail 'The release-candidate wheel and complete candidate test tree ran under native Windows Python 3.12.'
+    -Evidence @('native-tests.log', 'native-tests.junit.xml', 'installed-cli-matrix.log', 'installed-cli-matrix.junit.xml', 'wheel-install.log', 'sdist-install.log', 'spec-version.log') `
+    -Detail 'The wheel, source distribution, full candidate test tree, and explicitly enabled installed-artifact CLI matrix ran under native Windows Python 3.12.'
 
 $repositoryName = "specbutler-windows-$($runName.Replace('proof-', ''))"
 $repositorySlug = "$githubOwner/$repositoryName"
@@ -801,6 +831,42 @@ Set-EvidenceClaim `
     -Evidence @('autopilot-result.json', 'autopilot-adopted-state.json') `
     -Detail 'The reusable Windows 11 lab forced dispatcher death and proved durable native adoption and graceful stop with real subprocesses.'
 
+$operatorCodexHome = $env:CODEX_HOME
+if (-not $operatorCodexHome) {
+    $operatorCodexHome = Join-Path $env:USERPROFILE '.codex'
+}
+Invoke-LoggedNative -FilePath $sourcePython -Arguments @(
+    (Join-Path $sourceRoot 'tools\windows-lab\local_acceptance.py'),
+    '--source-root', $sourceRoot,
+    '--evidence-root', $evidenceRoot,
+    '--fixture-root', $fixtureRoot,
+    '--source-revision', $sourceRevision,
+    '--native-junit', (Join-Path $evidenceRoot 'native-tests.junit.xml'),
+    '--matrix-junit', (Join-Path $evidenceRoot 'installed-cli-matrix.junit.xml'),
+    '--wheel-python', $wheelPython,
+    '--sdist-python', $sdistPython,
+    '--operator-codex-home', $operatorCodexHome
+) -LogName 'local-acceptance.log'
+Set-EvidenceClaim `
+    -Id 'runtime.local-acceptance' `
+    -Evidence @(
+        'local-acceptance.log',
+        'native-command-matrix-result.json',
+        'lifecycle-fault-matrix-result.json',
+        'isolation-result.json',
+        'windows-path-result.json',
+        'review-isolation-result.json',
+        'native-claude-result.json',
+        'update-result.json',
+        'test-coverage-result.json',
+        'web-action-result.json',
+        'watch-result.json',
+        'web-integration-result.json',
+        'documentation-audit-result.json',
+        'package-release-result.json'
+    ) `
+    -Detail 'Field-level local acceptance artifacts were emitted only after exact native tests, real runtime evidence, and direct Windows path, package, watch, documentation, and secret probes passed.'
+
 $result = [ordered]@{
     status = 'evidence-collected'
     acceptance_status = 'requires-fail-closed-audit'
@@ -825,6 +891,7 @@ $result = [ordered]@{
     autopilot_dependency_dispatch = 'passed'
     autopilot_restart_adoption = 'passed'
     autopilot_stop = 'passed'
+    local_acceptance = 'passed'
     evidence_claims = $evidenceClaims
 }
 $resultJson = $result | ConvertTo-Json -Depth 12

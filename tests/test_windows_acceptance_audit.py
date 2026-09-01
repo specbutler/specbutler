@@ -297,6 +297,7 @@ def test_all_other_criteria_check_is_derived_from_sibling_results(tmp_path: Path
 
 def test_proof_records_exact_provenance_and_does_not_claim_release_passed() -> None:
     proof = (LAB_ROOT / "proof.ps1").read_text(encoding="utf-8")
+    controller = (LAB_ROOT / "labctl").read_text(encoding="utf-8")
 
     assert "source-provenance.json" in proof
     assert "'evidence-collected'" in proof
@@ -308,3 +309,8 @@ def test_proof_records_exact_provenance_and_does_not_claim_release_passed() -> N
     assert "install_command_windows = '" in proof
     assert 'install_shell_windows = "powershell"' in proof
     assert 'argv_windows = [".venv/Scripts/python.exe", "-m", "pytest", "-q"]' in proof
+    assert "local_acceptance.py" in proof
+    assert "installed-cli-matrix.junit.xml" in proof
+    assert "'--wheel', '--sdist'" in proof
+    assert "lab-controller-static-result.json" in controller
+    assert "acceptance audit will report it unproven" in controller

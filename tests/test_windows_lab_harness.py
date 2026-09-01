@@ -10,6 +10,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -30,6 +31,7 @@ REQUIRED_FILES = {
     "job-runner.ps1",
     "lab.env.example",
     "labctl",
+    "local_acceptance.py",
     "proof.ps1",
     "provision.ps1",
     "redact.py",
@@ -260,6 +262,74 @@ def test_windows_runtime_proof_declares_real_runtime_invariants() -> None:
     assert "report --status needs-input" in agent
     assert "$ErrorActionPreference = 'Continue'" in runner
     assert "$exitCode = if ($null -eq $LASTEXITCODE)" in runner
+
+
+def test_windows_local_acceptance_requires_executed_unskipped_tests(tmp_path: Path) -> None:
+    path = LAB_ROOT / "local_acceptance.py"
+    spec = importlib.util.spec_from_file_location("windows_local_acceptance", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    report = tmp_path / "report.xml"
+    report.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<testsuite tests="2" failures="0" errors="0" skipped="1">
+  <testcase classname="proof" name="passed_case" />
+  <testcase classname="proof" name="skipped_case"><skipped /></testcase>
+</testsuite>
+""",
+        encoding="utf-8",
+    )
+
+    passed = module.passed_tests(report)
+    assert passed == {"passed_case"}
+    assert module.require_tests(passed, ("passed_case",)) == ["passed_case"]
+    with pytest.raises(module.EvidenceError, match="did not pass"):
+        module.require_tests(passed, ("skipped_case",))
+
+    failed_report = tmp_path / "failed.xml"
+    failed_report.write_text(
+        """<testsuite tests="1" failures="1" errors="0" skipped="0">
+  <testcase classname="proof" name="failed_case"><failure>boom</failure></testcase>
+</testsuite>
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(module.EvidenceError, match="not green"):
+        module.passed_tests(failed_report)
+
+
+def test_windows_local_acceptance_covers_every_local_manifest_result() -> None:
+    path = LAB_ROOT / "local_acceptance.py"
+    spec = importlib.util.spec_from_file_location("windows_local_acceptance_contract", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    manifest = json.loads((LAB_ROOT / "acceptance-manifest.json").read_text(encoding="utf-8"))
+    manifest_artifacts = {
+        check["artifact"]
+        for criterion in manifest["criteria"]
+        for check in criterion["checks"]
+        if "artifact" in check
+    }
+
+    assert set(module.LOCAL_ARTIFACTS) <= manifest_artifacts
+    assert set(module.EXTERNAL_ARTIFACTS) <= manifest_artifacts
+    assert set(module.LOCAL_ARTIFACTS) == set(module.REQUIRED_TESTS)
+
+    proof = (LAB_ROOT / "proof.ps1").read_text(encoding="utf-8")
+    for artifact in module.LOCAL_ARTIFACTS:
+        assert artifact in proof or artifact == "package-release-result.json"
+    assert "installed-cli-matrix.junit.xml" in proof
+    assert "SPEC_WINDOWS_INSTALLED_CLI_MATRIX = '1'" in proof
+    assert "'--wheel', '--sdist'" in proof
+    assert "local_acceptance.py" in proof
+
+    controller = (LAB_ROOT / "labctl").read_text(encoding="utf-8")
+    assert "lab-controller-static-result.json" in controller
+    assert "lab-controller-result.json" in controller
+    assert "clean_snapshot_reset" in controller
 
 
 def test_windows_runtime_timeout_probe_kills_a_real_tree(tmp_path: Path) -> None:

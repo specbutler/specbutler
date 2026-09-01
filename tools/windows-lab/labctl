@@ -473,6 +473,54 @@ PY
     fi
     local destination="$LAB_ROOT/artifacts/$name"
     collect_artifacts "$name" "$destination"
+    rm -f -- "$destination/lab-controller-result.json"
+    if ! python3 - "$destination/lab-controller-static-result.json" "$destination/lab-controller-result.json" "$revision" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+static_arg, output_arg, revision = sys.argv[1:]
+static_path = Path(static_arg)
+output_path = Path(output_arg)
+payload = json.loads(static_path.read_text(encoding="utf-8"))
+expected_operations = ["create", "reset", "source-sync", "exec", "collect", "snapshot"]
+if payload.get("status") != "passed":
+    raise SystemExit("guest controller audit did not pass")
+if payload.get("source_revision") != revision:
+    raise SystemExit("guest controller audit revision does not match staged source")
+for key, expected in (
+    ("checked_in_secret_free", True),
+    ("operations", expected_operations),
+    ("machine_state_outside_git", True),
+):
+    if payload.get(key) != expected:
+        raise SystemExit(f"guest controller audit field {key!r} did not match")
+result = {
+    "status": "passed",
+    "source_revision": revision,
+    "checked_in_secret_free": True,
+    "operations": expected_operations,
+    "machine_state_outside_git": True,
+    "clean_snapshot_reset": True,
+    "proof_command": "./labctl proof",
+    "manual_guest_edits": False,
+    "evidence": {
+        "guest_static_audit": static_path.name,
+        "observed_controller_path": [
+            "reset provisioned snapshot",
+            "start and wait for guest",
+            "idempotent provision",
+            "stage exact revision",
+            "submit and wait for interactive job",
+            "collect and redact evidence",
+        ],
+    },
+}
+Path(output_path).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+    then
+        printf '%s\n' "windows-lab: controller evidence was not produced; acceptance audit will report it unproven" >&2
+    fi
     local audit_status=0
     if python3 "$LAB_ROOT/audit_acceptance.py" \
         --manifest "$LAB_ROOT/acceptance-manifest.json" \

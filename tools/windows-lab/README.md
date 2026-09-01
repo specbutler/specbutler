@@ -73,9 +73,10 @@ the proof in the console session, and retrieves redacted evidence:
 
 The proof:
 
-1. builds and installs the candidate wheel with the `dev`, `tui`, and `web`
-   surfaces;
-2. runs the full native test suite on Windows;
+1. builds and installs both the candidate wheel and source distribution with
+   the `dev`, `tui`, and `web` surfaces;
+2. runs the full native test suite on Windows, then runs the installed-wheel
+   CLI matrix again with its opt-in guard explicitly enabled;
 3. creates a uniquely named private repository under `LAB_GITHUB_OWNER`;
 4. runs a real Codex worktree lifecycle through implementation, local review,
    pull-request merge, and cleanup;
@@ -94,6 +95,16 @@ The proof:
    `tools/windows-lab/artifacts/<run-name>/`, then evaluates every one of the
    26 acceptance criteria in the three Windows specs against the checked-in
    evidence contract.
+
+Before the controller audit, `local_acceptance.py` parses the two JUnit reports
+and requires exact, unskipped test names for each local claim. It also validates
+the real lifecycle and web result fields and actively probes executable
+discovery, Windows path behavior, non-interactive watch, wheel/sdist imports,
+`pip check`, warning-free `spec doctor`, documentation, and credential cleanup.
+It writes each machine-readable local result only after that result's complete
+prerequisite set passes. The host controller adds its own result only after the
+clean-snapshot reset, staging, job execution, collection, and guest-side static
+harness audit have all completed.
 
 The deterministic autopilot provider is intentionally distinct from the real
 Codex evidence: adoption must hold children at a reproducible boundary across a
@@ -212,6 +223,14 @@ python3 tools/ci_evidence.py aggregate \
   --source-root . \
   --expected-revision "$(git rev-parse HEAD)"
 ```
+
+The local proof deliberately does not create
+`hosted-windows-ci-result.json`, `hosted-windows-smoke-result.json`,
+`cross-platform-lifecycle-result.json`, `cross-platform-web-result.json`, or
+`linux-claude-web-result.json`. Those claims require their named hosted,
+macOS/Linux, or real-Claude runs. Until independently produced artifacts for
+the exact staged revision are retained beside the VM evidence, the fail-closed
+audit reports those criteria as `unproven`.
 
 ## Controller commands
 
