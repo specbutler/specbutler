@@ -121,6 +121,7 @@ def _minimal_process_environment(**overrides: str) -> dict[str, str]:
         "HOMEPATH",
         "PATH",
         "PATHEXT",
+        "SPEC_PROCESS_CONTROL_ROOT",
         "SYSTEMROOT",
         "TEMP",
         "TMP",

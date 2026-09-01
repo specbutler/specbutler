@@ -9,6 +9,7 @@ signal, preventing a recycled PID from becoming a termination target.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import ctypes
 import json
 import os
@@ -28,6 +29,10 @@ from typing import Any, Sequence
 from spec_runtime.platform_fs import FileLock, atomic_write_text
 
 _REAL_POPEN_TYPE = subprocess.Popen
+_CONTROL_RECONCILE_LIMIT = 256
+_ORPHAN_LOCK_MIN_AGE_SECONDS = 3600.0
+_CONTROL_STATE_RECONCILE_LOCK = threading.Lock()
+_RECONCILED_CONTROL_ROOTS: set[Path] = set()
 _VM_STAT_PAGE_SIZE_RE = re.compile(r"page size of (?P<bytes>\d+) bytes", re.IGNORECASE)
 _VM_STAT_RECLAIMABLE_KEYS = frozenset(
     {
@@ -140,6 +145,35 @@ class ProcessIdentity:
             executable=str(value.get("executable", "")),
             command=str(value.get("command", "")),
         )
+
+
+def _control_record_identities(
+    state: object,
+    supervision_id: str,
+) -> tuple[str, ProcessIdentity, ProcessIdentity] | None:
+    """Return authenticated record fields needed for conservative cleanup."""
+    if not isinstance(state, dict):
+        return None
+    nonce = state.get("nonce")
+    keeper_value = state.get("keeper_identity")
+    payload_value = state.get("payload_identity")
+    if (
+        state.get("schema") != 2
+        or state.get("supervision_id") != supervision_id
+        or not isinstance(nonce, str)
+        or not nonce
+        or not isinstance(keeper_value, dict)
+        or not isinstance(payload_value, dict)
+    ):
+        return None
+    try:
+        keeper = ProcessIdentity.from_dict(keeper_value)
+        payload = ProcessIdentity.from_dict(payload_value)
+    except (TypeError, ValueError):
+        return None
+    if keeper.pid <= 0 or payload.pid <= 0 or not keeper.started_at or not payload.started_at:
+        return None
+    return nonce, keeper, payload
 
 
 class ProcessGroupOwnershipError(RuntimeError):
@@ -725,7 +759,13 @@ _CURRENT_WINDOWS_JOBS: dict[str, _WindowsJob] = {}
 
 
 def _windows_job_name(token: str) -> str:
-    return f"Local\\SpecButler-{token}"
+    # A Local\\ object is scoped to one Windows logon session. Web and
+    # autopilot processes commonly start in an interactive session but are
+    # later inspected or stopped over SSH in session 0, so their ownership
+    # capability must live in the cross-session namespace. Kernel objects
+    # other than file mappings and symbolic links do not require
+    # SeCreateGlobalPrivilege for this use.
+    return f"Global\\SpecButler-{token}"
 
 
 def _send_windows_break(process_group_id: int) -> bool:
@@ -912,6 +952,349 @@ def _retire_durable_records(metadata_path: Path, token: SupervisionToken) -> boo
                 control_path.parent.rmdir()
             except OSError:
                 pass
+            try:
+                metadata_path.parent.rmdir()
+            except OSError:
+                pass
+        return removed
+    except BaseException:
+        return False
+
+
+def _windows_job_definitively_absent(job_name: str) -> bool:
+    """Return true only when Windows proves that a named Job does not exist."""
+    if os.name != "nt":
+        return True
+    job = _WindowsJob.open(job_name)
+    if job is None:
+        # Access denied and transient API failures are not absence proofs. The
+        # Win32 object manager reports ERROR_FILE_NOT_FOUND when the final Job
+        # handle has closed and the name no longer exists.
+        return ctypes.get_last_error() == 2
+    try:
+        return False
+    finally:
+        job.close()
+
+
+def _control_boundary_is_inactive(
+    supervision_id: str,
+    keeper: ProcessIdentity,
+    payload: ProcessIdentity,
+) -> bool:
+    return bool(
+        not identity_matches(keeper)
+        and not identity_matches(payload)
+        and _windows_job_definitively_absent(_windows_job_name(supervision_id))
+    )
+
+
+def _same_reconciled_boundary(
+    token: SupervisionToken,
+    *,
+    supervision_id: str,
+    nonce: str,
+    keeper: ProcessIdentity,
+    payload: ProcessIdentity,
+) -> bool:
+    return bool(
+        token.version == 2
+        and token.token == supervision_id
+        and token.control_nonce == nonce
+        and token.identity == keeper
+        and token.payload == payload
+        and token.job_name == _windows_job_name(supervision_id)
+        and token.control_relpath == f"controls/{supervision_id}/control.json"
+    )
+
+
+def _read_durable_token(metadata_path: Path) -> SupervisionToken | None:
+    try:
+        value = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            return None
+        return SupervisionToken.from_dict(value)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _remove_empty_control_artifacts(control_path: Path, metadata_path: Path) -> None:
+    """Best-effort cleanup after releasing the per-boundary file lock."""
+    try:
+        control_path.with_suffix(".lock").unlink(missing_ok=True)
+    except OSError:
+        pass
+    for directory in (control_path.parent, metadata_path.parent):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def _reconcile_control_record(control_path: Path, supervision_id: str) -> bool:
+    """Retire one dead control record without trusting its path or PID alone."""
+    metadata_path = durable_metadata_path(supervision_id)
+    lock_path = control_path.with_suffix(".lock")
+    try:
+        initial_state = json.loads(control_path.read_text(encoding="utf-8"))
+        initial_identities = _control_record_identities(initial_state, supervision_id)
+        if initial_identities is None or not _control_boundary_is_inactive(
+            supervision_id,
+            initial_identities[1],
+            initial_identities[2],
+        ):
+            return False
+    except (OSError, TypeError, json.JSONDecodeError):
+        return False
+    lock = FileLock(lock_path, blocking=False)
+    try:
+        if not lock.acquire():
+            return False
+        try:
+            try:
+                state = json.loads(control_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, json.JSONDecodeError):
+                return False
+            identities = _control_record_identities(state, supervision_id)
+            if identities is None:
+                return False
+            nonce, keeper, payload = identities
+            if not _control_boundary_is_inactive(supervision_id, keeper, payload):
+                return False
+
+            metadata_token = _read_durable_token(metadata_path)
+            metadata_owned = metadata_token is not None and _same_reconciled_boundary(
+                metadata_token,
+                supervision_id=supervision_id,
+                nonce=nonce,
+                keeper=keeper,
+                payload=payload,
+            )
+            ack_owned = bool(
+                metadata_owned
+                and metadata_token is not None
+                and _durable_publication_acknowledged(metadata_path, metadata_token)
+            )
+            # Retire authorization before discovery. A crash between these
+            # unlinks leaves a fail-closed metadata token.
+            control_path.unlink()
+            if metadata_owned:
+                metadata_path.unlink(missing_ok=True)
+            if ack_owned:
+                _durable_publication_ack_path(metadata_path).unlink(missing_ok=True)
+        finally:
+            lock.release()
+    except (OSError, ValueError):
+        return False
+    _remove_empty_control_artifacts(control_path, metadata_path)
+    return True
+
+
+def _reconcile_orphan_metadata(metadata_path: Path, supervision_id: str) -> bool:
+    """Retire one dead discovery record after proving control is absent."""
+    control_path = _control_path(f"controls/{supervision_id}/control.json")
+    if control_path.exists():
+        return False
+    metadata_token = _read_durable_token(metadata_path)
+    if metadata_token is None or metadata_token.token != supervision_id:
+        return False
+    if not _control_boundary_is_inactive(
+        supervision_id,
+        metadata_token.identity,
+        metadata_token.payload,
+    ):
+        return False
+
+    lock = FileLock(control_path.with_suffix(".lock"), blocking=False)
+    try:
+        if not lock.acquire():
+            return False
+        try:
+            if control_path.exists():
+                return False
+            current = _read_durable_token(metadata_path)
+            if current != metadata_token or not _control_boundary_is_inactive(
+                supervision_id,
+                current.identity,
+                current.payload,
+            ):
+                return False
+            ack_owned = _durable_publication_acknowledged(metadata_path, current)
+            metadata_path.unlink()
+            if ack_owned:
+                _durable_publication_ack_path(metadata_path).unlink(missing_ok=True)
+        finally:
+            lock.release()
+    except (OSError, ValueError):
+        return False
+    _remove_empty_control_artifacts(control_path, metadata_path)
+    return True
+
+
+def _reconcile_lock_only_directory(directory: Path, supervision_id: str) -> bool:
+    """Remove an aged, unlocked artifact after proving no boundary exists."""
+    control_path = directory / "control.json"
+    metadata_path = durable_metadata_path(supervision_id)
+    lock_path = control_path.with_suffix(".lock")
+    try:
+        if (
+            control_path.exists()
+            or metadata_path.exists()
+            or lock_path.is_symlink()
+            or not lock_path.is_file()
+            or time.time() - lock_path.stat().st_mtime < _ORPHAN_LOCK_MIN_AGE_SECONDS
+            or not _windows_job_definitively_absent(_windows_job_name(supervision_id))
+        ):
+            return False
+    except OSError:
+        return False
+
+    lock = FileLock(lock_path, blocking=False)
+    try:
+        if not lock.acquire():
+            return False
+        try:
+            # A same-ID launch creates its Job before acquiring this lock.
+            # Rechecking both facts while serialized closes the scan/launch
+            # race without inferring ownership from an old filename.
+            if (
+                control_path.exists()
+                or metadata_path.exists()
+                or not _windows_job_definitively_absent(_windows_job_name(supervision_id))
+            ):
+                return False
+        finally:
+            lock.release()
+    except OSError:
+        return False
+    _remove_empty_control_artifacts(control_path, metadata_path)
+    return not lock_path.exists()
+
+
+def _oldest_paths(paths: Sequence[Path]) -> list[Path]:
+    def modified(path: Path) -> float:
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            return float("inf")
+
+    return sorted(paths, key=modified)
+
+
+def reconcile_stale_control_state(*, limit: int = _CONTROL_RECONCILE_LIMIT) -> int:
+    """Bounded, fail-closed reconciliation of dead Windows control records.
+
+    Records are removed only when both persisted process identities are dead,
+    the canonical named Job is proven absent, and no writer owns the record's
+    lock. Malformed or mismatched files are retained for diagnosis.
+    """
+    if limit <= 0:
+        return 0
+    root = _control_root()
+    controls_root = root / "controls"
+    metadata_root = root / "metadata"
+    retired = 0
+    considered = 0
+    seen: set[str] = set()
+
+    try:
+        if controls_root.is_symlink():
+            raise OSError("control directory is a symlink")
+        control_directories = _oldest_paths(
+            [path for path in controls_root.iterdir() if path.is_dir() and not path.is_symlink()]
+        )
+    except OSError:
+        control_directories = []
+    for directory in control_directories:
+        if considered >= limit:
+            break
+        considered += 1
+        supervision_id = directory.name
+        control_path = directory / "control.json"
+        if control_path.is_symlink() or not control_path.is_file():
+            if not (metadata_root / f"{supervision_id}.json").exists():
+                retired += int(_reconcile_lock_only_directory(directory, supervision_id))
+            continue
+        seen.add(supervision_id)
+        try:
+            if _control_path(f"controls/{supervision_id}/control.json") != control_path.resolve():
+                continue
+            retired += int(_reconcile_control_record(control_path, supervision_id))
+        except (OSError, ValueError):
+            continue
+
+    if considered >= limit:
+        return retired
+    try:
+        if metadata_root.is_symlink():
+            raise OSError("metadata directory is a symlink")
+        metadata_files = _oldest_paths(
+            [path for path in metadata_root.glob("*.json") if path.is_file() and not path.is_symlink()]
+        )
+    except OSError:
+        metadata_files = []
+    for metadata_path in metadata_files:
+        if considered >= limit:
+            break
+        supervision_id = metadata_path.stem
+        if supervision_id in seen:
+            continue
+        considered += 1
+        try:
+            if durable_metadata_path(supervision_id).resolve() != metadata_path.resolve():
+                continue
+            retired += int(_reconcile_orphan_metadata(metadata_path, supervision_id))
+        except (OSError, ValueError):
+            continue
+    return retired
+
+
+def _ensure_control_state_reconciled() -> None:
+    """Run bounded reconciliation once per resolved state root in this process."""
+    try:
+        root = _control_root().resolve()
+        with _CONTROL_STATE_RECONCILE_LOCK:
+            if root in _RECONCILED_CONTROL_ROOTS:
+                return
+            reconcile_stale_control_state()
+            _RECONCILED_CONTROL_ROOTS.add(root)
+    except BaseException:
+        # Housekeeping must never make a process launch unavailable.
+        pass
+
+
+def _retire_current_process_control(token: SupervisionToken, control_path: Path) -> bool:
+    """Remove an exact current-process claim during normal interpreter exit."""
+    try:
+        if token.identity.pid != os.getpid() or not identity_matches(token.identity):
+            return False
+        # Avoid creating a new lock file when a newer claim's atexit callback
+        # already retired this shared supervision ID.
+        if not control_path.is_file():
+            return False
+        lock_path = control_path.with_suffix(".lock")
+        lock = FileLock(lock_path, blocking=False)
+        if not lock.acquire():
+            return False
+        removed = False
+        try:
+            try:
+                state = json.loads(control_path.read_text(encoding="utf-8"))
+            except (OSError, TypeError, json.JSONDecodeError):
+                return False
+            identities = _control_record_identities(state, token.token)
+            if identities != (token.control_nonce, token.identity, token.payload):
+                return False
+            control_path.unlink()
+            removed = True
+        finally:
+            lock.release()
+        if removed:
+            metadata_path = control_path.parents[2] / "metadata" / f"{token.token}.json"
+            _remove_empty_control_artifacts(
+                control_path,
+                metadata_path,
+            )
         return removed
     except BaseException:
         return False
@@ -959,6 +1342,7 @@ def claim_current_process(supervision_id: str) -> SupervisionToken:
         )
     if os.name != "nt":
         raise RuntimeError(f"current-process ownership is unsupported on {os.name}")
+    _ensure_control_state_reconciled()
     identity = inspect_process(os.getpid())
     if identity is None:
         raise RuntimeError("Could not inspect current process")
@@ -1027,6 +1411,10 @@ def claim_current_process(supervision_id: str) -> SupervisionToken:
             time.sleep(0.05)
 
     threading.Thread(target=monitor, name=f"spec-stop-{supervision_id}", daemon=True).start()
+    # Install retirement after the monitor starts so it is the final lifecycle
+    # hook registered by this claim. This ordering matters for short-lived
+    # native Windows interpreters and is covered by a subprocess test.
+    atexit.register(_retire_current_process_control, token, control_path)
     return token
 
 
@@ -1291,6 +1679,7 @@ class ProcessSupervisor:
         control_relpath = f"controls/{supervision_id}/control.json"
         control_nonce = uuid.uuid4().hex
         if os.name == "nt":
+            _ensure_control_state_reconciled()
             flags = int(kwargs.pop("creationflags", 0))
             if self.mode is LifetimeMode.RUN_OWNED:
                 flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
@@ -1444,6 +1833,7 @@ class ProcessSupervisor:
         control_relpath = f"controls/{supervision_id}/control.json"
         control_nonce = uuid.uuid4().hex
         if os.name == "nt":
+            _ensure_control_state_reconciled()
             flags = int(kwargs.pop("creationflags", 0))
             flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
             if self.mode is LifetimeMode.RUN_OWNED:

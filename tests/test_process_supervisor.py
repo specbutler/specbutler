@@ -40,6 +40,10 @@ def test_token_round_trip_preserves_reopenable_identity() -> None:
     assert token.control_nonce
 
 
+def test_windows_job_name_uses_cross_session_namespace() -> None:
+    assert process_supervisor._windows_job_name("boundary") == r"Global\SpecButler-boundary"
+
+
 @pytest.mark.skipif(os.name != "posix", reason="legacy V1 tokens are rejected on Windows")
 def test_legacy_v1_posix_token_remains_deserializable() -> None:
     identity = ProcessIdentity(42, "created", "/usr/bin/python", "python child.py")
@@ -73,7 +77,7 @@ def test_v2_token_parser_does_not_mint_missing_security_fields(missing: str) -> 
     ("field", "value", "message"),
     [
         ("version", 3, "unsupported supervision token version"),
-        ("job_name", r"Local\SpecButler-arbitrary", "noncanonical Job name"),
+        ("job_name", r"Local\SpecButler-strict-token", "noncanonical Job name"),
         ("control_relpath", "controls/other/control.json", "noncanonical control path"),
     ],
 )
@@ -105,6 +109,245 @@ def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -
         lambda pid: ProcessIdentity(pid, "new", sys.executable),
     )
     assert identity_matches(expected) is False
+
+
+def _write_reconcilable_boundary(
+    root: Path,
+    supervision_id: str,
+    *,
+    nonce: str = "cleanup-nonce",
+) -> tuple[SupervisionToken, Path, Path]:
+    keeper = ProcessIdentity(4101, "keeper-start", "python.exe")
+    payload = ProcessIdentity(4102, "payload-start", "python.exe")
+    token = SupervisionToken(
+        LifetimeMode.DETACHED,
+        keeper,
+        keeper.pid,
+        keeper.started_at,
+        supervision_id,
+        payload_identity=payload,
+        control_nonce=nonce,
+    )
+    control_path = root / token.control_relpath
+    metadata_path = root / "metadata" / f"{supervision_id}.json"
+    control_path.parent.mkdir(parents=True)
+    metadata_path.parent.mkdir(parents=True)
+    control_path.write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "supervision_id": supervision_id,
+                "nonce": nonce,
+                "keeper_identity": keeper.to_dict(),
+                "payload_identity": payload.to_dict(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    metadata_path.write_text(json.dumps(token.to_dict()), encoding="utf-8")
+    process_supervisor._durable_publication_ack_path(metadata_path).write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "supervision_id": supervision_id,
+                "nonce": nonce,
+                "keeper_identity": keeper.to_dict(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return token, control_path, metadata_path
+
+
+def test_reconcile_stale_control_state_removes_authenticated_dead_records(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    token, control_path, metadata_path = _write_reconcilable_boundary(root, "dead-boundary")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setattr(process_supervisor, "_windows_job_definitively_absent", lambda _name: True)
+
+    assert process_supervisor.reconcile_stale_control_state() == 1
+    assert not control_path.exists()
+    assert not control_path.with_suffix(".lock").exists()
+    assert not metadata_path.exists()
+    assert not process_supervisor._durable_publication_ack_path(metadata_path).exists()
+    assert token.token == "dead-boundary"
+
+
+def test_windows_job_absence_requires_file_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setattr(process_supervisor._WindowsJob, "open", lambda _name: None)
+    monkeypatch.setattr(process_supervisor.ctypes, "get_last_error", lambda: 5, raising=False)
+    assert not process_supervisor._windows_job_definitively_absent("Global\\denied")
+    monkeypatch.setattr(process_supervisor.ctypes, "get_last_error", lambda: 2)
+    assert process_supervisor._windows_job_definitively_absent("Global\\missing")
+
+
+def test_reconcile_stale_control_state_preserves_a_live_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    token, control_path, metadata_path = _write_reconcilable_boundary(root, "live-boundary")
+    monkeypatch.setattr(
+        process_supervisor,
+        "identity_matches",
+        lambda identity: identity == token.identity,
+    )
+    absent = MagicMock(return_value=True)
+    monkeypatch.setattr(process_supervisor, "_windows_job_definitively_absent", absent)
+
+    assert process_supervisor.reconcile_stale_control_state() == 0
+    assert control_path.exists()
+    assert metadata_path.exists()
+    absent.assert_not_called()
+
+
+def test_reconcile_stale_control_state_preserves_mismatched_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    token, control_path, metadata_path = _write_reconcilable_boundary(root, "split-boundary")
+    mismatched = SupervisionToken(
+        token.mode,
+        token.identity,
+        token.owner_pid,
+        token.owner_started_at,
+        token.token,
+        payload_identity=token.payload,
+        control_nonce="different-nonce",
+    )
+    metadata_path.write_text(json.dumps(mismatched.to_dict()), encoding="utf-8")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setattr(process_supervisor, "_windows_job_definitively_absent", lambda _name: True)
+
+    assert process_supervisor.reconcile_stale_control_state() == 1
+    assert not control_path.exists()
+    assert metadata_path.exists()
+    assert process_supervisor._durable_publication_ack_path(metadata_path).exists()
+
+
+def test_reconcile_stale_control_state_revalidates_after_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    _token, control_path, metadata_path = _write_reconcilable_boundary(root, "racing-boundary")
+    checks = iter((True, False))
+    monkeypatch.setattr(
+        process_supervisor,
+        "_control_boundary_is_inactive",
+        lambda *_args: next(checks),
+    )
+
+    assert process_supervisor.reconcile_stale_control_state() == 0
+    assert control_path.exists()
+    assert metadata_path.exists()
+
+
+def test_reconcile_stale_control_state_removes_aged_lock_only_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    lock_path = root / "controls" / "lock-only" / "control.lock"
+    lock_path.parent.mkdir(parents=True)
+    lock_path.write_bytes(b"\0")
+    stale_time = time.time() - process_supervisor._ORPHAN_LOCK_MIN_AGE_SECONDS - 1
+    os.utime(lock_path, (stale_time, stale_time))
+    monkeypatch.setattr(process_supervisor, "_windows_job_definitively_absent", lambda _name: True)
+
+    assert process_supervisor.reconcile_stale_control_state() == 1
+    assert not lock_path.exists()
+    assert not lock_path.parent.exists()
+
+
+def test_reconcile_stale_control_state_preserves_recent_or_live_lock_only_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    recent = root / "controls" / "recent" / "control.lock"
+    live = root / "controls" / "live" / "control.lock"
+    for lock_path in (recent, live):
+        lock_path.parent.mkdir(parents=True)
+        lock_path.write_bytes(b"\0")
+    stale_time = time.time() - process_supervisor._ORPHAN_LOCK_MIN_AGE_SECONDS - 1
+    os.utime(live, (stale_time, stale_time))
+    monkeypatch.setattr(
+        process_supervisor,
+        "_windows_job_definitively_absent",
+        lambda name: not name.endswith("-live"),
+    )
+
+    assert process_supervisor.reconcile_stale_control_state() == 0
+    assert recent.exists()
+    assert live.exists()
+
+
+def test_reconcile_stale_control_state_removes_authenticated_orphan_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    _token, control_path, metadata_path = _write_reconcilable_boundary(root, "orphan-metadata")
+    control_path.unlink()
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setattr(process_supervisor, "_windows_job_definitively_absent", lambda _name: True)
+
+    assert process_supervisor.reconcile_stale_control_state() == 1
+    assert not metadata_path.exists()
+    assert not process_supervisor._durable_publication_ack_path(metadata_path).exists()
+    assert not control_path.with_suffix(".lock").exists()
+
+
+def test_current_process_retirement_requires_exact_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    identity = ProcessIdentity(os.getpid(), "current-start", sys.executable)
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        identity,
+        identity.pid,
+        identity.started_at,
+        "current-boundary",
+        payload_identity=identity,
+        control_nonce="current-nonce",
+    )
+    control_path = root / token.control_relpath
+    control_path.parent.mkdir(parents=True)
+    state = {
+        "schema": 2,
+        "supervision_id": token.token,
+        "nonce": "newer-claim",
+        "keeper_identity": identity.to_dict(),
+        "payload_identity": identity.to_dict(),
+    }
+    control_path.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda candidate: candidate == identity)
+
+    assert not process_supervisor._retire_current_process_control(token, control_path)
+    assert control_path.exists()
+    state["nonce"] = token.control_nonce
+    control_path.write_text(json.dumps(state), encoding="utf-8")
+    assert process_supervisor._retire_current_process_control(token, control_path)
+    assert not control_path.exists()
+    assert not control_path.with_suffix(".lock").exists()
 
 
 def test_detached_durable_token_publication_is_opt_in(
@@ -428,7 +671,7 @@ def test_token_persists_explicit_job_name() -> None:
         "owner",
         "supervision-id",
         payload_identity=payload,
-        job_name=r"Local\SpecButler-supervision-id",
+        job_name=r"Global\SpecButler-supervision-id",
     )
     restored = SupervisionToken.from_dict(token.to_dict())
     assert restored.identity == keeper
@@ -1004,7 +1247,7 @@ def test_windows_claimed_current_process_token_stops_from_another_process(
         assert token.version == 2
         assert helper_pid == token.identity.pid
         assert helper_pid != os.getpid()
-        assert token.job_name
+        assert token.job_name == f"Global\\SpecButler-{supervision_id}"
         assert token.control_relpath
 
         completed = subprocess.run(  # noqa: S603
@@ -1028,6 +1271,68 @@ def test_windows_claimed_current_process_token_stops_from_another_process(
         if process.pid != os.getpid() and process.poll() is None:
             process.kill()
         process.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows current-process cleanup")
+def test_windows_current_process_claim_retires_records_on_normal_exit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    supervision_id = f"normal-exit-{uuid.uuid4().hex}"
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "from spec_runtime.process_supervisor import claim_current_process; "
+                "claim_current_process(sys.argv[1])"
+            ),
+            supervision_id,
+        ],
+        env=os.environ.copy(),
+        check=False,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    control_path = root / "controls" / supervision_id / "control.json"
+    assert not control_path.exists()
+    assert not control_path.with_suffix(".lock").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows crash reconciliation")
+def test_windows_abrupt_current_process_claim_is_reconciled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "controls"
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
+    supervision_id = f"abrupt-exit-{uuid.uuid4().hex}"
+    completed = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os,sys; "
+                "from spec_runtime.process_supervisor import claim_current_process; "
+                "claim_current_process(sys.argv[1]); os._exit(0)"
+            ),
+            supervision_id,
+        ],
+        env=os.environ.copy(),
+        check=False,
+        timeout=10,
+    )
+    control_path = root / "controls" / supervision_id / "control.json"
+
+    assert completed.returncode == 0
+    assert control_path.exists()
+    assert process_supervisor.reconcile_stale_control_state() == 1
+    assert not control_path.exists()
+    assert not control_path.with_suffix(".lock").exists()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows timeout integration")
