@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import secrets
+import signal
 import socket
 import subprocess
 import sys
@@ -468,7 +469,11 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
             if stopped.returncode != 0:
                 raise _ProofFailure(f"spec web stop failed with exit code {stopped.returncode}")
             returncode = managed.wait(timeout=20)
-            if returncode != 0:
+            # Uvicorn completes graceful shutdown, restores the prior handler,
+            # and then deliberately re-raises the captured signal.  Both that
+            # POSIX status and a server implementation that returns zero are
+            # clean outcomes after the control-plane stop succeeded.
+            if returncode not in {0, -signal.SIGTERM}:
                 raise _ProofFailure(f"web server exited with status {returncode}")
             _wait_for_group_exit(pgid)
             stopped_cleanly = True

@@ -28,6 +28,8 @@ pytestmark = pytest.mark.skipif(
     reason="real Linux web service integration",
 )
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
 
 def _repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str, dict[str, str]]:
     token = "linux-web-service-token"
@@ -43,6 +45,17 @@ def _repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str, d
     monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(control_root))
     env = os.environ.copy()
     env.pop("SPEC_WEB_READY_NONCE", None)
+    # The service starts from a temporary repository, outside pytest's import
+    # path.  Point that child at this checkout explicitly: developers commonly
+    # run the suite from a worktree while their shared virtualenv is editable-
+    # installed from a different checkout.  Without this boundary the test can
+    # exercise stale installed code and, on assertion failure, leak its daemon.
+    env["PYTHONPATH"] = os.pathsep.join(
+        part
+        for part in (str(REPO_ROOT / "src"), env.get("PYTHONPATH", ""))
+        if part
+    )
+    env["SPEC_NO_UPDATE_CHECK"] = "1"
     return tmp_path, token, env
 
 
@@ -201,10 +214,11 @@ def test_linux_background_durable_start_auth_status_stop_and_cleanup(
     assert started.returncode == 0, started.stdout + started.stderr
     state_dir = repo / ".spec-state" / "web"
     token_path = state_dir / "server.supervision.json"
-    supervision = SupervisionToken.from_dict(
-        json.loads(token_path.read_text(encoding="utf-8"))
-    )
+    supervision: SupervisionToken | None = None
     try:
+        supervision = SupervisionToken.from_dict(
+            json.loads(token_path.read_text(encoding="utf-8"))
+        )
         assert supervision.mode is LifetimeMode.DETACHED
         assert identity_matches(supervision.identity)
         _wait_for_authenticated_http(port, token)
@@ -247,5 +261,18 @@ def test_linux_background_durable_start_auth_status_stop_and_cleanup(
             assert not (state_dir / name).exists()
         assert not durable_metadata_path(supervision.token).exists()
     finally:
-        if identity_matches(supervision.identity):
+        if supervision is not None and identity_matches(supervision.identity):
             terminate(supervision, grace_seconds=0.1)
+        elif supervision is None:
+            # Keep a failed ownership-publication assertion from leaking the
+            # test daemon.  The product stop path still requires a matching
+            # launch token or PID/start-time identity before it signals.
+            subprocess.run(
+                _cli_command("stop"),
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
