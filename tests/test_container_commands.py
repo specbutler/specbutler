@@ -800,11 +800,18 @@ def test_smoke_rejects_same_version_from_different_source(
 
     backend = StaleSourceBackend()
 
-    code = container.run_smoke(
-        Path("/tmp/repo"),
-        _config(),
-        backend=backend,  # type: ignore[arg-type]
-    )
+    # Installed wheels legitimately have no Git commit in their source ID.
+    # Pin an editable-checkout identity explicitly so this unit test exercises
+    # commit drift independent of how the test runner installed Spec Butler.
+    with patch(
+        "spec_runtime.container.host_spec_runtime_source_id",
+        return_value=f"{host_spec_runtime_version()}@{'1' * 40}",
+    ):
+        code = container.run_smoke(
+            Path("/tmp/repo"),
+            _config(),
+            backend=backend,  # type: ignore[arg-type]
+        )
 
     assert code == 1
     assert backend.cleaned is True
@@ -820,7 +827,8 @@ def test_host_source_identity_marks_dirty_editable_checkout() -> None:
     with (
         patch("spec_runtime.execution_backend.host_spec_runtime_version", return_value="1.2.3"),
         patch("importlib.metadata.distribution", side_effect=RuntimeError("no metadata")),
-        patch("spec_runtime.execution_backend.subprocess.run", side_effect=completed),
+        patch("spec_runtime.execution_backend._is_adjacent_spec_runtime_checkout", return_value=True),
+        patch("spec_runtime.execution_backend.run_git", side_effect=completed),
     ):
         source_id = host_spec_runtime_source_id()
 

@@ -323,6 +323,13 @@ def test_installed_wheel_read_only_cli_smoke(tmp_path: Path) -> None:
     # same environment a real Windows user gets outside a repository.
     env.pop("SPEC_CONFIG", None)
     env["PYTHONPATH"] = str(target)
+    # ``spec init`` deliberately requires a supported coding agent on PATH.
+    # The hosted Windows runner has none, so provide a discoverable inert shim;
+    # init only detects it and never launches it in this smoke test.
+    shim_dir = tmp_path / "agent-bin"
+    shim_dir.mkdir()
+    (shim_dir / "codex.cmd").write_text("@exit /b 0\n", encoding="utf-8")
+    env["PATH"] = os.pathsep.join((str(shim_dir), env.get("PATH", "")))
     outside_repo = tmp_path / "outside"
     outside_repo.mkdir()
     for args in (["--version"], ["--help"]):

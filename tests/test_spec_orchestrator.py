@@ -15228,9 +15228,15 @@ class TestSharedMemoryPreflight:
             stdout=self._ipcs_output_linux(4),
             stderr="",
         )
-        with patch.object(orch, "run_subprocess", return_value=mac_result):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", return_value=mac_result),
+        ):
             assert orch._count_sysv_shm_segments() == 3
-        with patch.object(orch, "run_subprocess", return_value=linux_result):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", return_value=linux_result),
+        ):
             assert orch._count_sysv_shm_segments() == 4
 
     def test_count_sysv_shm_segments_skips_native_windows(self):
@@ -15259,7 +15265,10 @@ class TestSharedMemoryPreflight:
             stderr="",
         )
 
-        with patch.object(orch, "run_subprocess", return_value=ipcs_result) as mock_run:
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", return_value=ipcs_result) as mock_run,
+        ):
             assert orch._verify_preflight_shared_memory(run, repo) is True
 
         assert run.last_error == ""
@@ -15294,7 +15303,10 @@ class TestSharedMemoryPreflight:
             ),
         ]
 
-        with patch.object(orch, "run_subprocess", side_effect=run_results) as mock_run:
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", side_effect=run_results) as mock_run,
+        ):
             assert orch._verify_preflight_shared_memory(run, repo) is True
 
         cleanup_call = mock_run.call_args_list[1]
@@ -15323,7 +15335,10 @@ class TestSharedMemoryPreflight:
             ),
         ]
 
-        with patch.object(orch, "run_subprocess", side_effect=run_results):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", side_effect=run_results),
+        ):
             assert orch._verify_preflight_shared_memory(run, repo) is True
 
         assert run.last_error == ""
@@ -15355,7 +15370,10 @@ class TestSharedMemoryPreflight:
             ),
         ]
 
-        with patch.object(orch, "run_subprocess", side_effect=run_results):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", side_effect=run_results),
+        ):
             assert orch._verify_preflight_shared_memory(run, repo) is True
 
         assert run.last_error == ""
@@ -29968,6 +29986,7 @@ class TestSpecAuthoring:
                 "_build_spec_authoring_command",
                 return_value=["codex", "Author spec `new-spec`"],
             ) as build_cmd,
+            patch.object(orch, "_windows_codex_authoring_env", return_value=None),
             patch.object(
                 orch.subprocess,
                 "run",
@@ -30032,6 +30051,7 @@ class TestSpecAuthoring:
                 "_build_spec_authoring_command",
                 return_value=["codex", "Author a new spec"],
             ) as build_cmd,
+            patch.object(orch, "_windows_codex_authoring_env", return_value=None),
             patch.object(
                 orch.subprocess,
                 "run",
@@ -30136,6 +30156,7 @@ class TestSpecAuthoring:
                 "_build_spec_authoring_command",
                 return_value=["codex", "Author spec `new-spec`"],
             ),
+            patch.object(orch, "_windows_codex_authoring_env", return_value=None),
             patch.object(
                 orch.subprocess,
                 "run",
