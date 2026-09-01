@@ -475,6 +475,33 @@ def test_ci_aggregate_handles_version_bump():
     assert "IS_VERSION_BUMP" in script
 
 
+def test_ci_evidence_waits_for_every_required_product_gate():
+    """A downloadable passing bundle cannot outlive a later package/security failure."""
+    evidence_job = _workflow_jobs()["ci-evidence"]
+
+    assert evidence_job["needs"] == [
+        "skip-check",
+        "lint",
+        "test",
+        "macos-test",
+        "package",
+        "security",
+        "windows-package",
+        "windows-probe",
+    ]
+    condition = str(evidence_job["if"])
+    for job_name in (
+        "lint",
+        "test",
+        "macos-test",
+        "package",
+        "security",
+        "windows-package",
+        "windows-probe",
+    ):
+        assert f"needs.{job_name}.result == 'success'" in condition
+
+
 def test_ci_skip_check_verifies_same_repo():
     """skip-check rejects version-bump branches from forks."""
     jobs = _workflow_jobs()

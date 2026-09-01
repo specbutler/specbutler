@@ -523,6 +523,8 @@ jobs:
       - lint
       - test
       - macos-test
+      - package
+      - security
       - windows-package
       - windows-probe
     if: >-
@@ -530,6 +532,8 @@ jobs:
       needs.lint.result == 'success' &&
       needs.test.result == 'success' &&
       needs.macos-test.result == 'success' &&
+      needs.package.result == 'success' &&
+      needs.security.result == 'success' &&
       needs.windows-package.result == 'success' &&
       needs.windows-probe.result == 'success'
     runs-on: ubuntu-latest

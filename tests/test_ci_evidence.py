@@ -429,6 +429,11 @@ def test_ci_workflow_aggregates_and_requires_hosted_evidence() -> None:
         "lint",
         "test",
         "macos-test",
+        "package",
+        "security",
         "windows-package",
         "windows-probe",
     ]
+    condition = str(evidence_job["if"])
+    assert "needs.package.result == 'success'" in condition
+    assert "needs.security.result == 'success'" in condition
