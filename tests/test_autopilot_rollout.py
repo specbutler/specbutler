@@ -146,14 +146,14 @@ def test_windows_available_memory_caps_computed_concurrency(tmp_path: Path) -> N
 
     assert available is not None and available > 0
     assert total is not None and available <= total
-    available_mb = available // (1024 * 1024)
+    total_mb = total // (1024 * 1024)
     config = load_spec_runtime_config(
         require=True,
         config_path=_write_config(
             tmp_path,
             f"""
             [autopilot]
-            worktree_memory_mb = {available_mb + 1}
+            worktree_memory_mb = {total_mb + 1}
             """,
         ),
     )
@@ -164,8 +164,10 @@ def test_windows_available_memory_caps_computed_concurrency(tmp_path: Path) -> N
         host_cpus=64,
     )
 
-    assert policy.host_memory_mb == available_mb
-    assert policy.memory_mb_per_run == available_mb + 1
+    # The policy takes its own live sample, so do not require the byte-for-byte
+    # value above to remain stable while Windows reclaims memory between calls.
+    assert 0 < policy.host_memory_mb <= total_mb
+    assert policy.memory_mb_per_run == total_mb + 1
     assert policy.cap == 1
 
 
