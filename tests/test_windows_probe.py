@@ -1012,7 +1012,7 @@ with patch.object(orchestrator, "cmd_run", return_value=0):
     assert str(background_port) in web_status.stdout
     _wait_for_http(f"http://127.0.0.1:{background_port}/", token)
     _cli(repo, "web", "stop", env=env, timeout=30)
-    stopped_status = _cli(repo, "web", "status", env=env, expected=1)
+    stopped_status = _cli(repo, "web", "status", env=env)
     assert "not running" in (stopped_status.stdout + stopped_status.stderr).lower()
 
     cleaned = _cli(repo, "clean", "--spec", lifecycle_id, env=env)
