@@ -14,7 +14,6 @@ state, outbox, logs, and forge authority outside the worker.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -39,6 +38,7 @@ from .config import (
     ExecutionConfig,
     SpecRuntimeConfig,
 )
+from .platform_fs import FileLock
 
 CONTAINER_WORKER_ENV_DENYLIST = frozenset(
     {
@@ -2619,12 +2619,10 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         lock_dir = run_root.parent / ".image-build-locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
         lock_digest = hashlib.sha256(f"{self._container.engine}\0{tag}".encode()).hexdigest()
-        lock_fd = os.open(str(lock_dir / f"{lock_digest}.lock"), os.O_CREAT | os.O_RDWR)
-        try:
+        with FileLock(lock_dir / f"{lock_digest}.lock"):
             # Concurrent autopilot runs commonly resolve the same cold image.
             # Serialize the inspect/build decision so the first process builds
             # it and every waiter reuses that completed tag.
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
             inspect = self._runner.run(
                 [self._container.engine, "image", "inspect", tag],
                 cwd=repo_root,
@@ -2701,9 +2699,6 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     f"Container backend image build failed for {tag}. See {logs / 'image-build.log'}"
                 )
             return tag
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
 
     def _prepare_build_context(
         self,

@@ -24,7 +24,13 @@ SPEC_RUN_BRANCH_RE = re.compile(r"^specrun/(?P<spec_id>[a-z0-9][a-z0-9-]*)--(?P<
 SPEC_AUTHORING_BRANCH_RE = re.compile(r"^spec/(?P<spec_id>[a-z0-9][a-z0-9-]*)$")
 SPEC_AUTHORING_SESSION_BRANCH_RE = re.compile(r"^spec-authoring/(?P<run_token>[A-Za-z0-9][A-Za-z0-9-]*)$")
 SPECDOC_BRANCH_RE = re.compile(r"^specdoc/(?P<spec_id>[a-z0-9][a-z0-9-]*)$")
-SPEC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_WINDOWS_RESERVED_BASENAMES = r"con|prn|aux|nul|com[1-9]|lpt[1-9]"
+# A bounded ID keeps generated branch and workspace components usable by Git
+# and common Windows tooling. The alphabet already excludes trailing dots and
+# spaces; IDs are lowercase, so the negative lookahead covers DOS device names.
+SPEC_ID_RE = re.compile(
+    rf"^(?!(?:{_WINDOWS_RESERVED_BASENAMES})$)[a-z0-9][a-z0-9-]{{0,63}}$",
+)
 PR_BODY_SPEC_ID_RE = re.compile(r"(?im)^Spec-ID:\s*(?P<spec_id>[a-z0-9][a-z0-9-]*)\s*$")
 PR_BODY_REVIEW_OWNER_RE = re.compile(r"(?im)^Review-Owner:\s*(?P<owner>[A-Za-z0-9][A-Za-z0-9-]*)\s*$")
 LOCAL_REVIEW_OWNER = "local"

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import grp
 import json
 import os
 import platform
@@ -812,6 +811,10 @@ def _append_config_snippet(path: Path) -> None:
 
 
 def _docker_socket_check() -> CheckResult:
+    if os.name == "nt":
+        return CheckResult("docker socket", False, "Unix docker socket is not available on native Windows")
+    import grp
+
     socket_path = Path("/var/run/docker.sock")
     if not socket_path.exists():
         return CheckResult("docker socket", False, "missing /var/run/docker.sock")

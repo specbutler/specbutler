@@ -212,8 +212,8 @@ def _cmd_clean(args: argparse.Namespace) -> int:
     # process inspection, or filesystem mutation can occur.
     if not SPEC_ID_RE.fullmatch(spec_id):
         print(
-            "Error: Invalid spec ID. Use lowercase letters, digits, and hyphens; "
-            "the first character must be alphanumeric.",
+            "Error: Invalid spec ID. Use at most 64 lowercase letters, digits, and hyphens; "
+            "start with an alphanumeric character and avoid Windows device names.",
             file=sys.stderr,
         )
         return 1
