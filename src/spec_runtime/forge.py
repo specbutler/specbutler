@@ -542,6 +542,12 @@ class GitHubForge:
         if result.returncode != 0:
             return MergeResult(ok=False, message=result.stderr.strip())
         if auto:
+            # Some gh versions print an explicit mutation acknowledgement.
+            # Preserve that as a valid postcondition (and avoid a redundant
+            # query); silent success still requires confirmation from GitHub.
+            acknowledgement = (result.stdout or "").strip().lower()
+            if acknowledgement == "merged" or "auto-merge enabled" in acknowledgement:
+                return MergeResult(ok=True, message=acknowledgement)
             confirmed, detail = confirm_auto_merge()
             if not confirmed:
                 return MergeResult(
