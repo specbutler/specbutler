@@ -15,16 +15,20 @@ _CONTROL_ROOT_SEQUENCE = itertools.count()
 def _pin_current_checkout_for_subprocesses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Make child interpreters exercise the checkout pytest is collecting.
+    """Make child interpreters exercise the same package pytest imported.
 
     Worktrees commonly share one editable virtualenv.  Pytest adds this
     checkout's ``src`` directory to its own import path, but a child launched
     from a temporary repository otherwise falls back to whichever checkout
-    that virtualenv last installed.  Put the collected checkout first while
-    still retaining any caller-supplied import paths.  Individual tests remain
-    free to clear or replace ``PYTHONPATH`` when that is the behavior at issue.
+    that virtualenv last installed.  Conversely, installed-wheel CI deliberately
+    disables pytest's checkout import path.  Derive the boundary from the package
+    already imported by this pytest process so both modes remain honest, while
+    retaining any caller-supplied import paths.  Individual tests remain free to
+    clear or replace ``PYTHONPATH`` when that is the behavior at issue.
     """
-    source_root = Path(__file__).resolve().parent.parent / "src"
+    import spec_runtime
+
+    source_root = Path(spec_runtime.__file__).resolve().parent.parent
     inherited = os.environ.get("PYTHONPATH", "")
     monkeypatch.setenv(
         "PYTHONPATH",
