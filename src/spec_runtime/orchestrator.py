@@ -70,6 +70,7 @@ from .agent_adapter import (
     codex_isolated_home,
     get_agent_adapter,
 )
+from .command_runtime import CommandSpec
 from .config import load_spec_runtime_config
 from .control_plane import (
     DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
@@ -2475,7 +2476,14 @@ def _run_implement_setup_command(
     run: RunState,
     worktree_path: Path,
 ) -> ImplementSetupManifest:
+    variants = SPEC_RUNTIME_CONFIG.implement.setup
+    selected = variants.select()
     command = SPEC_RUNTIME_CONFIG.implement.setup_command.strip()
+    if selected is not None and not command:
+        command = selected.display()
+    typed = selected is not None and (
+        selected.mode == "argv" or variants.shell or variants.windows_command
+    )
     backend = _resolve_execution_backend()
     if not command:
         _snapshot_container_workspace_after_setup(run, worktree_path, backend)
@@ -2488,7 +2496,7 @@ def _run_implement_setup_command(
     # raise past ``phase_implement``. Surfacing it as an ``ImplementSetupFailure``
     # lets the agent launch with diagnostics instead of aborting the phase.
     try:
-        split_command = shlex.split(command)
+        split_command = selected.argv() if typed and selected is not None else shlex.split(command)
     except ValueError as exc:
         # ``shlex.split`` failed (e.g. unclosed quote), so we cannot rely on
         # proper tokenization. Fall back to argv-aware best-effort redaction
@@ -2895,13 +2903,23 @@ def _position_review_retry_workspace_head(
 
 
 def _run_implement_teardown_command(run: RunState, worktree_path: Path) -> None:
+    variants = SPEC_RUNTIME_CONFIG.implement.teardown
+    selected = variants.select()
     command = SPEC_RUNTIME_CONFIG.implement.teardown_command.strip()
+    if selected is not None and not command:
+        command = selected.display()
     if not command:
         return
 
     env, args = _build_implement_command_metadata(run, worktree_path)
     _inject_worktree_venv_into_env(env, worktree_path)
-    teardown_cmd = [*shlex.split(command), *args]
+    typed = selected is not None and (
+        selected.mode == "argv" or variants.shell or variants.windows_command
+    )
+    teardown_cmd = [
+        *(selected.argv() if typed and selected is not None else shlex.split(command)),
+        *args,
+    ]
     backend = _resolve_execution_backend()
     try:
         result = backend.run_command(
@@ -12865,9 +12883,9 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
         if install_cmd:
             if not run_or_fail(
                 run,
-                ["sh", "-c", install_cmd],
+                install_cmd.argv(),
                 cwd=worktree_path,
-                action=install_cmd,
+                action=install_cmd.display(),
             ):
                 return "failed"
 
@@ -12982,20 +13000,29 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
     if install_cmd:
         if not run_or_fail(
             run,
-            ["sh", "-c", install_cmd],
+            install_cmd.argv(),
             cwd=worktree_path,
-            action=install_cmd,
+            action=install_cmd.display(),
         ):
             return "failed"
 
     return "passed"
 
 
-def _host_bootstrap_install_command(backend: ExecutionBackend) -> str:
-    install_cmd = SPEC_RUNTIME_CONFIG.bootstrap_install_command
+def _host_bootstrap_install_command(backend: ExecutionBackend) -> CommandSpec | None:
+    install_cmd = _selected_bootstrap_install_command()
     if backend.identity.backend == "container":
-        return ""
+        return None
     return install_cmd
+
+
+def _selected_bootstrap_install_command() -> CommandSpec | None:
+    """Select typed bootstrap config while honoring legacy constructed configs."""
+    selected = SPEC_RUNTIME_CONFIG.bootstrap_install.select()
+    if selected is not None:
+        return selected
+    legacy = str(SPEC_RUNTIME_CONFIG.bootstrap_install_command or "").strip()
+    return CommandSpec("script", legacy, "sh", "[bootstrap].install_command") if legacy else None
 
 
 def _backend_uses_provider_sandbox_config(backend: ExecutionBackend) -> bool:
@@ -16905,7 +16932,7 @@ def _run_verify_gate(
     gate: str,
     repo_root: Path | None = None,
 ) -> VerifyGateResult:
-    command = shlex.split(VERIFY_GATE_COMMANDS.get(gate, f"make {gate}"))
+    command = _verify_gate_command_args(gate)
     timeout_seconds = DEFAULT_VERIFY_GATE_TIMEOUT_SECONDS
     backend = _resolve_execution_backend()
 
@@ -17030,6 +17057,14 @@ def _run_verify_gate(
 
 
 def _verify_gate_command_args(gate: str) -> list[str]:
+    config = next((item for item in SPEC_RUNTIME_CONFIG.verify_gates if item.name == gate), None)
+    if config is not None:
+        variants = config.command_variants
+        selected = variants.select()
+        if selected is not None and (
+            selected.mode == "argv" or variants.shell or variants.windows_command
+        ):
+            return selected.argv()
     return shlex.split(VERIFY_GATE_COMMANDS.get(gate, f"make {gate}"))
 
 
@@ -18601,12 +18636,15 @@ def _bootstrap_review_worktree(
     summary when bootstrap did not complete cleanly.
     """
     warning_path.unlink(missing_ok=True)
-    install_cmd = str(SPEC_RUNTIME_CONFIG.bootstrap_install_command or "").strip()
-    if not install_cmd:
+    install_command = _selected_bootstrap_install_command()
+    if install_command is None:
         # No trusted bootstrap command configured: keep today's diff-only
         # review rather than guessing an install command from the tree under
         # review.
         return ""
+    install_display = install_command.display()
+    if SPEC_RUNTIME_CONFIG.bootstrap_install.select() is None:
+        install_display = str(SPEC_RUNTIME_CONFIG.bootstrap_install_command).strip()
 
     # Credentials stripped (no forge tokens) — reuse the hardened env the
     # reviewer subprocess runs with, then additionally drop the portable agent
@@ -18636,7 +18674,7 @@ def _bootstrap_review_worktree(
         payload = {
             "recorded_at": _now_iso(),
             "worktree": str(review_worktree),
-            "command": install_cmd,
+            "command": install_display,
             "summary": summary,
             "detail": detail[-4000:],
         }
@@ -18662,7 +18700,7 @@ def _bootstrap_review_worktree(
     try:
         try:
             proc = subprocess.Popen(
-                ["sh", "-lc", install_cmd],
+                install_command.argv(),
                 cwd=review_worktree,
                 env=env,
                 stdin=subprocess.DEVNULL,

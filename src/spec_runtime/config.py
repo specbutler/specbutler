@@ -8,6 +8,8 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from .command_runtime import CommandConfigurationError, CommandVariants, parse_command_variants
+
 _REPO_ROOT_MARKERS = (".git", ".spec.toml", "pyproject.toml")
 
 _LOCAL_CONFIG_FILENAME = ".spec.local.toml"
@@ -25,6 +27,7 @@ class VerifyGateConfig:
     command: str
     parallel: bool = False
     role: str = ""  # Semantic role: "test", "lint", "e2e". Defaults to name.
+    command_variants: CommandVariants = CommandVariants()
 
     @property
     def effective_role(self) -> str:
@@ -50,6 +53,8 @@ class AgentConfig:
 class ImplementConfig:
     setup_command: str = ""
     teardown_command: str = ""
+    setup: CommandVariants = CommandVariants()
+    teardown: CommandVariants = CommandVariants()
 
 
 @dataclass(frozen=True)
@@ -184,6 +189,7 @@ class SpecRuntimeConfig:
     )
     agents: AgentConfig = AgentConfig()
     bootstrap_install_command: str = ""
+    bootstrap_install: CommandVariants = CommandVariants()
     bootstrap_cache: BootstrapCacheConfig = BootstrapCacheConfig()
     implement: ImplementConfig = ImplementConfig()
     update: UpdateConfig = UpdateConfig()
@@ -562,8 +568,14 @@ def load_spec_runtime_config(
         if not isinstance(gate, dict):
             continue
         name = str(gate.get("name", "")).strip()
-        command = str(gate.get("command", "")).strip()
-        if not name or not command:
+        try:
+            variants = parse_command_variants(
+                gate, source=f"[[verify.gates]] name={name!r}"
+            )
+        except CommandConfigurationError as exc:
+            raise SpecConfigError(str(exc)) from exc
+        command = variants.command
+        if not name or not variants.select(windows=False) and not variants.select(windows=True):
             continue
         gates.append(
             VerifyGateConfig(
@@ -571,6 +583,7 @@ def load_spec_runtime_config(
                 command=command,
                 parallel=bool(gate.get("parallel", False)),
                 role=str(gate.get("role", "")).strip(),
+                command_variants=variants,
             )
         )
     # Only fall back to hardcoded defaults when there is NO [verify] section
@@ -584,7 +597,19 @@ def load_spec_runtime_config(
     ) or ("claude", "codex")
 
     bootstrap_payload = raw.get("bootstrap", {})
-    bootstrap_install_command = str(bootstrap_payload.get("install_command", "")).strip()
+    try:
+        bootstrap_install = parse_command_variants(
+            bootstrap_payload, command_key="install_command", source="[bootstrap]"
+        )
+        implement_setup = parse_command_variants(
+            implement_payload, command_key="setup_command", source="[implement setup]"
+        )
+        implement_teardown = parse_command_variants(
+            implement_payload, command_key="teardown_command", source="[implement teardown]"
+        )
+    except CommandConfigurationError as exc:
+        raise SpecConfigError(str(exc)) from exc
+    bootstrap_install_command = bootstrap_install.command
     bootstrap_cache_payload = bootstrap_payload.get("cache", {})
     bootstrap_cache = BootstrapCacheConfig()
     if isinstance(bootstrap_cache_payload, dict):
@@ -627,10 +652,13 @@ def load_spec_runtime_config(
             allowed=allowed_agents,
         ),
         bootstrap_install_command=bootstrap_install_command,
+        bootstrap_install=bootstrap_install,
         bootstrap_cache=bootstrap_cache,
         implement=ImplementConfig(
             setup_command=str(implement_payload.get("setup_command", "")).strip(),
             teardown_command=str(implement_payload.get("teardown_command", "")).strip(),
+            setup=implement_setup,
+            teardown=implement_teardown,
         ),
         update=UpdateConfig(
             check_enabled=bool(update_payload.get("check_enabled", True)),

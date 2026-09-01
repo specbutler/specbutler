@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .command_runtime import CommandSpec, looks_posix_script
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config
 from .platform import is_unc_path, is_windows
 
@@ -546,6 +547,8 @@ def _command_checks(
     which: ExecutableResolver,
 ) -> list[DoctorCheck]:
     checks: list[DoctorCheck] = []
+    if is_windows():
+        return _windows_command_checks(repo_root, config, which)
     commands = _configured_commands(config)
     bootstrap_deferred_executables: set[str] = set()
     if config.bootstrap_install_command:
@@ -616,6 +619,53 @@ def _command_checks(
             if pending_bootstrap:
                 detail += "; pending bootstrap: " + ", ".join(pending_bootstrap)
             checks.append(_ok(name, f"syntax valid; launcher(s): {detail}"))
+    return checks
+
+
+def _windows_command_checks(
+    repo_root: Path,
+    config: SpecRuntimeConfig,
+    which: ExecutableResolver,
+) -> list[DoctorCheck]:
+    """Validate exactly the typed command variants native Windows will run."""
+    configured: list[tuple[str, CommandSpec | None, str]] = [
+        ("bootstrap command", config.bootstrap_install.select(windows=True), "[bootstrap]"),
+    ]
+    configured.extend(
+        (
+            f"verify command ({gate.name})",
+            gate.command_variants.select(windows=True),
+            f"[[verify.gates]] name={gate.name!r}",
+        )
+        for gate in config.verify_gates
+    )
+    checks: list[DoctorCheck] = []
+    for name, command, location in configured:
+        if command is None:
+            if name == "bootstrap command":
+                checks.append(_ok(name, "not configured (optional)"))
+            continue
+        if command.mode == "script" and command.shell == "sh" and looks_posix_script(str(command.value)):
+            checks.append(
+                _error(
+                    name,
+                    "only a POSIX shell command is configured, which native Windows will not rewrite",
+                    f"Add `{location}` argv_windows, or command_windows with shell_windows set to powershell, pwsh, or cmd.",
+                )
+            )
+            continue
+        try:
+            argv = command.argv(which=which)
+        except FileNotFoundError as exc:
+            checks.append(_error(name, str(exc), f"Install the declared shell or update `{location}`."))
+            continue
+        executable = argv[0]
+        if _resolve_command_executable(executable, repo_root, which) is None:
+            checks.append(
+                _error(name, f"missing executable: `{executable}`", f"Install it or update `{location}`.")
+            )
+        else:
+            checks.append(_ok(name, f"selected command: {command.display(windows=True)}"))
     return checks
 
 
