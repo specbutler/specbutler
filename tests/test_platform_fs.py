@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from spec_runtime.platform import is_unc_path
-from spec_runtime.platform_fs import FileLock, atomic_write_text, remove_tree
+from spec_runtime.platform_fs import FileLock, _windows_extended_path, atomic_write_text, remove_tree
 from spec_runtime.spec_identity import SPEC_ID_RE
 
 
@@ -259,6 +259,18 @@ def test_remove_tree_repairs_read_only_file(tmp_path: Path) -> None:
     item.chmod(0o444)
     remove_tree(tree)
     assert not tree.exists()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (r"C:\repo\deep", r"\\?\C:\repo\deep"),
+        (r"\\server\share\repo", r"\\?\UNC\server\share\repo"),
+        (r"\\?\C:\already", r"\\?\C:\already"),
+    ],
+)
+def test_windows_extended_path_supports_drive_and_unc_roots(value: str, expected: str) -> None:
+    assert str(_windows_extended_path(Path(value))) == expected
 
 
 @pytest.mark.parametrize("value", [r"\\server\share\repo", "//server/share/repo"])

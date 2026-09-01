@@ -1017,6 +1017,19 @@ def _cleanup_worktree_checkout(
         if rm_result.returncode != 0:
             detail = redact_sensitive(tail_lines(rm_result.stderr or rm_result.stdout))
             logger.warning("worktree remove reported failure: %s", detail[-240:])
+            # Git for Windows can detach the worktree metadata but fail while
+            # deleting a deep isolated-agent cache at the legacy MAX_PATH
+            # boundary. Finish the authorized cleanup through our extended-
+            # length filesystem primitive; the prune below then removes any
+            # metadata Git left behind.
+            if worktree_path.is_dir():
+                try:
+                    remove_tree(worktree_path)
+                except OSError as exc:
+                    return (
+                        f"git worktree remove failed for {worktree_path}: {detail[-240:]}; "
+                        f"fallback directory removal also failed: {exc}"
+                    )
     elif worktree_path.is_dir():
         try:
             remove_tree(worktree_path)

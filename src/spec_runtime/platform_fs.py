@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import ntpath
 import os
 import shutil
 import stat
@@ -12,6 +13,16 @@ from pathlib import Path
 
 _DELAYS = (0.01, 0.025, 0.05, 0.1, 0.2)
 _WINDOWS = os.name == "nt"
+
+
+def _windows_extended_path(path: Path) -> Path:
+    """Return an absolute Windows path that is not limited by ``MAX_PATH``."""
+    rendered = ntpath.abspath(str(path))
+    if rendered.startswith("\\\\?\\"):
+        return Path(rendered)
+    if rendered.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + rendered.lstrip("\\"))
+    return Path("\\\\?\\" + rendered)
 
 
 def _transient(exc: OSError) -> bool:
@@ -61,13 +72,18 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
 
 def remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
     """Remove a tree while tolerating read-only and transient Windows entries."""
-    def onerror(function, name, _exc_info) -> None:
+    def onerror(function, name, exc_info) -> None:
+        exc = exc_info[1]
+        if isinstance(exc, FileNotFoundError) or getattr(exc, "winerror", None) in {2, 3}:
+            # Another remover (or a junction/cache cleanup) won the race.
+            return
         target = Path(name)
         target.chmod(target.stat().st_mode | stat.S_IWRITE)
         _retry(lambda: function(name))
 
+    removal_path = _windows_extended_path(path) if _WINDOWS else path
     try:
-        _retry(lambda: shutil.rmtree(path, onerror=onerror))
+        _retry(lambda: shutil.rmtree(removal_path, onerror=onerror))
     except OSError:
         if not ignore_errors:
             raise

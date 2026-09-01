@@ -26066,6 +26066,34 @@ class TestCleanupPhase:
         assert error == ""
         assert process_registry.list_registered_worktrees(state_root) == []
 
+    def test_cleanup_falls_back_when_git_cannot_delete_registered_worktree(self, repo: Path):
+        worktree = repo / ".worktrees" / "feature"
+        worktree.mkdir(parents=True)
+        listing = f"worktree {worktree}\nHEAD {'a' * 40}\nbranch refs/heads/code/feature\n\n"
+        commands: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):  # noqa: ARG001
+            commands.append(cmd)
+            if cmd[:3] == ["git", "worktree", "list"]:
+                output = listing if len([c for c in commands if c[:3] == ["git", "worktree", "list"]]) == 1 else ""
+                return subprocess.CompletedProcess(cmd, 0, output, "")
+            if cmd[:3] == ["git", "worktree", "remove"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "Filename too long")
+            if cmd[:3] == ["git", "worktree", "prune"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with patch.object(orch, "run_subprocess", side_effect=fake_run):
+            error = orch._cleanup_worktree_checkout(
+                repo,
+                worktree,
+                branch=None,
+                delete_branch=False,
+            )
+
+        assert error == ""
+        assert not worktree.exists()
+
     def test_orchestrator_sigterm_guard_reaps_registered_helpers(self, repo: Path):
         run = orch.RunState(
             run_id="my-feature-20260101T000000",
