@@ -23245,6 +23245,10 @@ class TestMergeRequiredChecks:
         wait_mock.assert_called_once_with(repo, run.branch, 12)
         assert sleep_mock.call_count == 1
 
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="requires POSIX Popen timeout busy-wait and executable shebang shim",
+    )
     def test_merge_poll_sleeps_exclude_subprocess_busy_wait(
         self,
         repo: Path,
