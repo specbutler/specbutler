@@ -34,7 +34,8 @@ from spec_runtime import execution_backend as eb
 from spec_runtime import orchestrator as orch
 from spec_runtime import spec_merge_tags as merge_tags
 from spec_runtime import worktree_process_registry as process_registry
-from spec_runtime.config import CoordinationConfig
+from spec_runtime.command_runtime import CommandVariants
+from spec_runtime.config import CoordinationConfig, VerifyGateConfig
 from spec_runtime.control_plane import save_run_lease
 from spec_runtime.control_plane.lease import build_lease
 from spec_runtime.coordination import CoordinatorError, CoordinatorLeaseConflictError
@@ -11751,6 +11752,37 @@ class TestImplementSetupTeardownHelpers:
         assert seen["env"]["SPEC_RUN_ID"] == run.run_id
         assert seen["env"]["SPEC_PATH"] == "specs/my-feature.md"
 
+    def test_windows_setup_override_does_not_change_posix_argv(self, repo: Path):
+        run = self._run()
+        variants = CommandVariants(
+            command="scripts/setup.sh 'literal && value'",
+            windows_command="Write-Output setup",
+            windows_shell="powershell",
+        )
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            implement=replace(
+                orch.SPEC_RUNTIME_CONFIG.implement,
+                setup_command=variants.command,
+                setup=variants,
+            ),
+        )
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(
+                orch,
+                "run_subprocess",
+                return_value=subprocess.CompletedProcess([], 0, "{}", ""),
+            ) as run_command,
+        ):
+            orch._run_implement_setup_command(run, repo)
+
+        assert run_command.call_args.args[0][:2] == [
+            "scripts/setup.sh",
+            "literal && value",
+        ]
+
     def test_run_setup_command_returns_failure_on_nonzero_exit(self, repo: Path):
         run = self._run()
         config = replace(
@@ -13897,6 +13929,55 @@ class TestImplementSetupTeardownHelpers:
             orch._run_implement_teardown_command(run, repo)
 
         assert "Implement teardown command failed" in caplog.text
+
+    def test_windows_teardown_override_does_not_change_posix_argv(self, repo: Path):
+        run = self._run()
+        variants = CommandVariants(
+            command="scripts/teardown.sh 'literal && value'",
+            windows_command="Write-Output teardown",
+            windows_shell="powershell",
+        )
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            implement=replace(
+                orch.SPEC_RUNTIME_CONFIG.implement,
+                teardown_command=variants.command,
+                teardown=variants,
+            ),
+        )
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(
+                orch,
+                "run_subprocess",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ) as run_command,
+        ):
+            orch._run_implement_teardown_command(run, repo)
+
+        assert run_command.call_args.args[0][:2] == [
+            "scripts/teardown.sh",
+            "literal && value",
+        ]
+
+    def test_windows_verify_override_does_not_change_posix_argv(self):
+        variants = CommandVariants(
+            command="pytest 'literal && value'",
+            windows_command="Write-Output verify",
+            windows_shell="powershell",
+        )
+        gate = VerifyGateConfig("test", variants.command, command_variants=variants)
+        config = replace(orch.SPEC_RUNTIME_CONFIG, verify_gates=(gate,))
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.dict(orch.VERIFY_GATE_COMMANDS, {"test": variants.command}),
+        ):
+            assert orch._verify_gate_command_args("test") == [
+                "pytest",
+                "literal && value",
+            ]
 
     def test_run_teardown_command_logs_launch_failure_without_raising(
         self,

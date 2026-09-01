@@ -70,7 +70,7 @@ from .agent_adapter import (
     codex_isolated_home,
     get_agent_adapter,
 )
-from .command_runtime import CommandSpec
+from .command_runtime import CommandSpec, CommandVariants
 from .config import load_spec_runtime_config
 from .control_plane import (
     DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
@@ -2481,9 +2481,7 @@ def _run_implement_setup_command(
     command = SPEC_RUNTIME_CONFIG.implement.setup_command.strip()
     if selected is not None and not command:
         command = selected.display()
-    typed = selected is not None and (
-        selected.mode == "argv" or variants.shell or variants.windows_command
-    )
+    typed = selected is not None and _selected_command_uses_typed_runtime(variants, selected)
     backend = _resolve_execution_backend()
     if not command:
         _snapshot_container_workspace_after_setup(run, worktree_path, backend)
@@ -2917,9 +2915,7 @@ def _run_implement_teardown_command(run: RunState, worktree_path: Path) -> None:
 
     env, args = _build_implement_command_metadata(run, worktree_path)
     _inject_worktree_venv_into_env(env, worktree_path)
-    typed = selected is not None and (
-        selected.mode == "argv" or variants.shell or variants.windows_command
-    )
+    typed = selected is not None and _selected_command_uses_typed_runtime(variants, selected)
     teardown_cmd = (
         selected.argv(arguments=tuple(args))
         if typed and selected is not None
@@ -17066,11 +17062,25 @@ def _verify_gate_command_args(gate: str) -> list[str]:
     if config is not None:
         variants = config.command_variants
         selected = variants.select()
-        if selected is not None and (
-            selected.mode == "argv" or variants.shell or variants.windows_command
-        ):
+        if selected is not None and _selected_command_uses_typed_runtime(variants, selected):
             return selected.argv()
     return shlex.split(VERIFY_GATE_COMMANDS.get(gate, f"make {gate}"))
+
+
+def _selected_command_uses_typed_runtime(
+    variants: CommandVariants,
+    selected: CommandSpec,
+) -> bool:
+    """Whether the variant selected for this platform opts into typed execution.
+
+    Legacy POSIX command strings remain argv-split unless they declare a shell.
+    A Windows-only script is additive and must not affect that POSIX decision.
+    """
+    return bool(
+        selected.mode == "argv"
+        or variants.shell
+        or (os.name == "nt" and variants.windows_command)
+    )
 
 
 def _run_verify_subprocess_with_timeout(
