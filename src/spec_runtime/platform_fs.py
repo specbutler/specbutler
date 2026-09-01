@@ -85,10 +85,6 @@ class FileLock:
                 import msvcrt
 
                 self.file.seek(0)
-                if self.file.read(1) == b"":
-                    self.file.write(b"\0")
-                    self.file.flush()
-                self.file.seek(0)
                 while True:
                     try:
                         msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
@@ -101,12 +97,17 @@ class FileLock:
                             self.file = None
                             return False
                         time.sleep(_DELAYS[0])
-                # Older POSIX lock files stored JSON beginning at byte zero.
-                # Once byte zero is locked, migrate that content behind the
-                # Windows sentinel before callers read or replace metadata.
+                # Never inspect byte zero before owning it: Windows denies even
+                # reads of a byte locked by another process. Initialize a new
+                # file, or migrate older POSIX metadata, only while holding the
+                # byte-range lock.
                 self.file.seek(0)
                 content = self.file.read()
-                if content and not content.startswith(b"\0"):
+                if not content:
+                    self.file.seek(0)
+                    self.file.write(b"\0")
+                    self.file.flush()
+                elif not content.startswith(b"\0"):
                     self.file.seek(0)
                     self.file.write(b"\0" + content)
                     self.file.truncate()

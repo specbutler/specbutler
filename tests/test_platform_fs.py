@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 
@@ -149,6 +150,77 @@ def test_windows_lock_migrates_legacy_metadata(monkeypatch: pytest.MonkeyPatch, 
         }
     finally:
         lock.release()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows byte-range locks")
+def test_windows_file_lock_contends_across_processes(tmp_path: Path) -> None:
+    path = tmp_path / "native.lock"
+    result_path = tmp_path / "result.txt"
+    contender = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from spec_runtime.platform_fs import FileLock\n"
+        "lock = FileLock(Path(sys.argv[1]), blocking=False)\n"
+        "Path(sys.argv[2]).write_text(str(lock.acquire()))\n"
+    )
+    with FileLock(path):
+        completed = subprocess.run(
+            [sys.executable, "-c", contender, str(path), str(result_path)],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert result_path.read_text() == "False"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows byte-range locks")
+def test_windows_file_lock_blocks_across_processes_until_release(tmp_path: Path) -> None:
+    path = tmp_path / "native.lock"
+    ready_path = tmp_path / "ready.txt"
+    result_path = tmp_path / "result.txt"
+    contender = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from spec_runtime.platform_fs import FileLock\n"
+        "Path(sys.argv[2]).write_text('ready')\n"
+        "with FileLock(Path(sys.argv[1])):\n"
+        "    Path(sys.argv[3]).write_text('acquired')\n"
+    )
+    lock = FileLock(path)
+    assert lock.acquire()
+    process = subprocess.Popen(
+        [sys.executable, "-c", contender, str(path), str(ready_path), str(result_path)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        for _ in range(1000):
+            if ready_path.exists() or process.poll() is not None:
+                break
+            time.sleep(0.01)
+        assert ready_path.exists()
+        assert process.poll() is None
+        assert not result_path.exists()
+    finally:
+        lock.release()
+    stdout, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, stdout + stderr
+    assert result_path.read_text() == "acquired"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows byte-range locks")
+def test_windows_file_lock_migrates_legacy_metadata_natively(tmp_path: Path) -> None:
+    from spec_runtime.platform_fs import read_lock_metadata
+
+    path = tmp_path / "legacy-native.lock"
+    legacy = b'{"pid": 4321, "command": "spec implement"}\n'
+    path.write_bytes(legacy)
+    with FileLock(path):
+        assert path.read_bytes() == b"\0" + legacy
+        assert json.loads(read_lock_metadata(path))["pid"] == 4321
 
 
 def test_remove_tree_repairs_read_only_file(tmp_path: Path) -> None:

@@ -648,7 +648,11 @@ class ProcessSupervisor:
             # Minimal Popen doubles used by callers do not represent a live OS
             # process. Keep that compatibility seam out of production paths.
             is_test_double = not isinstance(process, _REAL_POPEN_TYPE)
-            identity = ProcessIdentity(process.pid, "test-double") if is_test_double else inspect_process(process.pid)
+            identity = (
+                ProcessIdentity(int(getattr(process, "pid", os.getpid())), "test-double")
+                if is_test_double
+                else inspect_process(process.pid)
+            )
             if identity is None:
                 raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
             owner = ProcessIdentity(os.getpid(), "test-double") if is_test_double else inspect_process(os.getpid())

@@ -216,9 +216,11 @@ def run_command(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Launch a typed command without interpreting argv-mode arguments."""
+    from .process_supervisor import run as run_supervised
+
     try:
         with command.launch_argv(cwd=cwd) as argv:
-            return subprocess.run(
+            return run_supervised(
                 argv, cwd=cwd, env=None if env is None else dict(env),
                 capture_output=True, text=True, stdin=subprocess.DEVNULL,
                 timeout=timeout, check=False,
