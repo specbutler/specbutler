@@ -137,6 +137,12 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     )
     assert "Set-EvidenceClaim" in proof
     assert "Proof must run with a non-elevated user token" in proof
+    assert "Get-CimInstance -ClassName Win32_OperatingSystem" in proof
+    assert "$windowsBuildNumber -lt 22000" in proof
+    assert "$windowsProductType -ne 1" in proof
+    assert "windows_build_number = $windowsBuildNumber" in proof
+    assert "windows_product_type = $windowsProductType" in proof
+    assert "$windowsProduct -notmatch 'Windows 11'" not in proof
     register_job = (LAB_ROOT / "register-job.ps1").read_text(encoding="utf-8")
     assert "-RunLevel Limited" in register_job
     assert "-RunLevel Highest" not in register_job

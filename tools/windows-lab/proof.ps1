@@ -149,9 +149,14 @@ $sourceProvenance = [ordered]@{
 Write-Utf8NoBom `
     -LiteralPath (Join-Path $evidenceRoot 'source-provenance.json') `
     -Value ($sourceProvenance | ConvertTo-Json -Depth 4)
-$windowsProduct = (Get-ComputerInfo -Property WindowsProductName).WindowsProductName
+$windowsOs = Get-CimInstance -ClassName Win32_OperatingSystem
+$windowsProduct = [string]$windowsOs.Caption
+$windowsBuildNumber = [int]$windowsOs.BuildNumber
+$windowsProductType = [int]$windowsOs.ProductType
 $systemVolume = Get-Volume -DriveLetter C
-if ($windowsProduct -notmatch 'Windows 11') { throw "Proof requires Windows 11, found: $windowsProduct" }
+if ($windowsProductType -ne 1 -or $windowsBuildNumber -lt 22000) {
+    throw "Proof requires a Windows 11 client build (build >= 22000, product type 1), found: $windowsProduct build $windowsBuildNumber product type $windowsProductType"
+}
 if ($systemVolume.FileSystem -ne 'NTFS' -or $systemVolume.DriveType -ne 'Fixed') {
     throw "Proof requires a local fixed NTFS system volume, found: $($systemVolume.DriveType) $($systemVolume.FileSystem)"
 }
@@ -956,6 +961,8 @@ $result = [ordered]@{
     run_name = $runName
     source_revision = $sourceRevision
     windows_edition = $windowsProduct
+    windows_build_number = $windowsBuildNumber
+    windows_product_type = $windowsProductType
     filesystem = $systemVolume.FileSystem
     backend = 'worktree'
     agent = 'codex'
