@@ -107,7 +107,7 @@ from .execution_backend import (
 )
 from .execution_backend import get_execution_backend as _factory_get_execution_backend
 from .forge import GitHubForge, PushResult
-from .git_common import resolve_common_root
+from .git_common import git_text_kwargs, resolve_common_root, run_git
 from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
 from .process_supervisor import (
     LifetimeMode,
@@ -652,10 +652,8 @@ class BlockDebuggerAutoResumeExhausted(RuntimeError):
 
 def resolve_repo_root() -> Path:
     """Return the repository common root (main checkout for linked worktrees)."""
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
+    result = run_git(
+        ["rev-parse", "--show-toplevel"],
         check=True,
     )
     return resolve_common_root(Path(result.stdout.strip()))
@@ -4410,8 +4408,8 @@ def run_subprocess(
             "cwd": cwd,
             "env": merged_env,
             "capture_output": True,
-            "text": True,
             "timeout": timeout,
+            **git_text_kwargs(cmd),
         }
         if input_text is None:
             kwargs["stdin"] = subprocess.DEVNULL
@@ -4428,7 +4426,7 @@ def run_subprocess(
         "env": merged_env,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
+        **git_text_kwargs(cmd),
     }
     if input_text is None:
         kwargs["stdin"] = subprocess.DEVNULL
@@ -7054,11 +7052,9 @@ def _branch_commits_ahead_of_base(repo_root: Path, branch: str, base_ref: str) -
     if not branch:
         return 0
     try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", f"{base_ref}..{branch}"],
+        result = run_git(
+            ["rev-list", "--count", f"{base_ref}..{branch}"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except OSError:

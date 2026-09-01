@@ -9,8 +9,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .command_runtime import CommandConfigurationError, CommandVariants, parse_command_variants
-
-_REPO_ROOT_MARKERS = (".git", ".spec.toml", "pyproject.toml")
+from .git_common import run_git
 
 _LOCAL_CONFIG_FILENAME = ".spec.local.toml"
 
@@ -205,19 +204,6 @@ class SpecRuntimeConfig:
         return tail or self.base_ref
 
 
-def _repo_root_from_here() -> Path:
-    module_dir = Path(__file__).resolve().parent
-    package_root = module_dir.parent
-    boundary_root = package_root.parent if package_root.name == "src" else package_root
-
-    for candidate in (module_dir, *module_dir.parents):
-        if candidate == boundary_root.parent:
-            break
-        if any((candidate / marker).exists() for marker in _REPO_ROOT_MARKERS):
-            return candidate
-    return boundary_root
-
-
 def _discover_repo_root() -> Path:
     cwd = Path.cwd().resolve()
     for candidate in (cwd, *cwd.parents):
@@ -225,14 +211,16 @@ def _discover_repo_root() -> Path:
             return candidate
 
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
+        result = run_git(
+            ["rev-parse", "--show-toplevel"],
             check=True,
         )
     except (OSError, subprocess.CalledProcessError):
-        return _repo_root_from_here()
+        # Configuration belongs to the project being operated on, never to
+        # the Python environment that happens to contain Spec Butler. Falling
+        # back to ``__file__`` made a wheel installed in a Windows venv look
+        # for ``Lib/site-packages/.spec.toml`` (and the analogous POSIX path).
+        return cwd
     return Path(result.stdout.strip())
 
 

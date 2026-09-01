@@ -29,6 +29,7 @@ from .execution_backend import (
     host_spec_runtime_source_id,
     host_spec_runtime_version,
 )
+from .git_common import run_git
 from .process_supervisor import run as run_supervised
 from .source_repository import runtime_repository_https_url
 
@@ -868,11 +869,9 @@ def _one_line(text: str) -> str:
 
 def _current_branch(repo_root: Path) -> str:
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        result = run_git(
+            ["rev-parse", "--abbrev-ref", "HEAD"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except OSError:

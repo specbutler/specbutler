@@ -38,6 +38,7 @@ from .config import (
     ExecutionConfig,
     SpecRuntimeConfig,
 )
+from .git_common import git_text_kwargs, run_git
 from .platform_fs import FileLock, remove_tree
 from .process_supervisor import LifetimeMode, ManagedProcess, ProcessSupervisor
 from .process_supervisor import run as run_supervised
@@ -225,11 +226,9 @@ def host_spec_runtime_source_id() -> str:
     try:
         source_root = Path(__file__).resolve().parents[2]
         if _is_adjacent_spec_runtime_checkout(source_root):
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
+            result = run_git(
+                ["rev-parse", "HEAD"],
                 cwd=source_root,
-                capture_output=True,
-                text=True,
                 timeout=5,
                 check=False,
             )
@@ -237,11 +236,9 @@ def host_spec_runtime_source_id() -> str:
                 # Editable installs can retain stale direct_url metadata after a pull.
                 # The checkout containing the imported module is authoritative.
                 commit_id = result.stdout.strip()
-                status = subprocess.run(
-                    ["git", "status", "--porcelain", "--untracked-files=normal"],
+                status = run_git(
+                    ["status", "--porcelain", "--untracked-files=normal"],
                     cwd=source_root,
-                    capture_output=True,
-                    text=True,
                     timeout=5,
                     check=False,
                 )
@@ -1652,11 +1649,9 @@ class CloneExecutionBackend:
 
     @staticmethod
     def _run_git(argv: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", *argv],
+        return run_git(
+            argv,
             cwd=cwd,
-            capture_output=True,
-            text=True,
             check=False,
         )
 
@@ -1749,9 +1744,9 @@ class ContainerCliRunner:
             env=env,
             input=input_text,
             timeout=timeout,
-            text=True,
             capture_output=True,
             check=False,
+            **git_text_kwargs(argv),
         )
 
     def popen(

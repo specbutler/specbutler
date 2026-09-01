@@ -39,9 +39,10 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
-import subprocess
 import sys
 from pathlib import Path
+
+from .git_common import run_git
 
 
 def _lazy_config():
@@ -66,10 +67,8 @@ def _lazy_orchestrator():
 def _resolve_repo_root() -> Path:
     from .git_common import resolve_common_root
 
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
+    result = run_git(
+        ["rev-parse", "--show-toplevel"],
     )
     if result.returncode == 0:
         return resolve_common_root(Path(result.stdout.strip()))
@@ -369,10 +368,8 @@ def _clean_inactive_spec_artifacts(
 
     # Remove worktrees discovered by branch name
     wt_path = ""
-    wt_list = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
+    wt_list = run_git(
+        ["worktree", "list", "--porcelain"],
     )
     for line in wt_list.stdout.splitlines():
         if line.startswith("worktree "):
@@ -384,10 +381,8 @@ def _clean_inactive_spec_artifacts(
                 or branch_ref.startswith(f"task/{spec_id}--")
                 or branch_ref.startswith(f"specrun/{spec_id}--")
             ) and wt_path:
-                result = subprocess.run(
-                    ["git", "worktree", "remove", wt_path, "--force"],
-                    capture_output=True,
-                    text=True,
+                result = run_git(
+                    ["worktree", "remove", wt_path, "--force"],
                 )
                 if result.returncode == 0:
                     print(f"Removed worktree {wt_path} (by branch)")
@@ -401,10 +396,8 @@ def _clean_inactive_spec_artifacts(
     ]
 
     # Find code/task/specrun branches
-    branch_result = subprocess.run(
-        ["git", "branch", "--format=%(refname:short)"],
-        capture_output=True,
-        text=True,
+    branch_result = run_git(
+        ["branch", "--format=%(refname:short)"],
     )
     if branch_result.returncode == 0:
         for branch in branch_result.stdout.strip().splitlines():
@@ -420,15 +413,12 @@ def _clean_inactive_spec_artifacts(
     for branch in branch_patterns:
         if not branch:
             continue
-        check = subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-            capture_output=True,
+        check = run_git(
+            ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
         )
         if check.returncode == 0:
-            delete_result = subprocess.run(
-                ["git", "branch", "-D", branch],
-                capture_output=True,
-                text=True,
+            delete_result = run_git(
+                ["branch", "-D", branch],
             )
             if delete_result.returncode == 0:
                 print(f"Deleted local branch {branch}")
@@ -527,10 +517,8 @@ def _cleanup_run_owned_workspaces(
 def _remove_worktree_path(target: Path) -> int:
     """Remove a worktree or stale directory. Returns 1 if removed, 0 otherwise."""
     # Check if it's a registered worktree
-    wt_list = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
+    wt_list = run_git(
+        ["worktree", "list", "--porcelain"],
     )
     registered = False
     for line in wt_list.stdout.splitlines():
@@ -539,10 +527,8 @@ def _remove_worktree_path(target: Path) -> int:
             break
 
     if registered:
-        result = subprocess.run(
-            ["git", "worktree", "remove", str(target), "--force"],
-            capture_output=True,
-            text=True,
+        result = run_git(
+            ["worktree", "remove", str(target), "--force"],
         )
         if result.returncode == 0:
             print(f"Removed worktree {target}")
@@ -862,6 +848,7 @@ def _maybe_print_update_notice_for_init() -> None:
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``spec`` CLI."""
     effective_argv = argv if argv is not None else sys.argv[1:]
+    help_requested = any(arg in {"-h", "--help"} for arg in effective_argv)
 
     # Pre-detect "init" — it must bypass config loading since there's no
     # .spec.toml yet.  Do a lightweight scan for the first positional arg.
@@ -889,7 +876,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if first_positional == "init":
-        _maybe_print_update_notice_for_init()
+        if not help_requested:
+            _maybe_print_update_notice_for_init()
         init_parser = argparse.ArgumentParser(prog="spec init")
         init_parser.add_argument("-v", "--verbose", action="store_true")
         init_parser.add_argument(
@@ -939,22 +927,26 @@ def main(argv: list[str] | None = None) -> int:
             logging.basicConfig(level=logging.DEBUG)
         return _cmd_doctor(doctor_args)
 
-    # All other commands require config.
-    from .config import SpecConfigNotFoundError
+    # Help is documentation, not a repository operation. Build its parser
+    # from inert defaults so every help surface remains available before
+    # ``spec init`` and from a globally installed console entry point. Actual
+    # command dispatch still takes the strict configuration path below.
+    from .config import SpecConfigNotFoundError, SpecRuntimeConfig
 
     config_error: Exception | None = None
-    try:
-        config = _lazy_config()
-    except Exception as exc:
-        config = None
-        config_error = exc
+    if help_requested:
+        config = SpecRuntimeConfig()
+    else:
+        try:
+            config = _lazy_config()
+        except Exception as exc:
+            config = None
+            config_error = exc
 
-    from .config import SpecRuntimeConfig
-
-    if isinstance(config, SpecRuntimeConfig):
-        _emit_startup_update_notice(config)
-    elif config_error is not None:
-        _emit_startup_update_notice()
+        if isinstance(config, SpecRuntimeConfig):
+            _emit_startup_update_notice(config)
+        elif config_error is not None:
+            _emit_startup_update_notice()
 
     if config_error is not None:
         if isinstance(config_error, SpecConfigNotFoundError):

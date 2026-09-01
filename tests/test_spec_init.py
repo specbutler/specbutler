@@ -13,7 +13,6 @@ from spec_runtime.config import (
     SpecConfigError,
     SpecConfigNotFoundError,
     _discover_repo_root,
-    _repo_root_from_here,
     load_spec_runtime_config,
 )
 from spec_runtime.init import (
@@ -27,6 +26,7 @@ from spec_runtime.init import (
     _detect_verify_gates,
     _gather_repo_context,
     _generate_spec_toml,
+    _git_repo_root,
     _merge_file_with_agent,
     _read_bundled_template,
     _toml_escape,
@@ -159,63 +159,82 @@ name = "test"
             assert _discover_repo_root() == repo_root
         run.assert_not_called()
 
-    def test_discover_repo_root_falls_back_to_package_relative_search(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        outer_root = tmp_path / "outer"
-        project_root = outer_root / "project"
-        module_dir = project_root / "src" / "spec_runtime"
-        module_dir.mkdir(parents=True)
-        (module_dir / "config.py").write_text("# synthetic config module\n")
-        (outer_root / "pyproject.toml").write_text("[tool.outer]\nvalue = true\n")
-
-        # The host running the test may itself have a repository marker above
-        # pytest's temporary directory (for example /tmp/.git).  Hide only
-        # markers outside this fixture so the test controls its repository
-        # boundary without changing production's ancestor-search semantics.
+    @pytest.mark.parametrize(
+        "installed_module",
+        (
+            "venv/lib/python3.11/site-packages/spec_runtime/config.py",
+            "venv/Lib/site-packages/spec_runtime/config.py",
+        ),
+        ids=("posix-wheel", "windows-wheel"),
+    )
+    def test_discover_repo_root_never_uses_installed_package_location(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        installed_module: str,
+    ) -> None:
+        working_directory = tmp_path / "unconfigured-project"
+        working_directory.mkdir()
+        module_path = tmp_path / installed_module
+        module_path.parent.mkdir(parents=True)
+        module_path.write_text("# synthetic installed module\n")
+        monkeypatch.chdir(working_directory)
         path_exists = Path.exists
         path_is_file = Path.is_file
 
-        def fixture_scoped_exists(path: Path) -> bool:
-            if path.name == ".git" and tmp_path not in path.parents:
-                return False
-            return path_exists(path)
+        def without_git_markers(path: Path) -> bool:
+            return False if path.name == ".git" else path_exists(path)
 
-        def fixture_scoped_is_file(path: Path) -> bool:
-            if path.name == ".spec.toml" and tmp_path not in path.parents:
-                return False
-            return path_is_file(path)
+        def without_spec_config(path: Path) -> bool:
+            return False if path.name == ".spec.toml" else path_is_file(path)
 
-        with patch(
-            "spec_runtime.config.__file__",
-            str(module_dir / "config.py"),
-        ), patch(
+        with patch("spec_runtime.config.__file__", str(module_path)), patch(
             "spec_runtime.config.Path.exists",
-            fixture_scoped_exists,
+            without_git_markers,
         ), patch(
             "spec_runtime.config.Path.is_file",
-            fixture_scoped_is_file,
+            without_spec_config,
         ), patch(
             "spec_runtime.config.subprocess.run",
-            side_effect=subprocess.CalledProcessError(returncode=128, cmd=["git", "rev-parse", "--show-toplevel"]),
+            side_effect=subprocess.CalledProcessError(
+                returncode=128,
+                cmd=["git", "rev-parse", "--show-toplevel"],
+            ),
         ):
             repo_root = _discover_repo_root()
 
-        assert repo_root == project_root
-        assert repo_root != outer_root
+        assert repo_root == working_directory.resolve()
+        assert "site-packages" not in str(repo_root)
 
-    def test_repo_root_from_here_stops_at_package_boundary_without_in_package_markers(self, tmp_path):
-        outer_root = tmp_path / "outer"
-        project_root = outer_root / "project"
-        module_dir = project_root / "src" / "spec_runtime"
-        module_dir.mkdir(parents=True)
-        (module_dir / "config.py").write_text("# synthetic config module\n")
-        (outer_root / ".git").mkdir()
+    def test_git_repo_root_decodes_git_for_windows_output_as_utf8(self, tmp_path: Path) -> None:
+        expected = tmp_path / "Spec Butler snow-雪"
+        stdout = f"{expected}\n".encode("utf-8")
 
-        with patch("spec_runtime.config.__file__", str(module_dir / "config.py")):
-            repo_root = _repo_root_from_here()
+        def windows_locale_runner(command, **kwargs):  # noqa: ANN001
+            # Reproduce Python on an English Windows host: without an explicit
+            # encoding, subprocess would use cp1252 for Git's UTF-8 bytes.
+            encoding = kwargs.get("encoding") or "cp1252"
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=stdout.decode(encoding),
+                stderr="",
+            )
 
-        assert repo_root == project_root
-        assert repo_root != outer_root
+        with patch("spec_runtime.git_common.subprocess.run", side_effect=windows_locale_runner):
+            assert _git_repo_root() == expected
+
+    def test_git_repo_root_preserves_real_unicode_checkout(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo_root = tmp_path / "Spec Butler snow-雪"
+        repo_root.mkdir()
+        _init_git_repo(repo_root)
+        monkeypatch.chdir(repo_root)
+
+        assert _git_repo_root() == repo_root
 
     def test_cli_main_rejects_commands_without_config(self):
         from spec_runtime.cli import main

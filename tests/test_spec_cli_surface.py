@@ -720,6 +720,25 @@ class TestCLIMain:
         assert capsys.readouterr().out.strip() == "1.2.3"
         mock_config.assert_not_called()
 
+    @pytest.mark.parametrize(
+        "argv",
+        (["--help"], ["implement", "--help"], ["auto", "run", "--help"]),
+    )
+    def test_help_surfaces_do_not_load_repository_config(self, argv):
+        cli = self._import_cli()
+        with patch.object(
+            cli,
+            "_lazy_config",
+            side_effect=SpecConfigNotFoundError(
+                "Expected config file: C:\\venv\\Lib\\site-packages\\.spec.toml"
+            ),
+        ) as mock_config:
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main(argv)
+
+        assert exc_info.value.code == 0
+        mock_config.assert_not_called()
+
     def test_source_id_flag_prints_identity_without_config(self, capsys):
         cli = self._import_cli()
         with (
@@ -1092,7 +1111,7 @@ class TestResolveRepoRoot:
         )
 
         with (
-            patch.object(cli.subprocess, "run", return_value=result),
+            patch("spec_runtime.git_common.subprocess.run", return_value=result),
             patch("spec_runtime.git_common.resolve_common_root", return_value=repo) as mock_common_root,
         ):
             assert cli._resolve_repo_root() == repo

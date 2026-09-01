@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Sequence
 
+from .git_common import run_git
+
 _ACTION_LINE_RE = re.compile(
     r"^(?P<prefix>\s*(?:-\s+)?uses:\s+)"
     r"(?P<action>(?:actions/[A-Za-z0-9_.-]+|openai/codex-action))"
@@ -37,12 +39,10 @@ class DependabotPolicyError(ValueError):
 
 
 def _git(repo: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args],
+    result = run_git(
+        args,
         cwd=repo,
         check=True,
-        capture_output=True,
-        text=True,
     )
     return result.stdout
 

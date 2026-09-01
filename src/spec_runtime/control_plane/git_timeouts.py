@@ -87,6 +87,7 @@ def _run_fetch_process_group(
     cwd: str | None = None,
     capture_output: bool = True,
     text: bool = True,
+    encoding: str | None = None,
     timeout: float = DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
     check: bool = False,
 ) -> subprocess.CompletedProcess:
@@ -103,6 +104,7 @@ def _run_fetch_process_group(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=text,
+        encoding=encoding,
     )
     proc = managed.process
     try:
@@ -148,6 +150,7 @@ def run_git_fetch_with_timeout(
             cwd=str(cwd) if cwd is not None else None,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=float(timeout_seconds),
             check=False,
         )

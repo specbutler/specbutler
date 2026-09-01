@@ -22,6 +22,7 @@ from pathlib import Path
 
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config, load_spec_runtime_config, resolve_spec_path
 from .git_common import resolve_common_root as _resolve_common_root
+from .git_common import run_git
 from .spec_identity import SPEC_ID_RE, implementation_branch_identity, parse_worktree_name
 from .spec_metadata import SpecMetadata, parse_spec_metadata
 
@@ -87,11 +88,9 @@ def _git(
     *args: str,
     cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
+    return run_git(
+        args,
         cwd=cwd,
-        capture_output=True,
-        text=True,
     )
 
 
@@ -608,11 +607,9 @@ def refresh_merge_completion_state(
     tag_refspec = "+refs/tags/spec/merged/*:refs/tags/spec/merged/*"
     action = f"git fetch {remote_name} {branch_refspec} {tag_refspec}"
     try:
-        result = subprocess.run(
-            ["git", "fetch", remote_name, branch_refspec, tag_refspec],
+        result = run_git(
+            ["fetch", remote_name, branch_refspec, tag_refspec],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:

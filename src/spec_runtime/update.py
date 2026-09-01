@@ -20,6 +20,7 @@ from packaging.version import InvalidVersion, Version
 
 from .config import SpecRuntimeConfig
 from .git_common import resolve_common_root as _resolve_common_root_base
+from .git_common import run_git
 from .source_repository import runtime_repository_https_url
 
 LOGGER = logging.getLogger(__name__)
@@ -412,11 +413,9 @@ def _parse_github_repo(url: str) -> str | None:
 
 def _origin_remote_url(repo_root: Path) -> str:
     try:
-        result = subprocess.run(
-            ["git", "config", "--get", "remote.origin.url"],
+        result = run_git(
+            ["config", "--get", "remote.origin.url"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except OSError:
@@ -577,10 +576,8 @@ def fetch_latest_version(
 
 def _discover_repo_root() -> Path | None:
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
+        result = run_git(
+            ["rev-parse", "--show-toplevel"],
             check=False,
         )
     except OSError:
@@ -601,11 +598,9 @@ def resolve_common_root(repo_root: Path) -> Path:
 
     fallback_root = repo_root.resolve()
     try:
-        toplevel = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+        toplevel = run_git(
+            ["rev-parse", "--show-toplevel"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):

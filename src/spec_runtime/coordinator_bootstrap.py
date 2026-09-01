@@ -6,7 +6,6 @@ import argparse
 import contextlib
 import io
 import socket
-import subprocess
 import sys
 import tomllib
 import uuid
@@ -26,7 +25,7 @@ from .coordination import (
     build_client,
 )
 from .coordinator_service import CoordinatorStore
-from .git_common import resolve_common_root
+from .git_common import resolve_common_root, run_git
 
 DEFAULT_DB_PATH = "~/.local/state/spec/coord.sqlite"
 DEFAULT_HOST = "127.0.0.1"
@@ -408,17 +407,13 @@ def _shell_quote(value: str) -> str:
 
 
 def _warn_if_local_config_tracked_or_unignored(repo_root: Path) -> None:
-    tracked = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", ".spec.local.toml"],
+    tracked = run_git(
+        ["ls-files", "--error-unmatch", ".spec.local.toml"],
         cwd=repo_root,
-        capture_output=True,
-        text=True,
     ).returncode == 0
-    ignored = subprocess.run(
-        ["git", "check-ignore", "-q", ".spec.local.toml"],
+    ignored = run_git(
+        ["check-ignore", "-q", ".spec.local.toml"],
         cwd=repo_root,
-        capture_output=True,
-        text=True,
     ).returncode == 0
     if tracked or not ignored:
         print(

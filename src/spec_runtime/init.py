@@ -13,14 +13,14 @@ from pathlib import Path
 
 from packaging.requirements import InvalidRequirement, Requirement
 
+from .git_common import run_git
+
 
 def _git_repo_root() -> Path | None:
     """Return the git repo root, or None if not in a git repo."""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
+        result = run_git(
+            ["rev-parse", "--show-toplevel"],
             check=True,
         )
         return Path(result.stdout.strip())
@@ -30,9 +30,8 @@ def _git_repo_root() -> Path | None:
 
 def _has_remote(repo_root: Path, remote: str = "origin") -> bool:
     """Check if the named remote exists."""
-    result = subprocess.run(
-        ["git", "remote", "get-url", remote],
-        capture_output=True,
+    result = run_git(
+        ["remote", "get-url", remote],
         cwd=repo_root,
     )
     return result.returncode == 0
@@ -45,10 +44,8 @@ def _detect_base_branch(repo_root: Path) -> str:
     if has_origin:
         # Try remote HEAD
         try:
-            result = subprocess.run(
-                ["git", "remote", "show", "origin"],
-                capture_output=True,
-                text=True,
+            result = run_git(
+                ["remote", "show", "origin"],
                 timeout=10,
                 cwd=repo_root,
             )
@@ -63,9 +60,8 @@ def _detect_base_branch(repo_root: Path) -> str:
 
     # Fall back to checking local refs — only use origin/ prefix if remote exists
     for name in ("main", "master"):
-        check = subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"],
-            capture_output=True,
+        check = run_git(
+            ["show-ref", "--verify", "--quiet", f"refs/heads/{name}"],
             cwd=repo_root,
         )
         if check.returncode == 0:

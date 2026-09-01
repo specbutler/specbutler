@@ -10,7 +10,52 @@ instead of duplicating the logic.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+
+
+def is_git_command(command: Sequence[str]) -> bool:
+    """Return whether *command* launches Git, including a resolved git.exe."""
+    if not command:
+        return False
+    executable = str(command[0]).replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    return executable in {"git", "git.exe"}
+
+
+def git_text_kwargs(command: Sequence[str]) -> dict[str, object]:
+    """Text-mode subprocess kwargs with Git's documented UTF-8 boundary.
+
+    Git for Windows writes path-bearing stdout as UTF-8 independently of the
+    active Windows ANSI code page. Letting ``subprocess`` choose the locale
+    decoder can therefore turn a real path into a different, mojibake path.
+    Non-Git commands retain Python's normal locale behavior.
+    """
+    kwargs: dict[str, object] = {"text": True}
+    if is_git_command(command):
+        kwargs["encoding"] = "utf-8"
+    return kwargs
+
+
+def run_git(
+    args: Sequence[str],
+    *,
+    cwd: str | Path | None = None,
+    check: bool = False,
+    timeout: float | None = None,
+    env: Mapping[str, str] | None = None,
+    capture_output: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run Git through the shared UTF-8 stdout/stderr decoding boundary."""
+    command = ["git", *args]
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        check=check,
+        timeout=timeout,
+        env=env,
+        capture_output=capture_output,
+        **git_text_kwargs(command),
+    )
 
 
 def _resolve_common_root_fallback(repo_root: Path) -> Path:
@@ -77,11 +122,9 @@ def resolve_common_root(repo_root: Path | None = None) -> Path:
     """
     fallback_root = repo_root.resolve() if repo_root is not None else Path.cwd().resolve()
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        result = run_git(
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):

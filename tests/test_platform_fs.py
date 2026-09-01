@@ -307,9 +307,52 @@ def test_installed_wheel_read_only_cli_smoke(tmp_path: Path) -> None:
     subprocess.run([sys.executable, "-m", "pip", "install", "--target", str(target), str(wheel)], check=True)
     env = os.environ.copy()
     env["PYTHONPATH"] = str(target)
-    repo = tmp_path / "repo"
+    outside_repo = tmp_path / "outside"
+    outside_repo.mkdir()
+    for args in (["--version"], ["--help"]):
+        result = subprocess.run(
+            [sys.executable, "-m", "spec_runtime.cli", *args],
+            cwd=outside_repo,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        assert result.returncode == 0, (args, result.stdout, result.stderr)
+        assert "Traceback" not in result.stderr
+
+    strict_result = subprocess.run(
+        [sys.executable, "-m", "spec_runtime.cli", "list"],
+        cwd=outside_repo,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert strict_result.returncode == 1
+    assert str(outside_repo / ".spec.toml") in strict_result.stderr
+    assert "site-packages" not in strict_result.stderr
+
+    repo = tmp_path / "Spec Butler snow-雪"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, check=True)
-    for args in (["--version"], ["--help"], ["init"], ["list"], ["show", "--spec", "missing"], ["status", "--spec", "missing"]):
-        result = subprocess.run([sys.executable, "-m", "spec_runtime.cli", *args], cwd=repo, env=env, text=True, capture_output=True)
+    result = subprocess.run(
+        [sys.executable, "-m", "spec_runtime.cli", "init"],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "Traceback" not in result.stderr
+    assert (repo / ".spec.toml").is_file()
+    mojibake_name = repo.name.encode("utf-8").decode("cp1252")
+    assert not repo.with_name(mojibake_name).exists()
+
+    for args in (["list"], ["show", "--spec", "missing"], ["status", "--spec", "missing"]):
+        result = subprocess.run(
+            [sys.executable, "-m", "spec_runtime.cli", *args],
+            cwd=repo,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
         assert "Traceback" not in result.stderr

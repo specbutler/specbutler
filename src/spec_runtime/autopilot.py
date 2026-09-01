@@ -54,7 +54,7 @@ from spec_runtime.execution_backend import (
     get_execution_backend,
     inspect_container_capacity,
 )
-from spec_runtime.git_common import resolve_common_root
+from spec_runtime.git_common import resolve_common_root, run_git
 from spec_runtime.orchestrator import (
     BASE_REF,
     BLOCK_DEBUGGER_AUTO_RESUME_LIMIT,
@@ -1020,10 +1020,8 @@ def _annotate_candidate_with_dispatch_discipline(
 def resolve_repo_root(explicit: str | None = None) -> Path:
     if explicit:
         return Path(explicit).resolve()
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
+    result = run_git(
+        ["rev-parse", "--show-toplevel"],
         check=True,
     )
     return Path(result.stdout.strip())
@@ -3069,20 +3067,18 @@ def _create_merge_tag(repo_root: Path, spec_id: str, branch: str) -> bool:
         timestamp=str(pr_data.get("mergedAt", "") or "").strip() or utc_timestamp_now(),
     )
 
-    tag_result = subprocess.run(
-        annotated_tag_command(tag_name, merge_commit_sha, build_tag_message(provenance)),
+    tag_command = annotated_tag_command(tag_name, merge_commit_sha, build_tag_message(provenance))
+    tag_result = run_git(
+        tag_command[1:],
         cwd=repo_root,
-        capture_output=True,
-        text=True,
     )
     if tag_result.returncode != 0:
         print(f"  WARNING: git tag {tag_name} failed: {tag_result.stderr.strip()}")
         return False
-    push_result = subprocess.run(
-        push_tag_command(tag_name),
+    push_command = push_tag_command(tag_name)
+    push_result = run_git(
+        push_command[1:],
         cwd=repo_root,
-        capture_output=True,
-        text=True,
     )
     if push_result.returncode != 0:
         print(f"  WARNING: git push tag {tag_name} failed: {push_result.stderr.strip()}")
