@@ -11370,7 +11370,12 @@ def _render_local_review_prompt(
     if not template_path.is_file():
         template_path = repo_root / ".github" / "prompts" / "codex-review.md"
     if template_path.is_file():
-        rendered = template_path.read_text()
+        # Current ``spec init`` writes repository templates as UTF-8. Older
+        # native-Windows releases used the active ANSI code page, though, and
+        # the bundled em dash therefore became an invalid UTF-8 byte. Keep
+        # those initialized repositories reviewable while preserving every
+        # valid UTF-8 character in newly generated templates.
+        rendered = template_path.read_text(encoding="utf-8", errors="replace")
     else:
         import importlib.resources
 

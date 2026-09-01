@@ -17297,6 +17297,29 @@ class TestLocalReviewHelpers:
         assert first_pass == (f"{orch.LOCAL_REVIEW_FIRST_PASS_EXHAUSTIVE_INSTRUCTION}\n\nreview-template")
         assert rereview == "review-template"
 
+    def test_render_local_review_prompt_tolerates_legacy_windows_ansi_template(
+        self,
+        tmp_path: Path,
+    ):
+        prompt_dir = tmp_path / ".github" / "prompts"
+        prompt_dir.mkdir(parents=True)
+        # Native Windows releases before repository writes declared UTF-8
+        # encoded the bundled em dash as cp1252 byte 0x97.
+        (prompt_dir / "review.md").write_bytes(b"review \x97 ${REPO}")
+
+        rendered = orch._render_local_review_prompt(
+            tmp_path,
+            repo_name="acme/repo",
+            pr_number=42,
+            base_sha="b" * 40,
+            head_sha="a" * 40,
+            head_ref="code/my-feature--run123",
+            pr_body="",
+            review_changes=1,
+        )
+
+        assert rendered == "review \ufffd acme/repo"
+
     def test_build_local_review_env_strips_push_credentials(
         self,
         monkeypatch: pytest.MonkeyPatch,

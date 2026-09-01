@@ -19,6 +19,7 @@ from spec_runtime.init import (
     _ask_agent_for_config,
     _build_agent_merge_command,
     _build_yolo_prompt,
+    _copy_template,
     _detect_agents,
     _detect_base_branch,
     _detect_implement_commands,
@@ -711,6 +712,18 @@ class TestCmdInit:
         assert (tmp_path / ".github" / "prompts" / "review.md").is_file()
         assert (tmp_path / "AGENTS.md").is_file()
         assert "spec doctor" in capsys.readouterr().out
+
+    def test_template_copy_declares_utf8_encoding(self, tmp_path):
+        """Do not fall back to the native Windows ANSI code page."""
+        with patch.object(Path, "write_text", autospec=True) as write_text:
+            assert _copy_template(
+                tmp_path,
+                "review.md",
+                ".github/prompts/review.md",
+                force=False,
+            )
+
+        assert write_text.call_args.kwargs["encoding"] == "utf-8"
 
     def test_refuses_without_git(self):
         args = MagicMock(force=False, yolo=False)

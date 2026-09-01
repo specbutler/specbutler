@@ -444,7 +444,11 @@ def _copy_template(repo_root: Path, template_name: str, dest_rel: str, *, force:
     if dest.exists() and not force:
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(_read_bundled_template(template_name))
+    # Repository text is part of the cross-platform contract. In particular,
+    # the bundled review prompt contains Unicode punctuation; relying on the
+    # Windows ANSI code page writes that punctuation as cp1252 and makes a
+    # later UTF-8 review launch fail before the reviewer can start.
+    dest.write_text(_read_bundled_template(template_name), encoding="utf-8")
     return True
 
 
@@ -733,7 +737,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             setup_command=setup_command,
             teardown_command=teardown_command,
         )
-        spec_toml.write_text(toml_content)
+        spec_toml.write_text(toml_content, encoding="utf-8")
         print(f"  Created {spec_toml.relative_to(repo_root)}")
 
     # Create directories and spec template
@@ -744,7 +748,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     # lacks the directory required by the task flow.
     gitkeep = repo_root / "specs" / "tasks" / ".gitkeep"
     if not gitkeep.exists():
-        gitkeep.write_text("")
+        gitkeep.write_text("", encoding="utf-8")
     if _copy_template(repo_root, "TEMPLATE.md", "specs/TEMPLATE.md", force=force):
         print("  Created specs/ and specs/tasks/ with TEMPLATE.md")
     else:
@@ -818,7 +822,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                     template_name,
                 )
                 if result is not None:
-                    (repo_root / path).write_text(result)
+                    (repo_root / path).write_text(result, encoding="utf-8")
                     merged.append(path)
                     print(f"    Merged {path}")
                 else:
