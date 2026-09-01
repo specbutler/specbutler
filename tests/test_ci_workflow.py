@@ -225,6 +225,7 @@ def test_ci_workflow_has_blocking_aggregate_job():
         "security",
         "windows-package",
         "windows-probe",
+        "ci-evidence",
     ]
 
     steps = [step for step in ci_job.get("steps", []) if isinstance(step, dict)]
@@ -236,10 +237,13 @@ def test_ci_workflow_has_blocking_aggregate_job():
     assert "SECURITY_RESULT" in script
     assert "WINDOWS_PACKAGE_RESULT" in script
     assert "WINDOWS_RESULT" in script
+    assert "CI_EVIDENCE_RESULT" in script
     assert enforce_step["env"]["WINDOWS_PACKAGE_RESULT"] == "${{ needs.windows-package.result }}"
     assert enforce_step["env"]["WINDOWS_RESULT"] == "${{ needs.windows-probe.result }}"
+    assert enforce_step["env"]["CI_EVIDENCE_RESULT"] == "${{ needs.ci-evidence.result }}"
     assert '[ "$WINDOWS_PACKAGE_RESULT" != "success" ]' in script
     assert '[ "$WINDOWS_RESULT" != "success" ]' in script
+    assert '[ "$CI_EVIDENCE_RESULT" != "success" ]' in script
     assert "exit 1" in script
 
 
@@ -447,8 +451,10 @@ def test_ci_skip_check_gates_product_jobs():
         "test",
         "package",
         "security",
+        "macos-test",
         "windows-package",
         "windows-probe",
+        "ci-evidence",
     ):
         job = jobs[job_name]
         assert "skip-check" in job["needs"]

@@ -167,6 +167,52 @@ in `source-provenance.json`. Retain CI result JSON files named by the manifest
 alongside VM artifacts before the final audit. Do not synthesize a passing
 result for unavailable hosted, provider, or platform evidence.
 
+Hosted CI publishes those result files only after its complete Linux, macOS,
+Windows wheel, Windows source-distribution, native integration, lint, and
+installed-CLI matrices pass and a fail-closed aggregation job confirms every
+fragment belongs to one workflow run and one exact checkout SHA. This includes
+the static documentation and hermetic-test coverage reports; it does not claim
+that the separately marked real-provider test passed. Download the combined
+artifact and copy it into the sanitized VM evidence directory:
+
+```bash
+run_id=<github-actions-run-id>
+ci_evidence="$(mktemp -d)"
+gh run download "$run_id" \
+  --pattern 'hosted-ci-acceptance-evidence-*' \
+  --dir "$ci_evidence"
+ci_index="$(find "$ci_evidence" -type f -name hosted-ci-evidence-index.json -print -quit)"
+test -n "$ci_index"
+python3 - "$ci_index" "$(git rev-parse HEAD)" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+if payload.get("status") != "passed" or payload.get("source_revision") != sys.argv[2]:
+    raise SystemExit("hosted CI evidence does not match this checkout")
+PY
+find "$ci_evidence" -maxdepth 2 -type f -name '*-result.json' \
+  -exec cp {} "tools/windows-lab/artifacts/<run-name>/" \;
+```
+
+GitHub pull-request workflows normally test GitHub's synthetic merge commit;
+that exact revision is recorded in every report. It cannot be combined with VM
+evidence from the pull-request head or a later squash commit. For final release
+evidence, use the successful `main` push run for the same commit staged in the
+VM, or deliberately stage the exact tested pull-request merge SHA.
+
+If only per-job fragments were retained, the same strict aggregation can be
+repeated from a checkout at their revision:
+
+```bash
+gh run download "$run_id" --pattern 'ci-evidence-*' --dir ci-fragments
+python3 tools/ci_evidence.py aggregate \
+  --input ci-fragments \
+  --output hosted-ci-evidence \
+  --source-root . \
+  --expected-revision "$(git rev-parse HEAD)"
+```
+
 ## Controller commands
 
 | Command | Purpose |
@@ -200,6 +246,7 @@ bash -n tools/windows-lab/labctl
 sh -n tools/windows-lab/entrypoint.sh
 pytest tests/test_windows_lab_harness.py
 pytest tests/test_windows_acceptance_audit.py
+pytest tests/test_ci_evidence.py
 ```
 
 The real-provider pytest entrypoint is separately marked and skipped unless
