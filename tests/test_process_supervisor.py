@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -34,6 +35,22 @@ def test_token_round_trip_preserves_reopenable_identity() -> None:
     assert token.version == 2
     assert token.control_relpath.endswith("/control.json")
     assert token.control_nonce
+
+
+@pytest.mark.skipif(os.name != "posix", reason="legacy V1 tokens are rejected on Windows")
+def test_legacy_v1_posix_token_remains_deserializable() -> None:
+    identity = ProcessIdentity(42, "created", "/usr/bin/python", "python child.py")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        identity,
+        7,
+        "owner",
+        "legacy-token",
+        pgid=42,
+        version=1,
+    )
+
+    assert SupervisionToken.from_dict(token.to_dict()) == token
 
 
 @pytest.mark.parametrize(
@@ -96,6 +113,117 @@ def test_legacy_raw_popen_without_owned_group_fails_closed() -> None:
     finally:
         process.terminate()
         process.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX current-process ownership integration")
+def test_posix_claimed_current_process_token_stops_complete_group(tmp_path: Path) -> None:
+    state_path = tmp_path / "claimed.json"
+    helper = tmp_path / "claimed-helper.py"
+    helper.write_text(
+        "import json,signal,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "from spec_runtime.process_supervisor import claim_current_process\n"
+        "token=claim_current_process('claimed-posix-test')\n"
+        "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+        "child_ready=Path(sys.argv[1]+'.child-ready')\n"
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import signal,sys,time; from pathlib import Path; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "Path(sys.argv[1]).write_text(\"ready\"); time.sleep(30)',str(child_ready)])\n"
+        "while not child_ready.exists(): time.sleep(.02)\n"
+        "Path(sys.argv[1]).write_text(json.dumps({'token':token.to_dict(),'child_pid':child.pid}))\n"
+        "while True: time.sleep(.05)\n",
+        encoding="utf-8",
+    )
+    process = subprocess.Popen([sys.executable, str(helper), str(state_path)])  # noqa: S603
+    token: SupervisionToken | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while not state_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert state_path.exists()
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        token = SupervisionToken.from_dict(payload["token"])
+        assert token.pgid == token.identity.pid == process.pid
+        assert token.version == 1
+        assert token.job_name == ""
+        assert token.control_relpath == ""
+        assert token == SupervisionToken.from_dict(token.to_dict())
+
+        assert process_supervisor.stop_supervised_process(
+            token,
+            grace_seconds=0.1,
+            hard_grace_seconds=2,
+        ) is True
+        process.wait(timeout=5)
+        assert process_supervisor.is_process_group_alive(token.pgid) is False
+        assert inspect_process(int(payload["child_pid"])) is None
+    finally:
+        if token is not None and process_supervisor.is_process_group_alive(token.pgid):
+            os.killpg(token.pgid, signal.SIGKILL)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX orphan-group integration")
+def test_legacy_orphaned_group_with_live_descendant_fails_closed(tmp_path: Path) -> None:
+    state_path = tmp_path / "orphan.json"
+    exit_path = tmp_path / "exit"
+    helper = tmp_path / "orphan-helper.py"
+    helper.write_text(
+        "import json,os,signal,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "os.setpgrp()\n"
+        "child=subprocess.Popen([sys.executable,'-c','import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'])\n"
+        "Path(sys.argv[1]).write_text(json.dumps({'child_pid':child.pid}))\n"
+        "while not Path(sys.argv[2]).exists(): time.sleep(.02)\n",
+        encoding="utf-8",
+    )
+    process = subprocess.Popen([sys.executable, str(helper), str(state_path), str(exit_path)])  # noqa: S603
+    identity: ProcessIdentity | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while not state_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert state_path.exists()
+        identity = inspect_process(process.pid)
+        assert identity is not None
+        exit_path.write_text("exit", encoding="utf-8")
+        process.wait(timeout=5)
+        assert process_supervisor.is_process_group_alive(process.pid) is True
+
+        with pytest.raises(process_supervisor.ProcessGroupOwnershipError, match="orphaned or reused"):
+            process_supervisor.terminate_legacy_process_group(
+                process.pid,
+                process.pid,
+                identity.started_at,
+                grace_seconds=0,
+            )
+        assert inspect_process(int(json.loads(state_path.read_text())["child_pid"])) is not None
+    finally:
+        if process_supervisor.is_process_group_alive(process.pid):
+            os.killpg(process.pid, signal.SIGKILL)
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group identity policy")
+def test_legacy_reused_leader_identity_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(process_supervisor, "is_process_group_alive", lambda _pgid: True)
+    monkeypatch.setattr(
+        process_supervisor,
+        "inspect_process",
+        lambda pid: ProcessIdentity(pid, "different-start"),
+    )
+    monkeypatch.setattr(
+        process_supervisor.os,
+        "killpg",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must fail closed")),
+    )
+
+    with pytest.raises(process_supervisor.ProcessGroupOwnershipError, match="orphaned or reused"):
+        process_supervisor.terminate_legacy_process_group(42, 42, "recorded-start")
 
 
 def test_adoptable_token_records_new_logical_owner(
@@ -676,6 +804,54 @@ def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: 
     for level in range(3):
         pid = int(Path(f"{pid_file}-{level}").read_text(encoding="utf-8"))
         assert inspect_process(pid) is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows current-process Job integration")
+def test_windows_claimed_current_process_token_stops_from_another_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+    state_path = tmp_path / "claimed-token.json"
+    stopped_path = tmp_path / "stopped"
+    helper = tmp_path / "claim-current.py"
+    supervision_id = f"current-{uuid.uuid4().hex}"
+    helper.write_text(
+        "import json,signal,sys,time\n"
+        "from pathlib import Path\n"
+        "from spec_runtime.process_supervisor import claim_current_process\n"
+        "token=claim_current_process(sys.argv[1])\n"
+        "def stop(*_args):\n"
+        "    Path(sys.argv[3]).write_text('stopped')\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "Path(sys.argv[2]).write_text(json.dumps(token.to_dict()))\n"
+        "while True: time.sleep(.05)\n",
+        encoding="utf-8",
+    )
+    process = subprocess.Popen(  # noqa: S603
+        [sys.executable, str(helper), supervision_id, str(state_path), str(stopped_path)],
+        env=os.environ.copy(),
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not state_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert state_path.exists()
+        token = SupervisionToken.from_dict(json.loads(state_path.read_text(encoding="utf-8")))
+        assert token.version == 2
+        assert token.identity.pid == process.pid
+        assert token.job_name
+        assert token.control_relpath
+
+        assert process_supervisor.stop_supervised_process(token, grace_seconds=3) is True
+        process.wait(timeout=10)
+        assert stopped_path.read_text(encoding="utf-8") == "stopped"
+        assert inspect_process(process.pid) is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows timeout integration")

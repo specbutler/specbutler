@@ -28,7 +28,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spec_runtime import autopilot, git_common, spec_status, spec_table
+from spec_runtime import autopilot, git_common, process_supervisor, spec_status, spec_table
 from spec_runtime import backfill_merge_tags as spec_backfill
 from spec_runtime import execution_backend as eb
 from spec_runtime import orchestrator as orch
@@ -32115,7 +32115,7 @@ class TestEnsureOrchestratorProcessGroupSigttou:
             patch("os.setpgrp"),
             patch("sys.stdin", mock_stdin),
             patch("os.tcsetpgrp", side_effect=spy_tcsetpgrp),
-            patch.object(orch, "signal", proxy_signal),
+            patch.object(process_supervisor, "signal", proxy_signal),
         ):
             orch._ensure_orchestrator_process_group(run, Path("/tmp/fake"))
 
@@ -32163,6 +32163,30 @@ class TestEnsureOrchestratorProcessGroupSigttou:
             orch._ensure_orchestrator_process_group(run, Path("/tmp/fake"))
 
         assert signal.getsignal(signal.SIGTTOU) == original_handler
+
+
+def test_ensure_orchestrator_process_group_persists_portable_token(repo: Path) -> None:
+    identity = ProcessIdentity(4321, "created", "/usr/bin/python", "python orchestrator.py")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        identity,
+        identity.pid,
+        identity.started_at,
+        "orchestrator-test-run",
+        pgid=4321,
+        version=1,
+    )
+    run = orch.RunState(run_id="test-run", spec_id="test-spec", branch="test-branch")
+
+    with patch.object(orch, "claim_current_process", return_value=token) as claim:
+        orch._ensure_orchestrator_process_group(run, repo)
+
+    claim.assert_called_once_with("orchestrator-test-run")
+    assert run.pgid == 4321
+    assert run.process_started_at == "created"
+    assert run.supervision_token == token.to_dict()
+    persisted = orch.RunState.load(repo, run.run_id)
+    assert SupervisionToken.from_dict(persisted.supervision_token) == token
 
 
 # ---------------------------------------------------------------------------
@@ -33323,9 +33347,7 @@ class TestStopRunDeadProcess:
         )
         run.save(repo)
 
-        # is_pid_alive returns False → process is dead
-        monkeypatch.setattr(orch, "is_pid_alive", lambda pid, started_at: False)
-        monkeypatch.setattr(orch, "_is_process_group_alive", lambda *_args: False)
+        monkeypatch.setattr(orch, "terminate_legacy_process_group", lambda *_args, **_kwargs: False)
 
         result = orch.stop_run("my-feature", repo_root=repo)
 
@@ -33354,15 +33376,99 @@ class TestStopRunDeadProcess:
         run.save(repo)
         monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
         monkeypatch.setattr(orch, "os", SimpleNamespace(name="nt"))
-        identity_check = MagicMock(return_value=True)
-        monkeypatch.setattr(orch, "identity_matches", identity_check)
-        monkeypatch.setattr(orch, "is_pid_alive", MagicMock(side_effect=AssertionError("must not invoke ps")))
-        monkeypatch.setattr(orch, "terminate_supervised", MagicMock(return_value=True))
+        stop_supervised = MagicMock(return_value=True)
+        monkeypatch.setattr(orch, "stop_supervised_process", stop_supervised)
 
         result = orch.stop_run("my-feature", repo_root=repo)
 
         assert result.status == "failed"
-        identity_check.assert_called_once_with(identity)
+        stopped_token = stop_supervised.call_args.args[0]
+        assert stopped_token.identity == identity
+
+    def test_posix_v1_supervision_token_uses_portable_stop_boundary(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        identity = ProcessIdentity(99999, "created", "/usr/bin/python")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "orchestrator-my-feature",
+            pgid=identity.pid,
+            version=1,
+        )
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--token",
+            status="running",
+            phase="implement",
+            pgid=identity.pid,
+            process_started_at=identity.started_at,
+            supervision_token=token.to_dict(),
+        )
+        run.save(repo)
+        monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
+        stop_supervised = MagicMock(return_value=True)
+        monkeypatch.setattr(orch, "stop_supervised_process", stop_supervised)
+
+        result = orch.stop_run("my-feature", repo_root=repo)
+
+        assert result.status == "failed"
+        stopped_token = stop_supervised.call_args.args[0]
+        assert stopped_token == token
+
+    def test_windows_missing_supervision_token_fails_closed(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--token",
+            status="running",
+            phase="implement",
+            pgid=99999,
+            process_started_at="created",
+        )
+        run.save(repo)
+        monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
+        monkeypatch.setattr(orch, "os", SimpleNamespace(name="nt"))
+
+        with pytest.raises(RuntimeError, match="usable supervision token"):
+            orch.stop_run("my-feature", repo_root=repo)
+
+        assert orch.RunState.load(repo, run.run_id).status == "running"
+
+    def test_windows_legacy_supervision_token_fails_closed(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        identity = ProcessIdentity(99999, "created", "python.exe")
+        legacy_token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "legacy-token",
+            version=1,
+        )
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--token",
+            status="running",
+            phase="implement",
+            supervision_token=legacy_token.to_dict(),
+        )
+        run.save(repo)
+        monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
+        monkeypatch.setattr(orch, "os", SimpleNamespace(name="nt"))
+        monkeypatch.setattr(process_supervisor, "os", SimpleNamespace(name="nt"))
+
+        with pytest.raises(RuntimeError, match="unusable supervision token"):
+            orch.stop_run("my-feature", repo_root=repo)
+
+        assert orch.RunState.load(repo, run.run_id).status == "running"
 
     def test_dead_process_non_running_state_raises(self, repo: Path, monkeypatch: pytest.MonkeyPatch):
         run = orch.RunState(
@@ -33376,8 +33482,7 @@ class TestStopRunDeadProcess:
         )
         run.save(repo)
 
-        monkeypatch.setattr(orch, "is_pid_alive", lambda pid, started_at: False)
-        monkeypatch.setattr(orch, "_is_process_group_alive", lambda *_args: False)
+        monkeypatch.setattr(orch, "terminate_legacy_process_group", lambda *_args, **_kwargs: False)
 
         with pytest.raises(RuntimeError, match="No live process"):
             orch.stop_run("my-feature", repo_root=repo)
@@ -33395,8 +33500,7 @@ class TestStopRunDeadProcess:
         )
         run.save(repo)
 
-        monkeypatch.setattr(orch, "is_pid_alive", lambda pid, started_at: False)
-        monkeypatch.setattr(orch, "_is_process_group_alive", lambda *_args: False)
+        monkeypatch.setattr(orch, "terminate_legacy_process_group", lambda *_args, **_kwargs: False)
 
         # Simulate the run completing to "passed" on disk after the snapshot
         # but before the lock is acquired.
@@ -33434,15 +33538,17 @@ class TestStopRunDeadProcess:
             process_started_at="Mon Mar 17 12:00:00 2026",
         )
         run.save(repo)
-        monkeypatch.setattr(orch, "is_pid_alive", lambda pid, started_at: False)
-        monkeypatch.setattr(orch, "_is_process_group_alive", lambda *_args: True)
-        killpg = MagicMock()
-        monkeypatch.setattr(orch.os, "killpg", killpg)
+        terminate_group = MagicMock(
+            side_effect=orch.ProcessGroupOwnershipError(
+                "Recorded leader has exited; refusing to signal an orphaned or reused process group."
+            )
+        )
+        monkeypatch.setattr(orch, "terminate_legacy_process_group", terminate_group)
 
         with pytest.raises(RuntimeError, match="orphaned or reused process group"):
             orch.stop_run("my-feature", repo_root=repo)
 
-        killpg.assert_not_called()
+        terminate_group.assert_called_once()
         persisted = orch.RunState.load(repo, run.run_id)
         assert persisted.status == "running"
 

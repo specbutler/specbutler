@@ -142,6 +142,14 @@ class ProcessIdentity:
         )
 
 
+class ProcessGroupOwnershipError(RuntimeError):
+    """A live group cannot be tied to its recorded leader identity."""
+
+
+class ProcessGroupTerminationError(RuntimeError):
+    """A proven owned process group survived bounded termination."""
+
+
 @dataclass(frozen=True)
 class SupervisionToken:
     mode: LifetimeMode
@@ -305,6 +313,54 @@ def identity_matches(expected: ProcessIdentity) -> bool:
     if live is None or not expected.started_at or live.started_at != expected.started_at:
         return False
     return not expected.executable or not live.executable or Path(live.executable) == Path(expected.executable)
+
+
+def list_live_process_group_members(pgid: int) -> list[int] | None:
+    """Return non-zombie POSIX group members, or ``None`` if inventory fails."""
+    if pgid <= 0 or os.name != "posix":
+        return []
+    try:
+        result = subprocess.run(
+            ["ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+
+    members: list[int] = []
+    for line in result.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            live_pid = int(parts[0])
+            live_pgid = int(parts[1])
+        except ValueError:
+            continue
+        stat = parts[2].strip().upper()
+        if live_pgid == pgid and stat and not stat.startswith("Z"):
+            members.append(live_pid)
+    return members
+
+
+def is_process_group_alive(pgid: int) -> bool:
+    """Return complete POSIX group liveness without relying on its leader."""
+    if pgid <= 0 or os.name != "posix":
+        return False
+    members = list_live_process_group_members(pgid)
+    if members is not None:
+        return bool(members)
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
 
 
 def process_cwd(pid: int) -> Path | None:
@@ -861,12 +917,48 @@ def _retire_durable_records(metadata_path: Path, token: SupervisionToken) -> boo
         return False
 
 
+def _establish_current_posix_process_group() -> int:
+    """Make the caller a group leader while preserving interactive TTY use."""
+    pid = os.getpid()
+    current_pgid = os.getpgrp()
+    if current_pgid == pid:
+        return current_pgid
+
+    os.setpgrp()
+    current_pgid = os.getpgrp()
+    # setpgrp() makes this a background group. Ignore SIGTTOU while reclaiming
+    # the terminal foreground so interactive agent children can still use it.
+    old_sigttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+    try:
+        os.tcsetpgrp(sys.stdin.fileno(), current_pgid)
+    except (OSError, AttributeError):
+        pass
+    finally:
+        signal.signal(signal.SIGTTOU, old_sigttou)
+    return current_pgid
+
+
 def claim_current_process(supervision_id: str) -> SupervisionToken:
-    """Put the current Windows orchestrator in a retained kill-on-close Job."""
-    if os.name != "nt":
-        raise RuntimeError("current-process Job ownership is Windows-only")
+    """Claim a portable ownership boundary around the current orchestrator."""
     if not supervision_id:
         raise ValueError("supervision_id is required")
+    if os.name == "posix":
+        pgid = _establish_current_posix_process_group()
+        identity = inspect_process(os.getpid())
+        if identity is None:
+            raise RuntimeError("Could not inspect current process")
+        return SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            identity.pid,
+            identity.started_at,
+            supervision_id,
+            pgid=pgid,
+            payload_identity=identity,
+            version=1,
+        )
+    if os.name != "nt":
+        raise RuntimeError(f"current-process ownership is unsupported on {os.name}")
     identity = inspect_process(os.getpid())
     if identity is None:
         raise RuntimeError("Could not inspect current process")
@@ -1463,6 +1555,40 @@ class ProcessSupervisor:
         self.close()
 
 
+def _wait_for_process_group_exit(pgid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if not is_process_group_alive(pgid):
+            return True
+        time.sleep(0.05)
+    return not is_process_group_alive(pgid)
+
+
+def _terminate_verified_posix_group(
+    pgid: int,
+    *,
+    grace_seconds: float,
+    hard_grace_seconds: float = 1.0,
+) -> bool:
+    """Terminate a group whose leader identity was verified by the caller."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return not is_process_group_alive(pgid)
+    except (OSError, ValueError):
+        return False
+    if _wait_for_process_group_exit(pgid, grace_seconds):
+        return True
+
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return not is_process_group_alive(pgid)
+    except (OSError, ValueError):
+        return False
+    return _wait_for_process_group_exit(pgid, hard_grace_seconds)
+
+
 def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _WindowsJob | None = None) -> bool:
     """Revalidate identity, request cancellation, then kill the owned tree."""
     if os.name == "nt":
@@ -1539,27 +1665,84 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
             except OSError:
                 pass
 
+    pgid = token.pgid or token.identity.pid
     if not identity_matches(token.identity):
         return False
-    # Preserve the established POSIX process-group path independently of the
-    # stricter Windows persisted-Job protocol above.
-    tree = _windows_tree_identities(token.payload.pid)
     try:
-        os.killpg(token.pgid or token.identity.pid, signal.SIGTERM)
-    except (OSError, ValueError):
-        pass
-    deadline = time.monotonic() + max(0.0, grace_seconds)
-    while time.monotonic() < deadline:
+        if os.getpgid(token.identity.pid) != pgid:
+            return False
+    except (OSError, ProcessLookupError):
+        return False
+    # Once the exact leader and group are proven, group liveness—not leader
+    # liveness—controls escalation. The leader may exit before descendants.
+    return _terminate_verified_posix_group(pgid, grace_seconds=grace_seconds)
+
+
+def terminate_legacy_process_group(
+    pgid: int,
+    leader_pid: int,
+    leader_started_at: str,
+    *,
+    grace_seconds: float = 5.0,
+    hard_grace_seconds: float = 1.0,
+) -> bool:
+    """Stop an old pgid-only run record after exact leader revalidation.
+
+    Returns whether a live owned group was stopped. A live group whose leader
+    exited, changed creation identity, or no longer belongs to the group is
+    refused because the pgid may now be orphaned or reused.
+    """
+    if os.name != "posix" or pgid <= 0 or leader_pid <= 0 or not leader_started_at:
+        raise ProcessGroupOwnershipError("legacy process-group ownership is unavailable on this platform")
+
+    group_was_alive = is_process_group_alive(pgid)
+    expected = ProcessIdentity(leader_pid, leader_started_at)
+    leader_matches = identity_matches(expected)
+    leader_in_group = False
+    if leader_matches:
+        try:
+            leader_in_group = os.getpgid(leader_pid) == pgid
+        except (OSError, ProcessLookupError):
+            leader_matches = False
+
+    if not group_was_alive:
+        return False
+    if not leader_matches or not leader_in_group:
+        raise ProcessGroupOwnershipError(
+            f"Recorded leader {leader_pid} has exited or changed identity, but process group {pgid} "
+            "still has live members; refusing to signal an orphaned or reused process group."
+        )
+    if not _terminate_verified_posix_group(
+        pgid,
+        grace_seconds=grace_seconds,
+        hard_grace_seconds=hard_grace_seconds,
+    ):
+        raise ProcessGroupTerminationError(f"Failed to stop live process group {pgid}.")
+    return True
+
+
+def stop_supervised_process(
+    token: SupervisionToken,
+    *,
+    grace_seconds: float = 5.0,
+    hard_grace_seconds: float = 1.0,
+) -> bool:
+    """Stop a persisted portable token, returning whether it was live."""
+    if os.name == "nt":
         if not identity_matches(token.identity):
-            return _wait_for_identities_exit(tree) if tree else True
-        time.sleep(0.05)
-    if not identity_matches(token.identity):
-        return _wait_for_identities_exit(tree) if tree else True
-    try:
-        os.killpg(token.pgid or token.identity.pid, signal.SIGKILL)
-    except (OSError, ValueError):
-        return False
-    return _wait_for_identities_exit(tree) if tree else True
+            return False
+        if not terminate(token, grace_seconds=grace_seconds):
+            raise ProcessGroupTerminationError(
+                f"Failed to stop live supervised process {token.identity.pid}."
+            )
+        return True
+    return terminate_legacy_process_group(
+        token.pgid or token.identity.pid,
+        token.identity.pid,
+        token.identity.started_at,
+        grace_seconds=grace_seconds,
+        hard_grace_seconds=hard_grace_seconds,
+    )
 
 
 def terminate_legacy_popen_tree(process: subprocess.Popen[Any], *, grace_seconds: float = 5.0) -> bool:

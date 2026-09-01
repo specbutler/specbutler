@@ -112,15 +112,17 @@ from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read
 from .process_supervisor import (
     LifetimeMode,
     ManagedProcess,
+    ProcessGroupOwnershipError,
+    ProcessGroupTerminationError,
     ProcessSupervisor,
     SupervisionToken,
     claim_current_process,
-    identity_matches,
     inspect_process,
+    stop_supervised_process,
     terminate_legacy_popen_tree,
+    terminate_legacy_process_group,
 )
 from .process_supervisor import run as run_supervised
-from .process_supervisor import terminate as terminate_supervised
 from .spec_identity import (
     SPEC_ID_RE,
     authoring_branch_identity,
@@ -6266,64 +6268,12 @@ def read_process_identity(pid: int) -> ProcessIdentity | None:
     )
 
 
-def _list_live_process_group_members(pgid: int) -> list[int] | None:
-    if pgid <= 0 or os.name != "posix":
-        return []
-    try:
-        result = subprocess.run(
-            ["ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-
-    members: list[int] = []
-    for line in result.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) != 3:
-            continue
-        try:
-            live_pid = int(parts[0])
-            live_pgid = int(parts[1])
-        except ValueError:
-            continue
-        stat = parts[2].strip().upper()
-        if live_pgid != pgid or not stat or stat.startswith("Z"):
-            continue
-        members.append(live_pid)
-    return members
-
-
 def is_pid_alive(pid: int, expected_started_at: str = "") -> bool:
     identity = read_process_identity(pid)
     if identity is None:
         return False
     if expected_started_at and identity.started_at != expected_started_at:
         return False
-    return True
-
-
-def _is_process_group_alive(pgid: int, leader_pid: int, leader_started_at: str = "") -> bool:
-    if pgid <= 0 or os.name != "posix":
-        return False
-
-    members = _list_live_process_group_members(pgid)
-    if members is not None:
-        return bool(members)
-
-    if is_pid_alive(leader_pid, leader_started_at):
-        return True
-
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OSError):
-        return True
     return True
 
 
@@ -6412,35 +6362,10 @@ def _orchestrator_sigterm_guard(
 
 
 def _ensure_orchestrator_process_group(run: RunState, repo_root: Path) -> None:
-    if os.name != "posix":
-        run.pgid = None
-        token = claim_current_process(f"orchestrator-{run.run_id}")
-        run.process_started_at = token.identity.started_at
-        run.supervision_token = token.to_dict()
-        run.save(repo_root)
-        return
-
-    pid = os.getpid()
-    current_pgid = os.getpgrp()
-    if current_pgid != pid:
-        os.setpgrp()
-        current_pgid = os.getpgrp()
-        # Claim the foreground process group on the terminal so interactive
-        # child processes (e.g. claude in the scoping phase) can still use
-        # stdin/stdout without being stopped by SIGTTIN/SIGTTOU.
-        # We must ignore SIGTTOU first: after setpgrp() we are a background
-        # process group, and tcsetpgrp() would otherwise stop us with SIGTTOU.
-        old_sigttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-        try:
-            fd = sys.stdin.fileno()
-            os.tcsetpgrp(fd, current_pgid)
-        except (OSError, AttributeError):
-            pass  # not a TTY or no stdin — non-interactive runs unaffected
-        finally:
-            signal.signal(signal.SIGTTOU, old_sigttou)
-
-    run.pgid = current_pgid
-    run.process_started_at = _current_process_started_at()
+    token = claim_current_process(f"orchestrator-{run.run_id}")
+    run.pgid = token.pgid or None
+    run.process_started_at = token.identity.started_at
+    run.supervision_token = token.to_dict()
     run.save(repo_root)
 
 
@@ -7040,56 +6965,41 @@ def stop_run(spec_id: str, *, repo_root: Path | None = None) -> RunState:
     if latest is None:
         raise RuntimeError(f"No non-superseded run found for spec '{spec_id}'.")
 
-    if os.name != "posix" and latest.supervision_token:
-        token = SupervisionToken.from_dict(latest.supervision_token)
-        process_was_alive = identity_matches(token.identity)
-        if process_was_alive and not terminate_supervised(token, grace_seconds=RUN_STOP_GRACE_SECONDS):
-            raise RuntimeError(f"Failed to stop live supervised process for spec '{spec_id}'.")
-        process_group = None
-    else:
-        process_group = _resolve_recorded_process_group(root, latest)
-
-    if process_group is None and not (os.name != "posix" and latest.supervision_token):
-        raise RuntimeError(f"Spec '{spec_id}' does not have a recorded orchestrator process group.")
-    if process_group is not None:
-        pgid, leader_started_at = process_group
-        process_was_alive = is_pid_alive(pgid, leader_started_at)
-        group_was_alive = _is_process_group_alive(pgid, pgid, leader_started_at)
-    else:
-        pgid, leader_started_at, group_was_alive = 0, "", False
-    if not process_was_alive and group_was_alive:
-        raise RuntimeError(
-            f"Recorded leader {pgid} for spec '{spec_id}' has exited or changed identity, "
-            f"but process group {pgid} still has live members. Refusing to signal an "
-            "orphaned or reused process group without a verifiable leader; inspect and "
-            "terminate only the run-owned processes manually."
-        )
-    if process_group is not None and process_was_alive:
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError as exc:
-            raise RuntimeError(f"No live process is currently running for spec '{spec_id}'.") from exc
-
-        deadline = time.monotonic() + RUN_STOP_GRACE_SECONDS
-        while time.monotonic() < deadline:
-            if not _is_process_group_alive(pgid, pgid, leader_started_at):
-                break
-            _poll_sleep(0.1)
-
-        if _is_process_group_alive(pgid, pgid, leader_started_at):
+    try:
+        if latest.supervision_token:
             try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline:
-                if not _is_process_group_alive(pgid, pgid, leader_started_at):
-                    break
-                _poll_sleep(0.1)
+                token = SupervisionToken.from_dict(latest.supervision_token)
+            except (TypeError, ValueError) as exc:
+                raise ProcessGroupOwnershipError(
+                    f"Spec '{spec_id}' has an unusable supervision token; refusing PID-only termination."
+                ) from exc
+            process_was_alive = stop_supervised_process(
+                token,
+                grace_seconds=RUN_STOP_GRACE_SECONDS,
+                hard_grace_seconds=1.0,
+            )
+        elif os.name == "posix":
+            process_group = _resolve_recorded_process_group(root, latest)
+            if process_group is None:
+                raise ProcessGroupOwnershipError(
+                    f"Spec '{spec_id}' does not have a recorded orchestrator process group."
+                )
+            pgid, leader_started_at = process_group
+            process_was_alive = terminate_legacy_process_group(
+                pgid,
+                pgid,
+                leader_started_at,
+                grace_seconds=RUN_STOP_GRACE_SECONDS,
+                hard_grace_seconds=1.0,
+            )
+        else:
+            raise ProcessGroupOwnershipError(
+                f"Spec '{spec_id}' does not have a usable supervision token; refusing PID-only termination."
+            )
+    except (ProcessGroupOwnershipError, ProcessGroupTerminationError) as exc:
+        raise RuntimeError(str(exc)) from exc
 
-        if _is_process_group_alive(pgid, pgid, leader_started_at):
-            raise RuntimeError(f"Failed to stop live process group for spec '{spec_id}'.")
-    elif latest.status != "running":
+    if not process_was_alive and latest.status != "running":
         raise RuntimeError(f"No live process is currently running for spec '{spec_id}'.")
 
     path = _run_state_path(root, latest.run_id)
