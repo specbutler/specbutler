@@ -47,6 +47,35 @@ def test_v2_token_parser_does_not_mint_missing_security_fields(missing: str) -> 
         SupervisionToken.from_dict(payload)
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("version", 3, "unsupported supervision token version"),
+        ("job_name", r"Local\SpecButler-arbitrary", "noncanonical Job name"),
+        ("control_relpath", "controls/other/control.json", "noncanonical control path"),
+    ],
+)
+def test_v2_token_parser_rejects_noncanonical_ownership_metadata(
+    field: str, value: object, message: str
+) -> None:
+    identity = ProcessIdentity(42, "created", "python.exe", "python child.py")
+    payload = SupervisionToken(LifetimeMode.DETACHED, identity, 7, "owner", "strict-token").to_dict()
+    payload[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        SupervisionToken.from_dict(payload)
+
+
+@pytest.mark.parametrize("identity_field", ["keeper_identity", "payload_identity"])
+def test_v2_token_parser_rejects_nonpositive_identity(identity_field: str) -> None:
+    identity = ProcessIdentity(42, "created", "python.exe", "python child.py")
+    payload = SupervisionToken(LifetimeMode.DETACHED, identity, 7, "owner", "strict-token").to_dict()
+    payload[identity_field] = {**payload[identity_field], "pid": 0}
+
+    with pytest.raises(ValueError, match="positive PIDs"):
+        SupervisionToken.from_dict(payload)
+
+
 def test_identity_rejects_stale_creation_time(monkeypatch: pytest.MonkeyPatch) -> None:
     expected = ProcessIdentity(os.getpid(), "old", sys.executable)
     monkeypatch.setattr(
@@ -109,7 +138,7 @@ def test_token_persists_explicit_job_name() -> None:
         "owner",
         "supervision-id",
         payload_identity=payload,
-        job_name=r"Local\SpecButler-payload-job",
+        job_name=r"Local\SpecButler-supervision-id",
     )
     restored = SupervisionToken.from_dict(token.to_dict())
     assert restored.identity == keeper

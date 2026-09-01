@@ -157,7 +157,12 @@ class SupervisionToken:
 
     @classmethod
     def from_dict(cls, value: dict[str, object]) -> SupervisionToken:
-        version = int(value.get("version", 1))
+        try:
+            version = int(value.get("version", 1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid supervision token version") from exc
+        if version not in {1, 2}:
+            raise ValueError("unsupported supervision token version")
         if os.name == "nt" and version < 2:
             raise ValueError("legacy Windows supervision tokens are not safe to use")
         if version >= 2:
@@ -172,20 +177,30 @@ class SupervisionToken:
             missing = [key for key in required if not value.get(key)]
             if missing:
                 raise ValueError(f"V2 supervision token is missing {', '.join(missing)}")
-            _control_path(str(value["control_relpath"]))
+            supervision_id = str(value["supervision_id"])
+            expected_job_name = _windows_job_name(supervision_id)
+            if value["job_name"] != expected_job_name:
+                raise ValueError("V2 supervision token has a noncanonical Job name")
+            expected_control_relpath = f"controls/{supervision_id}/control.json"
+            if value["control_relpath"] != expected_control_relpath:
+                raise ValueError("V2 supervision token has a noncanonical control path")
+            _control_path(expected_control_relpath)
         keeper_value = value.get("keeper_identity") or value.get("supervisor_identity") or value.get("identity")
         if not isinstance(keeper_value, dict):
             raise ValueError("supervision token has no keeper identity")
+        keeper = ProcessIdentity.from_dict(keeper_value)
+        payload_value = value.get("payload_identity")
+        payload = ProcessIdentity.from_dict(payload_value) if isinstance(payload_value, dict) else None
+        if version == 2 and (keeper.pid <= 0 or payload is None or payload.pid <= 0):
+            raise ValueError("V2 supervision token identities must have positive PIDs")
         return cls(
             mode=LifetimeMode(str(value["mode"])),
-            identity=ProcessIdentity.from_dict(keeper_value),
+            identity=keeper,
             owner_pid=int(value.get("owner_pid", 0)),
             owner_started_at=str(value.get("owner_started_at", "")),
             token=str(value.get("supervision_id", value.get("token", ""))),
             pgid=int(value.get("pgid", 0)),
-            payload_identity=ProcessIdentity.from_dict(dict(value["payload_identity"]))
-            if isinstance(value.get("payload_identity"), dict)
-            else None,
+            payload_identity=payload,
             version=version,
             job_name=str(value.get("job_name", "")),
             control_relpath=str(value.get("control_relpath", "")),

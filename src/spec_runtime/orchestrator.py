@@ -114,6 +114,7 @@ from .process_supervisor import (
     ProcessSupervisor,
     SupervisionToken,
     claim_current_process,
+    identity_matches,
 )
 from .process_supervisor import run as run_supervised
 from .process_supervisor import terminate as terminate_supervised
@@ -7046,7 +7047,7 @@ def stop_run(spec_id: str, *, repo_root: Path | None = None) -> RunState:
 
     if os.name != "posix" and latest.supervision_token:
         token = SupervisionToken.from_dict(latest.supervision_token)
-        process_was_alive = is_pid_alive(token.identity.pid, token.identity.started_at)
+        process_was_alive = identity_matches(token.identity)
         if process_was_alive and not terminate_supervised(token, grace_seconds=RUN_STOP_GRACE_SECONDS):
             raise RuntimeError(f"Failed to stop live supervised process for spec '{spec_id}'.")
         process_group = None
@@ -21415,13 +21416,16 @@ def run_full_workflow(
     _normalize_logger_state()
     run.retry_cap = retry_cap
     try:
-        _ensure_orchestrator_process_group(run, repo_root)
-        if not run.worktree_path:
-            try:
-                run.worktree_path = str(resolve_worktree_path(run, repo_root))
-            except Exception:
-                pass
         with _orchestrator_sigterm_guard(run, repo_root):
+            # Install the graceful cleanup path before publishing a Windows
+            # control token. A concurrent `spec stop` may act as soon as the
+            # token reaches disk.
+            _ensure_orchestrator_process_group(run, repo_root)
+            if not run.worktree_path:
+                try:
+                    run.worktree_path = str(resolve_worktree_path(run, repo_root))
+                except Exception:
+                    pass
             phase_order = list(PHASES)
             phase_idx = phase_order.index(run.phase) if run.phase in phase_order else 0
             merge_race_retries = 0

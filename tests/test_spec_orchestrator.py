@@ -39,6 +39,7 @@ from spec_runtime.config import CoordinationConfig, VerifyGateConfig
 from spec_runtime.control_plane import save_run_lease
 from spec_runtime.control_plane.lease import build_lease
 from spec_runtime.coordination import CoordinatorError, CoordinatorLeaseConflictError
+from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -33191,6 +33192,38 @@ class TestStopRunDeadProcess:
 
         assert result.status == "failed"
         assert result.last_error == "stopped by user"
+
+    def test_windows_supervision_uses_portable_identity_boundary(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        identity = ProcessIdentity(99999, "created", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "orchestrator-my-feature",
+        )
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--token",
+            status="running",
+            phase="implement",
+            supervision_token=token.to_dict(),
+        )
+        run.save(repo)
+        monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
+        monkeypatch.setattr(orch, "os", SimpleNamespace(name="nt"))
+        identity_check = MagicMock(return_value=True)
+        monkeypatch.setattr(orch, "identity_matches", identity_check)
+        monkeypatch.setattr(orch, "is_pid_alive", MagicMock(side_effect=AssertionError("must not invoke ps")))
+        monkeypatch.setattr(orch, "terminate_supervised", MagicMock(return_value=True))
+
+        result = orch.stop_run("my-feature", repo_root=repo)
+
+        assert result.status == "failed"
+        identity_check.assert_called_once_with(identity)
 
     def test_dead_process_non_running_state_raises(self, repo: Path, monkeypatch: pytest.MonkeyPatch):
         run = orch.RunState(
