@@ -107,7 +107,7 @@ from .execution_backend import (
 from .execution_backend import get_execution_backend as _factory_get_execution_backend
 from .forge import GitHubForge, PushResult
 from .git_common import resolve_common_root
-from .platform_fs import FileLock, atomic_write_text
+from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
 from .spec_identity import (
     SPEC_ID_RE,
     format_pr_review_owner,
@@ -999,7 +999,7 @@ def _cleanup_worktree_checkout(
             logger.warning("worktree remove reported failure: %s", detail[-240:])
     elif worktree_path.is_dir():
         try:
-            shutil.rmtree(worktree_path)
+            remove_tree(worktree_path)
         except OSError as exc:
             return f"Could not remove worktree directory {worktree_path}: {exc}"
 
@@ -5706,7 +5706,7 @@ def _prepare_spec_authoring_worktree(
         resumed = True
     else:
         if worktree_path.exists():
-            shutil.rmtree(worktree_path)
+            remove_tree(worktree_path)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
         should_reuse_existing_branch = spec_id is not None
@@ -10266,7 +10266,7 @@ class SpecLock:
         }
         try:
             stream = self._lock.file
-            stream.seek(1 if os.name == "nt" else 0)
+            stream.seek(lock_metadata_offset())
             stream.truncate()
             stream.write((json.dumps(payload) + "\n").encode("utf-8"))
             stream.flush()
@@ -10278,7 +10278,7 @@ class SpecLock:
             try:
                 stream = self._lock.file
                 if stream is not None:
-                    stream.seek(1 if os.name == "nt" else 0)
+                    stream.seek(lock_metadata_offset())
                     stream.truncate()
             except OSError:
                 pass
@@ -10324,7 +10324,7 @@ def read_spec_lock_owner_from_path(path: Path) -> LockOwner | None:
     try:
         if not probe.acquire():
             try:
-                raw = path.read_text()
+                raw = read_lock_metadata(path)
             except OSError:
                 raw = ""
             return _parse_lock_owner_payload(raw)
@@ -12186,7 +12186,7 @@ def _cleanup_stale_block_debugger_worktrees(repo_root: Path) -> None:
         if marker_pid > 0 and marker_started_at and is_pid_alive(marker_pid, marker_started_at):
             continue
         _restore_tree_writable(candidate)
-        shutil.rmtree(candidate, ignore_errors=True)
+        remove_tree(candidate, ignore_errors=True)
 
 
 def _validated_block_debugger_surviving_workspace(
@@ -12250,7 +12250,7 @@ def _create_private_block_debugger_clone(
     )
     if clone_result.returncode != 0:
         detail = clone_result.stderr.strip() or clone_result.stdout.strip() or "git clone failed"
-        shutil.rmtree(destination, ignore_errors=True)
+        remove_tree(destination, ignore_errors=True)
         raise ValueError(f"private debugger clone failed: {detail}")
 
     checkout_result = run_subprocess(
@@ -12259,7 +12259,7 @@ def _create_private_block_debugger_clone(
     )
     if checkout_result.returncode != 0:
         detail = checkout_result.stderr.strip() or checkout_result.stdout.strip() or "git checkout failed"
-        shutil.rmtree(destination, ignore_errors=True)
+        remove_tree(destination, ignore_errors=True)
         raise ValueError(f"private debugger checkout failed: {detail}")
 
     # The clone must have no path back to the authoritative workspace. The
@@ -12451,7 +12451,7 @@ def _temporary_block_debugger_worktree(
     if actual_head_sha and actual_head_sha != head_sha:
         if private_clone:
             _restore_tree_writable(worktree_path)
-            shutil.rmtree(worktree_path, ignore_errors=True)
+            remove_tree(worktree_path, ignore_errors=True)
             cleanup_error = ""
         else:
             cleanup_error = _cleanup_worktree_checkout(
@@ -12498,9 +12498,9 @@ def _temporary_block_debugger_worktree(
         _restore_tree_writable(worktree_path)
         for temp_dir in guard_temp_dirs:
             _restore_tree_writable(temp_dir)
-            shutil.rmtree(str(temp_dir), ignore_errors=True)
+            remove_tree(temp_dir, ignore_errors=True)
         if private_clone:
-            shutil.rmtree(worktree_path, ignore_errors=True)
+            remove_tree(worktree_path, ignore_errors=True)
             cleanup_error = ""
         else:
             cleanup_error = _cleanup_worktree_checkout(
@@ -12907,7 +12907,7 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
     else:
         # Clean up stale directory if present
         if worktree_path.exists():
-            shutil.rmtree(worktree_path)
+            remove_tree(worktree_path)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
         if run.resumed_from_branch:
@@ -18699,7 +18699,7 @@ def _bootstrap_review_worktree(
             )
         return ""
     finally:
-        shutil.rmtree(isolated_home, ignore_errors=True)
+        remove_tree(isolated_home, ignore_errors=True)
 
 
 def _review_env_prompt_note(review_worktree: Path) -> str:

@@ -24,6 +24,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from spec_runtime.platform_fs import remove_tree
+
 from .bridge import (
     AgentEvent,
     ChatSession,
@@ -1242,13 +1244,11 @@ async def implement_chat_task(request: Request) -> Response:
 
     def _cleanup_orphaned_run() -> None:
         """Remove the pre-created run state so no ghost record remains on disk."""
-        import shutil
-
         run_json = _run_state_path(repo_root, run_id)
         run_json.unlink(missing_ok=True)
         snapshot_dir = _run_spec_snapshot_path(repo_root, run_id).parent
         if snapshot_dir.is_dir():
-            shutil.rmtree(snapshot_dir, ignore_errors=True)
+            remove_tree(snapshot_dir, ignore_errors=True)
 
     # Resume the pre-created run.  The orchestrator will find the pinned spec
     # in .spec-state and the worktree already checked out on the session branch.

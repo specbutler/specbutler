@@ -548,9 +548,9 @@ def _remove_worktree_path(target: Path) -> int:
             print(f"Removed worktree {target}")
             return 1
     elif target.is_dir():
-        import shutil
+        from .platform_fs import remove_tree
 
-        shutil.rmtree(target)
+        remove_tree(target)
         print(f"Removed stale directory {target}")
         return 1
     return 0

@@ -47,6 +47,7 @@ from spec_runtime.autopilot_tui.dashboard import (  # noqa: F401 — re-exported
 )
 from spec_runtime.config import load_repo_spec_runtime_config
 from spec_runtime.container import container_image_source
+from spec_runtime.platform_fs import remove_tree
 from spec_runtime.spec_metadata import iter_spec_metadata
 
 
@@ -120,7 +121,7 @@ def resume_spec_run(repo_root: Path, spec_id: str, *, actor: str = "autopilot-wa
 def _clear_spec_runtime_artifacts(repo_root: Path, spec_id: str) -> None:
     for state_root in _state_roots(repo_root):
         legacy_dir = state_root / spec_id
-        shutil.rmtree(legacy_dir, ignore_errors=True)
+        remove_tree(legacy_dir, ignore_errors=True)
 
         autopilot_runs = state_root / "autopilot" / "runs"
         if autopilot_runs.exists():
@@ -162,7 +163,7 @@ def _remove_spec_run_state(repo_root: Path, spec_id: str) -> None:
                     continue
                 run_id = str(payload.get("run_id", "")).strip() or run_json.stem
                 run_json.unlink(missing_ok=True)
-                shutil.rmtree(runs_root / run_id, ignore_errors=True)
+                remove_tree(runs_root / run_id, ignore_errors=True)
 
     _clear_spec_runtime_artifacts(repo_root, spec_id)
 

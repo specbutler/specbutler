@@ -11,10 +11,11 @@ import uuid
 from pathlib import Path
 
 _DELAYS = (0.01, 0.025, 0.05, 0.1, 0.2)
+_WINDOWS = os.name == "nt"
 
 
 def _transient(exc: OSError) -> bool:
-    return os.name == "nt" and (
+    return _WINDOWS and (
         getattr(exc, "winerror", None) in {5, 32, 33}
         or exc.errno in {errno.EACCES, errno.EPERM}
     )
@@ -45,14 +46,26 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
         temporary.unlink(missing_ok=True)
 
 
-def remove_tree(path: Path) -> None:
+def remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
     """Remove a tree while tolerating read-only and transient Windows entries."""
     def onerror(function, name, _exc_info) -> None:
         target = Path(name)
         target.chmod(target.stat().st_mode | stat.S_IWRITE)
         _retry(lambda: function(name))
 
-    _retry(lambda: shutil.rmtree(path, onerror=onerror))
+    try:
+        _retry(lambda: shutil.rmtree(path, onerror=onerror))
+    except OSError:
+        if not ignore_errors:
+            raise
+
+
+def _windows_lock_contended(exc: OSError) -> bool:
+    return getattr(exc, "winerror", None) in {32, 33, 36} or exc.errno in {
+        errno.EACCES,
+        errno.EAGAIN,
+        errno.EDEADLK,
+    }
 
 
 class FileLock:
@@ -67,7 +80,7 @@ class FileLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.file = self.path.open("a+b")
         try:
-            if os.name == "nt":
+            if _WINDOWS:
                 import msvcrt
 
                 self.file.seek(0)
@@ -75,8 +88,18 @@ class FileLock:
                     self.file.write(b"\0")
                     self.file.flush()
                 self.file.seek(0)
-                mode = msvcrt.LK_LOCK if self.blocking else msvcrt.LK_NBLCK
-                msvcrt.locking(self.file.fileno(), mode, 1)
+                while True:
+                    try:
+                        msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        if not _windows_lock_contended(exc):
+                            raise
+                        if not self.blocking:
+                            self.file.close()
+                            self.file = None
+                            return False
+                        time.sleep(_DELAYS[0])
             else:
                 import fcntl
 
@@ -85,6 +108,8 @@ class FileLock:
         except OSError:
             self.file.close()
             self.file = None
+            if _WINDOWS:
+                raise
             return False
         return True
 
@@ -92,7 +117,7 @@ class FileLock:
         if self.file is None:
             return
         try:
-            if os.name == "nt":
+            if _WINDOWS:
                 import msvcrt
 
                 self.file.seek(0)
@@ -112,3 +137,16 @@ class FileLock:
 
     def __exit__(self, *_: object) -> None:
         self.release()
+
+
+def read_lock_metadata(path: Path) -> str:
+    """Read metadata without touching byte zero, which Windows locks exclusively."""
+    with path.open("rb") as stream:
+        if _WINDOWS:
+            stream.seek(1)
+        return stream.read().decode("utf-8")
+
+
+def lock_metadata_offset() -> int:
+    """Return the first byte not covered by the platform lock region."""
+    return 1 if _WINDOWS else 0
