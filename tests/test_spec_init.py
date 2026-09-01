@@ -533,9 +533,15 @@ class TestDetectImplementCommands:
 class TestDetectBaseBranch:
     def test_falls_back_to_local_branch_without_remote(self, tmp_path):
         _init_git_repo(tmp_path)
+        current_branch = subprocess.check_output(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=tmp_path,
+            text=True,
+            encoding="utf-8",
+        ).strip()
         result = _detect_base_branch(tmp_path)
         # No remote — uses local branch name without origin/ prefix
-        assert result == "main"
+        assert result == current_branch
 
     def test_reads_remote_head_without_contacting_remote(self, tmp_path):
         _init_git_repo(tmp_path)
