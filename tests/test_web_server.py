@@ -6,7 +6,7 @@ import json
 import os
 import sys
 from datetime import UTC, datetime
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -178,19 +178,22 @@ class TestServerLifecycle:
             assert not pid_path.exists()
 
     def test_windows_background_persists_token_and_cleans_failed_start(self, tmp_path, capsys):
-        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.process_supervisor import (
+            LifetimeMode,
+            ProcessIdentity,
+            ProcessSupervisor,
+            SupervisionToken,
+        )
 
         token = SupervisionToken(
             LifetimeMode.DETACHED, ProcessIdentity(123, "created"), 1, "owner", "web-token"
         )
         managed = MagicMock(token=token)
-        supervisor = MagicMock()
-        supervisor.spawn.return_value = managed
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="auth"),
             patch("socket.create_connection", side_effect=OSError("free")),
-            patch("spec_runtime.process_supervisor.ProcessSupervisor", return_value=supervisor),
+            patch.object(ProcessSupervisor, "spawn", return_value=managed),
             patch("spec_runtime.web.server.write_supervision_token") as write_token,
             patch("spec_runtime.web.server._wait_for_ready_record", return_value=False),
             patch("spec_runtime.process_supervisor.identity_matches", return_value=False),
@@ -356,9 +359,10 @@ class TestServerLifecycle:
             patch("spec_runtime.web.server._pid_path", return_value=pid_path),
             patch("spec_runtime.process_supervisor.legacy_pid_record_is_live") as legacy_live,
         ):
-            from spec_runtime.web.server import is_server_running
+            from spec_runtime.web.server import ServerOwnershipStateError, is_server_running
 
-            assert is_server_running(tmp_path) == (False, None)
+            with pytest.raises(ServerOwnershipStateError, match="supervision state is malformed"):
+                is_server_running(tmp_path)
         legacy_live.assert_not_called()
         assert supervision_path.read_text(encoding="utf-8") == "not json"
 
@@ -518,6 +522,74 @@ class TestServerLifecycle:
             captured = capsys.readouterr()
             assert "already running" in captured.err
 
+    @pytest.mark.parametrize(
+        "state_name",
+        ["server.supervision.json", "server.launch.json", "server.pid"],
+    )
+    def test_run_server_refuses_malformed_ownership_state(
+        self,
+        tmp_path,
+        capsys,
+        state_name,
+    ):
+        state_dir = tmp_path / ".spec-state" / "web"
+        state_dir.mkdir(parents=True)
+        (state_dir / state_name).write_text("not valid ownership state", encoding="utf-8")
+
+        with patch("spec_runtime.web.server.load_or_create_token") as load_token:
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path) == 1
+
+        load_token.assert_not_called()
+        assert "cannot start safely" in capsys.readouterr().err
+
+    def test_payload_nonce_does_not_bypass_malformed_launch_reservation(
+        self,
+        tmp_path,
+        capsys,
+        monkeypatch,
+    ):
+        from spec_runtime.web.server import _launch_path, _write_launch_reservation, run_server
+
+        monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "process-controls"))
+        monkeypatch.setenv("SPEC_WEB_READY_NONCE", "payload-nonce")
+        helper_path = tmp_path / "wrong-helper.json"
+        _write_launch_reservation(
+            tmp_path,
+            supervision_id="payload-owner",
+            helper_path=helper_path,
+            nonce="payload-nonce",
+            host="127.0.0.1",
+            port=7700,
+        )
+        reservation = json.loads(_launch_path(tmp_path).read_text(encoding="utf-8"))
+        reservation["listener"] = "127.0.0.1:9999"
+        _launch_path(tmp_path).write_text(json.dumps(reservation), encoding="utf-8")
+
+        with patch("spec_runtime.web.server.load_or_create_token") as load_token:
+            assert run_server(tmp_path) == 1
+
+        load_token.assert_not_called()
+        assert "cannot start safely" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("operation", ["stop", "status"])
+    def test_management_refuses_malformed_ownership_state(
+        self,
+        tmp_path,
+        capsys,
+        operation,
+    ):
+        state_dir = tmp_path / ".spec-state" / "web"
+        state_dir.mkdir(parents=True)
+        (state_dir / "server.supervision.json").write_text("not json", encoding="utf-8")
+
+        from spec_runtime.web.server import server_status, stop_server
+
+        command = stop_server if operation == "stop" else server_status
+        assert command(tmp_path) == 1
+        assert "state is malformed" in capsys.readouterr().err
+
     def test_wait_for_port_returns_true_on_connection(self):
         """_wait_for_port returns True when a connection succeeds."""
         from spec_runtime.web.server import _wait_for_port
@@ -539,6 +611,7 @@ class TestServerLifecycle:
         from spec_runtime.process_supervisor import (
             LifetimeMode,
             ProcessIdentity,
+            ProcessSupervisor,
             SupervisionToken,
         )
 
@@ -550,16 +623,11 @@ class TestServerLifecycle:
             "failed-bind",
         )
         managed = MagicMock(token=token)
-        supervisor = MagicMock()
-        supervisor.spawn.return_value = managed
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
             patch("socket.create_connection", side_effect=OSError("refused")),
-            patch(
-                "spec_runtime.process_supervisor.ProcessSupervisor",
-                return_value=supervisor,
-            ),
+            patch.object(ProcessSupervisor, "spawn", return_value=managed),
             patch("spec_runtime.web.server._wait_for_ready_record", return_value=None),
             patch("spec_runtime.process_supervisor.identity_matches", return_value=False),
         ):
@@ -704,6 +772,7 @@ class TestServerLifecycle:
         from spec_runtime.process_supervisor import (
             LifetimeMode,
             ProcessIdentity,
+            ProcessSupervisor,
             SupervisionToken,
         )
 
@@ -715,8 +784,11 @@ class TestServerLifecycle:
             "logging-order",
         )
         managed = MagicMock(token=token)
-        supervisor = MagicMock()
-        supervisor.spawn.return_value = managed
+        supervisors = []
+
+        def fake_spawn(supervisor, _command, **_kwargs):
+            supervisors.append(supervisor)
+            return managed
 
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
@@ -724,10 +796,7 @@ class TestServerLifecycle:
             patch("logging.basicConfig", side_effect=fake_basic_config),
             patch("spec_runtime.web.chat_api.log_backend_availability", fake_log_backend),
             patch("socket.create_connection", side_effect=OSError("free")),
-            patch(
-                "spec_runtime.process_supervisor.ProcessSupervisor",
-                return_value=supervisor,
-            ) as supervisor_type,
+            patch.object(ProcessSupervisor, "spawn", new=fake_spawn),
             patch("spec_runtime.web.server._wait_for_ready_record", return_value=token),
             patch("spec_runtime.web.server._ready_record_matches", return_value=True),
             patch("spec_runtime.web.server._wait_for_port", return_value=True),
@@ -737,11 +806,10 @@ class TestServerLifecycle:
 
             run_server(tmp_path, background=True)
 
-        supervisor_type.assert_called_once_with(
-            LifetimeMode.DETACHED,
-            supervision_id=ANY,
-            publish_durable_token=True,
-        )
+        assert len(supervisors) == 1
+        assert supervisors[0].mode is LifetimeMode.DETACHED
+        assert supervisors[0]._supervision_id
+        assert supervisors[0]._publish_durable_token is True
         assert "basicConfig" in call_order, "logging.basicConfig was not called"
         assert "log_backend_availability" in call_order, "log_backend_availability was not called"
         assert call_order.index("basicConfig") < call_order.index("log_backend_availability"), (

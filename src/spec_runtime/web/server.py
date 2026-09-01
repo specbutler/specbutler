@@ -58,6 +58,10 @@ _LOGIN_HTML = """\
 """
 
 
+class ServerOwnershipStateError(RuntimeError):
+    """Persisted web ownership exists but cannot be verified safely."""
+
+
 # ---------------------------------------------------------------------------
 # Auth middleware (uses starlette types but defined as plain ASGI callable)
 # ---------------------------------------------------------------------------
@@ -247,6 +251,46 @@ def _write_launch_reservation(
     atomic_write_text(path, json.dumps(payload, sort_keys=True) + "\n")
 
 
+def _read_valid_launch_reservation(
+    repo_root: Path,
+) -> tuple[str, str, str, int, Path] | None:
+    """Parse a launch reservation only when every ownership field is valid."""
+    try:
+        reservation = json.loads(_launch_path(repo_root).read_text(encoding="utf-8"))
+        if (
+            not isinstance(reservation, dict)
+            or reservation.get("schema") != 1
+            or reservation.get("state") != "launching"
+        ):
+            return None
+        supervision_id = reservation["supervision_id"]
+        nonce = reservation["nonce"]
+        host = reservation["host"]
+        port = reservation["port"]
+        helper_path = reservation["helper_path"]
+        if (
+            not isinstance(supervision_id, str)
+            or not supervision_id
+            or not isinstance(nonce, str)
+            or not nonce
+            or not isinstance(host, str)
+            or not host
+            or not isinstance(port, int)
+            or isinstance(port, bool)
+            or not 0 < port <= 65535
+            or not isinstance(helper_path, str)
+            or not helper_path
+            or reservation.get("listener") != f"{host}:{port}"
+        ):
+            return None
+        expected_helper = _helper_metadata_path(repo_root, supervision_id).resolve()
+        if Path(helper_path).resolve() != expected_helper:
+            return None
+        return supervision_id, nonce, host, port, expected_helper
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError, json.JSONDecodeError):
+        return None
+
+
 def _recover_launch(repo_root: Path, *, readiness_timeout: float = 1.0) -> object | None:
     """Recover or reserve a supervised launch left by another launcher.
 
@@ -257,20 +301,11 @@ def _recover_launch(repo_root: Path, *, readiness_timeout: float = 1.0) -> objec
     """
     from spec_runtime.process_supervisor import SupervisionToken, identity_matches
 
+    reservation = _read_valid_launch_reservation(repo_root)
+    if reservation is None:
+        return None
+    supervision_id, nonce, host, port, expected_helper = reservation
     try:
-        reservation = json.loads(_launch_path(repo_root).read_text(encoding="utf-8"))
-        if not isinstance(reservation, dict) or reservation.get("state") != "launching":
-            return None
-        supervision_id = str(reservation["supervision_id"])
-        nonce = str(reservation["nonce"])
-        host = str(reservation["host"])
-        port = int(reservation["port"])
-        listener = f"{host}:{port}"
-        expected_helper = _helper_metadata_path(repo_root, supervision_id).resolve()
-        if Path(str(reservation["helper_path"])).resolve() != expected_helper:
-            return None
-        if reservation.get("listener") != listener or not supervision_id or not nonce:
-            return None
         # The payload executes the normal foreground start path.  It must not
         # mistake its own reservation for an already-running server.
         if os.environ.get("SPEC_WEB_READY_NONCE") == nonce:
@@ -321,6 +356,12 @@ def _recover_launch(repo_root: Path, *, readiness_timeout: float = 1.0) -> objec
     _launch_path(repo_root).unlink(missing_ok=True)
     expected_helper.unlink(missing_ok=True)
     return token
+
+
+def _launch_reservation_belongs_to_current_payload(repo_root: Path) -> bool:
+    """Return whether the valid reservation names this foreground payload."""
+    reservation = _read_valid_launch_reservation(repo_root)
+    return bool(reservation and os.environ.get("SPEC_WEB_READY_NONCE") == reservation[1])
 
 
 def _publish_ready_record(repo_root: Path, *, nonce: str, host: str, port: int) -> None:
@@ -518,7 +559,9 @@ def is_server_running(repo_root: Path) -> tuple[bool, int | None]:
     supervision_token = read_supervision_token(repo_root)
     if supervision_token is None and supervision_state_exists:
         # Never downgrade malformed durable ownership state to a raw PID.
-        return False, None
+        raise ServerOwnershipStateError(
+            f"durable supervision state is malformed: {_supervision_path(repo_root)}"
+        )
     if supervision_token is None and _launch_path(repo_root).exists():
         supervision_token = _recover_launch(repo_root)
     if isinstance(supervision_token, SupervisionToken):
@@ -529,9 +572,17 @@ def is_server_running(repo_root: Path) -> tuple[bool, int | None]:
     if _launch_path(repo_root).exists():
         # A malformed or otherwise unverifiable launch reservation is an
         # ownership boundary, not permission to fall back to a raw PID.
-        return False, None
+        if not _launch_reservation_belongs_to_current_payload(repo_root):
+            raise ServerOwnershipStateError(
+                f"launch reservation is malformed or unverifiable: {_launch_path(repo_root)}"
+            )
+    pid_state_exists = _pid_path(repo_root).exists()
     pid, stored_started_at = read_pid(repo_root)
     if pid is None:
+        if pid_state_exists:
+            raise ServerOwnershipStateError(
+                f"legacy PID state is malformed: {_pid_path(repo_root)}"
+            )
         return False, None
     if legacy_pid_record_is_live(pid, stored_started_at):
         return True, pid
@@ -652,7 +703,11 @@ def run_server(
 ) -> int:
     # Refuse to start if a server is already running — prevents orphaning
     # the existing process by overwriting its PID file.
-    running, existing_pid = is_server_running(repo_root)
+    try:
+        running, existing_pid = is_server_running(repo_root)
+    except ServerOwnershipStateError as exc:
+        print(f"spec web cannot start safely: {exc}", file=sys.stderr)
+        return 1
     if running:
         existing_port = read_port(repo_root)
         port_info = f" on port {existing_port}" if existing_port else ""
@@ -883,7 +938,11 @@ def run_server(
 
 
 def stop_server(repo_root: Path) -> int:
-    running, pid = is_server_running(repo_root)
+    try:
+        running, pid = is_server_running(repo_root)
+    except ServerOwnershipStateError as exc:
+        print(f"spec web cannot stop safely: {exc}", file=sys.stderr)
+        return 1
     if not running or pid is None:
         print("spec web is not running.", file=sys.stderr)
         return 1
@@ -921,7 +980,11 @@ def stop_server(repo_root: Path) -> int:
 
 
 def server_status(repo_root: Path) -> int:
-    running, pid = is_server_running(repo_root)
+    try:
+        running, pid = is_server_running(repo_root)
+    except ServerOwnershipStateError as exc:
+        print(f"spec web ownership state is invalid: {exc}", file=sys.stderr)
+        return 1
     if running:
         port = read_port(repo_root)
         if port:
