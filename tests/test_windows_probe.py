@@ -626,8 +626,7 @@ def test_cleanup_reaps_registered_helper_and_preserves_unrelated_process(tmp_pat
 
 def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
     fake_bin = tmp_path / "fake-bin"
-    fake_bin.mkdir()
-    (fake_bin / "codex.cmd").write_text("@echo off\nexit /b 0\n", encoding="utf-8")
+    _write_fake_cli_tools(fake_bin, Path(sys.executable))
     subprocess_env = _clean_subprocess_env()
     subprocess_env["PATH"] = os.pathsep.join(
         [str(fake_bin), subprocess_env.get("PATH", "")]

@@ -40,11 +40,12 @@ require_command() {
 }
 
 require_free_space() {
-    local available minimum=$((40 * 1024 * 1024 * 1024))
-    available="$(df --output=avail -B1 "$LAB_ROOT" | awk 'NR == 2 { print $1 }')"
+    local target="${1:-$LAB_ROOT}" available minimum=$((40 * 1024 * 1024 * 1024))
+    test -e "$target" || die "disk-space target does not exist: $target"
+    available="$(df --output=avail -B1 "$target" | awk 'NR == 2 { print $1 }')"
     [[ "$available" =~ ^[0-9]+$ ]] || die "could not determine available lab disk space"
     if (( available < minimum )); then
-        die "less than 40 GiB is free; refusing to initialize the Windows VM"
+        die "less than 40 GiB is free on the filesystem containing: $target"
     fi
 }
 
@@ -360,6 +361,28 @@ reset_lab() {
     printf '%s\n' "Reset run overlay to baseline $name; prior overlay retained at $trash"
 }
 
+proof_trash_keep() {
+    local keep="${LAB_PROOF_TRASH_KEEP:-1}"
+    [[ "$keep" =~ ^[1-9][0-9]*$ ]] || die "LAB_PROOF_TRASH_KEEP must be a positive integer"
+    printf '%s\n' "$keep"
+}
+
+proof_trash_retention() {
+    local keep="$1" mode="${2:-check}"
+    require_stopped
+    local args=(
+        "$LAB_ROOT/trash_retention.py"
+        --trash-root "$STATE_ROOT/trash"
+        --keep "$keep"
+    )
+    if [ "$mode" = apply ]; then
+        args+=(--apply)
+    elif [ "$mode" != check ]; then
+        die "invalid proof trash retention mode: $mode"
+    fi
+    python3 "${args[@]}"
+}
+
 stage_source() {
     wait_ssh
     local ref="${1:-${LAB_SOURCE_REF:-HEAD}}"
@@ -455,10 +478,18 @@ run_proof() {
     [[ "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" = /* ]] || die "SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT must be an absolute path"
     test -d "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" || die "external acceptance evidence root does not exist: $SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT"
     validate_name "$LAB_BASELINE"
+    local trash_keep
+    trash_keep="$(proof_trash_keep)"
     if vm_running; then
         shutdown_lab
     fi
+    # Validate every existing retired overlay before reset mutates state. The
+    # apply pass below validates the full set again, including the overlay that
+    # reset just retired, before removing any older recovery state.
+    proof_trash_retention "$trash_keep"
     reset_lab "$LAB_BASELINE"
+    proof_trash_retention "$trash_keep" apply
+    require_free_space "$STATE_ROOT"
     up_lab
     wait_ssh
     provision_guest

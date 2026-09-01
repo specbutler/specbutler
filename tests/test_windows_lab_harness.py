@@ -40,6 +40,7 @@ REQUIRED_FILES = {
     "register-job.ps1",
     "runtime_proof.py",
     "toolchain.json.example",
+    "trash_retention.py",
     "watch-conpty.cs",
 }
 
@@ -75,6 +76,10 @@ def test_windows_lab_has_complete_controller_surface() -> None:
         assert re.search(rf"(^|[| ]){re.escape(command)}([| )])", controller, re.MULTILINE)
 
     assert "reset_lab \"$LAB_BASELINE\"" in controller
+    assert 'require_free_space "$STATE_ROOT"' in controller
+    assert 'local keep="${LAB_PROOF_TRASH_KEEP:-1}"' in controller
+    assert 'trash_keep="$(proof_trash_keep)"' in controller
+    assert 'proof_trash_retention "$trash_keep" apply' in controller
     assert "provision_guest" in controller
     assert "stage_source" in controller
     assert 'mkdir -p "$STATE_ROOT/incoming"' in controller
@@ -159,6 +164,28 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert '--expected-revision "$revision"' in controller
     assert '--output "$destination/acceptance-audit.json"' in controller
     assert 'return "$audit_status"' in controller
+
+    reset = controller[controller.index("reset_lab() {") : controller.index("stage_source() {")]
+    assert reset.index("qemu_img check /state/disk/run.qcow2") < reset.index(
+        'printf \'%s\\n\' "Reset run overlay'
+    )
+    retention = controller[
+        controller.index("proof_trash_retention() {") : controller.index("stage_source() {")
+    ]
+    assert "require_stopped" in retention
+    env_example = (LAB_ROOT / "lab.env.example").read_text(encoding="utf-8")
+    assert "LAB_PROOF_TRASH_KEEP=1" in env_example
+    proof_run = controller[
+        controller.index("run_proof() {") : controller.index('command="${1:-help}"')
+    ]
+    assert (
+        proof_run.index("shutdown_lab")
+        < proof_run.index('proof_trash_retention "$trash_keep"')
+        < proof_run.index('reset_lab "$LAB_BASELINE"')
+        < proof_run.index('proof_trash_retention "$trash_keep" apply')
+        < proof_run.index('require_free_space "$STATE_ROOT"')
+        < proof_run.index("up_lab")
+    )
 
 
 def test_windows_lab_inputs_are_placeholder_only_and_private_state_is_ignored() -> None:

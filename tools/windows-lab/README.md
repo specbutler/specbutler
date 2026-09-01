@@ -137,6 +137,20 @@ delete it manually after retaining the release evidence. `proof` is intentionall
 opt-in because it creates that external repository and consumes real provider
 capacity. Microsoft and provider authentication may need renewal between runs.
 
+Each automated proof preflights at least 40 GiB of free space on the filesystem
+that contains `SPEC_WINDOWS_LAB_STATE_ROOT` before starting the VM. While the
+VM is stopped, proof validates existing trash, performs the cold reset, checks
+the replacement overlay, and then retains only the newest retired overlay by
+default before running that preflight. This ordering lets proof reclaim older
+reset predecessors when they caused the low-space condition. Reset only
+needs the negligible headroom for a new sparse qcow2 overlay and copies of the
+small NVRAM and TPM state. Set the positive integer `LAB_PROOF_TRASH_KEEP` in
+`lab.env` to retain more predecessors. The retention pass derives recency from
+the controller-owned timestamp/PID directory name, validates every direct trash
+child before deleting anything, and fails closed on partial directories,
+unknown entries, symlinks, or nested mounts. Sanitized evidence and raw
+collected logs are outside the overlay trash and are not affected.
+
 Provisioning uses the administrative SSH control plane. Interactive proof jobs
 use the logged-on account's filtered, non-elevated token and fail unless they are
 in a real desktop session; this matches the documented day-to-day Windows tier.
@@ -295,7 +309,10 @@ final acceptance audit.
 
 Snapshots are cold: shut Windows down before creating or resetting one. The
 controller moves replaced overlays into ignored `state/trash/` instead of
-deleting them. Remove old trash manually only after confirming it is not needed.
+deleting them. Explicit `labctl reset` remains conservative and never prunes
+those predecessors. The automated `labctl proof` flow bounds its own retained
+predecessors according to `LAB_PROOF_TRASH_KEEP` only after the replacement
+overlay passes `qemu-img check`.
 
 ## Development checks
 
