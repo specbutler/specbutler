@@ -41,8 +41,9 @@ boundaries that preserve current Linux and macOS behavior.
 7. From an installed wheel on Windows, `spec --version`, `spec --help`, `spec init`,
    `spec list`, `spec show`, and read-only `spec status` complete without a traceback
    in a temporary Git repository on NTFS.
-8. The package advertises Windows support only at the maturity actually delivered
-   by this spec, uses conditional dependencies where needed, and introduces no
+8. This phase does not add a Windows package classifier or make a general Windows
+   support claim. Any experimental capability label names the exact read-only/local
+   commands proven here. Dependencies are conditional where needed, with no
    unconditional Windows-only dependency on POSIX systems.
 9. Existing Linux tests plus new platform-unit tests pass, including explicit
    tests of both platform branches rather than tests that merely mock away all

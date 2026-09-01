@@ -20,8 +20,10 @@ promise, backed by both hosted CI and the persistent local Windows 11 lab.
    lint plus the full portable test suite on supported Python versions. Windows-
    specific integration tests are not skipped merely because CI is Windows Server.
 2. CI smoke tests create a repository whose path contains spaces and Unicode, run
-   `init`, `doctor`, `list`, `show`, `status`, lifecycle fixture flows, web
-   foreground/background, autopilot dispatch/stop, and cleanup from the wheel.
+   `init`, `doctor`, `list`, `show`, `status`, `input`, foreground/background
+   `update`, lifecycle fixture flows including `needs-input` resolution, web
+   foreground/background, autopilot dispatch/adoption/stop, and cleanup from the
+   wheel.
 3. A checked-in, secret-free Windows-lab harness documents and automates creation,
    reset, source sync, command execution, log/artifact retrieval, and snapshotting
    for the local KVM-backed Windows 11 evaluation VM. Machine-specific credentials

@@ -19,15 +19,17 @@ features whose isolation guarantees are unavailable.
 ## Acceptance Criteria
 
 1. `spec create`, `spec task`, `spec implement`, `spec phase`, `spec report`,
-   `spec status`, `spec stop`, `spec clean`, and `spec gc` operate in a native
-   Windows repository using the worktree backend and platform-valid Git paths.
+   `spec input`, `spec status`, `spec stop`, `spec clean`, `spec gc`, and foreground
+   `spec update` operate in a native Windows repository using the worktree backend
+   and platform-valid Git paths.
 2. A real Codex implementation run creates an isolated worktree, bootstraps it,
    edits and commits a fixture change, passes gates, performs review, opens and
    merges a pull request on a disposable GitHub repository, records provenance,
    and cleans up without manual repair.
 3. Stop, timeout, failed gate, review retry, resume after orchestrator restart,
-   stale state, and merge-conflict recovery are exercised on Windows. Owned
-   subprocesses are gone afterward and unrelated processes are untouched.
+   stale state, merge-conflict recovery, and `needs-input` followed by `spec input`
+   resolution are exercised on Windows. Owned subprocesses are gone afterward and
+   unrelated processes are untouched.
 4. Codex home/config/auth isolation works without requiring symlink privileges or
    Developer Mode. Secrets are copied or referenced with least privilege and are
    absent from logs, commits, review workspaces, and cleanup remnants.
@@ -40,10 +42,14 @@ features whose isolation guarantees are unavailable.
 7. Native Claude execution remains explicitly unavailable while its required
    host sandbox is unsupported; selection fails before launch with documented
    alternatives and does not weaken sandbox policy.
-8. Hermetic Windows integration tests cover the lifecycle without model, network,
+8. Foreground update checks and applies through the documented safety gates. The
+   background refresh mode uses the detached lifetime from
+   `windows-process-supervision`, survives CLI exit, records durable identity, and
+   leaves no stale process or state after completion.
+9. Hermetic Windows integration tests cover the lifecycle without model, network,
    or real-forge dependencies, and a separately marked real-provider proof test
    covers the end-to-end Codex path.
-9. Linux/macOS lifecycle behavior and state compatibility remain unchanged.
+10. Linux/macOS lifecycle behavior and state compatibility remain unchanged.
 
 ## Out of Scope
 

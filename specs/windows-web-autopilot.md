@@ -31,9 +31,11 @@ context, cancellation, and ownership guarantees as the core lifecycle.
 4. Web lifecycle actions invoke the same runtime and process-supervision paths as
    the CLI and report structured failures rather than POSIX tracebacks.
 5. `spec auto run` dispatches multiple dependency-ready specs on Windows up to the
-   configured concurrency, never dispatches blocked dependents, survives a
-   dispatcher restart, and `spec auto stop` drains/terminates according to its
-   documented contract.
+   configured concurrency and never dispatches blocked dependents. After a forced
+   dispatcher restart it reopens or transfers each durable supervision token,
+   adopts every live implementation child exactly once, and neither terminates nor
+   duplicates it; `spec auto stop` drains/terminates according to its documented
+   contract.
 6. `spec watch` and its chat surface run on Windows with portable process and
    memory inspection. Terminal limitations degrade explicitly without crashing
    the dispatcher.
