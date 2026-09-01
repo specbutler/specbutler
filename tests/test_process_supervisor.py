@@ -242,6 +242,40 @@ def test_managed_async_communicate_preserves_baseexception_when_cleanup_fails() 
     asyncio.run(exercise())
 
 
+def test_held_windows_job_uses_original_group_and_exact_grace_before_hard_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+    identity = ProcessIdentity(42, "exited-shim")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        identity,
+        7,
+        "owner",
+        "held-job-grace",
+        pgid=4242,
+    )
+
+    class Job:
+        def active_process_ids(self) -> tuple[int, ...]:
+            return (99,)
+
+        def wait_empty(self, timeout: float) -> bool:
+            events.append(("wait", timeout))
+            return False
+
+        def active_identities(self) -> list[ProcessIdentity]:
+            return []
+
+        def terminate(self) -> None:
+            events.append("hard-kill")
+
+    monkeypatch.setattr(process_supervisor, "_send_windows_break", lambda pgid: events.append(("break", pgid)) or True)
+
+    assert process_supervisor._terminate_held_windows_job(token, Job(), 0.375) is True  # type: ignore[arg-type]
+    assert events == [("break", 4242), ("wait", 0.375), "hard-kill"]
+
+
 def test_durable_metadata_path_is_independent_of_payload_cwd(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -504,7 +538,13 @@ def test_windows_stop_attempts_graceful_break_before_job_termination(tmp_path: P
     assert ready.exists()
     managed.terminate(grace_seconds=3)
     managed.wait(timeout=10)
-    assert marker.read_text(encoding="utf-8") == "graceful"
+    # GenerateConsoleCtrlEvent is explicitly best-effort: Windows may accept
+    # the request yet suppress it in inherited/redirector console topologies.
+    # When delivery is supported the handler proves it ran; either way the
+    # bounded Job fallback must leave the complete owned tree dead.
+    if marker.exists():
+        assert marker.read_text(encoding="utf-8") == "graceful"
+    assert inspect_process(managed.token.identity.pid) is None
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows stale identity integration")

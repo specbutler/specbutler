@@ -751,7 +751,7 @@ class ManagedProcess:
         # Popen leader. Popen.communicate then waits for EOF forever even
         # though the leader has exited. Close the run-owned Job as soon as the
         # leader exits so inherited pipe handles cannot outlive ownership.
-        if os.name == "nt" and self._job is not None:
+        if os.name == "nt" and isinstance(self.process, _REAL_POPEN_TYPE) and isinstance(self._job, _WindowsJob):
             threading.Thread(target=self._close_job_after_leader, daemon=True).start()
         try:
             result = self.process.communicate(input=input, timeout=timeout)
@@ -784,14 +784,18 @@ class ManagedProcess:
     def owned_tree_active(self) -> bool:
         """Whether the retained ownership boundary still has live members."""
         if os.name == "nt" and self._job is not None:
-            return bool(self._job.active_process_ids())
+            query = getattr(self._job, "active_process_ids", None)
+            if callable(query):
+                return bool(query())
         return self.process.poll() is None
 
     def _owned_tree_identities(self) -> list[ProcessIdentity]:
         if os.name == "nt" and self._job is not None:
             try:
-                return self._job.active_identities()
-            except OSError:
+                query = getattr(self._job, "active_identities", None)
+                if callable(query):
+                    return query()
+            except (OSError, AttributeError):
                 pass
         return _windows_tree_identities(self.token.identity.pid)
 
@@ -903,7 +907,7 @@ class ManagedAsyncProcess:
         return returncode
 
     async def communicate(self, input: bytes | None = None) -> tuple[bytes | None, bytes | None]:
-        if os.name == "nt" and self._job is not None:
+        if os.name == "nt" and isinstance(self.process, asyncio.subprocess.Process) and isinstance(self._job, _WindowsJob):
             asyncio.create_task(self._close_job_after_leader())
         try:
             result = await self.process.communicate(input)
@@ -934,8 +938,10 @@ class ManagedAsyncProcess:
     def _owned_tree_identities(self) -> list[ProcessIdentity]:
         if os.name == "nt" and self._job is not None:
             try:
-                return self._job.active_identities()
-            except OSError:
+                query = getattr(self._job, "active_identities", None)
+                if callable(query):
+                    return query()
+            except (OSError, AttributeError):
                 pass
         return _windows_tree_identities(self.token.identity.pid)
 
