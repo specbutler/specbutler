@@ -50,6 +50,23 @@ def test_container_path_translation_does_not_rewrite_prefix_collisions() -> None
     assert untouched == r"C:\src\project-other\tool.exe"
 
 
+def test_container_path_translation_preserves_unrelated_composite_backslashes() -> None:
+    composite = (
+        r'--config={"cwd":"C:\src\project\tools\run.py",'
+        r'"pattern":"\\d+","replacement":"\\1"}'
+    )
+
+    translated = eb.ContainerExecutionBackend._translate_container_paths(
+        composite,
+        [("C:/src/project", "/workspace/source")],
+    )
+
+    assert translated == (
+        r'--config={"cwd":"/workspace/source/tools/run.py",'
+        r'"pattern":"\\d+","replacement":"\\1"}'
+    )
+
+
 class TestExecutionConfigDefaults:
     def test_default_when_section_missing(self, tmp_path: Path):
         (tmp_path / ".git").mkdir()

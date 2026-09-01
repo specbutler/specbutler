@@ -1687,6 +1687,12 @@ def _replace_host_path_reference(value: str, *, host_path: str, container_path: 
     if not host_path:
         return value
     path_boundary = r"A-Za-z0-9_~\\/-"
+    # A mapped path may be embedded in an argv value such as a JSON document
+    # or path-list environment variable.  Normalize separators only through
+    # the end of that path reference; replacing every backslash in ``value``
+    # would also rewrite unrelated regexes, JSON escapes, or later values.
+    reference_terminators = "\"'`,;{}[]\r\n"
+    suffix_pattern = rf"(?P<suffix>(?:[\\/][^{re.escape(reference_terminators)}]*)?)"
     variants = sorted(
         {
             host_path,
@@ -1699,15 +1705,15 @@ def _replace_host_path_reference(value: str, *, host_path: str, container_path: 
     translated = value
     for variant in variants:
         pattern = re.compile(
-            rf"(?<![{path_boundary}]){re.escape(variant)}(?=$|[\\/]|[^{path_boundary}])"
+            rf"(?<![{path_boundary}]){re.escape(variant)}"
+            rf"(?=$|[\\/]|[^{path_boundary}]){suffix_pattern}"
         )
-        translated, count = pattern.subn(container_path, translated)
-        if count:
-            # The replacement target is a Linux container path.  A native
-            # Windows argument retains backslashes in the suffix after the
-            # rewritten worktree prefix unless the whole argv element is
-            # normalized here.
-            translated = translated.replace("\\", "/")
+
+        def replace_match(match: re.Match[str]) -> str:
+            suffix = match.group("suffix") or ""
+            return container_path + suffix.replace("\\", "/")
+
+        translated = pattern.sub(replace_match, translated)
     return translated
 
 

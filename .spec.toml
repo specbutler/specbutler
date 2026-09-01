@@ -16,6 +16,8 @@ review_default = "codex"
 allowed = ["claude", "codex"]
 
 [bootstrap]
+# This repository's full test gate imports the optional TUI and web modules,
+# so isolated development workspaces install all three test/runtime extras.
 install_command = "python -m venv .venv && .venv/bin/python -m pip install -e '.[dev,tui,web]'"
 install_command_windows = "python -m venv .venv; .\\.venv\\Scripts\\python.exe -m pip install -e '.[dev,tui,web]'"
 install_shell_windows = "powershell"
