@@ -2282,6 +2282,8 @@ def _build_implement_command_metadata(
         "SPEC_ID": run.spec_id,
         "SPEC_RUN_ID": run.run_id,
         "SPEC_PATH": spec_path,
+        "SPEC_WORKTREE": str(worktree_path),
+        "SPEC_ATTEMPT": str(run.attempts + 1),
     }
     args = [
         "--worktree",

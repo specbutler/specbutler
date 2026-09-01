@@ -11751,6 +11751,8 @@ class TestImplementSetupTeardownHelpers:
         assert seen["env"]["SPEC_ID"] == "my-feature"
         assert seen["env"]["SPEC_RUN_ID"] == run.run_id
         assert seen["env"]["SPEC_PATH"] == "specs/my-feature.md"
+        assert seen["env"]["SPEC_WORKTREE"] == str(repo)
+        assert seen["env"]["SPEC_ATTEMPT"] == "1"
 
     def test_windows_setup_override_does_not_change_posix_argv(self, repo: Path):
         run = self._run()
@@ -13912,23 +13914,38 @@ class TestImplementSetupTeardownHelpers:
             ),
         )
 
+        seen: dict[str, object] = {}
+
+        def fake_run_subprocess(cmd, cwd=None, env=None, **kwargs):
+            del kwargs
+            seen["cmd"] = cmd
+            seen["cwd"] = cwd
+            seen["env"] = env
+            return subprocess.CompletedProcess(
+                args=["scripts/implement-teardown.sh"],
+                returncode=3,
+                stdout="",
+                stderr="cleanup failed",
+            )
+
         with (
             patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
             patch.object(
                 orch,
                 "run_subprocess",
-                return_value=subprocess.CompletedProcess(
-                    args=["scripts/implement-teardown.sh"],
-                    returncode=3,
-                    stdout="",
-                    stderr="cleanup failed",
-                ),
+                side_effect=fake_run_subprocess,
             ),
             caplog.at_level(logging.WARNING),
         ):
             orch._run_implement_teardown_command(run, repo)
 
         assert "Implement teardown command failed" in caplog.text
+        assert seen["cwd"] == repo
+        assert seen["env"]["SPEC_ID"] == "my-feature"
+        assert seen["env"]["SPEC_RUN_ID"] == run.run_id
+        assert seen["env"]["SPEC_PATH"] == "specs/my-feature.md"
+        assert seen["env"]["SPEC_WORKTREE"] == str(repo)
+        assert seen["env"]["SPEC_ATTEMPT"] == "1"
 
     def test_windows_teardown_override_does_not_change_posix_argv(self, repo: Path):
         run = self._run()
