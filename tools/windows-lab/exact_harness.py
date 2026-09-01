@@ -26,6 +26,33 @@ def _git(repo_root: Path, *arguments: str, text: bool = False) -> bytes | str:
     return completed.stdout
 
 
+def _git_clean_object_id(repo_root: Path, relative: str, payload: bytes) -> str:
+    """Hash worktree bytes through the clean filters for *relative*."""
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "hash-object",
+            "--stdin",
+            f"--path={relative}",
+        ],
+        input=payload,
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.decode(errors="replace").strip()
+        raise HarnessMismatch(f"git hash-object failed for {relative}: {stderr}")
+    try:
+        object_id = completed.stdout.decode("ascii").strip().lower()
+    except UnicodeDecodeError as exc:
+        raise HarnessMismatch(f"git hash-object returned invalid output for {relative}") from exc
+    if not object_id or any(character not in "0123456789abcdef" for character in object_id):
+        raise HarnessMismatch(f"git hash-object returned invalid output for {relative}")
+    return object_id
+
+
 def verify_exact_harness(
     repo_root: Path,
     revision: str,
@@ -45,21 +72,66 @@ def verify_exact_harness(
         raise HarnessMismatch(
             f"proof revision {revision} is not the controller checkout HEAD {head}"
         )
-    dirty = str(
-        _git(
-            repo_root,
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
+    staged_diff = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-ext-diff",
+            revision,
             "--",
             "tools/windows-lab",
-            text=True,
-        )
-    ).strip()
-    if dirty:
+        ],
+        check=False,
+        capture_output=True,
+    )
+    worktree_diff = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--quiet",
+            "--no-ext-diff",
+            "--",
+            "tools/windows-lab",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    for label, completed in (
+        ("staged", staged_diff),
+        ("worktree", worktree_diff),
+    ):
+        if completed.returncode not in {0, 1}:
+            stderr = completed.stderr.decode(errors="replace").strip()
+            raise HarnessMismatch(f"git {label} diff failed: {stderr}")
+    if staged_diff.returncode == 1 or worktree_diff.returncode == 1:
         raise HarnessMismatch(
-            "tools/windows-lab differs from the exact proof revision; commit or remove: "
-            + ", ".join(line[3:] for line in dirty.splitlines())
+            "tools/windows-lab differs from the exact proof revision"
+        )
+    untracked_raw = _git(
+        repo_root,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        "tools/windows-lab",
+    )
+    assert isinstance(untracked_raw, bytes)
+    untracked = [
+        path.decode("utf-8", errors="replace")
+        for path in untracked_raw.split(b"\0")
+        if path
+    ]
+    if untracked:
+        raise HarnessMismatch(
+            "tools/windows-lab contains untracked files; commit or remove: "
+            + ", ".join(untracked)
         )
     tree_raw = _git(
         repo_root,
@@ -102,7 +174,10 @@ def verify_exact_harness(
             worktree = worktree_path.read_bytes()
         except OSError as exc:
             raise HarnessMismatch(f"harness file is unavailable: {relative}: {exc}") from exc
-        if worktree != committed:
+        # Git may legitimately smudge a clean checkout (most notably LF blobs
+        # to CRLF on Windows). Compare the worktree through the path's clean
+        # filters, while continuing to materialize the raw committed blob below.
+        if _git_clean_object_id(repo_root, relative, worktree) != object_id:
             raise HarnessMismatch(
                 f"harness file differs from exact revision: {relative}"
             )

@@ -312,11 +312,39 @@ def _source_checkout_checks(
         check=False,
         capture_output=True,
     )
+    manifest_clean_hash_run = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "hash-object",
+            "--stdin",
+            f"--path={manifest_relative.as_posix()}",
+        ],
+        input=manifest_bytes,
+        check=False,
+        capture_output=True,
+    )
+    committed_manifest_hash_run = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "hash-object",
+            "--stdin",
+            "--no-filters",
+        ],
+        input=manifest_blob_run.stdout,
+        check=False,
+        capture_output=True,
+    )
     clean = (
         tracked_run.returncode == 0
         and diff_run.returncode == 0
         and manifest_blob_run.returncode == 0
-        and manifest_blob_run.stdout == manifest_bytes
+        and manifest_clean_hash_run.returncode == 0
+        and committed_manifest_hash_run.returncode == 0
+        and manifest_clean_hash_run.stdout == committed_manifest_hash_run.stdout
     )
     contract_result = CheckResult(
         "global.source-contract-at-revision",

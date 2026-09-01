@@ -311,8 +311,15 @@ def _recover_launch(repo_root: Path, *, readiness_timeout: float = 1.0) -> objec
     supervision_id, nonce, host, port, expected_helper = reservation
     try:
         # The payload executes the normal foreground start path.  It must not
-        # mistake its own reservation for an already-running server.
-        if os.environ.get("SPEC_WEB_READY_NONCE") == nonce:
+        # mistake its own reservation for an already-running server.  The
+        # nonce alone is not authorization: environment variables can be
+        # inherited or operator-supplied, so also bind the current identity to
+        # the live durable ownership boundary.
+        if _launch_reservation_belongs_to_current_payload(
+            repo_root,
+            reservation=reservation,
+            helper_timeout=10.0,
+        ):
             return None
         token = SupervisionToken.from_dict(json.loads(expected_helper.read_text(encoding="utf-8")))
         if token.token != supervision_id:
@@ -362,10 +369,44 @@ def _recover_launch(repo_root: Path, *, readiness_timeout: float = 1.0) -> objec
     return token
 
 
-def _launch_reservation_belongs_to_current_payload(repo_root: Path) -> bool:
-    """Return whether the valid reservation names this foreground payload."""
-    reservation = _read_valid_launch_reservation(repo_root)
-    return bool(reservation and os.environ.get("SPEC_WEB_READY_NONCE") == reservation[1])
+def _launch_reservation_belongs_to_current_payload(
+    repo_root: Path,
+    *,
+    reservation: tuple[str, str, str, int, Path] | None = None,
+    helper_timeout: float = 0.0,
+) -> bool:
+    """Return whether the reservation owns this exact foreground payload."""
+    from spec_runtime.process_supervisor import (
+        SupervisionToken,
+        inspect_process,
+        supervision_token_contains_process,
+    )
+
+    reservation = reservation or _read_valid_launch_reservation(repo_root)
+    if reservation is None:
+        return False
+    supervision_id, nonce, _host, _port, expected_helper = reservation
+    if os.environ.get("SPEC_WEB_READY_NONCE") != nonce:
+        return False
+
+    deadline = time.monotonic() + max(0.0, helper_timeout)
+    first_attempt = True
+    while first_attempt or time.monotonic() < deadline:
+        first_attempt = False
+        try:
+            token = SupervisionToken.from_dict(
+                json.loads(expected_helper.read_text(encoding="utf-8"))
+            )
+            current = inspect_process(os.getpid())
+            if token.token != supervision_id or current is None:
+                return False
+            return supervision_token_contains_process(token, current)
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.02, remaining))
+    return False
 
 
 def _publish_ready_record(repo_root: Path, *, nonce: str, host: str, port: int) -> None:
@@ -889,10 +930,9 @@ def run_server(
             webbrowser.open(auth_url)
         return 0
 
+    background_payload = _launch_reservation_belongs_to_current_payload(repo_root)
     try:
-        if _native_windows_host() and not _launch_reservation_belongs_to_current_payload(
-            repo_root
-        ):
+        if _native_windows_host() and not background_payload:
             # A direct foreground Windows server has no durable helper parent.
             # Claim the current process before publishing it so status, a
             # second start, and an out-of-process stop all use a reopenable Job
@@ -928,7 +968,11 @@ def run_server(
             if server.started:
                 _publish_ready_record(
                     repo_root,
-                    nonce=os.environ.get("SPEC_WEB_READY_NONCE", ""),
+                    nonce=(
+                        os.environ.get("SPEC_WEB_READY_NONCE", "")
+                        if background_payload
+                        else ""
+                    ),
                     host=host,
                     port=port,
                 )
@@ -970,6 +1014,7 @@ def stop_server(repo_root: Path) -> int:
         return 1
     from spec_runtime.process_supervisor import (
         SupervisionToken,
+        identity_matches,
         retire_inactive_control_state,
         terminate,
         terminate_legacy_pid_record,
@@ -985,15 +1030,32 @@ def stop_server(repo_root: Path) -> int:
                 file=sys.stderr,
             )
             return 1
-        if _native_windows_host() and not retire_inactive_control_state(
-            supervision_token
-        ):
-            print(
-                f"spec web stopped process tree (pid {pid}) but could not "
-                "retire its authenticated control state; recovery state retained.",
-                file=sys.stderr,
-            )
-            return 1
+        if _native_windows_host():
+            # A durable helper can report an empty Job just before its own
+            # finally block retires the authenticated records. Wait only while
+            # that exact keeper identity remains live, then make one final
+            # exact-token retirement attempt. A same-ID replacement has a
+            # different nonce/identity and remains fail-closed.
+            retirement_deadline = time.monotonic() + 5.0
+            while not retire_inactive_control_state(supervision_token):
+                if not identity_matches(supervision_token.identity):
+                    if retire_inactive_control_state(supervision_token):
+                        break
+                    print(
+                        f"spec web stopped process tree (pid {pid}) but could not "
+                        "retire its authenticated control state; recovery state retained.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                remaining = retirement_deadline - time.monotonic()
+                if remaining <= 0:
+                    print(
+                        f"spec web stopped process tree (pid {pid}) but could not "
+                        "retire its authenticated control state; recovery state retained.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                time.sleep(min(0.05, remaining))
     else:
         recorded_pid, recorded_started_at = read_pid(repo_root)
         if recorded_pid != pid or not terminate_legacy_pid_record(

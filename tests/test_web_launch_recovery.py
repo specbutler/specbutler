@@ -66,10 +66,41 @@ def test_live_launch_is_occupied_before_ready(tmp_path):
 
 
 def test_payload_does_not_recover_own_launch(tmp_path):
-    token = _token("own-launch")
+    from spec_runtime.process_supervisor import inspect_process
+
+    current = inspect_process(os.getpid())
+    assert current is not None
+    token = SupervisionToken(
+        LifetimeMode.DETACHED,
+        ProcessIdentity(123, "helper", "python.exe"),
+        1,
+        "owner",
+        "own-launch",
+        payload_identity=current,
+    )
     _reserve(tmp_path, token, nonce="child-nonce")
-    with patch.dict(os.environ, {"SPEC_WEB_READY_NONCE": "child-nonce"}):
+    with (
+        patch.dict(os.environ, {"SPEC_WEB_READY_NONCE": "child-nonce"}),
+        patch("spec_runtime.process_supervisor.identity_matches", return_value=True),
+        patch(
+            "spec_runtime.process_supervisor.supervision_token_contains_process",
+            return_value=True,
+        ),
+    ):
         assert _recover_launch(tmp_path) is None
+
+
+def test_inherited_nonce_cannot_impersonate_reserved_payload(tmp_path):
+    token = _token("foreign-launch")
+    _reserve(tmp_path, token, nonce="inherited-nonce")
+    with (
+        patch.dict(os.environ, {"SPEC_WEB_READY_NONCE": "inherited-nonce"}),
+        patch("spec_runtime.process_supervisor.identity_matches", return_value=True),
+        patch("spec_runtime.web.server._wait_for_ready_record", return_value=False),
+    ):
+        assert _recover_launch(tmp_path, readiness_timeout=0.0) == token
+
+    assert _launch_path(tmp_path).exists()
 
 
 def test_dead_launch_is_cleared_before_retry(tmp_path):

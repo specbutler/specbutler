@@ -69,6 +69,10 @@ def _write_minimal_contract(tmp_path: Path, *, artifact: str = "evidence.json") 
     source = tmp_path / "source"
     specs = source / "specs"
     specs.mkdir(parents=True)
+    (source / ".gitattributes").write_text(
+        "manifest.json text eol=lf\nspecs/*.md text eol=lf\n",
+        encoding="ascii",
+    )
     (specs / "proof.md").write_text(
         """---
 id: proof
@@ -174,6 +178,13 @@ def test_production_manifest_exactly_tracks_all_windows_spec_criteria(tmp_path: 
 
 def test_audit_passes_only_with_exact_revision_and_satisfied_artifact(tmp_path: Path) -> None:
     source, manifest, revision = _write_minimal_contract(tmp_path)
+    manifest.write_bytes(manifest.read_bytes().replace(b"\n", b"\r\n"))
+    assert b"\r\n" in manifest.read_bytes()
+    assert subprocess.run(
+        ["git", "diff", "--quiet", "HEAD", "--", "manifest.json"],
+        cwd=source,
+        check=False,
+    ).returncode == 0
     evidence = tmp_path / "evidence"
     _write_provenance(evidence, configured=revision, staged=revision)
     (evidence / "evidence.json").write_text(
@@ -201,7 +212,8 @@ def test_immutable_manifest_snapshot_is_bound_to_canonical_repository_path(
     source, manifest, revision = _write_minimal_contract(tmp_path)
     snapshot = tmp_path / "immutable-snapshot" / "manifest.json"
     snapshot.parent.mkdir()
-    snapshot.write_bytes(manifest.read_bytes())
+    snapshot.write_bytes(manifest.read_bytes().replace(b"\n", b"\r\n"))
+    assert b"\r\n" in snapshot.read_bytes()
     evidence = tmp_path / "evidence"
     _write_provenance(evidence, configured=revision, staged=revision)
     (evidence / "evidence.json").write_text(

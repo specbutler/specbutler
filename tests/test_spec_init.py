@@ -270,7 +270,7 @@ name = "test"
 class TestDetectAgents:
     def test_both_available(self, monkeypatch):
         monkeypatch.setattr("spec_runtime.init.shutil.which", lambda name: f"/usr/bin/{name}")
-        default, allowed = _detect_agents()
+        default, allowed = _detect_agents(platform="linux")
         assert default == "claude"
         assert allowed == ["claude", "codex"]
 
@@ -281,7 +281,7 @@ class TestDetectAgents:
             if name in {"claude", "bwrap", "socat"}
             else None,
         )
-        default, allowed = _detect_agents()
+        default, allowed = _detect_agents(platform="linux")
         assert default == "claude"
         assert allowed == ["claude"]
 

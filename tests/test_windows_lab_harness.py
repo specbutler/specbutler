@@ -1387,6 +1387,10 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
     repo = tmp_path / "repo"
     harness = repo / "tools" / "windows-lab"
     harness.mkdir(parents=True)
+    (repo / ".gitattributes").write_text(
+        "tools/windows-lab/* text eol=lf\n",
+        encoding="ascii",
+    )
     labctl = harness / "labctl"
     labctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     labctl.chmod(0o755)
@@ -1409,6 +1413,17 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
         text=True,
     ).stdout.strip()
 
+    # Model a Windows checkout on Linux: the worktree is CRLF-smudged, while
+    # Git's clean filter still considers it identical to the committed LF blob.
+    labctl.write_bytes(labctl.read_bytes().replace(b"\n", b"\r\n"))
+    verifier.write_bytes(verifier.read_bytes().replace(b"\n", b"\r\n"))
+    assert b"\r\n" in labctl.read_bytes()
+    assert subprocess.run(
+        ["git", "diff", "--quiet", "HEAD", "--", "tools/windows-lab"],
+        cwd=repo,
+        check=False,
+    ).returncode == 0
+
     output = tmp_path / "exact.json"
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
@@ -1423,6 +1438,11 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
     }
     snapshot_labctl = snapshot / "tools" / "windows-lab" / "labctl"
     committed_labctl = snapshot_labctl.read_bytes()
+    assert committed_labctl == subprocess.check_output(
+        ["git", "show", f"{revision}:tools/windows-lab/labctl"],
+        cwd=repo,
+    )
+    assert b"\r\n" not in committed_labctl
     assert os.access(snapshot_labctl, os.X_OK)
 
     labctl.write_text("#!/usr/bin/env bash\nexit 23\n", encoding="utf-8")
@@ -1436,7 +1456,18 @@ def test_windows_lab_exact_harness_rejects_dirty_or_different_controller(
             tmp_path / "dirty.json",
             dirty_snapshot,
         )
+    subprocess.run(["git", "add", "tools/windows-lab/labctl"], cwd=repo, check=True)
+    staged_snapshot = tmp_path / "staged-snapshot"
+    staged_snapshot.mkdir()
+    with pytest.raises(module.HarnessMismatch, match="differs"):
+        module.verify_exact_harness(
+            repo,
+            revision,
+            tmp_path / "staged.json",
+            staged_snapshot,
+        )
     labctl.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    subprocess.run(["git", "add", "tools/windows-lab/labctl"], cwd=repo, check=True)
     (harness / "untracked.ps1").write_text("exit 0\n", encoding="utf-8")
     untracked_snapshot = tmp_path / "untracked-snapshot"
     untracked_snapshot.mkdir()
@@ -1491,7 +1522,8 @@ def test_windows_lab_launch_attestation_binds_exact_nonce_before_release(
     assert payload["status"] == "captured-before-release"
     assert payload["expected_nonce"] == nonce
     assert payload["receipt"] == receipt
-    assert output.stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert output.stat().st_mode & 0o777 == 0o600
     context = tmp_path / "user-context.json"
     context.write_text(
         json.dumps(

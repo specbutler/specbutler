@@ -466,6 +466,39 @@ class TestServerLifecycle:
         retire.assert_called_once_with(token)
         remove_pid.assert_called_once_with(tmp_path)
 
+    def test_windows_stop_waits_for_durable_keeper_retirement(self, tmp_path):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import stop_server
+
+        keeper = ProcessIdentity(123, "created", "python.exe")
+        payload = ProcessIdentity(124, "payload", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.DETACHED,
+            keeper,
+            1,
+            "owner",
+            "background-stop-retirement-race",
+            payload_identity=payload,
+        )
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(True, 124)),
+            patch("spec_runtime.web.server.read_supervision_token", return_value=token),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch("spec_runtime.process_supervisor.terminate", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.retire_inactive_control_state",
+                side_effect=[False, True],
+            ) as retire,
+            patch("spec_runtime.process_supervisor.identity_matches", return_value=True),
+            patch("spec_runtime.web.server.time.sleep") as sleep,
+            patch("spec_runtime.web.server.remove_pid") as remove_pid,
+        ):
+            assert stop_server(tmp_path) == 0
+
+        assert retire.call_count == 2
+        sleep.assert_called_once()
+        remove_pid.assert_called_once_with(tmp_path)
+
     def test_windows_control_retirement_failure_retains_recovery_state(
         self,
         tmp_path,

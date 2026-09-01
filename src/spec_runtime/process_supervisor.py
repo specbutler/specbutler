@@ -2557,6 +2557,71 @@ def _same_durable_boundary(left: SupervisionToken, right: SupervisionToken) -> b
     )
 
 
+def supervision_token_contains_process(
+    token: SupervisionToken,
+    candidate: ProcessIdentity,
+) -> bool:
+    """Authenticate *candidate* as a member of a live durable boundary.
+
+    A persisted token is discovery data, not by itself an ownership
+    capability.  On Windows, bind it back to the nonce-bearing control record
+    and canonical named Job while holding the record lock.  This is the
+    read-only counterpart to :func:`promote_payload_identity`; callers that
+    need to recognize a venv-launched interpreter before readiness must not
+    rewrite the durable boundary.  POSIX has no reopenable Job capability, so
+    it accepts only the exact recorded payload identity.
+    """
+    if (
+        token.mode not in {LifetimeMode.ADOPTABLE, LifetimeMode.DETACHED}
+        or not identity_matches(token.identity)
+        or not identity_matches(candidate)
+    ):
+        return False
+    if os.name != "nt":
+        return token.payload == candidate and identity_matches(token.payload)
+    if (
+        token.version != 2
+        or token.job_name != _windows_job_name(token.token)
+        or token.control_relpath != f"controls/{token.token}/control.json"
+        or not token.control_nonce
+    ):
+        return False
+
+    job = _WindowsJob.open(token.job_name)
+    if job is None:
+        return False
+    try:
+        control_path = _control_path(token.control_relpath)
+        metadata_path = durable_metadata_path(token.token)
+        with FileLock(control_path.with_suffix(".lock")):
+            if (
+                not identity_matches(token.identity)
+                or not identity_matches(candidate)
+                or not job.contains(candidate)
+            ):
+                return False
+            try:
+                state = json.loads(control_path.read_text(encoding="utf-8"))
+                metadata_token = SupervisionToken.from_dict(
+                    json.loads(metadata_path.read_text(encoding="utf-8"))
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                return False
+            return bool(
+                _control_record_identities(state, token.token)
+                == (token.control_nonce, token.identity, token.payload)
+                and _same_durable_boundary(token, metadata_token)
+                and metadata_token.payload == token.payload
+            )
+    except (OSError, ValueError):
+        return False
+    finally:
+        try:
+            job.close()
+        except OSError:
+            pass
+
+
 def promote_payload_identity(token: SupervisionToken, candidate: ProcessIdentity) -> SupervisionToken:
     """Promote a durable payload only after proving canonical Job membership.
 

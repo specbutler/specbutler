@@ -9394,6 +9394,9 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
+        monkeypatch.setattr(
+            autopilot, "_requires_authenticated_process_adoption", lambda: False
+        )
         active_path = autopilot.autopilot_active_path(repo)
         active_path.parent.mkdir(parents=True, exist_ok=True)
         active_path.write_text(
@@ -9591,6 +9594,9 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
+        monkeypatch.setattr(
+            autopilot, "_requires_authenticated_process_adoption", lambda: False
+        )
         active_path = autopilot.autopilot_active_path(repo)
         active_path.parent.mkdir(parents=True, exist_ok=True)
         active_path.write_text(
@@ -9628,6 +9634,9 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
+        monkeypatch.setattr(
+            autopilot, "_requires_authenticated_process_adoption", lambda: False
+        )
         active_path = autopilot.autopilot_active_path(repo)
         active_path.parent.mkdir(parents=True, exist_ok=True)
         active_path.write_text(
@@ -9679,6 +9688,9 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
+        monkeypatch.setattr(
+            autopilot, "_requires_authenticated_process_adoption", lambda: False
+        )
         # A freshly dispatched spec has no run_id (and therefore no lease)
         # until the child `spec implement` creates the run record. The live
         # child should still be adopted via PID identity so autopilot
