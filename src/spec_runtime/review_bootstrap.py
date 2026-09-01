@@ -187,8 +187,11 @@ def _permission_profile_override(
     filesystem: dict[str, object] = {
         ":minimal": "read",
         ":workspace_roots": {".": "write"},
-        str(operator_home): "deny",
     }
+    # Permission profiles are allowlists: an unlisted operator home remains
+    # unreadable. Do not add an explicit parent deny here, because Codex is
+    # commonly installed below that home (for example through nvm) and parent
+    # denies take precedence over the narrow executable read roots below.
     if codex_home != operator_home and not codex_home.is_relative_to(operator_home):
         filesystem[str(codex_home)] = "deny"
     for root in read_roots:

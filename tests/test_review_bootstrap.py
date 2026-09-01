@@ -36,7 +36,10 @@ def test_sandbox_profile_is_write_scoped_and_credential_blind(tmp_path: Path):
     codex_home = operator_home / ".codex"
     codex_home.mkdir(parents=True)
     (codex_home / "auth.json").write_text("operator-secret")
-    fake_codex = tmp_path / "tools" / "codex"
+    # Exercise the common nvm-style layout where the Codex distribution is
+    # installed below the operator home. A broad parent deny would override
+    # the narrow executable read grant and make the sandbox unable to start.
+    fake_codex = operator_home / "tools" / "codex"
     fake_codex.parent.mkdir()
     fake_codex.write_text("fake")
     inherited = {
@@ -89,7 +92,7 @@ def test_sandbox_profile_is_write_scoped_and_credential_blind(tmp_path: Path):
         filesystem = profile["filesystem"]
         assert filesystem[":minimal"] == "read"
         assert filesystem[":workspace_roots"] == {".": "write"}
-        assert filesystem[str(operator_home)] == "deny"
+        assert str(operator_home) not in filesystem
         assert filesystem[str(fake_codex.parent)] == "read"
         assert all(access != "write" for key, access in filesystem.items() if key != ":workspace_roots")
 
