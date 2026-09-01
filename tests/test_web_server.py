@@ -1213,6 +1213,42 @@ class TestAPIRoutes:
         getpgid.assert_not_called()
         kill.assert_not_called()
 
+    def test_stop_spec_uses_managed_process_when_run_metadata_exists(self, tmp_path):
+        """A web-started run retains its portable tree-termination boundary."""
+        spec_file = tmp_path / "specs" / "my-spec.md"
+        spec_file.parent.mkdir(parents=True, exist_ok=True)
+        spec_file.write_text("---\nid: my-spec\nstatus: not-started\n---\n")
+        proc = MagicMock(pid=42)
+        proc.poll.return_value = None
+        run = {"run_id": "my-spec-run", "spec_id": "my-spec", "status": "running"}
+        run_index = MagicMock(latest_by_spec={"my-spec": run})
+
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch(
+                "spec_runtime.autopilot_tui.dashboard._resolve_live_process_group",
+                return_value=(42, "creation-time"),
+            ),
+            patch("spec_runtime.autopilot.load_run_record_index", return_value=run_index),
+            patch("spec_runtime.config.load_repo_spec_runtime_config") as mock_config,
+            patch("spec_runtime.web.api.os.getpgid") as getpgid,
+            patch("spec_runtime.web.api.os.killpg") as killpg,
+        ):
+            mock_config.return_value = MagicMock(paths=MagicMock(specs_dir="specs"))
+            client = self._make_client(tmp_path)
+            start_resp = client.post(
+                "/api/v1/specs/my-spec/implement", headers=self._auth_headers()
+            )
+            resp = client.post("/api/v1/specs/my-spec/stop", headers=self._auth_headers())
+
+        assert start_resp.status_code == 200
+        assert resp.status_code == 200
+        proc.terminate.assert_called_once_with(grace_seconds=3)
+        proc.wait.assert_called_once_with(timeout=3)
+        getpgid.assert_not_called()
+        killpg.assert_not_called()
+        assert "my-spec" not in client.app.state.web_started_procs
+
     def test_process_registry_is_scoped_to_app_and_cleared_on_shutdown(self, tmp_path):
         from starlette.testclient import TestClient
 

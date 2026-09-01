@@ -432,31 +432,38 @@ async def stop_spec(request: Request) -> Response:
     started_processes = _started_processes(request)
 
     leader_pid: int | None = None
+    proc = started_processes.get(spec_id)
 
-    if pg is not None:
-        leader_pid = pg[0]
-    elif spec_id in started_processes:
-        # Fallback: use the Popen object we stored when the web API started
-        # the run.  poll() returns None only when the *original* child is
-        # still alive; once it exits, poll() returns an exit code and we
-        # know the PID may have been recycled by the OS.
-        proc = started_processes[spec_id]
+    if proc is not None:
+        # Prefer the managed process retained by the launch endpoint even
+        # after the orchestrator has persisted its process metadata.  Its
+        # termination boundary validates identity and owns the Windows Job;
+        # reducing it back to a PID/process group loses both guarantees.
         if proc.poll() is not None:
             # Child already exited — PID may have been reused; clean up.
             started_processes.pop(spec_id, None)
+            proc = None
         else:
             leader_pid = proc.pid
+    elif pg is not None:
+        leader_pid = pg[0]
 
     if leader_pid is None:
         return _json({"spec_id": spec_id, "status": "no_active_run"}, 404)
 
-    try:
-        os.killpg(os.getpgid(leader_pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
+    if proc is not None:
         try:
-            os.kill(leader_pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+            proc.terminate(grace_seconds=3)
+        except (ProcessLookupError, PermissionError, OSError):
             return _json({"spec_id": spec_id, "status": "not_found"}, 404)
+    else:
+        try:
+            os.killpg(os.getpgid(leader_pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(leader_pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                return _json({"spec_id": spec_id, "status": "not_found"}, 404)
 
     # Wait briefly for the process to exit so the persisted run record
     # has a chance to update before we read it back.
