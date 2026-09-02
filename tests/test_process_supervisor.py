@@ -1281,6 +1281,45 @@ def test_managed_process_keeps_live_job_registered_when_close_handle_fails(
     assert managed._job is job
 
 
+def test_windows_job_close_is_serialized_and_idempotent_across_callers() -> None:
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    calls: list[int] = []
+
+    class Kernel:
+        def CloseHandle(self, handle: int) -> bool:
+            calls.append(handle)
+            close_entered.set()
+            assert release_close.wait(timeout=5)
+            return True
+
+    job = process_supervisor._WindowsJob.__new__(process_supervisor._WindowsJob)
+    job._kernel32 = Kernel()
+    job._handle_lock = threading.RLock()
+    job.handle = 1234
+
+    first = threading.Thread(target=job.close)
+    second = threading.Thread(target=job.close)
+    first.start()
+    assert close_entered.wait(timeout=5)
+    second.start()
+    try:
+        # The second caller must wait outside CloseHandle while the first owns
+        # the wrapper lock. Without intrinsic serialization this becomes two
+        # closes of the same numeric handle.
+        time.sleep(0.05)
+        assert calls == [1234]
+    finally:
+        release_close.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert calls == [1234]
+    assert job.handle is None
+
+
 def test_bind_held_windows_job_payload_requires_kernel_membership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

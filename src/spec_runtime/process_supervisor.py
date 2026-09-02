@@ -799,6 +799,7 @@ class _ExtendedJobLimit(ctypes.Structure):
 class _WindowsJob:
     def __init__(self, name: str | None = None) -> None:
         self._kernel32 = _kernel32()
+        self._handle_lock = threading.RLock()
         self.handle = self._kernel32.CreateJobObjectW(None, name)
         if not self.handle:
             raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
@@ -819,53 +820,61 @@ class _WindowsJob:
             return None
         job = cls.__new__(cls)
         job._kernel32 = kernel32
+        job._handle_lock = threading.RLock()
         job.handle = handle
         return job
 
     def assign(self, process_handle: int) -> None:
-        if not self._kernel32.AssignProcessToJobObject(self.handle, process_handle):
-            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        with self._handle_lock:
+            if not self.handle:
+                raise OSError("Job handle is closed")
+            if not self._kernel32.AssignProcessToJobObject(self.handle, process_handle):
+                raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
 
     def terminate(self, code: int = 1) -> None:
-        if not self.handle:
-            return
-        if not self._kernel32.TerminateJobObject(self.handle, code):
-            raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
+        with self._handle_lock:
+            if not self.handle:
+                return
+            if not self._kernel32.TerminateJobObject(self.handle, code):
+                raise OSError(ctypes.get_last_error(), "TerminateJobObject failed")
 
     def active_process_ids(self) -> tuple[int, ...]:
         """Return the Job's active members from the kernel-owned membership list."""
         from ctypes import wintypes
 
-        capacity = 16
-        pointer_size = ctypes.sizeof(ctypes.c_size_t)
-        while True:
-            size = 8 + capacity * pointer_size
-            buffer = ctypes.create_string_buffer(size)
-            returned = wintypes.DWORD()
-            ok = self._kernel32.QueryInformationJobObject(
-                self.handle,
-                3,  # JobObjectBasicProcessIdList
-                buffer,
-                size,
-                ctypes.byref(returned),
-            )
-            assigned = ctypes.c_uint32.from_buffer(buffer, 0).value
-            included = ctypes.c_uint32.from_buffer(buffer, 4).value
-            if ok and included >= assigned:
-                if included == 0:
-                    return ()
-                array_type = ctypes.c_size_t * included
-                members = array_type.from_buffer(buffer, 8)
-                return tuple(int(pid) for pid in members)
-            if assigned > capacity:
-                capacity = assigned
-                continue
-            if not ok:
-                raise OSError(ctypes.get_last_error(), "QueryInformationJobObject failed")
-            # The Job grew between the query and the returned snapshot. Grow
-            # geometrically rather than accepting an incomplete membership
-            # list at a security boundary.
-            capacity *= 2
+        with self._handle_lock:
+            if not self.handle:
+                raise OSError("Job handle is closed")
+            capacity = 16
+            pointer_size = ctypes.sizeof(ctypes.c_size_t)
+            while True:
+                size = 8 + capacity * pointer_size
+                buffer = ctypes.create_string_buffer(size)
+                returned = wintypes.DWORD()
+                ok = self._kernel32.QueryInformationJobObject(
+                    self.handle,
+                    3,  # JobObjectBasicProcessIdList
+                    buffer,
+                    size,
+                    ctypes.byref(returned),
+                )
+                assigned = ctypes.c_uint32.from_buffer(buffer, 0).value
+                included = ctypes.c_uint32.from_buffer(buffer, 4).value
+                if ok and included >= assigned:
+                    if included == 0:
+                        return ()
+                    array_type = ctypes.c_size_t * included
+                    members = array_type.from_buffer(buffer, 8)
+                    return tuple(int(pid) for pid in members)
+                if assigned > capacity:
+                    capacity = assigned
+                    continue
+                if not ok:
+                    raise OSError(ctypes.get_last_error(), "QueryInformationJobObject failed")
+                # The Job grew between the query and the returned snapshot.
+                # Grow geometrically rather than accepting an incomplete
+                # membership list at a security boundary.
+                capacity *= 2
 
     def active_identities(self) -> list[ProcessIdentity]:
         return [identity for pid in self.active_process_ids() if (identity := inspect_process(pid)) is not None]
@@ -884,11 +893,15 @@ class _WindowsJob:
             time.sleep(min(0.05, remaining))
 
     def close(self) -> None:
-        if self.handle:
-            handle = self.handle
-            if not self._kernel32.CloseHandle(handle):
-                raise OSError(ctypes.get_last_error(), "CloseHandle failed")
-            self.handle = None
+        # A ManagedProcess waiter and registry cleanup can converge on the
+        # same retained Job. Serialize at the handle wrapper itself so every
+        # caller—not only one facade's lock—gets idempotent close semantics.
+        with self._handle_lock:
+            if self.handle:
+                handle = self.handle
+                if not self._kernel32.CloseHandle(handle):
+                    raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+                self.handle = None
 
 
 _LIVE_WINDOWS_JOBS: dict[tuple[int, str], _WindowsJob] = {}
