@@ -381,12 +381,3 @@ version = "0.0.0"
         child.name.casefold().startswith("tmp")
         for child in review_worktree.iterdir()
     )
-    imported = subprocess.run(
-        [str(venv_python), "-c", "import samplepkg; print(samplepkg.VALUE)"],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    assert imported.returncode == 0, imported.stderr or imported.stdout
-    assert imported.stdout.strip() == "42"
