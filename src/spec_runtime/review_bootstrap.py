@@ -183,6 +183,7 @@ def _permission_profile_override(
     operator_home: Path,
     codex_home: Path,
     read_roots: Sequence[Path],
+    write_roots: Sequence[Path],
 ) -> str:
     filesystem: dict[str, object] = {
         ":minimal": "read",
@@ -196,6 +197,8 @@ def _permission_profile_override(
         filesystem[str(codex_home)] = "deny"
     for root in read_roots:
         filesystem[str(root)] = "read"
+    for root in write_roots:
+        filesystem[str(root)] = "write"
 
     def render(value: object) -> str:
         if isinstance(value, str):
@@ -262,7 +265,13 @@ def isolated_review_bootstrap_sandbox(
             f"bootstrap executable is unavailable: {command_argv[0] if command_argv else '(empty command)'}"
         )
 
-    runtime_root = Path(tempfile.mkdtemp(prefix=".spec-review-bootstrap-", dir=review_worktree))
+    # Keep bootstrap runtime state outside the checkout. Build frontends and
+    # native sandbox backends both use temporary directories; placing those at
+    # repository top level can change package discovery (for example,
+    # setuptools flat-layout discovery treats a visible ``tmp*`` directory as
+    # another top-level package). The exact runtime root is granted write
+    # access below, while its siblings remain outside the sandbox allowlist.
+    runtime_root = Path(tempfile.mkdtemp(prefix="spec-review-bootstrap-")).resolve()
     try:
         configured_home = source_env.get("USERPROFILE" if use_windows else "HOME", "")
         operator_home = (
@@ -285,6 +294,7 @@ def isolated_review_bootstrap_sandbox(
             operator_home=operator_home,
             codex_home=codex_home,
             read_roots=tuple(sorted(read_roots, key=str)),
+            write_roots=(runtime_root,),
         )
         launcher = [
             str(codex_launcher),

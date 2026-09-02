@@ -19163,9 +19163,9 @@ def _bootstrap_review_worktree(
     Environment scrubbing, a temporary profile, chmod, and process supervision
     are not filesystem security boundaries. The command therefore runs only
     through :func:`isolated_review_bootstrap_sandbox`, with write access scoped
-    to this temporary review worktree, minimal system reads, operator-home
-    reads denied, and network disabled. If that policy cannot be enforced, the
-    command is not run at all.
+    to this temporary review worktree and a separate ephemeral runtime root,
+    minimal system reads, operator-home reads denied, and network disabled. If
+    that policy cannot be enforced, the command is not run at all.
 
     Bootstrap is best-effort: on failure (or timeout) the failure is recorded as
     a review-environment warning and the empty string is returned so review

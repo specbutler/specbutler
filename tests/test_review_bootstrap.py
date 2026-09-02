@@ -63,7 +63,8 @@ def test_sandbox_profile_is_write_scoped_and_credential_blind(tmp_path: Path):
         which=which,
     ) as sandbox:
         runtime_root = sandbox.runtime_root
-        assert runtime_root.is_relative_to(review_worktree)
+        assert not runtime_root.is_relative_to(review_worktree)
+        assert list(review_worktree.iterdir()) == []
         assert sandbox.env["HOME"].startswith(str(runtime_root))
         assert sandbox.env["USERPROFILE"].startswith(str(runtime_root))
         assert sandbox.env["TMPDIR"].startswith(str(runtime_root))
@@ -94,7 +95,10 @@ def test_sandbox_profile_is_write_scoped_and_credential_blind(tmp_path: Path):
         assert filesystem[":workspace_roots"] == {".": "write"}
         assert str(operator_home) not in filesystem
         assert filesystem[str(fake_codex.parent)] == "read"
-        assert all(access != "write" for key, access in filesystem.items() if key != ":workspace_roots")
+        assert filesystem[str(runtime_root)] == "write"
+        assert {
+            key for key, access in filesystem.items() if access == "write"
+        } == {str(runtime_root)}
 
         filters = _inline_value(_override(argv, "shell_environment_policy.filters="))
         assert filters == {key: "include" for key in sorted(sandbox.env)}
@@ -192,6 +196,7 @@ def test_native_sandbox_denies_operator_secret_and_sibling_write(tmp_path: Path)
 import json
 import pathlib
 import sys
+import tempfile
 
 secret, escaped = map(pathlib.Path, sys.argv[1:])
 outcome = {}
@@ -207,6 +212,9 @@ except OSError:
 marker = pathlib.Path("workspace-marker.txt")
 marker.write_text("sandbox-write")
 outcome["workspace_round_trip"] = marker.read_text()
+runtime_marker = pathlib.Path(tempfile.gettempdir()) / "sandbox-temp-marker.txt"
+runtime_marker.write_text("sandbox-temp-write")
+outcome["runtime_temp_round_trip"] = runtime_marker.read_text()
 print(json.dumps(outcome))
 """
     # Resolve virtual-environment launcher symlinks: the native sandbox must
@@ -223,6 +231,7 @@ print(json.dumps(outcome))
         command,
         inherited_env=inherited,
     ) as sandbox:
+        runtime_root = sandbox.runtime_root
         process = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
             sandbox.wrap(command),
             cwd=review_worktree,
@@ -236,8 +245,10 @@ print(json.dumps(outcome))
     assert process.returncode == 0, stderr or stdout
     assert json.loads(stdout) == {
         "credential": "denied",
+        "runtime_temp_round_trip": "sandbox-temp-write",
         "sibling_write": "denied",
         "workspace_round_trip": "sandbox-write",
     }
+    assert not runtime_root.exists()
     assert secret.read_text() == "operator-secret"
     assert not escaped.exists()
