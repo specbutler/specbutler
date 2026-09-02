@@ -107,14 +107,17 @@ function Set-ExactProtectedAcl {
     param(
         [Parameter(Mandatory = $true)] [string] $LiteralPath,
         [Parameter(Mandatory = $true)] [bool] $Container,
-        [switch] $IncludeIdentity
+        [switch] $IncludeIdentity,
+        [switch] $IncludeUsersReadAndExecute
     )
     $systemSidValue = 'S-1-5-18'
     $administratorsSidValue = 'S-1-5-32-544'
+    $usersSidValue = 'S-1-5-32-545'
     $systemSid = [System.Security.Principal.SecurityIdentifier]::new($systemSidValue)
     $administratorsSid = [System.Security.Principal.SecurityIdentifier]::new(
         $administratorsSidValue
     )
+    $usersSid = [System.Security.Principal.SecurityIdentifier]::new($usersSidValue)
     if ($Container) {
         $acl = [System.Security.AccessControl.DirectorySecurity]::new()
         $inheritance = (
@@ -131,6 +134,10 @@ function Set-ExactProtectedAcl {
     # Windows normalizes an allow-Modify ACE to include Synchronize.
     $modify = (
         [System.Security.AccessControl.FileSystemRights]::Modify -bor
+        [System.Security.AccessControl.FileSystemRights]::Synchronize
+    )
+    $readAndExecute = (
+        [System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor
         [System.Security.AccessControl.FileSystemRights]::Synchronize
     )
     $expectedRules = @(
@@ -150,6 +157,13 @@ function Set-ExactProtectedAcl {
             Sid = $identity.User
             SidValue = $identity.User.Value
             Rights = $modify
+        }
+    }
+    if ($IncludeUsersReadAndExecute) {
+        $expectedRules += [pscustomobject]@{
+            Sid = $usersSid
+            SidValue = $usersSidValue
+            Rights = $readAndExecute
         }
     }
     $acl.SetAccessRuleProtection($true, $false)
@@ -263,7 +277,11 @@ if ($Mode -eq 'Arm') {
         throw "Expected an ordinary directory: $harnessRoot"
     }
     Assert-TrustedExistingPath -LiteralPath $harnessRoot -AllowWriteRepair
-    Set-ExactProtectedAcl -LiteralPath $harnessRoot -Container $true -IncludeIdentity
+    # Codex's elevated native sandbox executes through dedicated local users.
+    # They need traversal and read/execute access to the staged toolchain below
+    # the harness root, but must never gain write or delete rights here.
+    Set-ExactProtectedAcl -LiteralPath $harnessRoot -Container $true `
+        -IncludeIdentity -IncludeUsersReadAndExecute
     Assert-OrdinaryFile -LiteralPath $cleanupSource
     Assert-TrustedExistingPath -LiteralPath $cleanupSource -AllowWriteRepair
     Set-ExactProtectedAcl -LiteralPath $cleanupSource -Container $false -IncludeIdentity

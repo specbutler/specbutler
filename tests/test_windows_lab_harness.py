@@ -287,6 +287,9 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "takeown.exe '/F' $cleanupScript '/A'" in console_session
     assert "$systemSidValue = 'S-1-5-18'" in console_session
     assert "$administratorsSidValue = 'S-1-5-32-544'" in console_session
+    assert "$usersSidValue = 'S-1-5-32-545'" in console_session
+    assert "[switch] $IncludeUsersReadAndExecute" in console_session
+    assert "FileSystemRights]::ReadAndExecute -bor" in console_session
     assert "$acl.SetAccessRuleProtection($true, $false)" in console_session
     assert "$rules.Count -ne $expectedRules.Count" in console_session
     assert "FileAttributes]::ReparsePoint" in console_session
@@ -303,7 +306,7 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "& $cleanupScript -RemoveTask" not in console_session
     assert (
         console_session.index(
-            "Set-ExactProtectedAcl -LiteralPath $harnessRoot -Container $true"
+            "Set-ExactProtectedAcl -LiteralPath $harnessRoot -Container $true `"
         )
         < console_session.index("[System.IO.File]::ReadAllBytes($cleanupSource)")
         < console_session.index(
@@ -316,6 +319,13 @@ def test_windows_lab_has_complete_controller_surface() -> None:
             "Set-ExactProtectedAcl -LiteralPath $cleanupScript -Container $false"
         )
         < console_session.index("Register-ScheduledTask")
+    )
+    assert (
+        "-IncludeIdentity -IncludeUsersReadAndExecute" in console_session
+    )
+    assert (
+        "Set-ExactProtectedAcl -LiteralPath $secureRoot -Container $true\n"
+        in console_session
     )
     assert "Remove-Item -LiteralPath $cleanupScript -Force -ErrorAction Stop" in console_session
     assert "Console cleanup script remained after checked removal" in console_session
