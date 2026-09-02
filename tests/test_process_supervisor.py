@@ -1519,6 +1519,33 @@ def test_posix_run_owned_boundary_requires_successful_empty_group_inventory(
     assert process_supervisor.supervision_boundary_is_inactive(token) is (members == [])
 
 
+def test_posix_run_owned_boundary_rejects_mismatched_keeper_and_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = ProcessIdentity(41, "keeper-created")
+    payload = ProcessIdentity(42, "payload-created")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "corrupt-posix-boundary",
+        pgid=99,
+        payload_identity=payload,
+    )
+    monkeypatch.setattr(process_supervisor.os, "name", "posix")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    inventory = MagicMock(side_effect=AssertionError("mismatched group inventoried"))
+    monkeypatch.setattr(
+        process_supervisor,
+        "list_live_process_group_members",
+        inventory,
+    )
+
+    assert not process_supervisor.supervision_boundary_is_inactive(token)
+    inventory.assert_not_called()
+
+
 def test_managed_process_wait_closes_job_after_leader_exit() -> None:
     events: list[str] = []
     identity = ProcessIdentity(42, "created")

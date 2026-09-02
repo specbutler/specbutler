@@ -1334,7 +1334,11 @@ def supervision_boundary_is_inactive(token: SupervisionToken) -> bool:
                 return False
         return _windows_job_definitively_absent(token.job_name)
 
-    if os.name == "posix" and token.pgid > 0:
+    if (
+        os.name == "posix"
+        and token.pgid > 0
+        and token.identity.pid == token.pgid
+    ):
         members = list_live_process_group_members(token.pgid)
         return members == []
     return False

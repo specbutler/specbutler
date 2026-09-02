@@ -316,6 +316,59 @@ def test_reap_retires_dead_token_when_boundary_is_definitively_inactive(
     assert registry.list_registered_worktrees(tmp_path) == []
 
 
+def test_mismatched_posix_keeper_and_group_token_is_never_retired(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from spec_runtime import process_supervisor
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    keeper = registry.ProcessIdentity(41, "keeper-created")
+    payload = registry.ProcessIdentity(42, "payload-created")
+    token = registry.SupervisionToken(
+        registry.LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "corrupt-posix-boundary",
+        pgid=99,
+        payload_identity=payload,
+    )
+    registry.register_process(
+        tmp_path,
+        worktree,
+        name="corrupt-boundary-service",
+        kind="server",
+        pid=payload.pid,
+        started_at=payload.started_at,
+        supervision_token=token,
+    )
+    monkeypatch.setattr(registry, "is_process_alive", lambda *_args: False)
+    monkeypatch.setattr(process_supervisor.os, "name", "posix")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    inventory = MagicMock(side_effect=AssertionError("mismatched group inventoried"))
+    monkeypatch.setattr(
+        process_supervisor,
+        "list_live_process_group_members",
+        inventory,
+    )
+    terminate_boundary = MagicMock(return_value=False)
+    monkeypatch.setattr(registry, "terminate", terminate_boundary)
+
+    assert registry.prune_dead_processes(tmp_path, worktree) == ()
+    report = registry.reap_registered_processes(tmp_path, worktree)
+
+    assert report.stale == ()
+    assert report.surviving == (
+        f"corrupt-boundary-service pid={payload.pid} exited but its owned "
+        "boundary could not be reaped",
+    )
+    assert registry.load_registered_processes(tmp_path, worktree)[0].pid == payload.pid
+    assert terminate_boundary.call_count == 1
+    inventory.assert_not_called()
+
+
 def test_setup_registration_batch_is_atomic_on_write_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
