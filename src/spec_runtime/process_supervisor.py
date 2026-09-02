@@ -1301,6 +1301,45 @@ def _windows_job_definitively_absent(job_name: str) -> bool:
         job.close()
 
 
+def supervision_boundary_is_inactive(token: SupervisionToken) -> bool:
+    """Prove that a persisted run-owned boundary has no live members.
+
+    Registry cleanup cannot treat an exited payload as sufficient proof: a
+    descendant may still be alive in the same Job or process group.  This
+    helper is the narrow retirement boundary for stale tokens.  It succeeds
+    only after both recorded identities are dead and the platform can
+    positively inventory the complete ownership boundary as empty.
+
+    On Windows an in-process Job handle is the strongest proof.  After a
+    coordinator restart, absence of the canonical named Job is accepted only
+    when Win32 reports ``ERROR_FILE_NOT_FOUND``.  Access-denied and query
+    failures remain fail-closed.  On POSIX, a successful ``ps`` inventory must
+    report no non-zombie member of the recorded process group.
+    """
+    if token.mode is not LifetimeMode.RUN_OWNED:
+        return False
+    if identity_matches(token.identity) or identity_matches(token.payload):
+        return False
+
+    if _platform_is_windows():
+        if token.job_name != _windows_job_name(token.token):
+            return False
+        held_job = _LIVE_WINDOWS_JOBS.get(
+            (token.identity.pid, token.identity.started_at)
+        )
+        if held_job is not None:
+            try:
+                return not held_job.active_process_ids()
+            except OSError:
+                return False
+        return _windows_job_definitively_absent(token.job_name)
+
+    if os.name == "posix" and token.pgid > 0:
+        members = list_live_process_group_members(token.pgid)
+        return members == []
+    return False
+
+
 def _control_boundary_is_inactive(
     supervision_id: str,
     keeper: ProcessIdentity,

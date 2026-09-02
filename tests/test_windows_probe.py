@@ -560,6 +560,235 @@ def test_native_windows_setup_manifest_hands_live_service_to_registry(
         close_empty_held_windows_jobs()
 
 
+def test_native_windows_setup_teardown_prunes_empty_owned_boundary(
+    tmp_path: Path,
+) -> None:
+    """A normally stopped setup service must not strand its worktree token."""
+    from dataclasses import replace
+    from unittest.mock import patch
+
+    from spec_runtime import (
+        orchestrator as orch,
+    )
+    from spec_runtime import (
+        process_supervisor,
+        worktree_process_registry,
+    )
+    from spec_runtime.process_supervisor import (
+        ProcessIdentity,
+        close_empty_held_windows_jobs,
+        terminate,
+    )
+
+    stop_marker = tmp_path / "stop-service"
+    setup_script = tmp_path / "setup_stoppable_service.py"
+    child_code = (
+        "from pathlib import Path; import sys,time; marker=Path(sys.argv[1]); "
+        "\nwhile not marker.exists(): time.sleep(0.05)"
+    )
+    setup_script.write_text(
+        "\n".join(
+            [
+                "import json, subprocess, sys, time",
+                "from spec_runtime.process_supervisor import inspect_process",
+                "child = subprocess.Popen(",
+                f"    [sys.executable, '-c', {child_code!r}, {str(stop_marker)!r}],",
+                "    stdin=subprocess.DEVNULL,",
+                "    stdout=subprocess.DEVNULL,",
+                "    stderr=subprocess.DEVNULL,",
+                ")",
+                "identity = None",
+                "deadline = time.monotonic() + 10",
+                "while identity is None and time.monotonic() < deadline:",
+                "    identity = inspect_process(child.pid)",
+                "    time.sleep(0.01)",
+                "assert identity is not None",
+                "print(json.dumps({'managed_processes': [{",
+                "    'name': 'stoppable-setup-service',",
+                "    'kind': 'server',",
+                "    'pid': identity.pid,",
+                "    'started_at': identity.started_at,",
+                "    'command': identity.command,",
+                "    'termination_scope': 'pid',",
+                "}]}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    command = f'"{Path(sys.executable).as_posix()}" "{setup_script.as_posix()}"'
+    config = replace(
+        orch.SPEC_RUNTIME_CONFIG,
+        implement=replace(
+            orch.SPEC_RUNTIME_CONFIG.implement,
+            setup_command=command,
+        ),
+    )
+    run = orch.RunState(
+        run_id="windows-setup-teardown-run",
+        spec_id="windows-setup-teardown",
+        branch="code/windows-setup-teardown--probe",
+        agent="codex",
+    )
+    manifest = None
+    try:
+        with patch.object(orch, "SPEC_RUNTIME_CONFIG", config):
+            manifest = orch._run_implement_setup_command(run, tmp_path)
+        assert manifest.failure is None
+        assert manifest.ownership_token is not None
+        orch._register_setup_manifest_processes(tmp_path, tmp_path, manifest)
+        service = manifest.managed_processes[0]
+        service_identity = ProcessIdentity(
+            service.pid,
+            service.started_at,
+            command=service.command,
+        )
+
+        stop_marker.write_text("stop\n", encoding="utf-8")
+        _wait_for_identity_exit(service_identity)
+        removed = orch._prune_registered_worktree_processes(tmp_path, tmp_path)
+
+        assert removed == (
+            f"stoppable-setup-service pid={service.pid} "
+            "owned boundary already inactive",
+        )
+        state_root = orch._worktree_registry_state_root(tmp_path, tmp_path)
+        assert worktree_process_registry.load_registered_processes(
+            state_root,
+            tmp_path,
+        ) == []
+        assert worktree_process_registry.reap_registered_processes(
+            state_root,
+            tmp_path,
+        ).surviving == ()
+        key = (
+            manifest.ownership_token.identity.pid,
+            manifest.ownership_token.identity.started_at,
+        )
+        assert key not in process_supervisor._LIVE_WINDOWS_JOBS
+    finally:
+        if manifest is not None and manifest.ownership_token is not None:
+            terminate(manifest.ownership_token, grace_seconds=0)
+        close_empty_held_windows_jobs()
+
+
+def test_native_windows_fast_exit_registration_prunes_retained_empty_job(
+    tmp_path: Path,
+) -> None:
+    """The agent poll path prunes before the backend closes its retained Job."""
+    from spec_runtime import worktree_process_registry
+    from spec_runtime.process_supervisor import (
+        LifetimeMode,
+        ProcessSupervisor,
+        close_empty_held_windows_jobs,
+    )
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "pass"]
+    )
+    token = managed.token
+    worktree_process_registry.register_process(
+        tmp_path,
+        worktree,
+        name="fast-agent",
+        kind="agent",
+        pid=token.payload.pid,
+        started_at=token.payload.started_at,
+        supervision_token=token,
+    )
+    try:
+        assert managed.process.wait(timeout=10) == 0
+
+        removed = worktree_process_registry.prune_dead_processes(
+            tmp_path,
+            worktree,
+        )
+        close_empty_held_windows_jobs()
+
+        assert removed == (
+            f"fast-agent pid={token.payload.pid} owned boundary already inactive",
+        )
+        assert worktree_process_registry.load_registered_processes(
+            tmp_path,
+            worktree,
+        ) == []
+        assert worktree_process_registry.reap_registered_processes(
+            tmp_path,
+            worktree,
+        ).surviving == ()
+    finally:
+        managed.close()
+        close_empty_held_windows_jobs()
+
+
+def test_native_windows_crashed_owner_registry_token_retires_after_job_disappears(
+    tmp_path: Path,
+) -> None:
+    """A replacement coordinator can retire a dead token after owner death."""
+    from spec_runtime import worktree_process_registry
+    from spec_runtime.process_supervisor import ProcessIdentity, SupervisionToken
+
+    state_root = tmp_path / "state"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    token_path = tmp_path / "crashed-token.json"
+    launcher = tmp_path / "crash_owner.py"
+    launcher.write_text(
+        "import json,os,sys\n"
+        "from pathlib import Path\n"
+        "from spec_runtime.process_supervisor import LifetimeMode,ProcessSupervisor\n"
+        "from spec_runtime.worktree_process_registry import register_process\n"
+        "state,worktree,token_path=map(Path,sys.argv[1:])\n"
+        "managed=ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn("
+        "[sys.executable,'-c','import time; time.sleep(60)'])\n"
+        "token=managed.token\n"
+        "register_process(state,worktree,name='crash-owned-agent',kind='agent',"
+        "pid=token.payload.pid,started_at=token.payload.started_at,"
+        "supervision_token=token)\n"
+        "token_path.write_text(json.dumps(token.to_dict()),encoding='utf-8')\n"
+        "os._exit(0)\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(launcher),
+            str(state_root),
+            str(worktree),
+            str(token_path),
+        ],
+        check=False,
+        timeout=20,
+    )
+    assert completed.returncode == 0
+    token = SupervisionToken.from_dict(
+        json.loads(token_path.read_text(encoding="utf-8"))
+    )
+    _wait_for_identity_exit(
+        ProcessIdentity(
+            token.payload.pid,
+            token.payload.started_at,
+            command=token.payload.command,
+        )
+    )
+
+    report = worktree_process_registry.reap_registered_processes(
+        state_root,
+        worktree,
+    )
+
+    assert report.terminated == ()
+    assert report.stale == (
+        f"crash-owned-agent pid={token.payload.pid} "
+        "owned boundary already inactive",
+    )
+    assert report.surviving == ()
+    assert worktree_process_registry.list_registered_worktrees(state_root) == []
+
+
 def test_spec_stop_terminates_owned_tree_without_touching_unrelated_process(tmp_path: Path) -> None:
     """Exercise the persisted ``spec stop`` boundary in separate real processes."""
     from spec_runtime.orchestrator import RunState, stop_run

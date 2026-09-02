@@ -1383,6 +1383,142 @@ def test_bind_held_windows_job_payload_requires_kernel_membership(
     )
 
 
+def test_windows_run_owned_boundary_is_inactive_when_named_job_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = ProcessIdentity(41, "keeper-created")
+    payload = ProcessIdentity(42, "payload-created")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "completed-boundary",
+        payload_identity=payload,
+    )
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    absent = MagicMock(return_value=True)
+    monkeypatch.setattr(process_supervisor, "_windows_job_definitively_absent", absent)
+
+    assert process_supervisor.supervision_boundary_is_inactive(token)
+    absent.assert_called_once_with(token.job_name)
+
+
+def test_windows_run_owned_boundary_retirement_fails_closed_without_absence_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = ProcessIdentity(41, "keeper-created")
+    payload = ProcessIdentity(42, "payload-created")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "unproven-boundary",
+        payload_identity=payload,
+    )
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setattr(
+        process_supervisor,
+        "_windows_job_definitively_absent",
+        lambda _name: False,
+    )
+
+    assert not process_supervisor.supervision_boundary_is_inactive(token)
+
+
+@pytest.mark.parametrize("members", [(), (99,)])
+def test_windows_run_owned_boundary_uses_retained_job_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    members: tuple[int, ...],
+) -> None:
+    keeper = ProcessIdentity(41, "keeper-created")
+    payload = ProcessIdentity(42, "payload-created")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        f"held-boundary-{len(members)}",
+        payload_identity=payload,
+    )
+
+    class Job:
+        def active_process_ids(self) -> tuple[int, ...]:
+            return members
+
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setitem(
+        process_supervisor._LIVE_WINDOWS_JOBS,
+        (keeper.pid, keeper.started_at),
+        Job(),
+    )
+    absent = MagicMock(side_effect=AssertionError("held Job bypassed"))
+    monkeypatch.setattr(process_supervisor, "_windows_job_definitively_absent", absent)
+
+    assert process_supervisor.supervision_boundary_is_inactive(token) is (not members)
+    absent.assert_not_called()
+
+
+def test_windows_run_owned_boundary_preserves_token_on_job_query_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    keeper = ProcessIdentity(41, "keeper-created")
+    payload = ProcessIdentity(42, "payload-created")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "query-failure-boundary",
+        payload_identity=payload,
+    )
+
+    class Job:
+        def active_process_ids(self) -> tuple[int, ...]:
+            raise OSError("access denied")
+
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setitem(
+        process_supervisor._LIVE_WINDOWS_JOBS,
+        (keeper.pid, keeper.started_at),
+        Job(),
+    )
+
+    assert not process_supervisor.supervision_boundary_is_inactive(token)
+
+
+@pytest.mark.parametrize("members", [[], [99], None])
+def test_posix_run_owned_boundary_requires_successful_empty_group_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+    members: list[int] | None,
+) -> None:
+    keeper = ProcessIdentity(41, "keeper-created")
+    payload = ProcessIdentity(42, "payload-created")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "posix-completed-boundary",
+        pgid=41,
+        payload_identity=payload,
+    )
+    monkeypatch.setattr(process_supervisor.os, "name", "posix")
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+    monkeypatch.setattr(
+        process_supervisor,
+        "list_live_process_group_members",
+        lambda _pgid: members,
+    )
+
+    assert process_supervisor.supervision_boundary_is_inactive(token) is (members == [])
+
+
 def test_managed_process_wait_closes_job_after_leader_exit() -> None:
     events: list[str] = []
     identity = ProcessIdentity(42, "created")

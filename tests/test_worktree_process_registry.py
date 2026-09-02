@@ -169,6 +169,11 @@ def test_dead_payload_is_reaped_through_its_live_owned_boundary(
         supervision_token=token,
     )
     monkeypatch.setattr(registry, "is_process_alive", lambda *_args: False)
+    monkeypatch.setattr(
+        registry,
+        "supervision_boundary_is_inactive",
+        lambda _token: False,
+    )
     terminate = MagicMock(return_value=True)
     monkeypatch.setattr(registry, "terminate", terminate)
 
@@ -184,6 +189,131 @@ def test_dead_payload_is_reaped_through_its_live_owned_boundary(
         token,
         grace_seconds=registry.PROCESS_TERMINATION_TIMEOUT_SECONDS,
     )
+
+
+def test_dead_token_is_pruned_after_complete_boundary_inactivity_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    keeper = registry.ProcessIdentity(41, "keeper-created")
+    payload = registry.ProcessIdentity(42, "payload-created")
+    token = registry.SupervisionToken(
+        registry.LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "completed-boundary",
+        pgid=keeper.pid,
+        payload_identity=payload,
+    )
+    registry.register_process(
+        tmp_path,
+        worktree,
+        name="completed-service",
+        kind="server",
+        pid=payload.pid,
+        started_at=payload.started_at,
+        supervision_token=token,
+    )
+    monkeypatch.setattr(registry, "is_process_alive", lambda *_args: False)
+    boundary_inactive = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        registry,
+        "supervision_boundary_is_inactive",
+        boundary_inactive,
+    )
+
+    assert registry.prune_dead_processes(tmp_path, worktree) == (
+        f"completed-service pid={payload.pid} owned boundary already inactive",
+    )
+    boundary_inactive.assert_called_once_with(token)
+    assert registry.load_registered_processes(tmp_path, worktree) == []
+    assert registry.list_registered_worktrees(tmp_path) == []
+
+
+def test_dead_token_is_preserved_without_complete_boundary_inactivity_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    keeper = registry.ProcessIdentity(41, "keeper-created")
+    payload = registry.ProcessIdentity(42, "payload-created")
+    token = registry.SupervisionToken(
+        registry.LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "active-boundary",
+        pgid=keeper.pid,
+        payload_identity=payload,
+    )
+    registry.register_process(
+        tmp_path,
+        worktree,
+        name="possibly-active-service",
+        kind="server",
+        pid=payload.pid,
+        started_at=payload.started_at,
+        supervision_token=token,
+    )
+    monkeypatch.setattr(registry, "is_process_alive", lambda *_args: False)
+    monkeypatch.setattr(
+        registry,
+        "supervision_boundary_is_inactive",
+        lambda _token: False,
+    )
+
+    assert registry.prune_dead_processes(tmp_path, worktree) == ()
+    assert registry.load_registered_processes(tmp_path, worktree)[0].pid == payload.pid
+
+
+def test_reap_retires_dead_token_when_boundary_is_definitively_inactive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    keeper = registry.ProcessIdentity(41, "keeper-created")
+    payload = registry.ProcessIdentity(42, "payload-created")
+    token = registry.SupervisionToken(
+        registry.LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "completed-before-reap",
+        pgid=keeper.pid,
+        payload_identity=payload,
+    )
+    registry.register_process(
+        tmp_path,
+        worktree,
+        name="completed-service",
+        kind="server",
+        pid=payload.pid,
+        started_at=payload.started_at,
+        supervision_token=token,
+    )
+    monkeypatch.setattr(registry, "is_process_alive", lambda *_args: False)
+    monkeypatch.setattr(
+        registry,
+        "supervision_boundary_is_inactive",
+        lambda _token: True,
+    )
+    terminate_boundary = MagicMock(side_effect=AssertionError("inactive boundary terminated"))
+    monkeypatch.setattr(registry, "terminate", terminate_boundary)
+
+    report = registry.reap_registered_processes(tmp_path, worktree)
+
+    assert report.terminated == ()
+    assert report.stale == (
+        f"completed-service pid={payload.pid} owned boundary already inactive",
+    )
+    assert report.surviving == ()
+    terminate_boundary.assert_not_called()
+    assert registry.list_registered_worktrees(tmp_path) == []
 
 
 def test_setup_registration_batch_is_atomic_on_write_failure(

@@ -12460,6 +12460,63 @@ class TestImplementSetupTeardownHelpers:
         close_posix.assert_called_once_with()
         close_windows.assert_called_once_with()
 
+    def test_prune_retires_completed_setup_boundary_before_closing_held_job(
+        self,
+        repo: Path,
+    ) -> None:
+        keeper = ProcessIdentity(1200, "owner-created", command="setup")
+        service = ProcessIdentity(1201, "service-created", command="server")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            keeper,
+            os.getpid(),
+            "orchestrator-created",
+            "completed-setup-boundary",
+            pgid=keeper.pid,
+            payload_identity=service,
+        )
+        state_root = orch._worktree_registry_state_root(repo, repo)
+        orch.worktree_process_registry.register_process(
+            state_root,
+            repo,
+            name="dev-server",
+            kind="server",
+            pid=service.pid,
+            started_at=service.started_at,
+            supervision_token=token,
+        )
+
+        with (
+            patch.object(
+                orch.worktree_process_registry,
+                "is_process_alive",
+                return_value=False,
+            ),
+            patch.object(
+                orch.worktree_process_registry,
+                "supervision_boundary_is_inactive",
+                return_value=True,
+            ) as boundary_inactive,
+            patch.object(orch, "close_empty_held_posix_groups") as close_posix,
+            patch.object(orch, "close_empty_held_windows_jobs") as close_windows,
+        ):
+            removed = orch._prune_registered_worktree_processes(repo, repo)
+
+        assert removed == (
+            f"dev-server pid={service.pid} owned boundary already inactive",
+        )
+        boundary_inactive.assert_called_once_with(token)
+        close_posix.assert_called_once_with()
+        close_windows.assert_called_once_with()
+        assert orch.worktree_process_registry.load_registered_processes(
+            state_root,
+            repo,
+        ) == []
+        assert orch.worktree_process_registry.reap_registered_processes(
+            state_root,
+            repo,
+        ).surviving == ()
+
     def test_setup_descendants_without_authenticated_handoff_are_stopped(
         self,
         repo: Path,

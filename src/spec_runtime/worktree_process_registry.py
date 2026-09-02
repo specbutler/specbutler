@@ -16,6 +16,7 @@ from .process_supervisor import (
     ProcessIdentity,
     SupervisionToken,
     inspect_process,
+    supervision_boundary_is_inactive,
     terminate,
     terminate_exact_process,
 )
@@ -264,7 +265,28 @@ def prune_dead_processes(state_root: Path, worktree_path: Path) -> tuple[str, ..
         if entry.supervision_token is not None:
             # The registered payload may exit while other members remain in
             # its owned Job/process group. Reaping must consult the boundary
-            # token before this entry can be classified as stale.
+            # token before this entry can be classified as stale. Conversely,
+            # retaining every token forever strands normally completed agents
+            # and setup services after their empty Job/group disappears.
+            try:
+                token = SupervisionToken.from_dict(entry.supervision_token)
+            except (KeyError, TypeError, ValueError):
+                alive.append(entry)
+                continue
+            if (
+                token.payload.pid != entry.pid
+                or token.payload.started_at != entry.started_at
+            ):
+                alive.append(entry)
+                continue
+            if (
+                not is_process_alive(entry.pid, entry.started_at)
+                and supervision_boundary_is_inactive(token)
+            ):
+                removed.append(
+                    f"{entry.name} pid={entry.pid} owned boundary already inactive"
+                )
+                continue
             alive.append(entry)
             continue
         if is_process_alive(entry.pid, entry.started_at):
@@ -372,8 +394,21 @@ def reap_registered_processes(
                     f"{entry.name} pid={entry.pid} owned boundary terminated"
                 )
                 continue
+            if not entry_alive and supervision_boundary_is_inactive(token):
+                stale.append(
+                    f"{entry.name} pid={entry.pid} owned boundary already inactive"
+                )
+                continue
             stopped = terminate(token, grace_seconds=timeout_seconds)
             if not stopped and not entry_alive:
+                # The boundary may have completed between the preflight proof
+                # and the termination attempt. Recheck before preserving a
+                # registry entry that would otherwise block worktree cleanup.
+                if supervision_boundary_is_inactive(token):
+                    stale.append(
+                        f"{entry.name} pid={entry.pid} owned boundary became inactive"
+                    )
+                    continue
                 # A dead payload does not prove its complete owned boundary is
                 # empty. Preserve the cleanup entry/workspace rather than
                 # silently orphaning a worker after its declared service exits.
