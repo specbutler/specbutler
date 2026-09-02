@@ -3040,6 +3040,86 @@ class TestImplementEndpoint:
         agent_idx = call_args.index("--agent")
         assert call_args[agent_idx + 1] == "codex"
 
+    def test_implement_handoff_uses_adoptable_lifetime(self, tmp_path):
+        """The orchestrator must survive a web-server restart after handoff."""
+        import subprocess
+
+        from spec_runtime.process_supervisor import LifetimeMode
+        from spec_runtime.web.bridge import create_session
+
+        client = self._make_client(tmp_path)
+        task_dir = tmp_path / "specs" / "tasks"
+        task_dir.mkdir(parents=True)
+        (task_dir / "durable-task.md").write_text(
+            "---\nid: durable-task\n---\n",
+            encoding="utf-8",
+        )
+        session = create_session(mode="task", agent="codex")
+        session.worktree_path = str(tmp_path)
+        session.branch = "task/durable-task"
+        session.base_sha = "abc123"
+        mock_diff = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="specs/tasks/durable-task.md\n",
+            stderr="",
+        )
+        mock_proc = MagicMock(pid=88888)
+        mock_proc.poll.return_value = None
+
+        with patch("spec_runtime.orchestrator.run_subprocess", return_value=mock_diff), \
+             patch("spec_runtime.web.chat_api.ProcessSupervisor") as supervisor_cls:
+            supervisor_cls.return_value.spawn.return_value = mock_proc
+            response = client.post(
+                f"/api/v1/chat/sessions/{session.session_id}/implement",
+                json={},
+                headers=self._auth_headers(),
+            )
+
+        assert response.status_code == 200
+        supervisor_cls.assert_called_once_with(LifetimeMode.ADOPTABLE)
+
+    def test_implement_supervisor_failure_rolls_back_session_and_run(self, tmp_path):
+        import subprocess
+
+        from spec_runtime.web.bridge import create_session
+
+        client = self._make_client(tmp_path)
+        task_dir = tmp_path / "specs" / "tasks"
+        task_dir.mkdir(parents=True)
+        (task_dir / "failed-handoff.md").write_text(
+            "---\nid: failed-handoff\n---\n",
+            encoding="utf-8",
+        )
+        session = create_session(mode="task", agent="codex")
+        session.worktree_path = str(tmp_path)
+        session.branch = "task/failed-handoff"
+        session.base_sha = "abc123"
+        mock_diff = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="specs/tasks/failed-handoff.md\n",
+            stderr="",
+        )
+
+        with patch("spec_runtime.orchestrator.run_subprocess", return_value=mock_diff), \
+             patch(
+                 "spec_runtime.web.chat_api.ProcessSupervisor.spawn",
+                 side_effect=RuntimeError("identity inspection failed"),
+             ):
+            response = client.post(
+                f"/api/v1/chat/sessions/{session.session_id}/implement",
+                json={},
+                headers=self._auth_headers(),
+            )
+
+        assert response.status_code == 422
+        assert "identity inspection failed" in response.json()["error"]
+        assert session.status == "active"
+        runs_root = tmp_path / ".spec-state" / "runs"
+        assert not list(runs_root.glob("*.json"))
+        assert not list(runs_root.glob("**/spec.md"))
+
 
 class TestSpecReviewDedup:
     """task_spec_ready dedup and clear-review flow."""

@@ -450,6 +450,35 @@ class TestBackendFactory:
 # ---------------------------------------------------------------------------
 
 
+class _ClosableAgentProcess:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_agent_monitor_closes_retained_process_after_success() -> None:
+    proc = _ClosableAgentProcess()
+
+    assert eb._run_agent_monitor(
+        proc,
+        lambda observed: 7 if observed is proc else 1,
+    ) == 7
+    assert proc.closed is True
+
+
+def test_agent_monitor_closes_retained_process_after_failure() -> None:
+    proc = _ClosableAgentProcess()
+
+    def fail(_proc: object) -> int:
+        raise RuntimeError("monitor failed")
+
+    with pytest.raises(RuntimeError, match="monitor failed"):
+        eb._run_agent_monitor(proc, fail)
+    assert proc.closed is True
+
+
 class TestWorktreeBackend:
     def _make(self) -> eb.WorktreeExecutionBackend:
         return eb.WorktreeExecutionBackend(ExecutionConfig())

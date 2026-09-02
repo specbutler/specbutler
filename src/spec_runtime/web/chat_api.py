@@ -1279,7 +1279,10 @@ async def implement_chat_task(request: Request) -> Response:
     from .api import _spec_executable
 
     try:
-        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        # This is a durable ownership transfer, not a web-owned child. The
+        # implementation must survive a web-server restart and remain
+        # stoppable through its persisted supervision token.
+        proc = ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
             [
                 _spec_executable(),
                 "implement",
@@ -1292,7 +1295,7 @@ async def implement_chat_task(request: Request) -> Response:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         _cleanup_orphaned_run()
         session.status = "active"
         return _json(

@@ -408,6 +408,26 @@ class AgentResult:
 AgentMonitor = Callable[["ManagedProcess | subprocess.Popen[Any]"], int]
 
 
+def _run_agent_monitor(
+    proc: ManagedProcess | subprocess.Popen[Any],
+    monitor: AgentMonitor,
+) -> int:
+    """Run an agent monitor and release its retained ownership handle.
+
+    Native Windows run-owned processes retain a Job Object until ``close``.
+    Monitors commonly finish by polling the leader rather than calling
+    ``wait``, so the backend owns this final release. Closing the Job also
+    terminates any descendants that outlived the provider leader.
+    """
+
+    try:
+        return monitor(proc)
+    finally:
+        close = getattr(proc, "close", None)
+        if callable(close):
+            close()
+
+
 @dataclass(frozen=True)
 class OutboxMetadata:
     """Optional PR/MR metadata published by the backend.
@@ -761,7 +781,7 @@ class WorktreeExecutionBackend:
                 stderr=stderr or "",
             )
         proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
-        returncode = monitor(proc)
+        returncode = _run_agent_monitor(proc, monitor)
         return AgentResult(returncode=returncode)
 
     def collect_outbox_metadata(self, workspace: WorkspaceHandle) -> OutboxMetadata | None:
@@ -944,7 +964,7 @@ class CloneExecutionBackend:
                 stderr=stderr or "",
             )
         proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
-        returncode = monitor(proc)
+        returncode = _run_agent_monitor(proc, monitor)
         self._write_command_log(
             kind="agent",
             cwd=request.cwd,
@@ -2107,7 +2127,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             env=client_env,
             popen_kwargs=popen_kwargs,
         )
-        returncode = monitor(proc)
+        returncode = _run_agent_monitor(proc, monitor)
         self._remember_container_id(run_root, state)
         self._sync_volume_workspace_to_host(run_root, state)
         self._write_command_log(

@@ -178,6 +178,52 @@ def test_missing_bootstrap_executable_fails_closed(tmp_path: Path):
     assert list(review_worktree.iterdir()) == []
 
 
+@pytest.mark.parametrize("unsafe_tool", ["codex", "bootstrap"])
+def test_executable_grant_never_promotes_to_operator_home(
+    tmp_path: Path,
+    unsafe_tool: str,
+):
+    review_worktree = tmp_path / "review"
+    review_worktree.mkdir()
+    operator_home = tmp_path / "operator-home"
+    home_bin = operator_home / "bin"
+    home_bin.mkdir(parents=True)
+    home_codex = home_bin / "codex"
+    home_python = home_bin / "python"
+    home_codex.write_text("fake", encoding="utf-8")
+    home_python.write_text("fake", encoding="utf-8")
+
+    if unsafe_tool == "codex":
+        fake_codex = home_codex
+        command = [sys.executable, "-c", "pass"]
+    else:
+        fake_codex = tmp_path / "tools" / "codex"
+        fake_codex.parent.mkdir()
+        fake_codex.write_text("fake", encoding="utf-8")
+        command = [str(home_python), "-c", "pass"]
+
+    def which(name: str, **kwargs: object) -> str | None:  # noqa: ARG001
+        return str(fake_codex) if name.startswith("codex") else None
+
+    with pytest.raises(
+        ReviewBootstrapSandboxUnavailable,
+        match="would expose the operator home",
+    ):
+        with isolated_review_bootstrap_sandbox(
+            review_worktree,
+            command,
+            inherited_env={
+                "HOME": str(operator_home),
+                "PATH": os.environ.get("PATH", os.defpath),
+            },
+            windows=False,
+            which=which,
+        ):
+            raise AssertionError("unreachable")
+
+    assert list(review_worktree.iterdir()) == []
+
+
 def test_runtime_cleanup_retries_delayed_handle_release(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

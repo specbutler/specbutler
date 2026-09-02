@@ -220,6 +220,33 @@ def _permission_profile_override(
     return f"permissions.{REVIEW_BOOTSTRAP_PERMISSION_PROFILE}={render(profile)}"
 
 
+def _reject_operator_home_read_grants(
+    *,
+    operator_home: Path,
+    read_roots: Sequence[Path],
+) -> None:
+    """Fail closed when an executable grant would expose the operator home.
+
+    ``_read_root_for_executable`` deliberately promotes ``bin`` and
+    ``Scripts`` executables to their adjacent runtime root. For an executable
+    installed directly in ``~/bin`` that promotion would grant the complete
+    home directory, including credentials, to pull-request-controlled build
+    hooks. Narrow descendants of the home are acceptable; the home itself and
+    any ancestor containing it are not.
+    """
+
+    normalized_home = operator_home.resolve()
+    for root in read_roots:
+        normalized_root = root.resolve()
+        if normalized_home == normalized_root or normalized_home.is_relative_to(
+            normalized_root
+        ):
+            raise ReviewBootstrapSandboxUnavailable(
+                "Executable runtime grant would expose the operator home; "
+                f"refusing isolated review bootstrap for {normalized_root}"
+            )
+
+
 def _shell_environment_overrides(env: Mapping[str, str]) -> tuple[str, ...]:
     # Codex normally merges the user's shell_environment_policy.  An operator
     # config can contain explicit `set` values, including secrets.  The exact
@@ -348,9 +375,10 @@ def isolated_review_bootstrap_sandbox(
     """Prepare a model-free Codex sandbox for one hostile bootstrap command.
 
     The active user Codex home is retained for trusted runner configuration and
-    native-Windows elevated-sandbox setup.  The permission profile explicitly
-    denies that home (and the rest of the operator home) to the untrusted child.
-    No auth file is copied into the writable review worktree.
+    native-Windows elevated-sandbox setup. The permission profile is an
+    allowlist: only narrow executable runtime roots below the operator home are
+    reopened to the untrusted child. No auth file is copied into the writable
+    review worktree.
     """
 
     use_windows = os.name == "nt" if windows is None else windows
@@ -397,6 +425,10 @@ def isolated_review_bootstrap_sandbox(
             *_codex_distribution_read_roots(codex_launcher),
             _read_root_for_executable(command_executable).resolve(),
         }
+        _reject_operator_home_read_grants(
+            operator_home=operator_home,
+            read_roots=tuple(read_roots),
+        )
         permission_override = _permission_profile_override(
             operator_home=operator_home,
             codex_home=codex_home,
