@@ -335,6 +335,20 @@ def test_mismatched_posix_keeper_and_group_token_is_never_retired(
         pgid=99,
         payload_identity=payload,
     )
+    inventory = MagicMock(side_effect=AssertionError("mismatched group inventoried"))
+    with monkeypatch.context() as posix_patch:
+        posix_patch.setattr(process_supervisor.os, "name", "posix")
+        posix_patch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
+        posix_patch.setattr(
+            process_supervisor,
+            "list_live_process_group_members",
+            inventory,
+        )
+
+        assert not process_supervisor.supervision_boundary_is_inactive(token)
+
+    inventory.assert_not_called()
+
     registry.register_process(
         tmp_path,
         worktree,
@@ -345,13 +359,11 @@ def test_mismatched_posix_keeper_and_group_token_is_never_retired(
         supervision_token=token,
     )
     monkeypatch.setattr(registry, "is_process_alive", lambda *_args: False)
-    monkeypatch.setattr(process_supervisor.os, "name", "posix")
-    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: False)
-    inventory = MagicMock(side_effect=AssertionError("mismatched group inventoried"))
+    boundary_inactive = MagicMock(return_value=False)
     monkeypatch.setattr(
-        process_supervisor,
-        "list_live_process_group_members",
-        inventory,
+        registry,
+        "supervision_boundary_is_inactive",
+        boundary_inactive,
     )
     terminate_boundary = MagicMock(return_value=False)
     monkeypatch.setattr(registry, "terminate", terminate_boundary)
@@ -366,7 +378,7 @@ def test_mismatched_posix_keeper_and_group_token_is_never_retired(
     )
     assert registry.load_registered_processes(tmp_path, worktree)[0].pid == payload.pid
     assert terminate_boundary.call_count == 1
-    inventory.assert_not_called()
+    assert boundary_inactive.call_count == 3
 
 
 def test_setup_registration_batch_is_atomic_on_write_failure(
