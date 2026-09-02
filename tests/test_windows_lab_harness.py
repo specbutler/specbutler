@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ REQUIRED_FILES = {
     "entrypoint.sh",
     "ensure-console-session.ps1",
     "exact_harness.py",
+    "extract_evidence.py",
     "import_external_evidence.py",
     "job-runner.ps1",
     "job-child.ps1",
@@ -107,6 +109,9 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "could not prove descendant cleanup" in controller
     assert "authoritative guest shutdown confirmed after unsafe job completion" in controller
     assert "collect_artifacts" in controller
+    assert 'python3 "$HARNESS_ROOT/extract_evidence.py"' in controller
+    assert '--destination "$raw"' in controller
+    assert 'unzip -q "$raw/evidence.zip"' not in controller
     assert "verify_exact_proof_harness" in controller
     proof_controller = controller[controller.index("run_proof() {") :]
     assert proof_controller.index(
@@ -1588,6 +1593,77 @@ def _load_exact_harness_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_evidence_extractor_module():
+    path = LAB_ROOT / "extract_evidence.py"
+    spec = importlib.util.spec_from_file_location("windows_evidence_extractor", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_windows_lab_extracts_guest_evidence_into_the_controller_root(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_extractor_module()
+    destination = tmp_path / "raw"
+    destination.mkdir()
+    archive = destination / "evidence.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("result.json", '{"status":"passed"}\n')
+        bundle.writestr("native-tests.log", "2691 passed\n")
+
+    extracted = module.extract_flat_archive(archive, destination)
+
+    assert extracted == ["result.json", "native-tests.log"]
+    assert (destination / "result.json").read_text(encoding="utf-8") == (
+        '{"status":"passed"}\n'
+    )
+    assert (destination / "native-tests.log").read_text(encoding="utf-8") == (
+        "2691 passed\n"
+    )
+    assert not (destination / "evidence").exists()
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["evidence/result.json", "evidence\\result.json", "../result.json"],
+)
+def test_windows_lab_rejects_nonflat_guest_evidence(
+    tmp_path: Path,
+    member: str,
+) -> None:
+    module = _load_evidence_extractor_module()
+    destination = tmp_path / "raw"
+    destination.mkdir()
+    archive = destination / "evidence.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr(member, "not flat")
+
+    with pytest.raises(module.EvidenceArchiveError, match="only flat files"):
+        module.extract_flat_archive(archive, destination)
+    assert {path.name for path in destination.iterdir()} == {"evidence.zip"}
+
+
+def test_windows_lab_guest_evidence_never_overwrites_host_records(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_extractor_module()
+    destination = tmp_path / "raw"
+    destination.mkdir()
+    completion = destination / "job.done.json"
+    completion.write_text("host attestation\n", encoding="utf-8")
+    archive = destination / "evidence.zip"
+    with zipfile.ZipFile(archive, "w") as bundle:
+        bundle.writestr("result.json", "would otherwise extract first")
+        bundle.writestr("job.done.json", "guest collision")
+
+    with pytest.raises(module.EvidenceArchiveError, match="overwrite"):
+        module.extract_flat_archive(archive, destination)
+    assert completion.read_text(encoding="utf-8") == "host attestation\n"
+    assert not (destination / "result.json").exists()
 
 
 def _load_host_timeout_module():

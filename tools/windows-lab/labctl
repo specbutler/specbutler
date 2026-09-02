@@ -940,7 +940,6 @@ collect_artifacts() {
     local destination="${2:-$LAB_ROOT/artifacts/$name}"
     local revision="${3:-}"
     validate_name "$name"
-    require_command unzip
     local raw="$STATE_ROOT/raw/$name"
     if [ -e "$raw" ] && find "$raw" -type f -print -quit | grep -q .; then
         die "raw artifact directory is not empty; refusing to mix runs: $raw"
@@ -971,7 +970,9 @@ collect_artifacts() {
         guest_scp "specadmin@127.0.0.1:C:/SpecHarness/$name-evidence.zip" "$raw/evidence.zip" 2>/dev/null || true
     fi
     if [ -f "$raw/evidence.zip" ]; then
-        unzip -q "$raw/evidence.zip" -d "$raw/evidence"
+        python3 "$HARNESS_ROOT/extract_evidence.py" \
+            --archive "$raw/evidence.zip" \
+            --destination "$raw"
         rm -f -- "$raw/evidence.zip"
     fi
     find "$raw" -type f -print -quit | grep -q . || die "no artifacts were available for job $name"
