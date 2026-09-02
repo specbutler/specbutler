@@ -71,6 +71,17 @@ The orchestrator applies the manifest like this:
   closed and preserve the worktree. Use a teardown command or a dedicated
   `pgid` on those platforms rather than relying on a raw PID.
 
+Setup hooks may start background services and then exit. The orchestrator waits
+only for the setup leader, so a child that inherits its output handles does not
+block setup completion. On native Windows, the setup command and all of its
+descendants are placed in one run-owned Job Object before execution begins. A
+declared `managed_processes` entry is accepted for teardown only when its exact
+process identity is also a live member of that Job. Undeclared descendants stay
+run-owned and are terminated when the orchestrator exits; they are never
+adopted from a raw PID. On POSIX, give each long-lived service a dedicated
+session/process group and report `termination_scope = "pgid"` when portable
+whole-tree cleanup is required.
+
 ## Examples
 
 Database bootstrap:
@@ -127,6 +138,10 @@ Because partial manifests are still consumed, setup scripts should:
 - **Emit a partial JSON manifest before crashing when possible.** If a
   `managed_processes` entry is printed before the script errors out, the
   orchestrator registers the process so teardown can clean it up.
+- **Keep Windows services inside the setup Job.** Do not request Job breakaway
+  when launching a service. Print the operating-system start identity for the
+  service itself; Spec Butler verifies that identity against kernel Job
+  membership before persisting teardown ownership.
 - **Not rely on prepare to be a gate.** Repo-specific failures surface as
   diagnostics for the agent to investigate as part of the spec work. Verify
   gates remain strict.

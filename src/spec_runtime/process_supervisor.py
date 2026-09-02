@@ -439,27 +439,43 @@ def _darwin_framework_python_exec_transition_matches(
         return expected[0].resolve(strict=False) == live[0].resolve(strict=False)
 
 
-def identity_matches(expected: ProcessIdentity) -> bool:
-    live = inspect_process(expected.pid)
-    if live is None or not expected.started_at or live.started_at != expected.started_at:
+def _process_identity_records_match(
+    expected: ProcessIdentity,
+    candidate: ProcessIdentity,
+) -> bool:
+    """Compare two observations of one process across an in-place exec.
+
+    PID plus creation time are the stable kernel identity. Executable paths add
+    a fail-closed check when both observations have one, except for the narrow
+    CPython framework stub-to-app transition that Darwin performs without
+    changing either stable field. Commands are descriptive and may legitimately
+    change across that exec.
+    """
+    if (
+        expected.pid != candidate.pid
+        or not expected.started_at
+        or expected.started_at != candidate.started_at
+    ):
         return False
-    if not expected.executable or not live.executable:
+    if not expected.executable or not candidate.executable:
         return True
     try:
-        # Ordinary executable aliases resolve to the same file.  CPython's
-        # Darwin framework stub and app runtime are distinct files joined by
-        # an in-place exec, so that narrower transition is handled below.
-        if os.path.samefile(live.executable, expected.executable):
+        if os.path.samefile(candidate.executable, expected.executable):
             return True
     except OSError:
-        if Path(live.executable).resolve(strict=False) == Path(
+        if Path(candidate.executable).resolve(strict=False) == Path(
             expected.executable
         ).resolve(strict=False):
             return True
     return _darwin_framework_python_exec_transition_matches(
         expected.executable,
-        live.executable,
+        candidate.executable,
     )
+
+
+def identity_matches(expected: ProcessIdentity) -> bool:
+    live = inspect_process(expected.pid)
+    return live is not None and _process_identity_records_match(expected, live)
 
 
 def list_live_process_group_members(pgid: int) -> list[int] | None:
@@ -887,6 +903,61 @@ def _windows_job_name(token: str) -> str:
     # other than file mappings and symbolic links do not require
     # SeCreateGlobalPrivilege for this use.
     return f"Global\\SpecButler-{token}"
+
+
+def bind_held_windows_job_payload(
+    token: SupervisionToken,
+    candidate: ProcessIdentity,
+) -> SupervisionToken | None:
+    """Bind a live setup descendant to a Job retained by this process.
+
+    This is the in-process counterpart to durable payload promotion. The setup
+    leader may already have exited, but its exact token still indexes the Job
+    handle created before the leader was resumed. Kernel membership plus the
+    candidate's creation identity is therefore sufficient to mint a teardown
+    token for a declared service without creating a forgeable persisted Job
+    capability.
+    """
+    if os.name != "nt" or token.mode is not LifetimeMode.RUN_OWNED:
+        return None
+    if token.job_name != _windows_job_name(token.token):
+        return None
+    job = _LIVE_WINDOWS_JOBS.get((token.identity.pid, token.identity.started_at))
+    if job is None:
+        return None
+    try:
+        if not job.contains(candidate):
+            return None
+    except OSError:
+        return None
+    return SupervisionToken(
+        token.mode,
+        token.identity,
+        token.owner_pid,
+        token.owner_started_at,
+        token.token,
+        token.pgid,
+        candidate,
+        version=token.version,
+        job_name=token.job_name,
+        control_relpath=token.control_relpath,
+        control_nonce=token.control_nonce,
+    )
+
+
+def close_empty_held_windows_jobs() -> None:
+    """Release retained Job handles only after the kernel reports them empty."""
+    if os.name != "nt":
+        return
+    for key, job in tuple(_LIVE_WINDOWS_JOBS.items()):
+        try:
+            if job.active_process_ids():
+                continue
+            job.close()
+        except OSError:
+            continue
+        if _LIVE_WINDOWS_JOBS.get(key) is job:
+            _LIVE_WINDOWS_JOBS.pop(key, None)
 
 
 def _send_windows_break(process_group_id: int) -> bool:
@@ -1679,6 +1750,7 @@ class ManagedProcess:
         self.token = token
         self._job = job
         self._close_lock = threading.Lock()
+        self._pipe_closer_started = False
 
     def terminate(self, grace_seconds: float = 5.0) -> None:
         if os.name == "nt" and self._job is not None:
@@ -1721,7 +1793,7 @@ class ManagedProcess:
         # though the leader has exited. Close the run-owned Job as soon as the
         # leader exits so inherited pipe handles cannot outlive ownership.
         if os.name == "nt" and isinstance(self.process, _REAL_POPEN_TYPE) and isinstance(self._job, _WindowsJob):
-            threading.Thread(target=self._close_job_after_leader, daemon=True).start()
+            self._start_pipe_closer_once()
         try:
             result = self.process.communicate(input=input, timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -1738,6 +1810,21 @@ class ManagedProcess:
             raise
         self.close()
         return result
+
+    def _start_pipe_closer_once(self) -> None:
+        """Start exactly one Windows inherited-pipe closer for this process.
+
+        ``Popen.communicate(timeout=...)`` is intentionally retryable.  Starting
+        a fresh waiter on every retry leaks one thread per poll while they all
+        wait for the same leader.  Serialize only the one-shot decision here;
+        the waiter must acquire ``_close_lock`` independently after the leader
+        exits.
+        """
+        with self._close_lock:
+            if self._pipe_closer_started:
+                return
+            self._pipe_closer_started = True
+        threading.Thread(target=self._close_job_after_leader, daemon=True).start()
 
     def _close_job_after_leader(self) -> None:
         self.process.wait()
@@ -1832,6 +1919,7 @@ class ManagedAsyncProcess:
         self.token = token
         self._job = job
         self._close_lock = threading.Lock()
+        self._pipe_closer_started = False
 
     def terminate(self) -> None:
         # Match asyncio.subprocess.Process.terminate: initiate graceful
@@ -1882,7 +1970,7 @@ class ManagedAsyncProcess:
 
     async def communicate(self, input: bytes | None = None) -> tuple[bytes | None, bytes | None]:
         if os.name == "nt" and isinstance(self.process, asyncio.subprocess.Process) and isinstance(self._job, _WindowsJob):
-            asyncio.create_task(self._close_job_after_leader())
+            self._start_pipe_closer_once()
         try:
             result = await self.process.communicate(input)
         except BaseException:
@@ -1901,6 +1989,13 @@ class ManagedAsyncProcess:
             raise
         self.close()
         return result
+
+    def _start_pipe_closer_once(self) -> None:
+        with self._close_lock:
+            if self._pipe_closer_started:
+                return
+            self._pipe_closer_started = True
+        asyncio.create_task(self._close_job_after_leader())
 
     async def _close_job_after_leader(self) -> None:
         await self.process.wait()
@@ -2003,17 +2098,23 @@ class ProcessSupervisor:
             _abort_windows_job(job)
             raise
         try:
-            if job is not None:
-                job.assign(int(process._handle))  # type: ignore[attr-defined]
-                _resume_windows_process(int(process._handle))  # type: ignore[attr-defined]
             # Minimal Popen doubles used by callers do not represent a live OS
             # process. Keep that compatibility seam out of production paths.
             is_test_double = not isinstance(process, _REAL_POPEN_TYPE)
-            identity = (
-                ProcessIdentity(int(getattr(process, "pid", os.getpid())), "test-double")
-                if is_test_double
-                else inspect_process(process.pid)
-            )
+            if is_test_double:
+                identity = ProcessIdentity(int(getattr(process, "pid", os.getpid())), "test-double")
+            elif job is not None:
+                process_handle = int(process._handle)  # type: ignore[attr-defined]
+                job.assign(process_handle)
+                # Capture the exact creation identity while the process is
+                # still suspended.  A successful short-lived command may exit
+                # before inspection if it is resumed first.
+                identity = inspect_process(process.pid)
+                if identity is None:
+                    raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
+                _resume_windows_process(process_handle)
+            else:
+                identity = inspect_process(process.pid)
             if identity is None:
                 raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
             owner = (
@@ -2153,24 +2254,25 @@ class ProcessSupervisor:
             _abort_windows_job(job)
             raise
         try:
-            if job is not None:
-                if isinstance(process, asyncio.subprocess.Process):
-                    transport_process = process._transport.get_extra_info("subprocess")  # type: ignore[attr-defined]
-                    process_handle = int(transport_process._handle)
-                    job.assign(process_handle)
-                    _resume_windows_process(process_handle)
-                else:
+            is_test_double = not isinstance(process, asyncio.subprocess.Process)
+            if is_test_double:
+                if job is not None:
                     # Explicit compatibility seam for lightweight async test
                     # doubles. Real Windows asyncio processes must expose the
                     # transport handle so assignment occurs before resume.
                     job.close()
                     job = None
-            is_test_double = not isinstance(process, asyncio.subprocess.Process)
-            identity = (
-                ProcessIdentity(int(getattr(process, "pid", os.getpid())), "test-double")
-                if is_test_double
-                else inspect_process(process.pid)
-            )
+                identity = ProcessIdentity(int(getattr(process, "pid", os.getpid())), "test-double")
+            elif job is not None:
+                transport_process = process._transport.get_extra_info("subprocess")  # type: ignore[attr-defined]
+                process_handle = int(transport_process._handle)
+                job.assign(process_handle)
+                identity = inspect_process(process.pid)
+                if identity is None:
+                    raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
+                _resume_windows_process(process_handle)
+            else:
+                identity = inspect_process(process.pid)
             if identity is None:
                 raise RuntimeError(f"Could not inspect launched process pid={process.pid}")
             owner = (
@@ -2701,7 +2803,10 @@ def supervision_token_contains_process(
     ):
         return False
     if os.name != "nt":
-        return token.payload == candidate and identity_matches(token.payload)
+        return _process_identity_records_match(
+            token.payload,
+            candidate,
+        ) and identity_matches(token.payload)
     if (
         token.version != 2
         or token.job_name != _windows_job_name(token.token)

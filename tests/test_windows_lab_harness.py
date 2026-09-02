@@ -170,12 +170,17 @@ def test_windows_lab_has_complete_controller_surface() -> None:
         "WaitForProviderExit",
         'inputWriter.Write("q")',
         "KILL_ON_JOB_CLOSE",
+        "JobObjectBasicProcessIdList",
+        "QueryInformationJobObject",
+        "WaitForJobEmpty",
         "CREATE_SUSPENDED",
         "ResumeThread",
         "TerminateJobObject",
         "watch-interactive-failure.json",
     ):
         assert native_boundary in watch_harness
+    assert "Parent-PID lineage becomes ambiguous" in watch_harness
+    assert "kernel-authenticated Job member(s) survived" in watch_harness
     main = watch_harness[watch_harness.index("public static int Main") :]
     assert (
         main.index("job = CreateJobObject")

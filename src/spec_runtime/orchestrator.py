@@ -106,6 +106,7 @@ from .execution_backend import (
     SnapshotRef,
     UnknownExecutionBackendError,
     WorkspaceHandle,
+    run_local_command_preserving_descendants,
 )
 from .execution_backend import get_execution_backend as _factory_get_execution_backend
 from .forge import GitHubForge, PushResult
@@ -118,12 +119,15 @@ from .process_supervisor import (
     ProcessGroupTerminationError,
     ProcessSupervisor,
     SupervisionToken,
+    bind_held_windows_job_payload,
     claim_current_process,
+    close_empty_held_windows_jobs,
     inspect_process,
     stop_supervised_process,
     terminate_legacy_popen_tree,
     terminate_legacy_process_group,
 )
+from .process_supervisor import ProcessIdentity as SupervisedProcessIdentity
 from .process_supervisor import (
     is_process_group_alive as _supervised_process_group_is_alive,
 )
@@ -1729,6 +1733,11 @@ class ImplementSetupManifest:
     mcp_servers: dict[str, dict[str, object]] = field(default_factory=dict)
     managed_processes: tuple[ImplementManagedProcess, ...] = ()
     failure: ImplementSetupFailure | None = None
+    ownership_token: SupervisionToken | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 def _coerce_implement_setup_mcp_servers(
@@ -2674,6 +2683,7 @@ def _run_implement_setup_command(
                     cwd=worktree_path,
                     env=env,
                     inherit_env=True,
+                    preserve_descendants=True,
                 )
             )
     except ExecutionBackendImportError:
@@ -2741,10 +2751,11 @@ def _run_implement_setup_command(
             mcp_servers=partial.mcp_servers,
             managed_processes=partial.managed_processes,
             failure=failure,
+            ownership_token=result.ownership_token,
         )
     manifest = _parse_implement_setup_manifest(result.stdout or "")
     _snapshot_container_workspace_after_setup(run, worktree_path, backend)
-    return manifest
+    return replace(manifest, ownership_token=result.ownership_token)
 
 
 def _snapshot_container_workspace_after_setup(
@@ -4513,10 +4524,32 @@ def run_subprocess(
     *,
     inherit_env: bool = True,
     input_text: str | None = None,
+    preserve_descendants: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess with optional env inheritance and timeout."""
     _raise_if_active_phase_lease_lost()
     merged_env = {**os.environ, **(env or {})} if inherit_env else dict(env or {})
+    if preserve_descendants:
+        result = run_local_command_preserving_descendants(
+            CommandRequest(
+                argv=cmd,
+                cwd=cwd or Path.cwd(),
+                env=merged_env,
+                inherit_env=False,
+                timeout=timeout,
+                input_text=input_text,
+                preserve_descendants=True,
+            ),
+            env=merged_env,
+        )
+        completed = subprocess.CompletedProcess(
+            cmd,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+        )
+        completed.ownership_token = result.ownership_token
+        return completed
     with _ACTIVE_PHASE_LEASE_FAILURE_LOCK:
         active_lease_failure = _ACTIVE_PHASE_LEASE_FAILURE
     if active_lease_failure is None:
@@ -6482,7 +6515,20 @@ def _register_setup_manifest_processes(
     worktree_path: Path,
     manifest: ImplementSetupManifest,
 ) -> None:
+    bound_services = 0
     for process in manifest.managed_processes:
+        supervision_token = None
+        if manifest.ownership_token is not None:
+            supervision_token = bind_held_windows_job_payload(
+                manifest.ownership_token,
+                SupervisedProcessIdentity(
+                    process.pid,
+                    process.started_at,
+                    command=process.command,
+                ),
+            )
+            if supervision_token is not None:
+                bound_services += 1
         _register_worktree_process(
             repo_root,
             worktree_path,
@@ -6493,6 +6539,13 @@ def _register_setup_manifest_processes(
             command=process.command,
             termination_scope=process.termination_scope,
             pgid=process.pgid,
+            supervision_token=supervision_token,
+        )
+    if manifest.ownership_token is not None and not bound_services:
+        logger.warning(
+            "Implement setup retained a Windows Job with live descendants, but no "
+            "managed_processes entry authenticated as a Job member; descendants "
+            "will remain run-owned and exit with the orchestrator."
         )
 
 
@@ -6514,6 +6567,7 @@ def _prune_registered_worktree_processes(
         return ()
     for entry in removed:
         logger.info("Pruned stale registered helper for %s: %s", worktree_path, entry)
+    close_empty_held_windows_jobs()
     return removed
 
 
@@ -6551,6 +6605,7 @@ def _reap_registered_worktree_processes(
             reason,
             entry,
         )
+    close_empty_held_windows_jobs()
     return report
 
 
@@ -14493,6 +14548,14 @@ def _prepare_implement_launch_plan(
     backend = _resolve_execution_backend()
     _require_agent_available_for_backend(run.agent, backend)
     setup_manifest = _run_implement_setup_command(run, worktree_path)
+    # Persist cleanup ownership immediately after setup returns. Later MCP or
+    # sandbox preparation may fail, but declared services must never become an
+    # undiscoverable side effect of that failure.
+    _register_setup_manifest_processes(
+        repo_root,
+        worktree_path,
+        setup_manifest,
+    )
     adapter = get_agent_adapter(run.agent)
     setup_mcp_servers = None
     if adapter.capabilities.supports_mcp:
@@ -14554,11 +14617,6 @@ def _prepare_implement_launch_plan(
             backend, worktree_path, (".spec-claude-home", ".claude/mcp-servers.json"),
         )
 
-    _register_setup_manifest_processes(
-        repo_root,
-        worktree_path,
-        setup_manifest,
-    )
     if adapter.capabilities.supports_mcp:
         ctx.visual_feedback_available = bool(setup_mcp_servers)
 
@@ -15638,6 +15696,11 @@ def _attempt_no_handshake_recovery(
         recovery_env = _build_implement_agent_env(run, worktree_path)
         recovery_env_redactions: tuple[str, ...] = ()
         setup_manifest = _run_implement_setup_command(run, worktree_path)
+        _register_setup_manifest_processes(
+            repo_root,
+            worktree_path,
+            setup_manifest,
+        )
         adapter = get_agent_adapter(run.agent)
         setup_mcp_servers = None
         if adapter.capabilities.supports_mcp:
@@ -15692,11 +15755,6 @@ def _attempt_no_handshake_recovery(
             _sync_orchestrator_paths_into_workspace(
                 backend, worktree_path, (".spec-claude-home", ".claude/mcp-servers.json"),
             )
-        _register_setup_manifest_processes(
-            repo_root,
-            worktree_path,
-            setup_manifest,
-        )
         if adapter.capabilities.supports_mcp:
             recovery_ctx.visual_feedback_available = bool(setup_mcp_servers)
 

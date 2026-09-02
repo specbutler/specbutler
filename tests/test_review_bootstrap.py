@@ -178,6 +178,46 @@ def test_missing_bootstrap_executable_fails_closed(tmp_path: Path):
     assert list(review_worktree.iterdir()) == []
 
 
+def test_relative_bootstrap_executable_resolves_from_review_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    review_worktree = tmp_path / "review"
+    script = review_worktree / "scripts" / "bootstrap"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_codex = tmp_path / "tools" / "codex"
+    fake_codex.parent.mkdir()
+    fake_codex.write_text("fake", encoding="utf-8")
+    operator_home = tmp_path / "operator-home"
+    operator_home.mkdir()
+    ambient_cwd = tmp_path / "unrelated"
+    ambient_cwd.mkdir()
+    monkeypatch.chdir(ambient_cwd)
+
+    def which(name: str, **kwargs: object) -> str | None:  # noqa: ARG001
+        return str(fake_codex) if name.startswith("codex") else None
+
+    with isolated_review_bootstrap_sandbox(
+        review_worktree,
+        ["./scripts/bootstrap"],
+        inherited_env={"HOME": str(operator_home), "PATH": os.defpath},
+        windows=False,
+        which=which,
+    ) as sandbox:
+        profile = _inline_value(
+            _override(
+                sandbox.launcher_argv,
+                f"permissions.{REVIEW_BOOTSTRAP_PERMISSION_PROFILE}=",
+            )
+        )
+        assert isinstance(profile, dict)
+        assert profile["filesystem"][":workspace_roots"] == {".": "write"}
+        assert sandbox.launcher_argv[
+            sandbox.launcher_argv.index("--cd") + 1
+        ] == str(review_worktree)
+
+
 @pytest.mark.parametrize("unsafe_tool", ["codex", "bootstrap"])
 def test_executable_grant_never_promotes_to_operator_home(
     tmp_path: Path,

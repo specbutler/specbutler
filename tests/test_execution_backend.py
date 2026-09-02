@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -13,6 +14,7 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -49,6 +51,55 @@ def test_container_path_translation_does_not_rewrite_prefix_collisions() -> None
     )
 
     assert untouched == r"C:\src\project-other\tool.exe"
+
+
+def test_descendant_preserving_command_closes_job_when_inventory_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class Process:
+        def wait(self, *, timeout: float | None = None) -> int:
+            assert timeout == 2.0
+            events.append("wait")
+            return 0
+
+    class Managed:
+        process = Process()
+
+        def owned_tree_active(self) -> bool:
+            events.append("inventory")
+            raise OSError("Job inventory failed")
+
+        def kill(self) -> None:
+            events.append("kill")
+
+        def close(self) -> None:
+            events.append("close")
+
+    class Supervisor:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def spawn(self, *_args: object, **_kwargs: object) -> Managed:
+            return Managed()
+
+    monkeypatch.setattr(eb, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(eb, "ProcessSupervisor", Supervisor)
+
+    with pytest.raises(OSError, match="Job inventory failed"):
+        eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=["setup"],
+                cwd=tmp_path,
+                timeout=2.0,
+                preserve_descendants=True,
+            ),
+            env={},
+        )
+
+    assert events == ["wait", "inventory", "kill", "close"]
 
 
 def test_container_path_translation_preserves_unrelated_composite_backslashes() -> None:
@@ -587,6 +638,38 @@ class TestWorktreeBackend:
         )
         assert result.returncode == 0
         assert result.stdout.strip() == "ok"
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX setup service handoff")
+    def test_descendant_preserving_command_returns_while_service_stays_live(
+        self,
+        tmp_path: Path,
+    ):
+        backend = self._make()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(p.pid, flush=True)"
+        )
+
+        result = backend.run_command(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", code],
+                cwd=worktree,
+                preserve_descendants=True,
+            )
+        )
+        child_pid = int(result.stdout.strip())
+        child_pgid = os.getpgid(child_pid)
+        try:
+            assert result.returncode == 0
+            assert result.ownership_token is None
+            assert child_pgid != os.getpgrp()
+            os.kill(child_pid, 0)
+        finally:
+            os.killpg(child_pgid, signal.SIGKILL)
 
     def test_cleanup_is_noop(self, tmp_path: Path):
         backend = self._make()

@@ -339,6 +339,38 @@ def test_cross_process_spec_lock_contention(tmp_path: Path) -> None:
         holder.wait(timeout=10)
 
 
+def test_run_owned_fast_exit_and_timeout_retries_are_stable() -> None:
+    """Exercise the two short-lived Windows launch races against real Jobs."""
+    import threading
+
+    from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+
+    for _ in range(30):
+        fast = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+            [sys.executable, "-c", "pass"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert fast.wait(timeout=10) == 0
+
+    baseline_threads = threading.active_count()
+    slow = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        for _ in range(40):
+            with pytest.raises(subprocess.TimeoutExpired):
+                slow.communicate(timeout=0.01)
+        # One inherited-pipe waiter is expected. The old retry behavior leaked
+        # one still-blocked thread per timeout.
+        assert threading.active_count() <= baseline_threads + 3
+    finally:
+        slow.kill()
+        slow.communicate(timeout=10)
+
+
 def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
     from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
     from spec_runtime.worktree_process_registry import (
@@ -427,6 +459,105 @@ def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
         if parent.poll() is None:
             parent.kill()
         parent.wait(timeout=10)
+
+
+def test_native_windows_setup_manifest_hands_live_service_to_registry(
+    tmp_path: Path,
+) -> None:
+    """A setup leader may exit while its declared service remains Job-owned."""
+    from dataclasses import replace
+    from unittest.mock import patch
+
+    from spec_runtime import orchestrator as orch
+    from spec_runtime import worktree_process_registry
+    from spec_runtime.process_supervisor import (
+        ProcessIdentity,
+        close_empty_held_windows_jobs,
+        identity_matches,
+        terminate,
+    )
+
+    setup_script = tmp_path / "setup_service.py"
+    setup_script.write_text(
+        "\n".join(
+            [
+                "import json, subprocess, sys, time",
+                "from spec_runtime.process_supervisor import inspect_process",
+                "child = subprocess.Popen(",
+                "    [sys.executable, '-c', 'import time; time.sleep(60)'],",
+                "    stdin=subprocess.DEVNULL,",
+                "    stdout=subprocess.DEVNULL,",
+                "    stderr=subprocess.DEVNULL,",
+                ")",
+                "identity = None",
+                "deadline = time.monotonic() + 10",
+                "while identity is None and time.monotonic() < deadline:",
+                "    identity = inspect_process(child.pid)",
+                "    time.sleep(0.01)",
+                "assert identity is not None",
+                "print(json.dumps({'managed_processes': [{",
+                "    'name': 'setup-service',",
+                "    'kind': 'server',",
+                "    'pid': identity.pid,",
+                "    'started_at': identity.started_at,",
+                "    'command': identity.command,",
+                "    'termination_scope': 'pid',",
+                "}]}), flush=True)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    command = f'"{Path(sys.executable).as_posix()}" "{setup_script.as_posix()}"'
+    config = replace(
+        orch.SPEC_RUNTIME_CONFIG,
+        implement=replace(
+            orch.SPEC_RUNTIME_CONFIG.implement,
+            setup_command=command,
+        ),
+    )
+    run = orch.RunState(
+        run_id="windows-setup-handoff-run",
+        spec_id="windows-setup-handoff",
+        branch="code/windows-setup-handoff--probe",
+        agent="codex",
+    )
+    manifest = None
+    try:
+        with patch.object(orch, "SPEC_RUNTIME_CONFIG", config):
+            manifest = orch._run_implement_setup_command(run, tmp_path)
+
+        assert manifest.failure is None
+        assert manifest.ownership_token is not None
+        assert len(manifest.managed_processes) == 1
+        service = manifest.managed_processes[0]
+        service_identity = ProcessIdentity(
+            service.pid,
+            service.started_at,
+            command=service.command,
+        )
+        assert identity_matches(service_identity)
+
+        orch._register_setup_manifest_processes(tmp_path, tmp_path, manifest)
+        state_root = orch._worktree_registry_state_root(tmp_path, tmp_path)
+        entries = worktree_process_registry.load_registered_processes(
+            state_root,
+            tmp_path,
+        )
+        assert len(entries) == 1
+        assert entries[0].supervision_token is not None
+
+        report = worktree_process_registry.reap_registered_processes(
+            state_root,
+            tmp_path,
+            timeout_seconds=0.1,
+        )
+        assert report.terminated
+        _wait_for_identity_exit(service_identity)
+    finally:
+        if manifest is not None and manifest.ownership_token is not None:
+            terminate(manifest.ownership_token, grace_seconds=0)
+        close_empty_held_windows_jobs()
 
 
 def test_spec_stop_terminates_owned_tree_without_touching_unrelated_process(tmp_path: Path) -> None:

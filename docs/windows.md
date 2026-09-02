@@ -153,6 +153,13 @@ The native process supervisor uses durable, authenticated control identity and
 Windows Job Objects. Never terminate a raw PID copied from state. Preserve logs
 and the run workspace until unpublished changes have been inspected.
 
+Repository setup hooks may launch a background service and declare it in the
+[implement setup manifest](setup-manifest.md). Spec Butler keeps the setup Job
+alive after the setup command exits, authenticates each declared service by its
+creation identity and kernel Job membership, and reaps the complete Job during
+teardown. A service that deliberately breaks away from the setup Job is not a
+supported handoff and will not receive raw-PID cleanup authority.
+
 ### Background web service or chat does not start
 
 Install the `web` extra, run `spec web status`, and inspect `.spec-state\web`.

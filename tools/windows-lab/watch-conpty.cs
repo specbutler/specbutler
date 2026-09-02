@@ -19,8 +19,8 @@ public static class WatchConptyProof
     private const uint CREATE_SUSPENDED = 0x00000004;
     private const uint PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016;
     private const int STARTF_USESTDHANDLES = 0x00000100;
-    private const uint TH32CS_SNAPPROCESS = 0x00000002;
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    private const int JobObjectBasicProcessIdList = 3;
     private const int JobObjectExtendedLimitInformation = 9;
     private const uint WAIT_OBJECT_0 = 0;
     private const uint WAIT_TIMEOUT = 258;
@@ -78,23 +78,6 @@ public static class WatchConptyProof
         public int nLength;
         public IntPtr lpSecurityDescriptor;
         public int bInheritHandle;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct PROCESSENTRY32
-    {
-        public uint dwSize;
-        public uint cntUsage;
-        public uint th32ProcessID;
-        public IntPtr th32DefaultHeapID;
-        public uint th32ModuleID;
-        public uint cntThreads;
-        public uint th32ParentProcessID;
-        public int pcPriClassBase;
-        public uint dwFlags;
-
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
-        public string szExeFile;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -233,13 +216,13 @@ public static class WatchConptyProof
     private static extern bool TerminateJobObject(IntPtr hJob, uint uExitCode);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
-
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
-
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+    private static extern bool QueryInformationJobObject(
+        IntPtr hJob,
+        int jobObjectInfoClass,
+        IntPtr lpJobObjectInfo,
+        uint cbJobObjectInfoLength,
+        out uint lpReturnLength
+    );
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool ProcessIdToSessionId(uint dwProcessId, out uint pSessionId);
@@ -250,6 +233,7 @@ public static class WatchConptyProof
         new Dictionary<string, ProcessIdentity>(StringComparer.Ordinal);
 
     private static int RootPid;
+    private static IntPtr OwnershipJob;
     private static bool ProviderObserved;
     private static ProcessIdentity ProviderIdentity;
 
@@ -369,76 +353,17 @@ public static class WatchConptyProof
         }
     }
 
-    private static List<PROCESSENTRY32> ProcessSnapshot()
-    {
-        IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot == new IntPtr(-1))
-        {
-            throw new System.ComponentModel.Win32Exception(
-                Marshal.GetLastWin32Error(), "CreateToolhelp32Snapshot"
-            );
-        }
-        try
-        {
-            List<PROCESSENTRY32> entries = new List<PROCESSENTRY32>();
-            PROCESSENTRY32 entry = new PROCESSENTRY32();
-            entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
-            if (!Process32First(snapshot, ref entry))
-            {
-                throw new System.ComponentModel.Win32Exception(
-                    Marshal.GetLastWin32Error(), "Process32First"
-                );
-            }
-            do
-            {
-                entries.Add(entry);
-                entry = new PROCESSENTRY32();
-                entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
-            }
-            while (Process32Next(snapshot, ref entry));
-            return entries;
-        }
-        finally
-        {
-            CloseHandle(snapshot);
-        }
-    }
-
-    private static bool IsDescendant(
-        uint pid,
-        Dictionary<uint, uint> parents,
-        uint rootPid
-    )
-    {
-        HashSet<uint> visited = new HashSet<uint>();
-        uint current = pid;
-        while (parents.ContainsKey(current) && visited.Add(current))
-        {
-            uint parent = parents[current];
-            if (parent == rootPid)
-            {
-                return true;
-            }
-            if (parent == 0 || parent == current)
-            {
-                return false;
-            }
-            current = parent;
-        }
-        return false;
-    }
-
-    private static ProcessIdentity IdentityFor(PROCESSENTRY32 entry)
+    private static ProcessIdentity IdentityForPid(uint pid)
     {
         try
         {
-            using (Process process = Process.GetProcessById((int)entry.th32ProcessID))
+            using (Process process = Process.GetProcessById((int)pid))
             {
                 return new ProcessIdentity
                 {
-                    Pid = (int)entry.th32ProcessID,
+                    Pid = (int)pid,
                     StartTimeUtcTicks = process.StartTime.ToUniversalTime().Ticks,
-                    Name = entry.szExeFile ?? ""
+                    Name = process.ProcessName + ".exe"
                 };
             }
         }
@@ -456,26 +381,80 @@ public static class WatchConptyProof
         }
     }
 
+    private static List<uint> ActiveJobProcessIds(IntPtr job)
+    {
+        int capacity = 16;
+        while (true)
+        {
+            int size = 8 + (capacity * IntPtr.Size);
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                for (int index = 0; index < size; index++)
+                {
+                    Marshal.WriteByte(buffer, index, 0);
+                }
+                uint returned;
+                bool ok = QueryInformationJobObject(
+                    job,
+                    JobObjectBasicProcessIdList,
+                    buffer,
+                    (uint)size,
+                    out returned
+                );
+                uint assigned = (uint)Marshal.ReadInt32(buffer, 0);
+                uint included = (uint)Marshal.ReadInt32(buffer, 4);
+                if (ok && included >= assigned)
+                {
+                    List<uint> pids = new List<uint>();
+                    for (int index = 0; index < (int)included; index++)
+                    {
+                        long value = IntPtr.Size == 8
+                            ? Marshal.ReadInt64(buffer, 8 + (index * IntPtr.Size))
+                            : Marshal.ReadInt32(buffer, 8 + (index * IntPtr.Size));
+                        pids.Add((uint)value);
+                    }
+                    return pids;
+                }
+                if (assigned > (uint)capacity)
+                {
+                    capacity = (int)assigned;
+                    continue;
+                }
+                if (!ok)
+                {
+                    throw new System.ComponentModel.Win32Exception(
+                        Marshal.GetLastWin32Error(),
+                        "QueryInformationJobObject(JobObjectBasicProcessIdList)"
+                    );
+                }
+                capacity *= 2;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+    }
+
     private static void TrackDescendants()
     {
-        if (RootPid <= 0)
+        if (RootPid <= 0 || OwnershipJob == IntPtr.Zero)
         {
             return;
         }
-        List<PROCESSENTRY32> entries = ProcessSnapshot();
-        Dictionary<uint, uint> parents = new Dictionary<uint, uint>();
-        foreach (PROCESSENTRY32 entry in entries)
+        // Parent-PID lineage becomes ambiguous as soon as the watch root exits:
+        // Windows can reuse that PID while we audit graceful shutdown, making
+        // an unrelated desktop tree look owned. The Job membership list is the
+        // kernel capability established before resume and remains exact even
+        // after the root has exited.
+        foreach (uint pid in ActiveJobProcessIds(OwnershipJob))
         {
-            parents[entry.th32ProcessID] = entry.th32ParentProcessID;
-        }
-        foreach (PROCESSENTRY32 entry in entries)
-        {
-            if (entry.th32ProcessID == (uint)RootPid
-                || !IsDescendant(entry.th32ProcessID, parents, (uint)RootPid))
+            if (pid == (uint)RootPid)
             {
                 continue;
             }
-            ProcessIdentity identity = IdentityFor(entry);
+            ProcessIdentity identity = IdentityForPid(pid);
             if (identity == null)
             {
                 continue;
@@ -620,6 +599,23 @@ public static class WatchConptyProof
         return remaining;
     }
 
+    private static List<uint> WaitForJobEmpty(IntPtr job, int timeoutSeconds)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(timeoutSeconds);
+        List<uint> active;
+        do
+        {
+            active = ActiveJobProcessIds(job);
+            if (active.Count == 0)
+            {
+                return active;
+            }
+            Thread.Sleep(100);
+        }
+        while (DateTime.UtcNow < deadline);
+        return active;
+    }
+
     private static string DescribeAlive(IEnumerable<ProcessIdentity> identities)
     {
         List<string> values = new List<string>();
@@ -663,6 +659,7 @@ public static class WatchConptyProof
         if (job != IntPtr.Zero)
         {
             TerminateJobObject(job, 1);
+            OwnershipJob = IntPtr.Zero;
             CloseHandle(job);
             job = IntPtr.Zero;
         }
@@ -1011,6 +1008,7 @@ public static class WatchConptyProof
                 AssignProcessToJobObject(job, processInformation.hProcess),
                 "AssignProcessToJobObject"
             );
+            OwnershipJob = job;
             jobAssignedBeforeResume = true;
             uint resumeResult = ResumeThread(processInformation.hThread);
             RequireWin32(resumeResult != INVALID_RESUME_RESULT, "ResumeThread(spec watch)");
@@ -1124,12 +1122,21 @@ public static class WatchConptyProof
             TrackDescendants();
             int remaining = WaitForObservedExit(15, true);
             int providerRemaining = CountAliveProviders();
+            List<uint> jobRemaining = WaitForJobEmpty(job, 15);
             Require(
                 remaining == 0,
                 remaining + " owned descendant process(es) survived graceful q cleanup: "
                     + DescribeAlive(Observed.Values)
             );
             Require(providerRemaining == 0, "Codex provider process survived q");
+            Require(
+                jobRemaining.Count == 0,
+                jobRemaining.Count
+                    + " kernel-authenticated Job member(s) survived graceful q cleanup: "
+                    + string.Join(", ", jobRemaining.ConvertAll(delegate(uint pid) {
+                        return pid.ToString();
+                    }).ToArray())
+            );
 
             // The exact tree is already empty. Terminal teardown may now close
             // its input and ConPTY before draining the reader; only then is the
@@ -1148,6 +1155,7 @@ public static class WatchConptyProof
 
             // All exact descendants are already gone. Releasing the now-empty
             // Job cannot conceal a leak and is not emergency cleanup.
+            OwnershipJob = IntPtr.Zero;
             RequireWin32(CloseHandle(job), "CloseHandle(empty watch Job)");
             job = IntPtr.Zero;
 

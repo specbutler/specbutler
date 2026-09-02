@@ -194,6 +194,35 @@ def test_identity_matches_rejects_darwin_framework_transition_across_roots(
     assert not identity_matches(expected)
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX durable token membership")
+def test_posix_token_membership_accepts_darwin_framework_exec_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    framework = tmp_path / "Python.framework" / "Versions" / "3.12"
+    stub = framework / "bin" / "python3.12"
+    app = framework / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    stub.parent.mkdir(parents=True)
+    app.parent.mkdir(parents=True)
+    stub.write_text("stub", encoding="utf-8")
+    app.write_text("app", encoding="utf-8")
+    recorded = ProcessIdentity(42, "created", str(stub), f"{stub} worker.py")
+    live = ProcessIdentity(42, "created", str(app), f"{app} worker.py")
+    token = SupervisionToken(
+        LifetimeMode.ADOPTABLE,
+        recorded,
+        7,
+        "owner",
+        "darwin-framework-transition",
+        pgid=42,
+        payload_identity=recorded,
+    )
+    monkeypatch.setattr(process_supervisor.sys, "platform", "darwin")
+    monkeypatch.setattr(process_supervisor, "inspect_process", lambda _pid: live)
+
+    assert process_supervisor.supervision_token_contains_process(token, live)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX launch invariant")
 def test_posix_spawn_records_session_group_without_post_launch_getpgid(
     monkeypatch: pytest.MonkeyPatch,
@@ -1252,6 +1281,45 @@ def test_managed_process_keeps_live_job_registered_when_close_handle_fails(
     assert managed._job is job
 
 
+def test_bind_held_windows_job_payload_requires_kernel_membership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    leader = ProcessIdentity(41, "leader-created")
+    candidate = ProcessIdentity(42, "service-created", command="service")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        leader,
+        7,
+        "owner",
+        "setup-handoff",
+        pgid=41,
+    )
+
+    class Job:
+        def contains(self, identity: ProcessIdentity) -> bool:
+            return identity == candidate
+
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setitem(
+        process_supervisor._LIVE_WINDOWS_JOBS,
+        (leader.pid, leader.started_at),
+        Job(),
+    )
+
+    bound = process_supervisor.bind_held_windows_job_payload(token, candidate)
+
+    assert bound is not None
+    assert bound.identity == leader
+    assert bound.payload == candidate
+    assert (
+        process_supervisor.bind_held_windows_job_payload(
+            token,
+            ProcessIdentity(99, "other"),
+        )
+        is None
+    )
+
+
 def test_managed_process_wait_closes_job_after_leader_exit() -> None:
     events: list[str] = []
     identity = ProcessIdentity(42, "created")
@@ -1270,6 +1338,52 @@ def test_managed_process_wait_closes_job_after_leader_exit() -> None:
     assert managed.wait(timeout=2.0) == 23
     assert events == ["wait:2.0", "close"]
     assert managed._job is None
+
+
+def test_managed_process_starts_only_one_pipe_closer_across_timeout_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = ProcessIdentity(42, "created")
+    token = SupervisionToken(LifetimeMode.RUN_OWNED, identity, 7, "owner", "one-closer")
+    started: list[object] = []
+
+    class Thread:
+        def __init__(self, *, target: object, daemon: bool) -> None:
+            assert daemon is True
+            self.target = target
+
+        def start(self) -> None:
+            started.append(self.target)
+
+    monkeypatch.setattr(process_supervisor.threading, "Thread", Thread)
+    managed = process_supervisor.ManagedProcess(object(), token, object())  # type: ignore[arg-type]
+
+    managed._start_pipe_closer_once()
+    managed._start_pipe_closer_once()
+    managed._start_pipe_closer_once()
+
+    assert started == [managed._close_job_after_leader]
+
+
+def test_managed_async_process_starts_only_one_pipe_closer_across_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity = ProcessIdentity(42, "created")
+    token = SupervisionToken(LifetimeMode.RUN_OWNED, identity, 7, "owner", "one-async-closer")
+    started: list[object] = []
+
+    monkeypatch.setattr(
+        process_supervisor.asyncio,
+        "create_task",
+        lambda coroutine: started.append(coroutine) or MagicMock(),
+    )
+    managed = process_supervisor.ManagedAsyncProcess(object(), token, object())  # type: ignore[arg-type]
+
+    managed._start_pipe_closer_once()
+    managed._start_pipe_closer_once()
+
+    assert len(started) == 1
+    started[0].close()  # type: ignore[union-attr]
 
 
 def test_managed_process_communicate_preserves_baseexception_when_cleanup_fails() -> None:
@@ -2254,6 +2368,115 @@ def test_windows_sync_launch_baseexception_closes_unassigned_job(
         ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn([sys.executable, "-c", "pass"])
 
     assert events == ["open", "terminate", "close"]
+
+
+def test_windows_sync_spawn_captures_identity_before_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class Process:
+        pid = 4242
+        _handle = 17
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    class Job:
+        def __init__(self, _name: str) -> None:
+            events.append("open")
+
+        def assign(self, handle: int) -> None:
+            events.append(("assign", handle))
+
+        def active_identities(self) -> list[ProcessIdentity]:
+            return []
+
+        def close(self) -> None:
+            events.append("close")
+
+    def inspect(pid: int) -> ProcessIdentity:
+        events.append(("inspect", pid))
+        return ProcessIdentity(pid, f"created-{pid}")
+
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setattr(process_supervisor, "_ensure_control_state_reconciled", lambda: None)
+    monkeypatch.setattr(process_supervisor, "_WindowsJob", Job)
+    monkeypatch.setattr(process_supervisor, "_REAL_POPEN_TYPE", Process)
+    monkeypatch.setattr(process_supervisor.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    monkeypatch.setattr(process_supervisor, "inspect_process", inspect)
+    monkeypatch.setattr(
+        process_supervisor,
+        "_resume_windows_process",
+        lambda handle: events.append(("resume", handle)),
+    )
+
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(["fast-command"])
+    try:
+        assert events.index(("inspect", 4242)) < events.index(("resume", 17))
+    finally:
+        managed.close()
+
+
+def test_windows_async_spawn_captures_identity_before_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[object] = []
+
+    class TransportProcess:
+        _handle = 23
+
+    class Transport:
+        def get_extra_info(self, name: str) -> TransportProcess:
+            assert name == "subprocess"
+            return TransportProcess()
+
+    class Process:
+        pid = 4343
+        _transport = Transport()
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    class Job:
+        def __init__(self, _name: str) -> None:
+            events.append("open")
+
+        def assign(self, handle: int) -> None:
+            events.append(("assign", handle))
+
+        def close(self) -> None:
+            events.append("close")
+
+    def inspect(pid: int) -> ProcessIdentity:
+        events.append(("inspect", pid))
+        return ProcessIdentity(pid, f"created-{pid}")
+
+    async def create(*_args: object, **_kwargs: object) -> Process:
+        return Process()
+
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setattr(process_supervisor, "_ensure_control_state_reconciled", lambda: None)
+    monkeypatch.setattr(process_supervisor, "_WindowsJob", Job)
+    monkeypatch.setattr(process_supervisor.asyncio.subprocess, "Process", Process)
+    monkeypatch.setattr(process_supervisor.asyncio, "create_subprocess_exec", create)
+    monkeypatch.setattr(process_supervisor, "inspect_process", inspect)
+    monkeypatch.setattr(
+        process_supervisor,
+        "_resume_windows_process",
+        lambda handle: events.append(("resume", handle)),
+    )
+
+    async def exercise() -> None:
+        managed = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+            ["fast-command"]
+        )
+        try:
+            assert events.index(("inspect", 4343)) < events.index(("resume", 23))
+        finally:
+            managed.close()
+
+    asyncio.run(exercise())
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows BaseException cleanup integration")

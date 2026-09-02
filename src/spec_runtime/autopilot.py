@@ -1680,6 +1680,7 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
         process_alive = is_pid_alive(pid, process_started_at)
         live_identity = read_process_identity(pid) if process_alive else None
         live_started_at = live_identity.started_at if live_identity is not None else ""
+        parsed_token: SupervisionToken | None = None
         if supervision_token:
             try:
                 parsed_token = SupervisionToken.from_dict(supervision_token)
@@ -1694,7 +1695,12 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
                 ):
                     continue
                 if _requires_authenticated_process_adoption():
-                    supervision_token = adopt(parsed_token).to_dict()
+                    # Parsing proves that this record names a plausible durable
+                    # boundary; the one-way ownership claim is intentionally
+                    # deferred until the PID and lease decision below accepts
+                    # the run. A stale or conflicting lease must not make the
+                    # current dispatcher the Job's logical owner.
+                    pass
                 elif os.name == "posix":
                     # POSIX ADOPTABLE children are session leaders, not
                     # durable-helper payloads, so there is intentionally no
@@ -1720,6 +1726,7 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
             )
             continue
 
+        adoption_suffix = ""
         if not run_id:
             # Newly dispatched spec: the child `spec implement` has not yet
             # created a run record (and therefore no lease) but the process
@@ -1729,50 +1736,35 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
             if not process_alive:
                 print(format_status_line("stale", f"{spec_id} pid={pid} no longer alive"))
                 continue
-            adopted[spec_id] = ActiveRunProcess(
-                spec_id=spec_id,
-                agent=str(item.get("agent", "")),
-                pid=pid,
-                started_at=str(item.get("started_at", "")),
-                started_monotonic=0.0,
-                log_path=str(item.get("log_path", "")),
-                run_id="",
-                phase=str(item.get("phase", "unknown")),
-                process_started_at=process_started_at,
-                supervision_token=supervision_token,
-                launch_state="ready",
-                supervision_id=str(item.get("supervision_id", "")),
-                ready_path=ready_path,
-                adoption_generation=int(item.get("adoption_generation", 0) or 0) + 1,
-                adopted_by={"pid": os.getpid()},
+            adoption_suffix = " (pre-lease)"
+        else:
+            lease = load_run_lease(state_runs_dir, run_id)
+            outcome = evaluate_process_adoption(
+                expected_run_id=run_id,
+                expected_spec_id=spec_id,
+                lease=lease,
+                recorded_pid=pid,
+                recorded_process_started_at=process_started_at,
+                process_alive=process_alive,
+                live_process_started_at=live_started_at,
             )
-            print(
-                format_status_line(
-                    "adopt",
-                    f"{spec_id} pid={pid} phase={adopted[spec_id].phase} (pre-lease)",
+            if not outcome.should_wait:
+                reason = outcome.reason or outcome.decision.value
+                print(
+                    format_status_line(
+                        "stale",
+                        f"{spec_id} pid={pid} not adopted ({outcome.decision.value}): {reason}",
+                    )
                 )
-            )
-            continue
+                continue
 
-        lease = load_run_lease(state_runs_dir, run_id)
-        outcome = evaluate_process_adoption(
-            expected_run_id=run_id,
-            expected_spec_id=spec_id,
-            lease=lease,
-            recorded_pid=pid,
-            recorded_process_started_at=process_started_at,
-            process_alive=process_alive,
-            live_process_started_at=live_started_at,
-        )
-        if not outcome.should_wait:
-            reason = outcome.reason or outcome.decision.value
-            print(
-                format_status_line(
-                    "stale",
-                    f"{spec_id} pid={pid} not adopted ({outcome.decision.value}): {reason}",
-                )
-            )
-            continue
+        if _requires_authenticated_process_adoption():
+            if parsed_token is None:
+                continue
+            try:
+                supervision_token = adopt(parsed_token).to_dict()
+            except (KeyError, TypeError, ValueError, ProcessLookupError):
+                continue
         adopted[spec_id] = ActiveRunProcess(
             spec_id=spec_id,
             agent=str(item.get("agent", "")),
@@ -1790,7 +1782,12 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
             adoption_generation=int(item.get("adoption_generation", 0) or 0) + 1,
             adopted_by={"pid": os.getpid()},
         )
-        print(format_status_line("adopt", f"{spec_id} pid={pid} phase={adopted[spec_id].phase}"))
+        print(
+            format_status_line(
+                "adopt",
+                f"{spec_id} pid={pid} phase={adopted[spec_id].phase}{adoption_suffix}",
+            )
+        )
     return adopted
 
 

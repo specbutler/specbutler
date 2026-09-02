@@ -91,10 +91,23 @@ def _operator_codex_home(environ: Mapping[str, str]) -> Path:
     return Path(configured).expanduser().resolve() if configured else (Path.home() / ".codex").resolve()
 
 
-def _resolve_executable(executable: str, *, path: str) -> Path | None:
+def _resolve_executable(
+    executable: str,
+    *,
+    path: str,
+    cwd: Path,
+) -> Path | None:
     candidate = Path(executable)
     if candidate.is_absolute():
         return candidate.resolve() if candidate.exists() else None
+    if candidate.parent != Path("."):
+        # A path-bearing command is interpreted relative to the command's
+        # working directory, not the coordinator's ambient cwd. Review
+        # bootstrap normally runs from an isolated checkout, so resolving
+        # ``./scripts/bootstrap`` anywhere else produces a false unavailable
+        # result (or could select an unrelated executable).
+        relative = cwd / candidate
+        return relative.resolve() if relative.exists() else None
     resolved = shutil.which(executable, path=path)
     return Path(resolved).resolve() if resolved else None
 
@@ -392,7 +405,15 @@ def isolated_review_bootstrap_sandbox(
         )
 
     codex_launcher = Path(resolved_codex)
-    command_executable = _resolve_executable(str(command_argv[0]), path=path) if command_argv else None
+    command_executable = (
+        _resolve_executable(
+            str(command_argv[0]),
+            path=path,
+            cwd=review_worktree,
+        )
+        if command_argv
+        else None
+    )
     if command_executable is None:
         raise ReviewBootstrapSandboxUnavailable(
             f"bootstrap executable is unavailable: {command_argv[0] if command_argv else '(empty command)'}"

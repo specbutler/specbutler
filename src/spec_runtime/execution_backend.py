@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import locale
 import os
 import platform
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -40,7 +42,12 @@ from .config import (
 )
 from .git_common import run_git, subprocess_text_kwargs
 from .platform_fs import FileLock, remove_tree
-from .process_supervisor import LifetimeMode, ManagedProcess, ProcessSupervisor
+from .process_supervisor import (
+    LifetimeMode,
+    ManagedProcess,
+    ProcessSupervisor,
+    SupervisionToken,
+)
 from .process_supervisor import run as run_supervised
 
 CONTAINER_WORKER_ENV_DENYLIST = frozenset(
@@ -355,6 +362,10 @@ class CommandRequest:
       default-True behavior).
     * ``stdin_devnull`` ensures commands cannot accidentally inherit the
       orchestrator's stdin when no ``input_text`` is provided.
+    * ``preserve_descendants`` is reserved for setup hooks that intentionally
+      hand declared background services to the orchestrator. It waits for the
+      command leader without waiting on inherited output handles and returns a
+      live Windows Job ownership token when descendants remain.
     """
 
     argv: list[str]
@@ -365,6 +376,7 @@ class CommandRequest:
     input_text: str | None = None
     stdin_devnull: bool = True
     redactions: Sequence[str] = ()
+    preserve_descendants: bool = False
 
 
 @dataclass(frozen=True)
@@ -375,6 +387,11 @@ class CommandResult:
     stdout: str
     stderr: str
     argv: list[str]
+    ownership_token: SupervisionToken | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -691,6 +708,101 @@ def _read_outbox_metadata(outbox_path: Path) -> OutboxMetadata | None:
     )
 
 
+def run_local_command_preserving_descendants(
+    request: CommandRequest,
+    *,
+    env: dict[str, str] | None,
+) -> CommandResult:
+    """Run a setup leader while retaining descendants for an agent handoff.
+
+    Pipes are deliberately not used: a background service can inherit them and
+    keep ``communicate()`` waiting forever. Temporary files let us wait for only
+    the setup leader. On Windows the retained Job handle remains the cleanup
+    capability for descendants; on POSIX their dedicated session/process group
+    is later registered from the setup manifest.
+    """
+    if request.input_text is not None:
+        raise ValueError("descendant-preserving commands do not accept input_text")
+
+    encoding = str(
+        subprocess_text_kwargs(request.argv).get("encoding")
+        or locale.getpreferredencoding(False)
+    )
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_file,
+        tempfile.TemporaryFile(mode="w+b") as stderr_file,
+    ):
+        managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+            request.argv,
+            cwd=request.cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        try:
+            returncode = int(managed.process.wait(timeout=request.timeout))
+        except subprocess.TimeoutExpired as exc:
+            try:
+                managed.kill()
+                managed.process.wait(timeout=5.0)
+            finally:
+                managed.close()
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read().decode(encoding, errors="replace")
+            stderr = stderr_file.read().decode(encoding, errors="replace")
+            exc.output = stdout
+            exc.stdout = stdout
+            exc.stderr = stderr
+            raise
+        except BaseException:
+            try:
+                managed.kill()
+            except BaseException:
+                pass
+            try:
+                managed.close()
+            except BaseException:
+                pass
+            raise
+
+        try:
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read().decode(encoding, errors="replace")
+            stderr = stderr_file.read().decode(encoding, errors="replace")
+            ownership_token: SupervisionToken | None = None
+            if os.name == "nt" and managed.owned_tree_active():
+                # The Job is already retained in process_supervisor's live Job
+                # registry. Do not close it until manifest registration gives
+                # the orchestrator an identity-checked teardown path.
+                ownership_token = managed.token
+            else:
+                managed.close()
+        except BaseException:
+            # Once the setup leader has exited, a Job inventory or output-read
+            # failure must still close the kill-on-close ownership boundary.
+            # Otherwise a retained setup service could become an undiscoverable
+            # side effect of a command whose manifest was never consumed.
+            try:
+                managed.kill()
+            except BaseException:
+                pass
+            try:
+                managed.close()
+            except BaseException:
+                pass
+            raise
+        return CommandResult(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            argv=list(request.argv),
+            ownership_token=ownership_token,
+        )
+
+
 class WorktreeExecutionBackend:
     """Backend that wraps the existing linked-worktree behavior."""
 
@@ -749,12 +861,15 @@ class WorktreeExecutionBackend:
             kwargs["inherit_env"] = False
         if request.input_text is not None:
             kwargs["input_text"] = request.input_text
+        if request.preserve_descendants:
+            kwargs["preserve_descendants"] = True
         completed = orchestrator.run_subprocess(list(request.argv), **kwargs)
         return CommandResult(
             returncode=completed.returncode,
             stdout=completed.stdout or "",
             stderr=completed.stderr or "",
             argv=list(request.argv),
+            ownership_token=getattr(completed, "ownership_token", None),
         )
 
     def launch_agent(
@@ -896,6 +1011,8 @@ class CloneExecutionBackend:
                 env.update(request.env)
         elif request.env is not None:
             env = dict(request.env)
+        if request.preserve_descendants:
+            return run_local_command_preserving_descendants(request, env=env)
         stdin = subprocess.DEVNULL if request.stdin_devnull and request.input_text is None else None
         completed = run_supervised(
             request.argv,

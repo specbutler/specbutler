@@ -9647,6 +9647,61 @@ class TestSpecAutopilot:
         assert autopilot.adopt_active_processes(repo) == {}
         assert "no authenticated supervision token" in capsys.readouterr().out
 
+    def test_adopt_active_processes_validates_lease_before_windows_job_claim(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        payload_identity = ProcessIdentity(9292, "payload-created", command="spec")
+        token = SupervisionToken(
+            LifetimeMode.ADOPTABLE,
+            ProcessIdentity(8181, "keeper-created", command="helper"),
+            7,
+            "owner-created",
+            "deferred-windows-claim",
+            payload_identity=payload_identity,
+        )
+        active_path = autopilot.autopilot_active_path(repo)
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps(
+                {
+                    "missing-lease": {
+                        "pid": payload_identity.pid,
+                        "agent": "codex",
+                        "started_at": "2026-09-01T00:00:00+00:00",
+                        "phase": "implement",
+                        "run_id": "missing-lease-run",
+                        "log_path": "/tmp/missing-lease.log",
+                        "process_started_at": payload_identity.started_at,
+                        "supervision_token": token.to_dict(),
+                        "supervision_id": token.token,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        claim = MagicMock(side_effect=AssertionError("stale lease must not claim Job"))
+        monkeypatch.setattr(
+            autopilot,
+            "_requires_authenticated_process_adoption",
+            lambda: True,
+        )
+        monkeypatch.setattr(autopilot, "adopt", claim)
+        monkeypatch.setattr(autopilot, "is_pid_alive", lambda *_args: True)
+        monkeypatch.setattr(
+            autopilot,
+            "read_process_identity",
+            lambda pid: orch.ProcessIdentity(
+                pid=pid,
+                started_at=payload_identity.started_at,
+                command="spec",
+            ),
+        )
+
+        assert autopilot.adopt_active_processes(repo) == {}
+        claim.assert_not_called()
+
     def test_adopt_active_processes_drops_dead_entries(
         self,
         repo: Path,
@@ -12381,8 +12436,18 @@ class TestImplementSetupTeardownHelpers:
         )
         seen: dict[str, object] = {}
 
-        def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None, *, inherit_env=True, input_text=None):
+        def fake_run_subprocess(
+            cmd,
+            cwd=None,
+            env=None,
+            timeout=None,
+            *,
+            inherit_env=True,
+            input_text=None,
+            preserve_descendants=False,
+        ):
             del timeout, inherit_env, input_text
+            assert preserve_descendants is True
             seen["cmd"] = cmd
             seen["cwd"] = cwd
             seen["env"] = env
@@ -14847,6 +14912,65 @@ class TestImplementSetupTeardownHelpers:
                 (".spec-claude-home", ".claude/mcp-servers.json"),
             )
         ]
+
+    def test_prepare_registers_setup_services_before_sandbox_failure(
+        self,
+        repo: Path,
+    ):
+        run = self._run()
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="dev-server",
+                    kind="server",
+                    pid=4321,
+                    started_at="created",
+                ),
+            ),
+        )
+        backend = SimpleNamespace(
+            identity=eb.BackendIdentity(
+                backend="worktree",
+                safety_mode="provider-sandbox",
+                workspace_root=".worktrees",
+            )
+        )
+        events: list[str] = []
+        ctx = orch.ImplementContext(
+            implement_reason="initial",
+            run_id=run.run_id,
+            attempt_number=1,
+            spec_path="specs/my-feature.md",
+            spec_revision="sha256:deadbeef",
+        )
+
+        def register(*_args: object, **_kwargs: object) -> None:
+            events.append("register")
+
+        def fail_sandbox(*_args: object, **_kwargs: object) -> None:
+            events.append("sandbox")
+            raise RuntimeError("sandbox preparation failed")
+
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+            patch.object(orch, "_require_agent_available_for_backend"),
+            patch.object(orch, "_run_implement_setup_command", return_value=manifest),
+            patch.object(orch, "_register_setup_manifest_processes", side_effect=register),
+            patch.object(orch, "_write_sandbox_config", side_effect=fail_sandbox),
+            pytest.raises(RuntimeError, match="sandbox preparation failed"),
+        ):
+            orch._prepare_implement_launch_plan(
+                run,
+                repo,
+                worktree,
+                ctx,
+                reason="initial",
+                use_stream_json=False,
+            )
+
+        assert events == ["register", "sandbox"]
 
 
 # ---------------------------------------------------------------------------
