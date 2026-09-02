@@ -1,0 +1,1225 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LAB_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+HARNESS_ROOT="$LAB_ROOT"
+REPO_ROOT="$(cd -- "$LAB_ROOT/../.." && pwd)"
+STATE_ROOT="${SPEC_WINDOWS_LAB_STATE_ROOT:-$LAB_ROOT/state}"
+CONFIG_FILE="${SPEC_WINDOWS_LAB_CONFIG:-$LAB_ROOT/lab.env}"
+TOOLCHAIN_FILE="${SPEC_WINDOWS_TOOLCHAIN_CONFIG:-$LAB_ROOT/toolchain.json}"
+IDENTITY_FILE="$STATE_ROOT/identity.env"
+CONTAINER_NAME=specbutler-windows-lab
+SSH_OPTIONS=()
+VM_STATE=
+VM_STATE_ERROR=
+
+die() {
+    printf '%s\n' "windows-lab: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+usage: labctl COMMAND [ARGS]
+
+  init                         validate inputs and create the Windows VM
+  up | down | shutdown | wait  control the VM and wait for SSH
+  provision                   install the pinned guest toolchain
+  snapshot NAME               create a cold qcow2 baseline
+  reset NAME                  replace the run overlay from a baseline
+  stage [REF]                 stage a tracked source revision in the guest
+  exec -- POWERSHELL          run a foreground guest command
+  job submit NAME FILE        submit an interactive-session PowerShell job
+  job wait NAME [SECONDS]     wait for a job completion record
+  job logs NAME               stream the current job log
+  collect NAME [DESTINATION]  retrieve and redact job/evidence artifacts
+  proof                       reset, stage, and run the real-provider proof
+  logs | status | ssh         inspect the VM
+EOF
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command is unavailable: $1"
+}
+
+require_free_space() {
+    local target="${1:-$LAB_ROOT}" available minimum=$((40 * 1024 * 1024 * 1024))
+    test -e "$target" || die "disk-space target does not exist: $target"
+    available="$(df --output=avail -B1 "$target" | awk 'NR == 2 { print $1 }')"
+    [[ "$available" =~ ^[0-9]+$ ]] || die "could not determine available lab disk space"
+    if (( available < minimum )); then
+        die "less than 40 GiB is free on the filesystem containing: $target"
+    fi
+}
+
+shutdown_timeout_seconds() {
+    load_config
+    local timeout="${LAB_SHUTDOWN_TIMEOUT_SECONDS:-600}"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "LAB_SHUTDOWN_TIMEOUT_SECONDS must be a positive integer"
+    printf '%s\n' "$timeout"
+}
+
+compose_down_timeout_seconds() {
+    load_config
+    local timeout="${LAB_COMPOSE_DOWN_TIMEOUT_SECONDS:-180}"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "LAB_COMPOSE_DOWN_TIMEOUT_SECONDS must be a positive integer"
+    printf '%s\n' "$timeout"
+}
+
+docker_query_timeout_seconds() {
+    load_config
+    local timeout="${LAB_DOCKER_QUERY_TIMEOUT_SECONDS:-30}"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "LAB_DOCKER_QUERY_TIMEOUT_SECONDS must be a positive integer"
+    printf '%s\n' "$timeout"
+}
+
+bounded_host_command() {
+    local timeout="$1"
+    shift
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "host command timeout must be a positive integer"
+    python3 "$HARNESS_ROOT/run_with_timeout.py" "$timeout" -- "$@"
+}
+
+load_config() {
+    test -f "$CONFIG_FILE" || die "copy lab.env.example to lab.env and fill every placeholder"
+    set -a
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    set +a
+    : "${WINDOWS_ISO:?WINDOWS_ISO is required in lab.env}"
+    : "${WINDOWS_ISO_SHA256:?WINDOWS_ISO_SHA256 is required in lab.env}"
+    : "${WINDOWS_IMAGE_INDEX:?WINDOWS_IMAGE_INDEX is required in lab.env}"
+    [[ "$WINDOWS_ISO" = /* ]] || die "WINDOWS_ISO must be an absolute path"
+    [[ "$WINDOWS_ISO_SHA256" =~ ^[[:xdigit:]]{64}$ ]] || die "WINDOWS_ISO_SHA256 must contain 64 hexadecimal characters"
+    [[ "$WINDOWS_IMAGE_INDEX" =~ ^[1-9][0-9]*$ ]] || die "WINDOWS_IMAGE_INDEX must be a positive integer"
+    [[ "$WINDOWS_ISO" != *'<'* && "$WINDOWS_ISO_SHA256" != *'<'* ]] || die "lab.env still contains placeholders"
+}
+
+load_identity() {
+    test -f "$IDENTITY_FILE" || die "lab is not initialized; run: $0 init"
+    set -a
+    # shellcheck disable=SC1090
+    source "$IDENTITY_FILE"
+    set +a
+}
+
+compose() {
+    load_config
+    load_identity
+    SPEC_WINDOWS_LAB_STATE_ROOT="$STATE_ROOT" \
+        docker compose \
+            --project-name windows-lab \
+            --project-directory "$HARNESS_ROOT" \
+            -f "$HARNESS_ROOT/compose.yaml" \
+            "$@"
+}
+
+bounded_compose_down() {
+    local container_grace="${1:-30}" host_timeout
+    [[ "$container_grace" =~ ^[1-9][0-9]*$ ]] || die "container shutdown grace must be a positive integer"
+    host_timeout="$(compose_down_timeout_seconds)"
+    load_config
+    load_identity
+    SPEC_WINDOWS_LAB_STATE_ROOT="$STATE_ROOT" \
+        bounded_host_command "$host_timeout" docker compose \
+            --project-name windows-lab \
+            --project-directory "$HARNESS_ROOT" \
+            -f "$HARNESS_ROOT/compose.yaml" \
+            down --timeout "$container_grace"
+}
+
+try_refresh_vm_state() {
+    local output state query_timeout query_status=0
+    VM_STATE_ERROR=
+    query_timeout="$(docker_query_timeout_seconds)"
+    output="$(
+        bounded_host_command "$query_timeout" docker ps -a \
+            --filter "name=^/${CONTAINER_NAME}$" \
+            --format '{{.Names}}|{{.State}}' \
+            2>/dev/null
+    )" || query_status=$?
+    if (( query_status != 0 )); then
+        if (( query_status == 124 )); then
+            VM_STATE_ERROR="Docker VM state query timed out after ${query_timeout}s"
+        else
+            VM_STATE_ERROR="could not query Docker for the Windows VM state"
+        fi
+        return 1
+    fi
+    if [ -z "$output" ]; then
+        VM_STATE=absent
+        return
+    fi
+    if [[ "$output" = *$'\n'* || "$output" != "$CONTAINER_NAME|"* ]]; then
+        VM_STATE_ERROR="Docker returned an ambiguous Windows VM state"
+        return 1
+    fi
+    state="${output#"$CONTAINER_NAME|"}"
+    case "$state" in
+        created|exited|dead|running|paused|restarting|removing)
+            VM_STATE="$state"
+            ;;
+        *)
+            VM_STATE_ERROR="Docker returned an unknown Windows VM state: ${state:-<empty>}"
+            return 1
+            ;;
+    esac
+}
+
+refresh_vm_state() {
+    try_refresh_vm_state || die "$VM_STATE_ERROR"
+}
+
+vm_running() {
+    refresh_vm_state
+    case "$VM_STATE" in
+        running|paused|restarting|removing) return 0 ;;
+        absent|created|exited|dead) return 1 ;;
+    esac
+    die "internal error: unclassified Windows VM state"
+}
+
+require_stopped() {
+    refresh_vm_state
+    case "$VM_STATE" in
+        absent|created|exited|dead) return ;;
+        running|paused|restarting|removing)
+            die "the VM must be stopped for this operation (state: $VM_STATE)"
+            ;;
+    esac
+    die "internal error: unclassified Windows VM state"
+}
+
+prepare_ssh_options() {
+    load_config
+    load_identity
+    SSH_OPTIONS=(
+        -o BatchMode=yes
+        -o ConnectTimeout=10
+        -o "UserKnownHostsFile=$STATE_ROOT/ssh/known_hosts"
+        -i "$STATE_ROOT/ssh/id_ed25519"
+        -p "${LAB_SSH_PORT:-12222}"
+    )
+}
+
+guest_ssh() {
+    prepare_ssh_options
+    # The caller intentionally supplies the PowerShell command evaluated by the guest.
+    # shellcheck disable=SC2029
+    ssh "${SSH_OPTIONS[@]}" specadmin@127.0.0.1 "$@"
+}
+
+guest_command_timeout_seconds() {
+    load_config
+    local timeout="${LAB_GUEST_COMMAND_TIMEOUT_SECONDS:-30}"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "LAB_GUEST_COMMAND_TIMEOUT_SECONDS must be a positive integer"
+    printf '%s\n' "$timeout"
+}
+
+guest_ssh_timeout() {
+    local timeout="$1"
+    shift
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "SSH timeout must be a positive integer"
+    prepare_ssh_options
+    # The caller intentionally supplies the PowerShell command evaluated by the guest.
+    # shellcheck disable=SC2029
+    bounded_host_command "$timeout" \
+        ssh "${SSH_OPTIONS[@]}" specadmin@127.0.0.1 "$@"
+}
+
+guest_ssh_stdin() {
+    local input="$1"
+    shift
+    test -f "$input" || die "SSH input file does not exist: $input"
+    prepare_ssh_options
+    ssh "${SSH_OPTIONS[@]}" specadmin@127.0.0.1 "$@" < "$input"
+}
+
+guest_scp() {
+    load_config
+    load_identity
+    scp -q \
+        -P "${LAB_SSH_PORT:-12222}" \
+        -o "UserKnownHostsFile=$STATE_ROOT/ssh/known_hosts" \
+        -i "$STATE_ROOT/ssh/id_ed25519" \
+        "$@"
+}
+
+guest_scp_timeout() {
+    local timeout="$1"
+    shift
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "SCP timeout must be a positive integer"
+    load_config
+    load_identity
+    bounded_host_command "$timeout" scp -q \
+            -P "${LAB_SSH_PORT:-12222}" \
+            -o "UserKnownHostsFile=$STATE_ROOT/ssh/known_hosts" \
+            -i "$STATE_ROOT/ssh/id_ed25519" \
+            "$@"
+}
+
+validate_name() {
+    [[ "${1:-}" =~ ^[a-z0-9][a-z0-9-]{0,47}$ ]] || die "name must match [a-z0-9][a-z0-9-]{0,47}"
+}
+
+qemu_img() {
+    compose run --rm --no-deps windows qemu-img "$@"
+}
+
+render_unattend() {
+    local password public_key
+    password="$(<"$STATE_ROOT/secrets/admin-password")"
+    public_key="$(<"$STATE_ROOT/ssh/id_ed25519.pub")"
+    python3 - \
+        "$HARNESS_ROOT/Autounattend.xml.template" \
+        "$STATE_ROOT/unattend/Autounattend.xml" \
+        "$HARNESS_ROOT/bootstrap.ps1.template" \
+        "$STATE_ROOT/unattend/bootstrap.ps1" \
+        "$password" \
+        "$public_key" \
+        "$WINDOWS_IMAGE_INDEX" <<'PY'
+import sys
+from pathlib import Path
+
+xml_source, xml_dest, ps_source, ps_dest, password, public_key, image_index = sys.argv[1:]
+xml = Path(xml_source).read_text(encoding="utf-8")
+ps = Path(ps_source).read_text(encoding="utf-8")
+for placeholder in ("__ADMIN_PASSWORD__", "__WINDOWS_IMAGE_INDEX__"):
+    if placeholder not in xml:
+        raise SystemExit(f"missing template placeholder: {placeholder}")
+if "__SSH_PUBLIC_KEY__" not in ps:
+    raise SystemExit("missing template placeholder: __SSH_PUBLIC_KEY__")
+Path(xml_dest).write_text(
+    xml.replace("__ADMIN_PASSWORD__", password).replace("__WINDOWS_IMAGE_INDEX__", image_index),
+    encoding="utf-8",
+)
+Path(ps_dest).write_text(ps.replace("__SSH_PUBLIC_KEY__", public_key), encoding="utf-8")
+PY
+    chmod 0600 "$STATE_ROOT/unattend/Autounattend.xml" "$STATE_ROOT/unattend/bootstrap.ps1"
+}
+
+require_admin_password_state() {
+    local password_file="$STATE_ROOT/secrets/admin-password" metadata password
+    test -f "$password_file" && test ! -L "$password_file" && test -r "$password_file" && test -s "$password_file" || \
+        die "private lab credential is missing or unreadable: $password_file; restore the original credential or recreate the lab"
+    if metadata="$(stat -c '%u:%a:%s' -- "$password_file" 2>/dev/null)"; then
+        :
+    elif metadata="$(stat -f '%u:%Lp:%z' "$password_file" 2>/dev/null)"; then
+        :
+    else
+        die "could not inspect private lab credential metadata: $password_file"
+    fi
+    test "$metadata" = "$(id -u):600:37" || \
+        die "private lab credential must be owned by the current user, mode 0600, and use the generated format: $password_file"
+    IFS= read -r password < "$password_file" || \
+        die "private lab credential is not newline-terminated: $password_file"
+    if [[ ! "$password" =~ ^Sb1\![0-9a-f]{32}$ ]]; then
+        unset password
+        die "private lab credential does not use the generated format: $password_file"
+    fi
+    unset password
+}
+
+lab_has_guest_state() {
+    local path root
+    for path in \
+        "$STATE_ROOT/unattend/Autounattend.xml" \
+        "$STATE_ROOT/unattend/bootstrap.ps1" \
+        "$STATE_ROOT/unattend.iso" \
+        "$STATE_ROOT/disk/run.qcow2" \
+        "$STATE_ROOT/run/nvram.fd" \
+        "$STATE_ROOT/run/tpm"; do
+        test ! -e "$path" || return 0
+    done
+    for root in "$STATE_ROOT/baselines" "$STATE_ROOT/trash"; do
+        test -d "$root" || continue
+        if find "$root" -mindepth 2 -maxdepth 2 \
+            \( -name disk.qcow2 -o -name run.qcow2 -o -name nvram.fd -o -name tpm \) \
+            -print -quit | grep -q .; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+preflight_init_admin_password_state() {
+    local password_file="$STATE_ROOT/secrets/admin-password"
+    if [ -L "$password_file" ]; then
+        die "private lab credential must not be a symbolic link: $password_file"
+    fi
+    if [ -e "$password_file" ]; then
+        require_admin_password_state
+        return
+    fi
+    if lab_has_guest_state; then
+        die "initialized lab is missing its original private credential; refusing to generate a password that would not match the guest"
+    fi
+}
+
+init_lab() {
+    load_config
+    # Refuse mismatched recovery before creating identity or any other durable
+    # state. A new password cannot unlock a guest created with the old value.
+    preflight_init_admin_password_state
+    for command in awk df docker git python3 sha256sum ssh ssh-keygen scp; do
+        require_command "$command"
+    done
+    require_free_space
+    if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+        die "/dev/kvm must be readable and writable"
+    fi
+    test -f "$WINDOWS_ISO" || die "Windows ISO not found: $WINDOWS_ISO"
+    printf '%s  %s\n' "${WINDOWS_ISO_SHA256,,}" "$WINDOWS_ISO" | sha256sum --check --strict
+
+    mkdir -p "$STATE_ROOT"/{baselines,disk,downloads,incoming,raw,run,secrets,ssh,trash,unattend}
+    chmod 0700 "$STATE_ROOT" "$STATE_ROOT/secrets" "$STATE_ROOT/ssh" "$STATE_ROOT/unattend"
+    if [ ! -f "$IDENTITY_FILE" ]; then
+        python3 - "$(id -u)" "$(id -g)" "$(stat -c %g /dev/kvm)" > "$IDENTITY_FILE" <<'PY'
+import secrets
+import sys
+import uuid
+
+uid, gid, kvm_gid = sys.argv[1:]
+identity = uuid.uuid4()
+mac = "52:54:00:" + ":".join(f"{byte:02x}" for byte in secrets.token_bytes(3))
+print(f"LAB_UID={uid}")
+print(f"LAB_GID={gid}")
+print(f"LAB_KVM_GID={kvm_gid}")
+print(f"LAB_VM_UUID={identity}")
+print(f"LAB_VM_MAC={mac}")
+print(f"LAB_DISK_SERIAL=SPECBUTLER{identity.hex[:10]}")
+print("LAB_ATTACH_UNATTEND=1")
+PY
+        chmod 0600 "$IDENTITY_FILE"
+    fi
+    if [ ! -e "$STATE_ROOT/secrets/admin-password" ]; then
+        python3 - <<'PY' > "$STATE_ROOT/secrets/admin-password"
+import secrets
+
+print("Sb1!" + secrets.token_hex(16))
+PY
+        chmod 0600 "$STATE_ROOT/secrets/admin-password"
+    fi
+    require_admin_password_state
+    if [ ! -f "$STATE_ROOT/ssh/id_ed25519" ]; then
+        ssh-keygen -q -t ed25519 -N '' -C specbutler-windows-lab -f "$STATE_ROOT/ssh/id_ed25519"
+    fi
+    load_identity
+    render_unattend
+    compose build
+    compose run --rm --no-deps windows \
+        xorriso -as mkisofs -quiet -V SPECBUTLER -o /state/unattend.iso /state/unattend
+    chmod 0600 "$STATE_ROOT/unattend.iso"
+    if [ ! -f "$STATE_ROOT/disk/run.qcow2" ]; then
+        qemu_img create -f qcow2 /state/disk/run.qcow2 "${LAB_DISK_SIZE:-80G}"
+    fi
+    printf '%s\n' "Initialized the lab. Start it with: $0 up"
+    printf '%s\n' "Console: http://127.0.0.1:${LAB_VNC_PORT:-16080}/vnc.html?autoconnect=1&resize=scale"
+}
+
+up_lab() {
+    compose up -d
+    printf '%s\n' "Console: http://127.0.0.1:${LAB_VNC_PORT:-16080}/vnc.html?autoconnect=1&resize=scale"
+}
+
+wait_ssh() {
+    load_config
+    load_identity
+    local deadline=$((SECONDS + 2700))
+    prepare_ssh_options
+    until ssh "${SSH_OPTIONS[@]}" -o StrictHostKeyChecking=accept-new specadmin@127.0.0.1 'exit 0' 2>/dev/null; do
+        (( SECONDS < deadline )) || die "SSH did not become ready within 45 minutes"
+        sleep 5
+    done
+}
+
+authoritative_shutdown_lab() {
+    local graceful_timeout="${1:-$(shutdown_timeout_seconds)}"
+    [[ "$graceful_timeout" =~ ^[1-9][0-9]*$ ]] || die "shutdown timeout must be a positive integer"
+    if try_refresh_vm_state; then
+        case "$VM_STATE" in
+            absent|created|exited|dead) return 0 ;;
+            running|paused|restarting|removing) ;;
+        esac
+    else
+        printf '%s\n' "windows-lab: initial VM state query failed; continuing bounded shutdown: $VM_STATE_ERROR" >&2
+    fi
+
+    local command_timeout deadline down_status=0 graceful_stopped=0
+    command_timeout="$(guest_command_timeout_seconds)"
+    guest_ssh_timeout "$command_timeout" 'Stop-Computer -Force' >/dev/null 2>&1 || true
+    deadline=$((SECONDS + graceful_timeout))
+    while (( SECONDS < deadline )); do
+        if ! try_refresh_vm_state; then
+            printf '%s\n' "windows-lab: VM state query failed during graceful shutdown: $VM_STATE_ERROR" >&2
+            break
+        fi
+        case "$VM_STATE" in
+            absent|created|exited|dead)
+                graceful_stopped=1
+                break
+                ;;
+            running|paused|restarting|removing) ;;
+        esac
+        sleep 1
+    done
+    if (( graceful_stopped == 0 )); then
+        printf '%s\n' "windows-lab: graceful shutdown timed out; forcing the VM down" >&2
+    fi
+    if bounded_compose_down 30; then
+        down_status=0
+    else
+        down_status=$?
+    fi
+    if ! try_refresh_vm_state; then
+        printf '%s\n' "windows-lab: could not verify VM state after forced shutdown: $VM_STATE_ERROR" >&2
+        return 1
+    fi
+    case "$VM_STATE" in
+        absent|created|exited|dead) ;;
+        running|paused|restarting|removing)
+            printf '%s\n' "windows-lab: VM remained active after forced shutdown (state: $VM_STATE)" >&2
+            return 1
+            ;;
+        *)
+            printf '%s\n' "windows-lab: could not classify VM state after forced shutdown" >&2
+            return 1
+            ;;
+    esac
+    if (( down_status != 0 )); then
+        printf '%s\n' "windows-lab: compose down failed even though the VM no longer appears active" >&2
+        return "$down_status"
+    fi
+    return 0
+}
+
+shutdown_lab() {
+    authoritative_shutdown_lab "$(shutdown_timeout_seconds)" || \
+        die "could not confirm authoritative Windows guest shutdown"
+}
+
+set_unattend_attached() {
+    local value="$1"
+    python3 - "$IDENTITY_FILE" "$value" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+value = sys.argv[2]
+lines = path.read_text(encoding="utf-8").splitlines()
+lines = [line for line in lines if not line.startswith("LAB_ATTACH_UNATTEND=")]
+lines.append(f"LAB_ATTACH_UNATTEND={value}")
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+    chmod 0600 "$IDENTITY_FILE"
+}
+
+fetch_toolchain() {
+    test -f "$TOOLCHAIN_FILE" || die "copy toolchain.json.example to toolchain.json and pin each URL and SHA-256"
+    python3 - "$TOOLCHAIN_FILE" "$STATE_ROOT/downloads" <<'PY'
+import hashlib
+import json
+import re
+import sys
+import urllib.request
+from pathlib import Path
+
+manifest_path, cache_path = map(Path, sys.argv[1:])
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+required = {"git", "gh", "uv", "codex", "codex_code_mode_host", "codex_sandbox_setup"}
+if set(manifest) != required:
+    raise SystemExit(f"toolchain keys must be exactly: {', '.join(sorted(required))}")
+cache_path.mkdir(parents=True, exist_ok=True)
+for name, item in manifest.items():
+    url = str(item.get("url", ""))
+    digest = str(item.get("sha256", "")).lower()
+    filename = str(item.get("filename", ""))
+    if "<" in url or "<" in digest:
+        raise SystemExit(f"toolchain entry {name} still contains a placeholder")
+    if not url.startswith("https://"):
+        raise SystemExit(f"toolchain entry {name} must use HTTPS")
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SystemExit(f"toolchain entry {name} has an invalid SHA-256")
+    if not filename or Path(filename).name != filename:
+        raise SystemExit(f"toolchain entry {name} has an unsafe filename")
+    destination = cache_path / filename
+    if not destination.exists() or hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+        partial = destination.with_suffix(destination.suffix + ".partial")
+        urllib.request.urlretrieve(url, partial)
+        if hashlib.sha256(partial.read_bytes()).hexdigest() != digest:
+            partial.unlink(missing_ok=True)
+            raise SystemExit(f"SHA-256 mismatch for {name}")
+        partial.replace(destination)
+PY
+}
+
+provision_guest() {
+    wait_ssh
+    fetch_toolchain
+    guest_ssh 'New-Item -ItemType Directory -Force C:\SpecHarness\toolchain | Out-Null'
+    guest_scp "$TOOLCHAIN_FILE" "specadmin@127.0.0.1:C:/SpecHarness/toolchain/toolchain.json"
+    while IFS= read -r filename; do
+        guest_scp "$STATE_ROOT/downloads/$filename" "specadmin@127.0.0.1:C:/SpecHarness/toolchain/$filename"
+    done < <(python3 - "$TOOLCHAIN_FILE" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+for entry in manifest.values():
+    print(entry["filename"])
+PY
+)
+    guest_scp "$HARNESS_ROOT/provision.ps1" "specadmin@127.0.0.1:C:/SpecHarness/provision.ps1"
+    guest_ssh '& C:\SpecHarness\provision.ps1'
+    set_unattend_attached 0
+}
+
+snapshot_lab() {
+    load_config
+    load_identity
+    local name="${1:-}"
+    validate_name "$name"
+    require_stopped
+    local destination="$STATE_ROOT/baselines/$name"
+    test ! -e "$destination" || die "baseline already exists: $name"
+    if [ ! -f "$STATE_ROOT/run/nvram.fd" ] || [ ! -d "$STATE_ROOT/run/tpm" ]; then
+        die "boot the VM before creating a baseline"
+    fi
+    qemu_img check /state/disk/run.qcow2
+    mkdir -p "$destination"
+    mv "$STATE_ROOT/disk/run.qcow2" "$destination/disk.qcow2"
+    cp "$STATE_ROOT/run/nvram.fd" "$destination/nvram.fd"
+    cp -a "$STATE_ROOT/run/tpm" "$destination/tpm"
+    chmod 0444 "$destination/disk.qcow2"
+    qemu_img create -f qcow2 -F qcow2 -b "/state/baselines/$name/disk.qcow2" /state/disk/run.qcow2
+    printf 'name=%s\ncreated_at=%s\n' "$name" "$(date --iso-8601=seconds)" > "$destination/manifest"
+    printf '%s\n' "Created cold baseline: $name"
+}
+
+reset_lab() {
+    load_config
+    load_identity
+    local name="${1:-}"
+    validate_name "$name"
+    require_stopped
+    local source="$STATE_ROOT/baselines/$name"
+    test -f "$source/disk.qcow2" || die "baseline not found: $name"
+    local trash
+    trash="$STATE_ROOT/trash/$(date +%Y%m%dT%H%M%S)-$$"
+    mkdir -p "$trash"
+    test ! -f "$STATE_ROOT/disk/run.qcow2" || mv "$STATE_ROOT/disk/run.qcow2" "$trash/run.qcow2"
+    test ! -f "$STATE_ROOT/run/nvram.fd" || mv "$STATE_ROOT/run/nvram.fd" "$trash/nvram.fd"
+    test ! -d "$STATE_ROOT/run/tpm" || mv "$STATE_ROOT/run/tpm" "$trash/tpm"
+    cp "$source/nvram.fd" "$STATE_ROOT/run/nvram.fd"
+    cp -a "$source/tpm" "$STATE_ROOT/run/tpm"
+    qemu_img create -f qcow2 -F qcow2 -b "/state/baselines/$name/disk.qcow2" /state/disk/run.qcow2
+    qemu_img check /state/disk/run.qcow2
+    printf '%s\n' "Reset run overlay to baseline $name; prior overlay retained at $trash"
+}
+
+proof_trash_keep() {
+    local keep="${LAB_PROOF_TRASH_KEEP:-1}"
+    [[ "$keep" =~ ^[1-9][0-9]*$ ]] || die "LAB_PROOF_TRASH_KEEP must be a positive integer"
+    printf '%s\n' "$keep"
+}
+
+proof_trash_retention() {
+    local keep="$1" mode="${2:-check}"
+    require_stopped
+    local args=(
+        "$HARNESS_ROOT/trash_retention.py"
+        --trash-root "$STATE_ROOT/trash"
+        --keep "$keep"
+    )
+    if [ "$mode" = apply ]; then
+        args+=(--apply)
+    elif [ "$mode" != check ]; then
+        die "invalid proof trash retention mode: $mode"
+    fi
+    python3 "${args[@]}"
+}
+
+stage_source() {
+    wait_ssh
+    local ref="${1:-${LAB_SOURCE_REF:-HEAD}}"
+    local commit archive
+    commit="$(git -C "$REPO_ROOT" rev-parse --verify "$ref^{commit}")" || die "source ref does not resolve: $ref"
+    mkdir -p "$STATE_ROOT/incoming"
+    archive="$STATE_ROOT/incoming/source.zip"
+    git -C "$REPO_ROOT" archive --format=zip --output "$archive" "$commit"
+    guest_scp "$archive" "specadmin@127.0.0.1:C:/SpecHarness/source.zip"
+    guest_ssh "Remove-Item -Recurse -Force -ErrorAction SilentlyContinue C:\\SpecHarness\\source; Expand-Archive -LiteralPath C:\\SpecHarness\\source.zip -DestinationPath C:\\SpecHarness\\source; Set-Content -LiteralPath C:\\SpecHarness\\source\\.lab-source-revision -Encoding ascii -Value '$commit'"
+    printf '%s\n' "$commit"
+}
+
+resolve_source_revision() {
+    local ref="${1:-${LAB_SOURCE_REF:-HEAD}}" commit
+    commit="$(git -C "$REPO_ROOT" rev-parse --verify "$ref^{commit}")" || die "source ref does not resolve: $ref"
+    printf '%s\n' "$commit"
+}
+
+verify_exact_proof_harness() {
+    local revision="$1" output="$STATE_ROOT/incoming/exact-harness.json"
+    local snapshot_root
+    mkdir -p "$STATE_ROOT/incoming"
+    snapshot_root="$(mktemp -d "$STATE_ROOT/incoming/exact-harness.XXXXXX")"
+    chmod 0700 "$snapshot_root"
+    rm -f -- "$output"
+    python3 "$LAB_ROOT/exact_harness.py" \
+        --repo-root "$REPO_ROOT" \
+        --revision "$revision" \
+        --output "$output" \
+        --snapshot-root "$snapshot_root" || die "proof controller does not match exact source revision $revision"
+    test -d "$snapshot_root/tools/windows-lab" || die "exact harness snapshot was not materialized"
+    HARNESS_ROOT="$snapshot_root/tools/windows-lab"
+}
+
+interactive_session_grace_seconds() {
+    local timeout="${LAB_INTERACTIVE_SESSION_GRACE_SECONDS:-30}"
+    [[ "$timeout" =~ ^[0-9]+$ ]] || die "LAB_INTERACTIVE_SESSION_GRACE_SECONDS must be a non-negative integer"
+    printf '%s\n' "$timeout"
+}
+
+interactive_session_repair_enabled() {
+    local enabled="${LAB_INTERACTIVE_SESSION_REPAIR:-1}"
+    [[ "$enabled" = 0 || "$enabled" = 1 ]] || die "LAB_INTERACTIVE_SESSION_REPAIR must be 0 or 1"
+    printf '%s\n' "$enabled"
+}
+
+console_session_ready() {
+    guest_ssh '& C:\SpecHarness\ensure-console-session.ps1 -Mode Check' >/dev/null 2>&1
+}
+
+wait_console_session() {
+    local timeout="$1"
+    local deadline=$((SECONDS + timeout))
+    while ! console_session_ready; do
+        (( SECONDS < deadline )) || return 1
+        sleep 2
+    done
+}
+
+disarm_console_session() {
+    if guest_ssh '& C:\SpecHarness\ensure-console-session.ps1 -Mode Disarm' >/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "windows-lab: could not remove the temporary Windows console recovery credential" >&2
+    shutdown_lab
+    die "console recovery cleanup failed; authoritative guest shutdown was confirmed"
+}
+
+wait_guest_disconnect() {
+    local deadline=$((SECONDS + 120))
+    while guest_ssh 'exit 0' >/dev/null 2>&1; do
+        (( SECONDS < deadline )) || return 1
+        sleep 2
+    done
+}
+
+ensure_console_session() {
+    wait_ssh
+    guest_ssh 'New-Item -ItemType Directory -Force C:\SpecHarness | Out-Null'
+    guest_scp \
+        "$HARNESS_ROOT/ensure-console-session.ps1" \
+        "$HARNESS_ROOT/disarm-autologon.ps1" \
+        "specadmin@127.0.0.1:C:/SpecHarness/"
+    local grace repair_enabled
+    grace="$(interactive_session_grace_seconds)"
+    repair_enabled="$(interactive_session_repair_enabled)"
+    if wait_console_session "$grace"; then
+        disarm_console_session
+        printf '%s\n' "Confirmed the logged-on Windows desktop session and disabled autologon."
+        return 0
+    fi
+    if [ "$repair_enabled" != 1 ]; then
+        die "no logged-on Windows desktop session appeared; sign in at http://127.0.0.1:${LAB_VNC_PORT:-16080}/vnc.html and retry"
+    fi
+
+    # The generated password travels only on SSH stdin. The guest script never
+    # writes or emits it, and disarms Winlogon immediately after the reboot.
+    require_admin_password_state
+    if ! guest_ssh_stdin \
+        "$STATE_ROOT/secrets/admin-password" \
+        '& C:\SpecHarness\ensure-console-session.ps1 -Mode Arm' >/dev/null; then
+        printf '%s\n' "windows-lab: console recovery arming failed; cleaning up and stopping the guest" >&2
+        guest_ssh '& C:\SpecHarness\ensure-console-session.ps1 -Mode Disarm' >/dev/null 2>&1 || true
+        shutdown_lab
+        die "console recovery arming failed; authoritative guest shutdown was confirmed"
+    fi
+    guest_ssh 'Restart-Computer -Force' >/dev/null 2>&1 || true
+    if ! wait_guest_disconnect; then
+        disarm_console_session
+        shutdown_lab
+        die "Windows did not begin the requested console-recovery reboot; authoritative guest shutdown was confirmed"
+    fi
+    wait_ssh
+    if ! wait_console_session 120; then
+        guest_ssh '& C:\SpecHarness\ensure-console-session.ps1 -Mode Disarm' >/dev/null 2>&1 || true
+        shutdown_lab
+        die "Windows console recovery did not establish the expected Explorer session; authoritative guest shutdown was confirmed"
+    fi
+    disarm_console_session
+    console_session_ready || die "the recovered Windows desktop session disappeared before job launch"
+    printf '%s\n' "Recovered the Windows desktop session and removed the temporary autologon credential."
+}
+
+cleanup_job_task() {
+    local name="$1"
+    guest_ssh_timeout "$(guest_command_timeout_seconds)" "\$task = Get-ScheduledTask -TaskName 'SpecButlerLab-$name' -ErrorAction SilentlyContinue; if (\$null -ne \$task) { Stop-ScheduledTask -TaskName 'SpecButlerLab-$name' -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName 'SpecButlerLab-$name' -Confirm:\$false -ErrorAction Stop }; if (\$null -ne (Get-ScheduledTask -TaskName 'SpecButlerLab-$name' -ErrorAction SilentlyContinue)) { throw 'scheduled task cleanup was not observable' }" >/dev/null 2>&1
+}
+
+cleanup_job_task_or_stop() {
+    local name="$1"
+    if cleanup_job_task "$name"; then
+        return 0
+    fi
+    printf '%s\n' "windows-lab: could not verify scheduled-task cleanup for $name; stopping the guest" >&2
+    shutdown_lab
+    printf '%s\n' "windows-lab: authoritative guest shutdown confirmed after cleanup failure" >&2
+    return 1
+}
+
+preserve_unsafe_job_diagnostics() {
+    local name="$1" destination="$STATE_ROOT/unsafe-cleanup/$name"
+    local command_timeout
+    command_timeout="$(guest_command_timeout_seconds)"
+    mkdir -p "$destination"
+    chmod 0700 "$STATE_ROOT/unsafe-cleanup" "$destination"
+    guest_scp_timeout "$command_timeout" "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.log" "$destination/job.log" 2>/dev/null || true
+    guest_scp_timeout "$command_timeout" "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.done.json" "$destination/job.done.json" 2>/dev/null || true
+    guest_scp_timeout "$command_timeout" "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.started.json" "$destination/job.started.json" 2>/dev/null || true
+    guest_ssh_timeout "$command_timeout" "if (Test-Path C:\\SpecHarness\\evidence\\$name) { Compress-Archive -Force -Path C:\\SpecHarness\\evidence\\$name\\* -DestinationPath C:\\SpecHarness\\$name-unsafe-evidence.zip }" >/dev/null 2>&1 || true
+    guest_scp_timeout "$command_timeout" "specadmin@127.0.0.1:C:/SpecHarness/$name-unsafe-evidence.zip" "$destination/evidence.zip" 2>/dev/null || true
+}
+
+capture_launch_attestation() {
+    local name="$1" nonce="$2"
+    local launch_root="$STATE_ROOT/launch-attestations"
+    local captured="$launch_root/$name.started.json"
+    local attestation="$launch_root/$name.json"
+    mkdir -p "$launch_root"
+    chmod 0700 "$launch_root"
+    if [ -e "$captured" ] || [ -e "$attestation" ]; then
+        printf '%s\n' "windows-lab: launch attestation already exists for $name" >&2
+        return 1
+    fi
+    if ! guest_scp \
+        "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.started.json" \
+        "$captured"; then
+        printf '%s\n' "windows-lab: could not capture the acknowledged launch receipt for $name" >&2
+        return 1
+    fi
+    chmod 0600 "$captured"
+    if ! python3 "$HARNESS_ROOT/launch_attestation.py" capture \
+        --receipt "$captured" \
+        --output "$attestation" \
+        --expected-job "$name" \
+        --expected-nonce "$nonce"; then
+        return 1
+    fi
+}
+
+job_submit() {
+    local name="${1:-}" script="${2:-}"
+    validate_name "$name"
+    test -f "$script" || die "job script not found: $script"
+    ensure_console_session
+    guest_ssh 'New-Item -ItemType Directory -Force C:\SpecHarness\jobs | Out-Null'
+    guest_scp \
+        "$HARNESS_ROOT/job-child.ps1" \
+        "$HARNESS_ROOT/job-supervisor.cs" \
+        "$HARNESS_ROOT/job-runner.ps1" \
+        "$HARNESS_ROOT/register-job.ps1" \
+        "specadmin@127.0.0.1:C:/SpecHarness/"
+    guest_scp "$script" "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.ps1"
+    local nonce
+    nonce="$(python3 - <<'PY'
+import secrets
+
+print(secrets.token_hex(16))
+PY
+)"
+    if ! guest_ssh "& C:\\SpecHarness\\register-job.ps1 -JobName '$name' -LaunchNonce '$nonce'" >/dev/null; then
+        printf '%s\n' "windows-lab: interactive task registration or launch acknowledgement failed for $name" >&2
+        cleanup_job_task_or_stop "$name" || true
+        return 1
+    fi
+    if ! capture_launch_attestation "$name" "$nonce"; then
+        cleanup_job_task_or_stop "$name" || true
+        return 1
+    fi
+    if ! guest_ssh "\$release = 'C:\\SpecHarness\\jobs\\$name.release'; \$temporary = \"\$release.tmp\"; [System.IO.File]::WriteAllText(\$temporary, '$nonce', [System.Text.Encoding]::ASCII); Move-Item -LiteralPath \$temporary -Destination \$release -Force"; then
+        printf '%s\n' "windows-lab: could not release acknowledged interactive job $name" >&2
+        cleanup_job_task_or_stop "$name" || true
+        return 1
+    fi
+}
+
+job_wait() {
+    local name="${1:-}" timeout="${2:-7200}"
+    validate_name "$name"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "timeout must be a positive integer"
+    local deadline=$((SECONDS + timeout))
+    until guest_ssh "Test-Path C:\\SpecHarness\\jobs\\$name.done.json" 2>/dev/null | tr -d '\r' | grep -qx True; do
+        if (( SECONDS >= deadline )); then
+            printf '%s\n' "windows-lab: job $name did not finish within $timeout seconds" >&2
+            cleanup_job_task_or_stop "$name" || true
+            return 124
+        fi
+        local task_state
+        if ! task_state="$(guest_ssh "\$task = Get-ScheduledTask -TaskName 'SpecButlerLab-$name' -ErrorAction SilentlyContinue; if (\$null -eq \$task) { 'Missing' } else { \$task.State }" 2>/dev/null | tr -d '\r')"; then
+            printf '%s\n' "windows-lab: could not inspect interactive job $name" >&2
+            cleanup_job_task_or_stop "$name" || true
+            return 1
+        fi
+        case "$task_state" in
+            Running|Queued) ;;
+            Ready)
+                if ! guest_ssh "Test-Path C:\\SpecHarness\\jobs\\$name.done.json" 2>/dev/null | tr -d '\r' | grep -qx True; then
+                    printf '%s\n' "windows-lab: interactive job $name returned to Ready without a completion record" >&2
+                    cleanup_job_task_or_stop "$name" || true
+                    return 1
+                fi
+                ;;
+            *)
+                printf '%s\n' "windows-lab: interactive job $name entered unexpected task state: ${task_state:-<empty>}" >&2
+                cleanup_job_task_or_stop "$name" || true
+                return 1
+                ;;
+        esac
+        sleep 3
+    done
+    local done_payload
+    if ! done_payload="$(guest_ssh "Get-Content C:\\SpecHarness\\jobs\\$name.done.json" 2>/dev/null)"; then
+        printf '%s\n' "windows-lab: could not read completion record for $name" >&2
+        cleanup_job_task_or_stop "$name" || true
+        return 1
+    fi
+    local completion_state
+    if ! completion_state="$(python3 -c '
+import json, sys
+payload = json.load(sys.stdin)
+if payload.get("descendants_gone") is not True:
+    print("unsafe")
+elif payload.get("status") == "ok":
+    print("ok")
+else:
+    print("failed")
+' <<<"$done_payload")"; then
+        completion_state=unsafe
+    fi
+    if [ "$completion_state" = unsafe ]; then
+        printf '%s\n' "windows-lab: job $name could not prove descendant cleanup; preserving diagnostics and stopping the guest" >&2
+        preserve_unsafe_job_diagnostics "$name"
+        if ! authoritative_shutdown_lab "$(shutdown_timeout_seconds)"; then
+            printf '%s\n' "windows-lab: could not confirm authoritative guest shutdown after unsafe job completion" >&2
+            return 1
+        fi
+        mkdir -p "$STATE_ROOT/unsafe-cleanup/$name"
+        printf '%s\n' "authoritative_guest_shutdown=confirmed" > "$STATE_ROOT/unsafe-cleanup/$name/authoritative-shutdown.txt"
+        printf '%s\n' "windows-lab: authoritative guest shutdown confirmed after unsafe job completion" >&2
+        return 1
+    fi
+    printf '%s\n' "$done_payload"
+    local result=0
+    [ "$completion_state" = ok ] || result=1
+    if ! cleanup_job_task_or_stop "$name"; then
+        return 1
+    fi
+    return "$result"
+}
+
+job_logs() {
+    local name="${1:-}"
+    validate_name "$name"
+    guest_ssh "if (Test-Path C:\\SpecHarness\\jobs\\$name.log) { Get-Content C:\\SpecHarness\\jobs\\$name.log }"
+}
+
+collect_artifacts() {
+    local name="${1:-}"
+    local destination="${2:-$LAB_ROOT/artifacts/$name}"
+    local revision="${3:-}"
+    validate_name "$name"
+    local raw="$STATE_ROOT/raw/$name"
+    if [ -e "$raw" ] && find "$raw" -type f -print -quit | grep -q .; then
+        die "raw artifact directory is not empty; refusing to mix runs: $raw"
+    fi
+    if [ -e "$destination" ] && find "$destination" -type f -print -quit | grep -q .; then
+        die "artifact destination is not empty; refusing to mix runs: $destination"
+    fi
+    mkdir -p "$raw" "$destination"
+    local unsafe="$STATE_ROOT/unsafe-cleanup/$name"
+    if [ -d "$unsafe" ]; then
+        cp -a "$unsafe/." "$raw/"
+    fi
+    if vm_running; then
+        guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.log" "$raw/job.log" 2>/dev/null || true
+        guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.done.json" "$raw/job.done.json" 2>/dev/null || true
+        guest_scp "specadmin@127.0.0.1:C:/SpecHarness/jobs/$name.started.json" "$raw/job.started.json" 2>/dev/null || true
+    fi
+    local launch_attestation="$STATE_ROOT/launch-attestations/$name.json"
+    test -f "$launch_attestation" || die "host launch attestation is missing: $launch_attestation"
+    cp -- "$launch_attestation" "$raw/job.launch-attestation.json"
+    if [ -n "$revision" ]; then
+        local exact_harness="$STATE_ROOT/incoming/exact-harness.json"
+        test -f "$exact_harness" || die "exact harness preflight is missing: $exact_harness"
+        cp -- "$exact_harness" "$raw/exact-harness.json"
+    fi
+    if vm_running; then
+        guest_ssh "if (Test-Path C:\\SpecHarness\\evidence\\$name) { Compress-Archive -Force -Path C:\\SpecHarness\\evidence\\$name\\* -DestinationPath C:\\SpecHarness\\$name-evidence.zip }"
+        guest_scp "specadmin@127.0.0.1:C:/SpecHarness/$name-evidence.zip" "$raw/evidence.zip" 2>/dev/null || true
+    fi
+    if [ -f "$raw/evidence.zip" ]; then
+        python3 "$HARNESS_ROOT/extract_evidence.py" \
+            --archive "$raw/evidence.zip" \
+            --destination "$raw"
+        rm -f -- "$raw/evidence.zip"
+    fi
+    find "$raw" -type f -print -quit | grep -q . || die "no artifacts were available for job $name"
+    if [ -n "$revision" ]; then
+        python3 "$HARNESS_ROOT/redact.py" "$raw" "$destination" "$revision"
+    else
+        python3 "$HARNESS_ROOT/redact.py" "$raw" "$destination"
+    fi
+    printf '%s\n' "$destination"
+}
+
+run_proof() {
+    load_config
+    : "${LAB_BASELINE:?LAB_BASELINE is required for a repeatable proof}"
+    : "${LAB_GITHUB_OWNER:?LAB_GITHUB_OWNER is required for the real-provider proof}"
+    : "${SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT:?SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT is required for the complete release audit}"
+    [[ "$LAB_GITHUB_OWNER" != *'<'* ]] || die "LAB_GITHUB_OWNER still contains a placeholder"
+    [[ "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" = /* ]] || die "SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT must be an absolute path"
+    test -d "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" || die "external acceptance evidence root does not exist: $SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT"
+    # Validate irreplaceable host-only state before shutdown or overlay reset.
+    # Generating a new value would not match the password inside an existing
+    # guest or baseline.
+    require_admin_password_state
+    validate_name "$LAB_BASELINE"
+    local trash_keep revision
+    revision="$(resolve_source_revision "${LAB_SOURCE_REF:-HEAD}")"
+    # This must happen before shutdown, reset, pruning, or guest launch. A
+    # release proof may never attribute working-tree controller code to another
+    # commit merely because that commit was used for the source archive.
+    verify_exact_proof_harness "$revision"
+    trash_keep="$(proof_trash_keep)"
+    if vm_running; then
+        shutdown_lab
+    fi
+    # Validate every existing retired overlay before reset mutates state. The
+    # apply pass below validates the full set again, including the overlay that
+    # reset just retired, before removing any older recovery state.
+    proof_trash_retention "$trash_keep"
+    reset_lab "$LAB_BASELINE"
+    proof_trash_retention "$trash_keep" apply
+    require_free_space "$STATE_ROOT"
+    up_lab
+    wait_ssh
+    provision_guest
+    local staged_revision name config
+    staged_revision="$(stage_source "$revision")"
+    test "$staged_revision" = "$revision" || die "staged source revision changed after exact-harness preflight"
+    name="proof-$(date -u +%Y%m%dt%H%M%Sz | tr '[:upper:]' '[:lower:]')"
+    config="$STATE_ROOT/incoming/proof-config.json"
+    python3 - "$config" "$name" "$revision" "$LAB_GITHUB_OWNER" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path, run_name, revision, github_owner = sys.argv[1:]
+Path(path).write_text(
+    json.dumps({"run_name": run_name, "source_revision": revision, "github_owner": github_owner}, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+    guest_scp "$config" "specadmin@127.0.0.1:C:/SpecHarness/proof-config.json"
+    job_submit "$name" "$HARNESS_ROOT/proof.ps1"
+    local proof_status=0
+    if job_wait "$name" 14400; then
+        proof_status=0
+    else
+        proof_status=$?
+    fi
+    local destination="$LAB_ROOT/artifacts/$name"
+    collect_artifacts "$name" "$destination" "$revision"
+    local external_status=0
+    if python3 "$HARNESS_ROOT/import_external_evidence.py" \
+        --source "$SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT" \
+        --destination "$destination" \
+        --expected-revision "$revision"; then
+        external_status=0
+    else
+        external_status=$?
+    fi
+    rm -f -- "$destination/lab-controller-result.json"
+    if (( proof_status != 0 )); then
+        printf '%s\n' "windows-lab: guest proof failed; controller success evidence will not be produced" >&2
+    elif ! python3 - \
+        "$destination/lab-controller-static-result.json" \
+        "$destination/lab-controller-result.json" \
+        "$revision" \
+        "$destination/job.launch-attestation.json" \
+        "$destination/job.started.json" \
+        "$destination/job.done.json" \
+        "$destination/exact-harness.json" \
+        "$destination/user-context.json" \
+        "$HARNESS_ROOT/launch_attestation.py" \
+        "$name" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+(
+    static_arg,
+    output_arg,
+    revision,
+    attestation_arg,
+    started_arg,
+    done_arg,
+    exact_harness_arg,
+    user_context_arg,
+    launch_helper_arg,
+    run_name,
+) = sys.argv[1:]
+sys.path.insert(0, str(Path(launch_helper_arg).resolve().parent))
+from launch_attestation import validate_attestation
+
+static_path = Path(static_arg)
+output_path = Path(output_arg)
+payload = json.loads(static_path.read_text(encoding="utf-8"))
+attestation_path = Path(attestation_arg)
+started_path = Path(started_arg)
+done_path = Path(done_arg)
+exact_harness_path = Path(exact_harness_arg)
+user_context_path = Path(user_context_arg)
+validate_attestation(
+    attestation_path,
+    started_path,
+    user_context_path,
+    expected_job=run_name,
+)
+done_payload = json.loads(done_path.read_text(encoding="ascii"))
+if done_payload.get("status") != "ok":
+    raise SystemExit("interactive Job did not retain an ok completion record")
+if done_payload.get("job_supervision") != "kill-on-close-job":
+    raise SystemExit("interactive Job did not use the kill-on-close supervisor")
+if done_payload.get("descendants_gone") is not True:
+    raise SystemExit("interactive Job descendant cleanup was not verified")
+exact_harness = json.loads(exact_harness_path.read_text(encoding="utf-8"))
+if exact_harness.get("status") != "passed":
+    raise SystemExit("exact harness preflight did not pass")
+if exact_harness.get("source_revision") != revision:
+    raise SystemExit("exact harness preflight belongs to another revision")
+if exact_harness.get("controller_head") != revision:
+    raise SystemExit("proof controller HEAD differs from the source revision")
+if not isinstance(exact_harness.get("sha256"), dict) or not exact_harness["sha256"]:
+    raise SystemExit("exact harness preflight contains no verified files")
+if exact_harness.get("snapshot_materialized") is not True:
+    raise SystemExit("exact harness was not executed from a materialized snapshot")
+if exact_harness.get("snapshot_files_verified") != exact_harness.get("files_verified"):
+    raise SystemExit("exact harness snapshot file count does not match preflight")
+expected_operations = ["create", "reset", "source-sync", "exec", "collect", "snapshot"]
+if payload.get("status") != "passed":
+    raise SystemExit("guest controller audit did not pass")
+if payload.get("source_revision") != revision:
+    raise SystemExit("guest controller audit revision does not match staged source")
+for key, expected in (
+    ("checked_in_secret_free", True),
+    ("operations", expected_operations),
+    ("machine_state_outside_git", True),
+):
+    if payload.get(key) != expected:
+        raise SystemExit(f"guest controller audit field {key!r} did not match")
+result = {
+    "status": "passed",
+    "source_revision": revision,
+    "checked_in_secret_free": True,
+    "operations": expected_operations,
+    "machine_state_outside_git": True,
+    "clean_snapshot_reset": True,
+    "proof_command": "./labctl proof",
+    "manual_guest_edits": False,
+    "interactive_launch_confirmed": True,
+    "interactive_job_supervision": "kill-on-close-job",
+    "interactive_job_descendants_gone": True,
+    "exact_harness_revision": revision,
+    "evidence": {
+        "guest_static_audit": static_path.name,
+        "interactive_launch_attestation": attestation_path.name,
+        "interactive_launch_receipt": started_path.name,
+        "interactive_job_completion": done_path.name,
+        "exact_harness": exact_harness_path.name,
+        "observed_controller_path": [
+            "reset provisioned snapshot",
+            "start and wait for guest",
+            "idempotent provision",
+            "stage exact revision",
+            "confirm nonce-bound interactive launch and wait for completion",
+            "collect and redact evidence",
+        ],
+    },
+}
+Path(output_path).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY
+    then
+        printf '%s\n' "windows-lab: controller evidence was not produced; acceptance audit will report it unproven" >&2
+    fi
+    local audit_status=0
+    if python3 "$HARNESS_ROOT/audit_acceptance.py" \
+        --manifest "$HARNESS_ROOT/acceptance-manifest.json" \
+        --manifest-source-path "tools/windows-lab/acceptance-manifest.json" \
+        --source-root "$REPO_ROOT" \
+        --evidence-root "$destination" \
+        --expected-revision "$revision" \
+        --output "$destination/acceptance-audit.json"; then
+        audit_status=0
+    else
+        audit_status=$?
+    fi
+    if (( proof_status != 0 )); then
+        return "$proof_status"
+    fi
+    if (( external_status != 0 )); then
+        return "$external_status"
+    fi
+    return "$audit_status"
+}
+
+command="${1:-help}"
+case "$command" in
+    init) init_lab ;;
+    up) up_lab ;;
+    down) bounded_compose_down 120 ;;
+    shutdown) shutdown_lab ;;
+    wait) wait_ssh ;;
+    provision) provision_guest ;;
+    snapshot) snapshot_lab "${2:-}" ;;
+    reset) reset_lab "${2:-}" ;;
+    stage) stage_source "${2:-${LAB_SOURCE_REF:-HEAD}}" ;;
+    exec)
+        shift
+        test "${1:-}" != -- || shift
+        (( $# > 0 )) || die "exec requires a PowerShell command"
+        guest_ssh "$@"
+        ;;
+    job)
+        case "${2:-}" in
+            submit) job_submit "${3:-}" "${4:-}" ;;
+            wait) job_wait "${3:-}" "${4:-7200}" ;;
+            logs) job_logs "${3:-}" ;;
+            *) die "job requires submit, wait, or logs" ;;
+        esac
+        ;;
+    collect) collect_artifacts "${2:-}" "${3:-$LAB_ROOT/artifacts/${2:-}}" ;;
+    proof) run_proof ;;
+    logs) compose logs "${@:2}" ;;
+    status) compose ps ;;
+    ssh)
+        shift
+        prepare_ssh_options
+        exec ssh "${SSH_OPTIONS[@]}" specadmin@127.0.0.1 "$@"
+        ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command: $command" ;;
+esac

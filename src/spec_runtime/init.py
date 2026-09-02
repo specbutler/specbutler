@@ -8,19 +8,22 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
+from typing import Callable
 
 from packaging.requirements import InvalidRequirement, Requirement
+
+from .agent_adapter import host_agent_unavailability_reason
+from .git_common import run_git
 
 
 def _git_repo_root() -> Path | None:
     """Return the git repo root, or None if not in a git repo."""
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
+        result = run_git(
+            ["rev-parse", "--show-toplevel"],
             check=True,
         )
         return Path(result.stdout.strip())
@@ -30,42 +33,71 @@ def _git_repo_root() -> Path | None:
 
 def _has_remote(repo_root: Path, remote: str = "origin") -> bool:
     """Check if the named remote exists."""
-    result = subprocess.run(
-        ["git", "remote", "get-url", remote],
-        capture_output=True,
+    result = run_git(
+        ["remote", "get-url", remote],
         cwd=repo_root,
     )
     return result.returncode == 0
 
 
+class BaseBranchDetectionError(RuntimeError):
+    """The local repository does not identify one safe default branch."""
+
+
 def _detect_base_branch(repo_root: Path) -> str:
-    """Detect the default branch name from the remote or local refs."""
+    """Detect the default branch from local Git configuration and refs only.
+
+    ``spec init`` must remain a local operation.  In particular, ``git remote
+    show`` may contact the forge and invoke an interactive credential helper,
+    which can make initialization hang in an otherwise healthy repository.
+    """
     has_origin = _has_remote(repo_root)
+    current_branch_result = run_git(
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+        cwd=repo_root,
+    )
+    current_branch = (
+        current_branch_result.stdout.strip() if current_branch_result.returncode == 0 else ""
+    )
 
     if has_origin:
-        # Try remote HEAD
-        try:
-            result = subprocess.run(
-                ["git", "remote", "show", "origin"],
-                capture_output=True,
-                text=True,
-                timeout=10,
+        remote_head = run_git(
+            ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"],
+            cwd=repo_root,
+        )
+        branch = remote_head.stdout.strip()
+        if remote_head.returncode == 0 and branch.startswith("origin/"):
+            return branch
+
+        for name in ("main", "master"):
+            remote_ref = run_git(
+                ["show-ref", "--verify", "--quiet", f"refs/remotes/origin/{name}"],
                 cwd=repo_root,
             )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    if "HEAD branch:" in line:
-                        branch = line.split("HEAD branch:")[-1].strip()
-                        if branch and branch != "(unknown)":
-                            return f"origin/{branch}"
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            if remote_ref.returncode == 0:
+                return f"origin/{name}"
+
+        remote_refs = run_git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"],
+            cwd=repo_root,
+        )
+        candidates = [
+            ref.strip()
+            for ref in remote_refs.stdout.splitlines()
+            if ref.strip() and ref.strip() != "origin/HEAD"
+        ]
+        if remote_refs.returncode == 0 and len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            raise BaseBranchDetectionError(
+                "Cannot determine the default branch from local origin refs "
+                f"({', '.join(candidates)}). Run spec init --base origin/<branch>."
+            )
 
     # Fall back to checking local refs — only use origin/ prefix if remote exists
     for name in ("main", "master"):
-        check = subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{name}"],
-            capture_output=True,
+        check = run_git(
+            ["show-ref", "--verify", "--quiet", f"refs/heads/{name}"],
             cwd=repo_root,
         )
         if check.returncode == 0:
@@ -73,14 +105,26 @@ def _detect_base_branch(repo_root: Path) -> str:
                 return f"origin/{name}"
             return name
 
+    if current_branch:
+        return f"origin/{current_branch}" if has_origin else current_branch
     return "origin/main" if has_origin else "main"
 
 
-def _detect_agents() -> tuple[str, list[str]]:
-    """Detect available agents on PATH. Returns (default, allowed)."""
+def _detect_agents(
+    *,
+    platform: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> tuple[str, list[str]]:
+    """Detect installed agents that can run safely on this host."""
+    active_platform = platform or sys.platform
+    resolve = which or shutil.which
     available = []
     for name in ("claude", "codex"):
-        if shutil.which(name):
+        if resolve(name) and not host_agent_unavailability_reason(
+            name,
+            platform=active_platform,
+            which=resolve,
+        ):
             available.append(name)
 
     if not available:
@@ -88,6 +132,34 @@ def _detect_agents() -> tuple[str, list[str]]:
 
     default = available[0]
     return default, available
+
+
+def _agent_detection_failure_message(
+    *,
+    platform: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> str:
+    active_platform = platform or sys.platform
+    resolve = which or shutil.which
+    installed = [name for name in ("claude", "codex") if resolve(name)]
+    if not installed:
+        return (
+            "No coding agents found on PATH (looked for: claude, codex). "
+            "Install at least one before running spec init."
+        )
+    reasons = [
+        host_agent_unavailability_reason(
+            name,
+            platform=active_platform,
+            which=resolve,
+        )
+        for name in installed
+    ]
+    actionable = " ".join(reason for reason in reasons if reason)
+    return (
+        "No installed coding agent can run safely on this host. "
+        f"{actionable}"
+    ).strip()
 
 
 def _normalize_requirement_name(name: str) -> str:
@@ -101,7 +173,7 @@ def _detect_python_tooling(repo_root: Path) -> tuple[bool, bool, frozenset[str] 
         return False, False, None
 
     try:
-        raw = tomllib.loads(pyproject_path.read_text())
+        raw = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
     except Exception:
         return False, False, None
 
@@ -146,7 +218,9 @@ def _detect_install_command(repo_root: Path) -> str:
     makefile_path = repo_root / "Makefile"
     if makefile_path.is_file():
         try:
-            if re.search(r"^install\s*:", makefile_path.read_text(), re.MULTILINE):
+            if re.search(
+                r"^install\s*:", makefile_path.read_text(encoding="utf-8"), re.MULTILINE
+            ):
                 return "make install"
         except Exception:
             pass
@@ -192,7 +266,14 @@ def _detect_verify_gates(repo_root: Path) -> list[dict]:
                 test_command = (
                     ".venv/bin/python -m pytest" if uses_project_venv else "pytest"
                 )
-                gates.append({"name": "test", "command": test_command, "parallel": True})
+                gate = {"name": "test", "command": test_command, "parallel": True}
+                if uses_project_venv:
+                    gate["argv_windows"] = [
+                        ".venv/Scripts/python.exe",
+                        "-m",
+                        "pytest",
+                    ]
+                gates.append(gate)
                 seen_names.add("test")
             if has_ruff:
                 lint_command = (
@@ -200,7 +281,16 @@ def _detect_verify_gates(repo_root: Path) -> list[dict]:
                     if uses_project_venv
                     else "ruff check ."
                 )
-                gates.append({"name": "lint", "command": lint_command, "parallel": True})
+                gate = {"name": "lint", "command": lint_command, "parallel": True}
+                if uses_project_venv:
+                    gate["argv_windows"] = [
+                        ".venv/Scripts/python.exe",
+                        "-m",
+                        "ruff",
+                        "check",
+                        ".",
+                    ]
+                gates.append(gate)
                 seen_names.add("lint")
         except Exception:
             pass
@@ -209,7 +299,7 @@ def _detect_verify_gates(repo_root: Path) -> list[dict]:
     makefile_path = repo_root / "Makefile"
     if makefile_path.is_file():
         try:
-            makefile_text = makefile_path.read_text()
+            makefile_text = makefile_path.read_text(encoding="utf-8")
             target_re = re.compile(r"^(test|lint|check|e2e|typecheck)\s*:", re.MULTILINE)
             for match in target_re.finditer(makefile_text):
                 name = match.group(1)
@@ -229,7 +319,7 @@ def _detect_verify_gates(repo_root: Path) -> list[dict]:
     pkg_json_path = repo_root / "package.json"
     if pkg_json_path.is_file():
         try:
-            pkg = json.loads(pkg_json_path.read_text())
+            pkg = json.loads(pkg_json_path.read_text(encoding="utf-8"))
             scripts = pkg.get("scripts", {})
             for name in ("test", "lint", "check", "e2e", "typecheck"):
                 if name in scripts and name not in seen_names:
@@ -321,11 +411,15 @@ def _generate_spec_toml(
     ]
     if install_command:
         lines.append(f'install_command = "{_toml_escape(install_command)}"')
-        lines.append(
-            'install_command_windows = "python -m venv .venv; '
-            '.\\\\.venv\\\\Scripts\\\\python.exe -m pip install -e ."'
-        )
-        lines.append('install_shell_windows = "powershell"')
+        if install_command.startswith("python -m venv .venv && .venv/bin/python "):
+            windows_install_command = install_command.replace(" && ", "; ", 1).replace(
+                ".venv/bin/python",
+                r".\.venv\Scripts\python.exe",
+            )
+            lines.append(
+                f'install_command_windows = "{_toml_escape(windows_install_command)}"'
+            )
+            lines.append('install_shell_windows = "powershell"')
     else:
         lines.append(
             '# install_command = "python -m venv .venv && '
@@ -361,6 +455,11 @@ def _generate_spec_toml(
             lines.append("[[verify.gates]]")
             lines.append(f'name = "{_toml_escape(gate["name"])}"')
             lines.append(f'command = "{_toml_escape(gate["command"])}"')
+            if gate.get("argv_windows"):
+                lines.append(
+                    "argv_windows = "
+                    + json.dumps(gate["argv_windows"], ensure_ascii=False)
+                )
             lines.append(f"parallel = {'true' if gate.get('parallel') else 'false'}")
     else:
         lines.append("")
@@ -380,7 +479,7 @@ def _update_gitignore(repo_root: Path) -> bool:
     gitignore_path = repo_root / ".gitignore"
     existing = ""
     if gitignore_path.is_file():
-        existing = gitignore_path.read_text()
+        existing = gitignore_path.read_text(encoding="utf-8")
 
     existing_lines = set(line.strip() for line in existing.splitlines())
     entries_to_add = []
@@ -403,7 +502,7 @@ def _update_gitignore(repo_root: Path) -> bool:
         return False
 
     separator = "" if existing.endswith("\n") or not existing else "\n"
-    with open(gitignore_path, "a") as f:
+    with open(gitignore_path, "a", encoding="utf-8") as f:
         f.write(separator + "\n".join(entries_to_add) + "\n")
     return True
 
@@ -420,7 +519,11 @@ def _copy_template(repo_root: Path, template_name: str, dest_rel: str, *, force:
     if dest.exists() and not force:
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(_read_bundled_template(template_name))
+    # Repository text is part of the cross-platform contract. In particular,
+    # the bundled review prompt contains Unicode punctuation; relying on the
+    # Windows ANSI code page writes that punctuation as cp1252 and makes a
+    # later UTF-8 review launch fail before the reviewer can start.
+    dest.write_text(_read_bundled_template(template_name), encoding="utf-8")
     return True
 
 
@@ -449,7 +552,7 @@ def _gather_repo_context(repo_root: Path) -> str:
         readme_path = repo_root / readme_name
         if readme_path.is_file():
             try:
-                lines = readme_path.read_text().splitlines()[:100]
+                lines = readme_path.read_text(encoding="utf-8").splitlines()[:100]
                 sections.append(f"--- {readme_name} ---\n" + "\n".join(lines))
             except OSError:
                 pass
@@ -467,8 +570,8 @@ def _gather_repo_context(repo_root: Path) -> str:
             ci_configs.append(ci_path)
     for ci_path in ci_configs:
         try:
-            lines = ci_path.read_text().splitlines()[:50]
-            rel = ci_path.relative_to(repo_root)
+            lines = ci_path.read_text(encoding="utf-8").splitlines()[:50]
+            rel = ci_path.relative_to(repo_root).as_posix()
             sections.append(f"--- {rel} ---\n" + "\n".join(lines))
         except OSError:
             pass
@@ -487,7 +590,7 @@ def _gather_repo_context(repo_root: Path) -> str:
         manifest_path = repo_root / manifest_name
         if manifest_path.is_file():
             try:
-                lines = manifest_path.read_text().splitlines()[:50]
+                lines = manifest_path.read_text(encoding="utf-8").splitlines()[:50]
                 sections.append(f"--- {manifest_name} ---\n" + "\n".join(lines))
             except OSError:
                 pass
@@ -496,7 +599,7 @@ def _gather_repo_context(repo_root: Path) -> str:
     contributing = repo_root / "CONTRIBUTING.md"
     if contributing.is_file():
         try:
-            lines = contributing.read_text().splitlines()[:50]
+            lines = contributing.read_text(encoding="utf-8").splitlines()[:50]
             sections.append("--- CONTRIBUTING.md ---\n" + "\n".join(lines))
         except OSError:
             pass
@@ -551,6 +654,8 @@ def _ask_agent_for_config(agent: str, prompt: str) -> dict | None:
             input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         if result.returncode != 0:
@@ -629,6 +734,8 @@ def _merge_file_with_agent(
             input=prompt,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
         if result.returncode != 0:
@@ -661,14 +768,18 @@ def cmd_init(args: argparse.Namespace) -> int:
         return 1
 
     # Detect settings
-    base_ref = _detect_base_branch(repo_root)
+    requested_base = str(vars(args).get("base", "") or "").strip()
+    try:
+        base_ref = requested_base or _detect_base_branch(repo_root)
+    except BaseBranchDetectionError as exc:
+        print(f"Error: {exc}", flush=True)
+        return 1
     default_agent, allowed_agents = _detect_agents()
     review_default = "codex" if "codex" in allowed_agents else default_agent
 
     if not default_agent:
         print(
-            "Error: No coding agents found on PATH (looked for: claude, codex). "
-            "Install at least one before running spec init.",
+            f"Error: {_agent_detection_failure_message()}",
             flush=True,
         )
         return 1
@@ -709,7 +820,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             setup_command=setup_command,
             teardown_command=teardown_command,
         )
-        spec_toml.write_text(toml_content)
+        spec_toml.write_text(toml_content, encoding="utf-8")
         print(f"  Created {spec_toml.relative_to(repo_root)}")
 
     # Create directories and spec template
@@ -720,7 +831,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     # lacks the directory required by the task flow.
     gitkeep = repo_root / "specs" / "tasks" / ".gitkeep"
     if not gitkeep.exists():
-        gitkeep.write_text("")
+        gitkeep.write_text("", encoding="utf-8")
     if _copy_template(repo_root, "TEMPLATE.md", "specs/TEMPLATE.md", force=force):
         print("  Created specs/ and specs/tasks/ with TEMPLATE.md")
     else:
@@ -783,7 +894,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 f"_read_bundled_template('{template_name}'))\""
             )
             if answer.strip().lower() in ("", "y"):
-                existing_content = (repo_root / path).read_text()
+                existing_content = (repo_root / path).read_text(encoding="utf-8")
                 template_content = _read_bundled_template(
                     template_name,
                 )
@@ -794,7 +905,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                     template_name,
                 )
                 if result is not None:
-                    (repo_root / path).write_text(result)
+                    (repo_root / path).write_text(result, encoding="utf-8")
                     merged.append(path)
                     print(f"    Merged {path}")
                 else:

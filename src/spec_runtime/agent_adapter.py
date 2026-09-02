@@ -30,6 +30,10 @@ _logger = logging.getLogger(__name__)
 _BARE_TOML_KEY_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
+class HostAgentUnavailableError(RuntimeError):
+    """Raised before an agent whose host isolation is unavailable is launched."""
+
+
 def claude_sandbox_unavailability_reason(
     *,
     platform: str | None = None,
@@ -59,8 +63,43 @@ def claude_sandbox_unavailability_reason(
         return ""
     return (
         f"Claude's host sandbox is not supported on platform {active_platform!r}. "
-        "Use WSL2, macOS, or the container execution backend."
+        "Use Codex for native execution, run Claude under WSL2 or macOS, or "
+        "use the Linux container execution backend for implementation."
     )
+
+
+def host_agent_unavailability_reason(
+    agent_name: str,
+    *,
+    platform: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> str:
+    """Return why *agent_name* cannot be launched directly on this host.
+
+    This is the common policy boundary for every host-side provider launch.
+    Container implementation workers deliberately do not call it because the
+    provider process runs in their Linux environment; authoring, local review,
+    block debugging, and local chat always run on the host.
+    """
+    if agent_name.strip().lower() == "claude":
+        return claude_sandbox_unavailability_reason(platform=platform, which=which)
+    return ""
+
+
+def require_host_agent_available(
+    agent_name: str,
+    *,
+    platform: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+) -> None:
+    """Fail closed before starting an unavailable host-side provider."""
+    reason = host_agent_unavailability_reason(
+        agent_name,
+        platform=platform,
+        which=which,
+    )
+    if reason:
+        raise HostAgentUnavailableError(reason)
 
 
 def _toml_quote(s: str) -> str:
@@ -258,7 +297,7 @@ def _codex_linux_sandbox_overrides() -> list[str]:
 def _read_gitdir_file(path: Path) -> Path | None:
     """Resolve a Git ``.git`` file or ``commondir`` file path."""
     try:
-        text = path.read_text().strip()
+        text = path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     if text.startswith("gitdir:"):
@@ -411,6 +450,7 @@ class AgentAdapter(Protocol):
         output_path: Path,
         schema_path: Path | None = None,
         mcp_config_path: Path | None = None,
+        writable_temp_dir: Path | None = None,
     ) -> list[str]:
         """Build the shell command to run an independent code review.
 
@@ -499,8 +539,9 @@ class ClaudeAgent:
         output_path: Path,
         schema_path: Path | None = None,
         mcp_config_path: Path | None = None,
+        writable_temp_dir: Path | None = None,
     ) -> list[str]:
-        del output_path, schema_path  # Claude streams review JSON to stdout.
+        del output_path, schema_path, writable_temp_dir  # Claude streams review JSON to stdout.
         cmd = ["claude", "-p", "--dangerously-skip-permissions"]
         if mcp_config_path:
             cmd += ["--mcp-config", str(mcp_config_path), "--strict-mcp-config"]
@@ -603,15 +644,29 @@ class CodexAgent:
         output_path: Path,
         schema_path: Path | None = None,
         mcp_config_path: Path | None = None,
+        writable_temp_dir: Path | None = None,
     ) -> list[str]:
         del mcp_config_path  # Codex non-interactive isolation uses CODEX_HOME, not a config file path.
         cmd = [
             "codex",
             "exec",
             "--ephemeral",
-            "-s",
-            "read-only",
         ]
+        if writable_temp_dir is None:
+            cmd += ["-s", "read-only"]
+        else:
+            # Codex accepts --add-dir with read-only but does not project that
+            # directory into the effective writable sandbox. Invert the
+            # workspace instead: start in disposable scratch under
+            # workspace-write, while the PR checkout remains an external,
+            # readable-but-unwritable directory named in the review prompt.
+            cmd += [
+                "-s",
+                "workspace-write",
+                "-C",
+                str(writable_temp_dir),
+                "--skip-git-repo-check",
+            ]
         cmd += _codex_linux_sandbox_overrides()
         if schema_path:
             cmd += ["--output-schema", str(schema_path)]

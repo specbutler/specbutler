@@ -104,6 +104,7 @@ class CommandSpec:
         which: Callable[[str], str | None] = shutil.which,
         windows: bool | None = None,
         arguments: tuple[str, ...] = (),
+        temp_dir: Path | None = None,
     ) -> Iterator[list[str]]:
         """Materialize any launch-only resources and yield the process argv.
 
@@ -114,12 +115,26 @@ class CommandSpec:
         """
         use_windows = os.name == "nt" if windows is None else windows
         if self.mode != "script" or self.shell != "cmd" or not use_windows:
-            yield self.argv(which=which, windows=windows, arguments=arguments)
+            argv = self.argv(which=which, windows=windows, arguments=arguments)
+            if use_windows and self.mode == "argv" and argv:
+                executable = Path(argv[0])
+                if not executable.is_absolute() and (
+                    "/" in argv[0] or "\\" in argv[0]
+                ):
+                    # CreateProcess does not use Popen(cwd=...) when resolving
+                    # an executable path. Anchor explicit relative paths to
+                    # the command cwd; bare names still use PATH normally.
+                    argv[0] = str((cwd / executable).resolve())
+            yield argv
             return
         if arguments:
             # Keep the targeted configuration error from argv().
             self.argv(which=which, windows=windows, arguments=arguments)
-        fd, raw_path = tempfile.mkstemp(prefix="spec-command-", suffix=".cmd")
+        fd, raw_path = tempfile.mkstemp(
+            prefix="spec-command-",
+            suffix=".cmd",
+            dir=temp_dir,
+        )
         script_path = Path(raw_path)
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n") as handle:
@@ -216,11 +231,13 @@ def run_command(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Launch a typed command without interpreting argv-mode arguments."""
+    from .process_supervisor import run as run_supervised
+
     try:
         with command.launch_argv(cwd=cwd) as argv:
-            return subprocess.run(
+            return run_supervised(
                 argv, cwd=cwd, env=None if env is None else dict(env),
-                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, errors="replace", stdin=subprocess.DEVNULL,
                 timeout=timeout, check=False,
             )
     except FileNotFoundError as exc:

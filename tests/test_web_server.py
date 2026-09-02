@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import UTC, datetime
@@ -176,6 +177,165 @@ class TestServerLifecycle:
             remove_pid(tmp_path)
             assert not pid_path.exists()
 
+    def test_windows_background_persists_token_and_cleans_failed_start(self, tmp_path, capsys):
+        from spec_runtime.process_supervisor import (
+            LifetimeMode,
+            ProcessIdentity,
+            ProcessSupervisor,
+            SupervisionToken,
+        )
+
+        token = SupervisionToken(
+            LifetimeMode.DETACHED, ProcessIdentity(123, "created"), 1, "owner", "web-token"
+        )
+        managed = MagicMock(token=token)
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
+            patch("spec_runtime.web.server.load_or_create_token", return_value="auth"),
+            patch("socket.create_connection", side_effect=OSError("free")),
+            patch.object(ProcessSupervisor, "spawn", return_value=managed),
+            patch("spec_runtime.web.server.write_supervision_token") as write_token,
+            patch("spec_runtime.web.server._wait_for_ready_record", return_value=False),
+            patch("spec_runtime.process_supervisor.identity_matches", return_value=False),
+            patch("spec_runtime.web.server.remove_pid") as remove_pid,
+        ):
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path, background=True) == 1
+        write_token.assert_not_called()
+        managed.terminate.assert_called_once_with(grace_seconds=0.5)
+        remove_pid.assert_called_once_with(tmp_path)
+
+    def test_windows_recovers_interrupted_background_launch(self, tmp_path, monkeypatch):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import (
+            _helper_metadata_path,
+            _launch_path,
+            _ready_path,
+            _recover_launch,
+            _write_launch_reservation,
+            read_supervision_token,
+        )
+
+        monkeypatch.setenv(
+            "SPEC_PROCESS_CONTROL_ROOT",
+            str(tmp_path / "process-controls"),
+        )
+        supervision_id = "recover-web"
+        nonce = "child-authenticated"
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.DETACHED,
+            identity,
+            1,
+            "owner",
+            supervision_id,
+            payload_identity=ProcessIdentity(124, "payload", "python.exe"),
+        )
+        helper_path = _helper_metadata_path(tmp_path, supervision_id)
+        helper_path.parent.mkdir(parents=True, exist_ok=True)
+        helper_path.write_text(json.dumps(token.to_dict()), encoding="utf-8")
+        _write_launch_reservation(
+            tmp_path,
+            supervision_id=supervision_id,
+            helper_path=helper_path,
+            nonce=nonce,
+            host="127.0.0.1",
+            port=7700,
+        )
+        ready_path = _ready_path(tmp_path)
+        ready_path.write_text(
+            json.dumps(
+                {
+                    "nonce": nonce,
+                    "payload_identity": token.payload.to_dict(),
+                    "host": "127.0.0.1",
+                    "port": 7700,
+                    "listener": "127.0.0.1:7700",
+                }
+            ),
+            encoding="utf-8",
+        )
+        with (
+            patch("spec_runtime.process_supervisor.identity_matches", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.promote_payload_identity",
+                return_value=token,
+            ) as promote_payload,
+            patch("spec_runtime.web.server._wait_for_port", return_value=True),
+        ):
+            assert _recover_launch(tmp_path) == token
+        if os.name == "nt":
+            promote_payload.assert_called_once_with(token, token.payload)
+        else:
+            promote_payload.assert_not_called()
+        assert read_supervision_token(tmp_path) == token
+        assert not _launch_path(tmp_path).exists()
+        assert not helper_path.exists()
+
+    @pytest.mark.parametrize("corruption", ["malformed", "wrong-listener", "stale-identity"])
+    def test_windows_recovery_rejects_untrusted_launch_state(
+        self,
+        tmp_path,
+        corruption,
+        monkeypatch,
+    ):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import (
+            _helper_metadata_path,
+            _launch_path,
+            _ready_path,
+            _recover_launch,
+            _write_launch_reservation,
+        )
+
+        monkeypatch.setenv(
+            "SPEC_PROCESS_CONTROL_ROOT",
+            str(tmp_path / "process-controls"),
+        )
+        supervision_id = "reject-web"
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(LifetimeMode.DETACHED, identity, 1, "owner", supervision_id)
+        helper_path = _helper_metadata_path(tmp_path, supervision_id)
+        helper_path.parent.mkdir(parents=True, exist_ok=True)
+        helper_path.write_text(json.dumps(token.to_dict()), encoding="utf-8")
+        _write_launch_reservation(
+            tmp_path,
+            supervision_id=supervision_id,
+            helper_path=helper_path,
+            nonce="nonce",
+            host="127.0.0.1",
+            port=7700,
+        )
+        ready = {
+            "nonce": "nonce",
+            "payload_identity": token.payload.to_dict(),
+            "host": "127.0.0.1",
+            "port": 7700,
+            "listener": "127.0.0.1:7700",
+        }
+        _ready_path(tmp_path).write_text(json.dumps(ready), encoding="utf-8")
+        if corruption == "malformed":
+            _launch_path(tmp_path).write_text("not json", encoding="utf-8")
+        elif corruption == "wrong-listener":
+            ready["listener"] = "127.0.0.1:9999"
+            _ready_path(tmp_path).write_text(json.dumps(ready), encoding="utf-8")
+        with (
+            patch(
+                "spec_runtime.process_supervisor.identity_matches",
+                return_value=corruption != "stale-identity",
+            ),
+            patch("spec_runtime.web.server._wait_for_port", return_value=True),
+        ):
+            recovered = _recover_launch(tmp_path)
+        if corruption == "wrong-listener":
+            assert recovered == token
+            assert _launch_path(tmp_path).exists()
+        else:
+            assert recovered is None
+            assert _launch_path(tmp_path).exists() == (corruption == "malformed")
+        assert helper_path.exists() == (corruption != "stale-identity")
+
     def test_is_server_running_false_when_no_pid(self, tmp_path):
         with patch("spec_runtime.web.server._pid_path", return_value=tmp_path / "nonexistent"):
             from spec_runtime.web.server import is_server_running
@@ -183,6 +343,28 @@ class TestServerLifecycle:
             running, pid = is_server_running(tmp_path)
             assert not running
             assert pid is None
+
+    def test_is_server_running_does_not_downgrade_malformed_supervision_to_pid(
+        self,
+        tmp_path,
+    ):
+        state_dir = tmp_path / "web"
+        state_dir.mkdir()
+        supervision_path = state_dir / "server.supervision.json"
+        supervision_path.write_text("not json", encoding="utf-8")
+        pid_path = state_dir / "server.pid"
+        pid_path.write_text(str(os.getpid()), encoding="utf-8")
+        with (
+            patch("spec_runtime.web.server._supervision_path", return_value=supervision_path),
+            patch("spec_runtime.web.server._pid_path", return_value=pid_path),
+            patch("spec_runtime.process_supervisor.legacy_pid_record_is_live") as legacy_live,
+        ):
+            from spec_runtime.web.server import ServerOwnershipStateError, is_server_running
+
+            with pytest.raises(ServerOwnershipStateError, match="supervision state is malformed"):
+                is_server_running(tmp_path)
+        legacy_live.assert_not_called()
+        assert supervision_path.read_text(encoding="utf-8") == "not json"
 
     def test_is_server_running_true_for_own_process(self, tmp_path):
         from spec_runtime.web.server import _read_process_started_at
@@ -196,8 +378,14 @@ class TestServerLifecycle:
             from spec_runtime.web.server import is_server_running
 
             running, pid = is_server_running(tmp_path)
-            assert running
-            assert pid == os.getpid()
+            if os.name == "nt":
+                # PID files are diagnostic-only on Windows. Without a durable
+                # Job token, trusting one would permit PID-reuse ownership bugs.
+                assert not running
+                assert pid is None
+            else:
+                assert running
+                assert pid == os.getpid()
 
     def test_stop_server_not_running(self, tmp_path, capsys):
         with patch("spec_runtime.web.server._pid_path", return_value=tmp_path / "nonexistent"):
@@ -205,6 +393,144 @@ class TestServerLifecycle:
 
             rc = stop_server(tmp_path)
             assert rc == 1
+
+    def test_stop_server_routes_legacy_pid_through_supervision_boundary(
+        self,
+        tmp_path,
+    ):
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(True, 123)),
+            patch("spec_runtime.web.server.read_supervision_token", return_value=None),
+            patch("spec_runtime.web.server.read_pid", return_value=(123, "created")),
+            patch(
+                "spec_runtime.process_supervisor.terminate_legacy_pid_record",
+                return_value=True,
+            ) as terminate_legacy,
+            patch("spec_runtime.web.server.remove_pid") as remove_pid,
+        ):
+            from spec_runtime.web.server import stop_server
+
+            assert stop_server(tmp_path) == 0
+        terminate_legacy.assert_called_once_with(123, "created")
+        remove_pid.assert_called_once_with(tmp_path)
+
+    def test_windows_failed_stop_retains_all_recovery_state(self, tmp_path):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import stop_server
+
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(LifetimeMode.DETACHED, identity, 1, "owner", "failed-stop")
+        state_dir = tmp_path / ".spec-state" / "web"
+        state_dir.mkdir(parents=True)
+        paths = [
+            state_dir / "server.supervision.json",
+            state_dir / "server.launch.json",
+            state_dir / "server.ready.json",
+        ]
+        for path in paths:
+            path.write_text("retained", encoding="utf-8")
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(True, token.payload.pid)),
+            patch("spec_runtime.web.server.read_supervision_token", return_value=token),
+            patch("spec_runtime.process_supervisor.terminate", return_value=False),
+        ):
+            assert stop_server(tmp_path) == 1
+        assert all(path.read_text(encoding="utf-8") == "retained" for path in paths)
+
+    def test_windows_successful_stop_retires_exact_control_state(self, tmp_path):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import stop_server
+
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            1,
+            "owner",
+            "foreground-stop",
+            payload_identity=identity,
+        )
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(True, 123)),
+            patch("spec_runtime.web.server.read_supervision_token", return_value=token),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch("spec_runtime.process_supervisor.terminate", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.retire_inactive_control_state",
+                return_value=True,
+            ) as retire,
+            patch("spec_runtime.web.server.remove_pid") as remove_pid,
+        ):
+            assert stop_server(tmp_path) == 0
+
+        retire.assert_called_once_with(token)
+        remove_pid.assert_called_once_with(tmp_path)
+
+    def test_windows_stop_waits_for_durable_keeper_retirement(self, tmp_path):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import stop_server
+
+        keeper = ProcessIdentity(123, "created", "python.exe")
+        payload = ProcessIdentity(124, "payload", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.DETACHED,
+            keeper,
+            1,
+            "owner",
+            "background-stop-retirement-race",
+            payload_identity=payload,
+        )
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(True, 124)),
+            patch("spec_runtime.web.server.read_supervision_token", return_value=token),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch("spec_runtime.process_supervisor.terminate", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.retire_inactive_control_state",
+                side_effect=[False, True],
+            ) as retire,
+            patch("spec_runtime.process_supervisor.identity_matches", return_value=True),
+            patch("spec_runtime.web.server.time.sleep") as sleep,
+            patch("spec_runtime.web.server.remove_pid") as remove_pid,
+        ):
+            assert stop_server(tmp_path) == 0
+
+        assert retire.call_count == 2
+        sleep.assert_called_once()
+        remove_pid.assert_called_once_with(tmp_path)
+
+    def test_windows_control_retirement_failure_retains_recovery_state(
+        self,
+        tmp_path,
+        capsys,
+    ):
+        from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+        from spec_runtime.web.server import stop_server
+
+        identity = ProcessIdentity(123, "created", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            1,
+            "owner",
+            "foreground-stop-failed-retirement",
+            payload_identity=identity,
+        )
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(True, 123)),
+            patch("spec_runtime.web.server.read_supervision_token", return_value=token),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch("spec_runtime.process_supervisor.terminate", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.retire_inactive_control_state",
+                return_value=False,
+            ),
+            patch("spec_runtime.web.server.remove_pid") as remove_pid,
+        ):
+            assert stop_server(tmp_path) == 1
+
+        remove_pid.assert_not_called()
+        assert "recovery state retained" in capsys.readouterr().err
 
     def test_server_status_not_running(self, tmp_path, capsys):
         with patch("spec_runtime.web.server._pid_path", return_value=tmp_path / "nonexistent"):
@@ -234,7 +560,10 @@ class TestServerLifecycle:
             rc = server_status(tmp_path)
             assert rc == 0
             captured = capsys.readouterr()
-            assert "port 7700" in captured.out
+            if os.name == "nt":
+                assert "not running" in captured.out
+            else:
+                assert "port 7700" in captured.out
 
     def test_is_server_running_rejects_stale_pid(self, tmp_path):
         """A PID file with a mismatched started_at must not match the live process."""
@@ -288,6 +617,74 @@ class TestServerLifecycle:
             captured = capsys.readouterr()
             assert "already running" in captured.err
 
+    @pytest.mark.parametrize(
+        "state_name",
+        ["server.supervision.json", "server.launch.json", "server.pid"],
+    )
+    def test_run_server_refuses_malformed_ownership_state(
+        self,
+        tmp_path,
+        capsys,
+        state_name,
+    ):
+        state_dir = tmp_path / ".spec-state" / "web"
+        state_dir.mkdir(parents=True)
+        (state_dir / state_name).write_text("not valid ownership state", encoding="utf-8")
+
+        with patch("spec_runtime.web.server.load_or_create_token") as load_token:
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path) == 1
+
+        load_token.assert_not_called()
+        assert "cannot start safely" in capsys.readouterr().err
+
+    def test_payload_nonce_does_not_bypass_malformed_launch_reservation(
+        self,
+        tmp_path,
+        capsys,
+        monkeypatch,
+    ):
+        from spec_runtime.web.server import _launch_path, _write_launch_reservation, run_server
+
+        monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "process-controls"))
+        monkeypatch.setenv("SPEC_WEB_READY_NONCE", "payload-nonce")
+        helper_path = tmp_path / "wrong-helper.json"
+        _write_launch_reservation(
+            tmp_path,
+            supervision_id="payload-owner",
+            helper_path=helper_path,
+            nonce="payload-nonce",
+            host="127.0.0.1",
+            port=7700,
+        )
+        reservation = json.loads(_launch_path(tmp_path).read_text(encoding="utf-8"))
+        reservation["listener"] = "127.0.0.1:9999"
+        _launch_path(tmp_path).write_text(json.dumps(reservation), encoding="utf-8")
+
+        with patch("spec_runtime.web.server.load_or_create_token") as load_token:
+            assert run_server(tmp_path) == 1
+
+        load_token.assert_not_called()
+        assert "cannot start safely" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("operation", ["stop", "status"])
+    def test_management_refuses_malformed_ownership_state(
+        self,
+        tmp_path,
+        capsys,
+        operation,
+    ):
+        state_dir = tmp_path / ".spec-state" / "web"
+        state_dir.mkdir(parents=True)
+        (state_dir / "server.supervision.json").write_text("not json", encoding="utf-8")
+
+        from spec_runtime.web.server import server_status, stop_server
+
+        command = stop_server if operation == "stop" else server_status
+        assert command(tmp_path) == 1
+        assert "state is malformed" in capsys.readouterr().err
+
     def test_wait_for_port_returns_true_on_connection(self):
         """_wait_for_port returns True when a connection succeeds."""
         from spec_runtime.web.server import _wait_for_port
@@ -306,12 +703,28 @@ class TestServerLifecycle:
 
     def test_background_start_fails_when_port_unavailable(self, tmp_path, capsys):
         """Background mode must return 1 when the child fails to bind."""
+        from spec_runtime.process_supervisor import (
+            LifetimeMode,
+            ProcessIdentity,
+            ProcessSupervisor,
+            SupervisionToken,
+        )
+
+        token = SupervisionToken(
+            LifetimeMode.DETACHED,
+            ProcessIdentity(123, "created"),
+            1,
+            "owner",
+            "failed-bind",
+        )
+        managed = MagicMock(token=token)
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
             patch("socket.create_connection", side_effect=OSError("refused")),
-            patch("os.fork", return_value=123),  # Simulate parent process
-            patch("spec_runtime.web.server._wait_for_port", return_value=False),
+            patch.object(ProcessSupervisor, "spawn", return_value=managed),
+            patch("spec_runtime.web.server._wait_for_ready_record", return_value=None),
+            patch("spec_runtime.process_supervisor.identity_matches", return_value=False),
         ):
             from spec_runtime.web.server import run_server
 
@@ -319,6 +732,7 @@ class TestServerLifecycle:
             assert rc == 1
             captured = capsys.readouterr()
             assert "failed" in captured.err.lower()
+        managed.terminate.assert_called_once_with(grace_seconds=0.5)
 
     def test_foreground_banner_prints_after_bind(self, tmp_path, capsys):
         """Foreground banner must fire after Server.startup() (post-bind)."""
@@ -354,6 +768,7 @@ class TestServerLifecycle:
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=False),
             patch("spec_runtime.web.server.write_pid"),
             patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), None)),
             patch("spec_runtime.web.server.remove_pid"),
@@ -401,6 +816,7 @@ class TestServerLifecycle:
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=False),
             patch("spec_runtime.web.server.write_pid"),
             patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), None)),
             patch("spec_runtime.web.server.remove_pid"),
@@ -425,6 +841,7 @@ class TestServerLifecycle:
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=False),
             patch("spec_runtime.web.server.write_pid"),
             patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), None)),
             patch("spec_runtime.web.server.remove_pid") as remove_pid,
@@ -439,6 +856,133 @@ class TestServerLifecycle:
         assert rc == 0
         remove_pid.assert_called_once_with(tmp_path)
 
+    @pytest.mark.parametrize("stale_nonce", [False, True])
+    def test_direct_windows_foreground_publishes_current_process_claim(
+        self,
+        tmp_path,
+        monkeypatch,
+        stale_nonce,
+    ):
+        from spec_runtime.process_supervisor import (
+            LifetimeMode,
+            ProcessIdentity,
+            SupervisionToken,
+        )
+
+        if stale_nonce:
+            monkeypatch.setenv("SPEC_WEB_READY_NONCE", "stale-inherited-nonce")
+        else:
+            monkeypatch.delenv("SPEC_WEB_READY_NONCE", raising=False)
+        identity = ProcessIdentity(os.getpid(), "created", "python.exe")
+        claimed = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "web-foreground-test",
+        )
+        call_order: list[str] = []
+        fake_server = MagicMock()
+        fake_server.startup = AsyncMock()
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
+            patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch(
+                "spec_runtime.process_supervisor.claim_current_process",
+                side_effect=lambda _name: (call_order.append("claim"), claimed)[1],
+            ) as claim,
+            patch(
+                "spec_runtime.web.server.write_supervision_token",
+                side_effect=lambda *_args: call_order.append("supervision"),
+            ) as write_supervision,
+            patch(
+                "spec_runtime.web.server.write_pid",
+                side_effect=lambda *_args, **_kwargs: call_order.append("pid"),
+            ),
+            patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), "created")),
+            patch("spec_runtime.web.server.remove_pid"),
+            patch("spec_runtime.web.server.create_app", return_value=MagicMock()),
+            patch("uvicorn.Config"),
+            patch("uvicorn.Server", return_value=fake_server),
+        ):
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path, background=False) == 0
+
+        claim.assert_called_once()
+        write_supervision.assert_called_once_with(tmp_path, claimed)
+        assert call_order == ["claim", "supervision", "pid"]
+
+    def test_matching_background_payload_reservation_skips_current_process_claim(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("SPEC_WEB_READY_NONCE", "matching-payload-nonce")
+        fake_server = MagicMock()
+        fake_server.startup = AsyncMock()
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
+            patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch(
+                "spec_runtime.web.server._launch_reservation_belongs_to_current_payload",
+                return_value=True,
+            ),
+            patch("spec_runtime.process_supervisor.claim_current_process") as claim,
+            patch("spec_runtime.web.server.write_supervision_token") as write_supervision,
+            patch("spec_runtime.web.server.write_pid"),
+            patch("spec_runtime.web.server.read_pid", return_value=(os.getpid(), "created")),
+            patch("spec_runtime.web.server.remove_pid"),
+            patch("spec_runtime.web.server.create_app", return_value=MagicMock()),
+            patch("uvicorn.Config"),
+            patch("uvicorn.Server", return_value=fake_server),
+        ):
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path, background=False) == 0
+
+        claim.assert_not_called()
+        write_supervision.assert_not_called()
+
+    def test_background_windows_parent_does_not_claim_its_current_process(
+        self,
+        tmp_path,
+    ):
+        from spec_runtime.process_supervisor import (
+            LifetimeMode,
+            ProcessIdentity,
+            ProcessSupervisor,
+            SupervisionToken,
+        )
+
+        token = SupervisionToken(
+            LifetimeMode.DETACHED,
+            ProcessIdentity(123, "created"),
+            1,
+            "owner",
+            "background-no-self-claim",
+        )
+        managed = MagicMock(token=token)
+        with (
+            patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
+            patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
+            patch("spec_runtime.web.server._native_windows_host", return_value=True),
+            patch("spec_runtime.process_supervisor.claim_current_process") as claim,
+            patch("socket.create_connection", side_effect=OSError("free")),
+            patch.object(ProcessSupervisor, "spawn", return_value=managed),
+            patch("spec_runtime.web.server._wait_for_ready_record", return_value=token),
+            patch("spec_runtime.web.server._ready_record_matches", return_value=True),
+            patch("spec_runtime.web.server._wait_for_port", return_value=True),
+            patch("spec_runtime.web.server.write_supervision_token"),
+        ):
+            from spec_runtime.web.server import run_server
+
+            assert run_server(tmp_path, background=True) == 0
+
+        claim.assert_not_called()
+
     def test_logging_configured_before_backend_availability_check(self, tmp_path):
         """Regression: logging.basicConfig must run before log_backend_availability
         so that INFO-level startup diagnostics are visible."""
@@ -450,19 +994,47 @@ class TestServerLifecycle:
         def fake_log_backend(_repo_root=None):
             call_order.append("log_backend_availability")
 
+        from spec_runtime.process_supervisor import (
+            LifetimeMode,
+            ProcessIdentity,
+            ProcessSupervisor,
+            SupervisionToken,
+        )
+
+        token = SupervisionToken(
+            LifetimeMode.DETACHED,
+            ProcessIdentity(123, "created"),
+            1,
+            "owner",
+            "logging-order",
+        )
+        managed = MagicMock(token=token)
+        supervisors = []
+
+        def fake_spawn(supervisor, _command, **_kwargs):
+            supervisors.append(supervisor)
+            return managed
+
         with (
             patch("spec_runtime.web.server.is_server_running", return_value=(False, None)),
             patch("spec_runtime.web.server.load_or_create_token", return_value="tok"),
             patch("logging.basicConfig", side_effect=fake_basic_config),
             patch("spec_runtime.web.chat_api.log_backend_availability", fake_log_backend),
-            patch("os.fork", return_value=123),
+            patch("socket.create_connection", side_effect=OSError("free")),
+            patch.object(ProcessSupervisor, "spawn", new=fake_spawn),
+            patch("spec_runtime.web.server._wait_for_ready_record", return_value=token),
+            patch("spec_runtime.web.server._ready_record_matches", return_value=True),
             patch("spec_runtime.web.server._wait_for_port", return_value=True),
-            patch("os.waitpid", return_value=(0, 0)),
+            patch("spec_runtime.web.server.write_supervision_token"),
         ):
             from spec_runtime.web.server import run_server
 
             run_server(tmp_path, background=True)
 
+        assert len(supervisors) == 1
+        assert supervisors[0].mode is LifetimeMode.DETACHED
+        assert supervisors[0]._supervision_id
+        assert supervisors[0]._publish_durable_token is True
         assert "basicConfig" in call_order, "logging.basicConfig was not called"
         assert "log_backend_availability" in call_order, "log_backend_availability was not called"
         assert call_order.index("basicConfig") < call_order.index("log_backend_availability"), (
@@ -1203,15 +1775,45 @@ class TestAPIRoutes:
                 "spec_runtime.autopilot_tui.dashboard._resolve_live_process_group",
                 return_value=None,
             ),
-            patch("spec_runtime.web.api.os.getpgid") as getpgid,
-            patch("spec_runtime.web.api.os.kill") as kill,
+            patch("spec_runtime.orchestrator.stop_run") as stop_run,
         ):
             client = self._make_client(tmp_path)
             resp = client.post("/api/v1/specs/my-spec/stop", headers=self._auth_headers())
 
         assert resp.status_code == 404
-        getpgid.assert_not_called()
-        kill.assert_not_called()
+        stop_run.assert_not_called()
+
+    def test_stop_spec_uses_managed_process_when_run_metadata_exists(self, tmp_path):
+        """A web-started run retains its portable tree-termination boundary."""
+        spec_file = tmp_path / "specs" / "my-spec.md"
+        spec_file.parent.mkdir(parents=True, exist_ok=True)
+        spec_file.write_text("---\nid: my-spec\nstatus: not-started\n---\n")
+        proc = MagicMock(pid=42)
+        proc.poll.return_value = None
+        run = {"run_id": "my-spec-run", "spec_id": "my-spec", "status": "running"}
+        run_index = MagicMock(latest_by_spec={"my-spec": run})
+
+        with (
+            patch("subprocess.Popen", return_value=proc),
+            patch(
+                "spec_runtime.autopilot_tui.dashboard._resolve_live_process_group",
+                return_value=(42, "creation-time"),
+            ),
+            patch("spec_runtime.autopilot.load_run_record_index", return_value=run_index),
+            patch("spec_runtime.config.load_repo_spec_runtime_config") as mock_config,
+        ):
+            mock_config.return_value = MagicMock(paths=MagicMock(specs_dir="specs"))
+            client = self._make_client(tmp_path)
+            start_resp = client.post(
+                "/api/v1/specs/my-spec/implement", headers=self._auth_headers()
+            )
+            resp = client.post("/api/v1/specs/my-spec/stop", headers=self._auth_headers())
+
+        assert start_resp.status_code == 200
+        assert resp.status_code == 200
+        proc.terminate.assert_called_once_with(grace_seconds=3)
+        proc.wait.assert_called_once_with(timeout=3)
+        assert "my-spec" not in client.app.state.web_started_procs
 
     def test_process_registry_is_scoped_to_app_and_cleared_on_shutdown(self, tmp_path):
         from starlette.testclient import TestClient
@@ -1269,6 +1871,8 @@ class TestAPIRoutes:
         assert "Queue:" in body["stdout"]
         # The --dry-run flag must be present in the spawned command.
         assert "--dry-run" in mock_run.call_args[0][0]
+        assert mock_run.call_args.kwargs["encoding"] == "utf-8"
+        assert mock_run.call_args.kwargs["errors"] == "replace"
 
     def test_dispatch_stop(self, tmp_path):
         with patch("subprocess.run") as mock_run:
@@ -1278,6 +1882,8 @@ class TestAPIRoutes:
 
         assert resp.status_code == 200
         assert resp.json()["status"] == "stopped"
+        assert mock_run.call_args.kwargs["encoding"] == "utf-8"
+        assert mock_run.call_args.kwargs["errors"] == "replace"
 
     def test_dispatch_stop_not_running(self, tmp_path):
         # `spec auto stop` reports "not running" (and may exit non-zero) when

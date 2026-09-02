@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import errno
+import ntpath
 import os
 import shutil
 import stat
+import tempfile
 import time
-import uuid
 from pathlib import Path
 
 _DELAYS = (0.01, 0.025, 0.05, 0.1, 0.2)
 _WINDOWS = os.name == "nt"
+
+
+def _windows_extended_path(path: Path) -> Path:
+    """Return an absolute Windows path that is not limited by ``MAX_PATH``."""
+    rendered = ntpath.abspath(str(path))
+    if rendered.startswith("\\\\?\\"):
+        return Path(rendered)
+    if rendered.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + rendered.lstrip("\\"))
+    return Path("\\\\?\\" + rendered)
 
 
 def _transient(exc: OSError) -> bool:
@@ -33,28 +44,48 @@ def _retry(operation) -> None:
 
 
 def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None:
-    """Replace a file atomically using a unique sibling temporary file."""
+    """Replace a file atomically using a short, unique sibling temp file.
+
+    The temporary basename deliberately does not include the destination
+    basename.  Appending a PID and UUID to a long run-state filename can push
+    an otherwise valid path over the legacy Windows ``MAX_PATH`` boundary.
+    ``mkstemp`` still gives concurrent writers a unique sibling, which keeps
+    the final ``os.replace`` atomic without spending that path-length budget.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    descriptor, raw_temporary = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=".spec-",
+        suffix=".tmp",
+        text=True,
+    )
+    temporary = Path(raw_temporary)
     try:
-        with temporary.open("w", encoding=encoding, newline="") as stream:
+        with os.fdopen(descriptor, "w", encoding=encoding, newline="") as stream:
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
-        _retry(lambda: os.replace(temporary, path))
+        replace_source = _windows_extended_path(temporary) if _WINDOWS else temporary
+        replace_target = _windows_extended_path(path) if _WINDOWS else path
+        _retry(lambda: os.replace(replace_source, replace_target))
     finally:
         temporary.unlink(missing_ok=True)
 
 
 def remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
     """Remove a tree while tolerating read-only and transient Windows entries."""
-    def onerror(function, name, _exc_info) -> None:
+    def onerror(function, name, exc_info) -> None:
+        exc = exc_info[1]
+        if isinstance(exc, FileNotFoundError) or getattr(exc, "winerror", None) in {2, 3}:
+            # Another remover (or a junction/cache cleanup) won the race.
+            return
         target = Path(name)
         target.chmod(target.stat().st_mode | stat.S_IWRITE)
         _retry(lambda: function(name))
 
+    removal_path = _windows_extended_path(path) if _WINDOWS else path
     try:
-        _retry(lambda: shutil.rmtree(path, onerror=onerror))
+        _retry(lambda: shutil.rmtree(removal_path, onerror=onerror))
     except OSError:
         if not ignore_errors:
             raise
@@ -85,10 +116,6 @@ class FileLock:
                 import msvcrt
 
                 self.file.seek(0)
-                if self.file.read(1) == b"":
-                    self.file.write(b"\0")
-                    self.file.flush()
-                self.file.seek(0)
                 while True:
                     try:
                         msvcrt.locking(self.file.fileno(), msvcrt.LK_NBLCK, 1)
@@ -101,12 +128,17 @@ class FileLock:
                             self.file = None
                             return False
                         time.sleep(_DELAYS[0])
-                # Older POSIX lock files stored JSON beginning at byte zero.
-                # Once byte zero is locked, migrate that content behind the
-                # Windows sentinel before callers read or replace metadata.
+                # Never inspect byte zero before owning it: Windows denies even
+                # reads of a byte locked by another process. Initialize a new
+                # file, or migrate older POSIX metadata, only while holding the
+                # byte-range lock.
                 self.file.seek(0)
                 content = self.file.read()
-                if content and not content.startswith(b"\0"):
+                if not content:
+                    self.file.seek(0)
+                    self.file.write(b"\0")
+                    self.file.flush()
+                elif not content.startswith(b"\0"):
                     self.file.seek(0)
                     self.file.write(b"\0" + content)
                     self.file.truncate()

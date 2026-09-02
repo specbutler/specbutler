@@ -64,11 +64,13 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from . import review_feedback, worktree_process_registry
 from .agent_adapter import (
     AgentAdapter,
+    HostAgentUnavailableError,
     _codex_linux_sandbox_overrides,
     _render_codex_mcp_toml,
     claude_isolated_home,
     codex_isolated_home,
     get_agent_adapter,
+    require_host_agent_available,
 )
 from .command_runtime import CommandSpec, CommandVariants
 from .config import load_spec_runtime_config
@@ -104,11 +106,43 @@ from .execution_backend import (
     SnapshotRef,
     UnknownExecutionBackendError,
     WorkspaceHandle,
+    run_local_command_preserving_descendants,
 )
 from .execution_backend import get_execution_backend as _factory_get_execution_backend
 from .forge import GitHubForge, PushResult
-from .git_common import resolve_common_root
+from .git_common import resolve_common_root, run_git, subprocess_text_kwargs
 from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
+from .process_supervisor import (
+    LifetimeMode,
+    ManagedProcess,
+    ProcessGroupOwnershipError,
+    ProcessGroupTerminationError,
+    ProcessSupervisor,
+    SupervisionToken,
+    bind_held_posix_group_payload,
+    bind_held_windows_job_payload,
+    claim_current_process,
+    close_empty_held_posix_groups,
+    close_empty_held_windows_jobs,
+    inspect_process,
+    stop_supervised_process,
+    terminate_exact_process,
+    terminate_legacy_popen_tree,
+    terminate_legacy_process_group,
+)
+from .process_supervisor import ProcessIdentity as SupervisedProcessIdentity
+from .process_supervisor import (
+    is_process_group_alive as _supervised_process_group_is_alive,
+)
+from .process_supervisor import run as run_supervised
+from .process_supervisor import (
+    terminate as terminate_supervision_token,
+)
+from .review_bootstrap import (
+    ReviewBootstrapSandboxUnavailable,
+    isolated_review_bootstrap_sandbox,
+)
+from .review_decision import REVIEW_DECISION_VALUES, review_payload_decision
 from .spec_identity import (
     SPEC_ID_RE,
     authoring_branch_identity,
@@ -131,6 +165,13 @@ from .spec_merge_tags import (
 from .spec_metadata import parse_spec_frontmatter as load_spec_frontmatter
 from .spec_status import collect_git_spec_state, is_spec_merged, refresh_merge_completion_state
 from .spec_status import get_spec_status as read_spec_status
+from .worktree_safety import (
+    UnsafeWorktreePathError,
+    configured_worktrees_root,
+    expected_run_worktree_names,
+    paths_equal,
+    validate_owned_worktree_path,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -247,11 +288,15 @@ REVIEW_FINDING_CLASS_INSTRUCTION = (
 LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX = "Local review must rerun before merge"
 LOCAL_REVIEW_RERUN_AFTER_SYNC_LEGACY_PREFIX = "Local review must rerun after syncing with origin/main"
 LOCAL_REVIEW_WORKTREE_PREFIX = "spec-review-"
+# Deliberately does not match LOCAL_REVIEW_WORKTREE_PREFIX: concurrent stale
+# worktree cleanup must never mistake a live reviewer scratch root for a stale
+# detached Git checkout.
+LOCAL_REVIEW_SCRATCH_PREFIX = "spec-reviewer-scratch-"
 LOCAL_MERGEABILITY_WORKTREE_PREFIX = "spec-mergeability-"
 LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX = "spec-block-debugger-"
 BLOCK_DEBUGGER_PRIVATE_CLONE_MARKER = ".spec-block-debugger-owner.json"
 BLOCK_DEBUGGER_AUTO_RESUME_LIMIT = 1
-LOCAL_REVIEW_WORKTREE_ROOT = Path("/tmp").resolve()
+LOCAL_REVIEW_WORKTREE_ROOT = Path(tempfile.gettempdir()).resolve()
 GITHUB_API_VERSION = "2022-11-28"
 LOCAL_REVIEW_DISABLED_CREDENTIAL_ENV_VARS = (
     "GH_ENTERPRISE_TOKEN",
@@ -266,7 +311,6 @@ LOCAL_REVIEW_DISABLED_CREDENTIAL_ENV_VARS = (
 )
 MERGE_CHECKS_POLL_INTERVAL_SECONDS = 10
 MERGE_CHECKS_TIMEOUT_SECONDS = 900
-REVIEW_DECISION_VALUES = ("approved", "request_changes", "blocked", "failed")
 INTAKE_FILE_VERSION = 1
 INTAKE_INPUT_TYPES = ("string", "int", "float", "bool", "choice")
 TASK_SCOPING_PROMPT_FILE = "prompts/task-scoping.md"
@@ -634,10 +678,8 @@ class BlockDebuggerAutoResumeExhausted(RuntimeError):
 
 def resolve_repo_root() -> Path:
     """Return the repository common root (main checkout for linked worktrees)."""
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
+    result = run_git(
+        ["rev-parse", "--show-toplevel"],
         check=True,
     )
     return resolve_common_root(Path(result.stdout.strip()))
@@ -685,7 +727,10 @@ def _is_task_spec_path(spec_path: Path, repo_root: Path) -> bool:
 
 
 def _worktrees_root(repo_root: Path | None = None) -> Path:
-    return resolve_common_root(repo_root) / SPEC_RUNTIME_CONFIG.paths.worktrees_dir
+    return configured_worktrees_root(
+        resolve_common_root(repo_root),
+        SPEC_RUNTIME_CONFIG.paths.worktrees_dir,
+    )
 
 
 def _common_state_root(repo_root: Path | None = None) -> Path:
@@ -862,12 +907,13 @@ def _worktree_is_registered(repo_root: Path, worktree_path: Path) -> tuple[bool,
     if result.returncode != 0:
         detail = redact_sensitive(tail_lines(result.stderr or result.stdout))
         return False, f"git worktree list failed: {detail[-240:]}"
-    resolved = str(worktree_path.resolve())
+    resolved = worktree_path.expanduser().resolve(strict=False)
     for line in result.stdout.splitlines():
         if not line.startswith("worktree "):
             continue
         registered_path = line[len("worktree ") :]
-        if registered_path == str(worktree_path) or registered_path == resolved:
+        listed = Path(registered_path).expanduser().resolve(strict=False)
+        if paths_equal(listed, resolved):
             return True, ""
     return False, ""
 
@@ -972,20 +1018,71 @@ def _stop_worktree_postgres_if_present(worktree_path: Path) -> None:
         )
 
 
+def _validated_worktree_cleanup_target(
+    repo_root: Path,
+    worktree_path: Path,
+    *,
+    branch: str | None = None,
+    expected_spec_id: str = "",
+    temporary_prefix: str = "",
+) -> Path:
+    """Return an authorized canonical target for lifecycle cleanup."""
+    if temporary_prefix:
+        return validate_owned_worktree_path(
+            owner_root=LOCAL_REVIEW_WORKTREE_ROOT,
+            target=worktree_path,
+            expected_prefix=temporary_prefix,
+        )
+    expected_names = ()
+    if expected_spec_id:
+        expected_names = expected_run_worktree_names(
+            expected_spec_id,
+            branch or "",
+        )
+        if not expected_names:
+            raise UnsafeWorktreePathError(
+                "persisted run branch/spec identity does not authorize a worktree path"
+            )
+    return validate_owned_worktree_path(
+        owner_root=_worktrees_root(repo_root),
+        target=worktree_path,
+        relative_to=resolve_common_root(repo_root),
+        expected_names=expected_names,
+    )
+
+
 def _cleanup_worktree_checkout(
     repo_root: Path,
     worktree_path: Path,
     *,
     branch: str | None = None,
     delete_branch: bool,
+    expected_spec_id: str = "",
+    temporary_prefix: str = "",
 ) -> str:
     """Remove a spec worktree and optionally its branch, failing on leftovers."""
-    _reap_registered_worktree_processes(
+    try:
+        worktree_path = _validated_worktree_cleanup_target(
+            repo_root,
+            worktree_path,
+            branch=branch,
+            expected_spec_id=expected_spec_id,
+            temporary_prefix=temporary_prefix,
+        )
+    except UnsafeWorktreePathError as exc:
+        return f"Refusing unsafe worktree cleanup for {worktree_path}: {exc}"
+
+    _stop_worktree_postgres_if_present(worktree_path)
+    reap_report = _reap_registered_worktree_processes(
         repo_root,
         worktree_path,
         reason="worktree cleanup",
     )
-    _stop_worktree_postgres_if_present(worktree_path)
+    if reap_report.surviving:
+        return (
+            f"Refusing to remove worktree {worktree_path}: registered processes survived "
+            f"cleanup ({'; '.join(reap_report.surviving)})."
+        )
 
     registered, error = _worktree_is_registered(repo_root, worktree_path)
     if error:
@@ -999,10 +1096,37 @@ def _cleanup_worktree_checkout(
         if rm_result.returncode != 0:
             detail = redact_sensitive(tail_lines(rm_result.stderr or rm_result.stdout))
             logger.warning("worktree remove reported failure: %s", detail[-240:])
+            # Git for Windows can detach the worktree metadata but fail while
+            # deleting a deep isolated-agent cache at the legacy MAX_PATH
+            # boundary. Finish the authorized cleanup through our extended-
+            # length filesystem primitive; the prune below then removes any
+            # metadata Git left behind.
+            if worktree_path.is_dir():
+                try:
+                    worktree_path = _validated_worktree_cleanup_target(
+                        repo_root,
+                        worktree_path,
+                        branch=branch,
+                        expected_spec_id=expected_spec_id,
+                        temporary_prefix=temporary_prefix,
+                    )
+                    remove_tree(worktree_path)
+                except (OSError, UnsafeWorktreePathError) as exc:
+                    return (
+                        f"git worktree remove failed for {worktree_path}: {detail[-240:]}; "
+                        f"fallback directory removal also failed: {exc}"
+                    )
     elif worktree_path.is_dir():
         try:
+            worktree_path = _validated_worktree_cleanup_target(
+                repo_root,
+                worktree_path,
+                branch=branch,
+                expected_spec_id=expected_spec_id,
+                temporary_prefix=temporary_prefix,
+            )
             remove_tree(worktree_path)
-        except OSError as exc:
+        except (OSError, UnsafeWorktreePathError) as exc:
             return f"Could not remove worktree directory {worktree_path}: {exc}"
 
     prune_result = run_subprocess(["git", "worktree", "prune"], cwd=repo_root)
@@ -1039,6 +1163,20 @@ def _cleanup_worktree_checkout(
     if branch_check.returncode not in (0, 1):
         detail = redact_sensitive(tail_lines(branch_check.stderr or branch_check.stdout))
         return f"git show-ref failed while checking {branch}: {detail[-240:]}"
+    return ""
+
+
+def _remove_temporary_worktree_tree(worktree_path: Path, *, prefix: str) -> str:
+    """Raw-remove a generated temporary checkout after proving its boundary."""
+    try:
+        target = validate_owned_worktree_path(
+            owner_root=LOCAL_REVIEW_WORKTREE_ROOT,
+            target=worktree_path,
+            expected_prefix=prefix,
+        )
+    except UnsafeWorktreePathError as exc:
+        return f"Refusing unsafe temporary worktree cleanup for {worktree_path}: {exc}"
+    remove_tree(target, ignore_errors=True)
     return ""
 
 
@@ -1533,16 +1671,18 @@ def _write_latest_and_attempt_artifacts(
     run_dir.mkdir(parents=True, exist_ok=True)
     latest_path = run_dir / filename
     rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-    latest_path.write_text(rendered)
+    latest_path.write_text(rendered, encoding="utf-8")
     if attempt_number is not None and attempt_number > 0:
-        _attempt_artifact_path(run_dir, filename, attempt_number).write_text(rendered)
+        _attempt_artifact_path(run_dir, filename, attempt_number).write_text(
+            rendered, encoding="utf-8"
+        )
     if launch_number is not None and launch_number > 0:
         launch_path = run_dir / _launch_artifact_filename(filename, launch_number)
         # Launch identifiers are monotonic and immutable. A later annotation of
         # the latest/attempt alias must not erase the evidence captured when the
         # agent launch was first recorded.
         if not launch_path.exists():
-            launch_path.write_text(rendered)
+            launch_path.write_text(rendered, encoding="utf-8")
     return latest_path
 
 
@@ -1599,6 +1739,11 @@ class ImplementSetupManifest:
     mcp_servers: dict[str, dict[str, object]] = field(default_factory=dict)
     managed_processes: tuple[ImplementManagedProcess, ...] = ()
     failure: ImplementSetupFailure | None = None
+    ownership_token: SupervisionToken | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 def _coerce_implement_setup_mcp_servers(
@@ -2544,6 +2689,7 @@ def _run_implement_setup_command(
                     cwd=worktree_path,
                     env=env,
                     inherit_env=True,
+                    preserve_descendants=True,
                 )
             )
     except ExecutionBackendImportError:
@@ -2611,10 +2757,11 @@ def _run_implement_setup_command(
             mcp_servers=partial.mcp_servers,
             managed_processes=partial.managed_processes,
             failure=failure,
+            ownership_token=result.ownership_token,
         )
     manifest = _parse_implement_setup_manifest(result.stdout or "")
     _snapshot_container_workspace_after_setup(run, worktree_path, backend)
-    return manifest
+    return replace(manifest, ownership_token=result.ownership_token)
 
 
 def _snapshot_container_workspace_after_setup(
@@ -2640,7 +2787,8 @@ def _snapshot_container_workspace_after_setup(
         logs = run_root / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         (logs / "snapshot-restore-fallback.log").write_text(
-            f"Container backend setup snapshot unavailable: {exc}\n"
+            f"Container backend setup snapshot unavailable: {exc}\n",
+            encoding="utf-8",
         )
 
 
@@ -2673,7 +2821,8 @@ def _restore_container_workspace_for_retry(
         logs = run_root / "logs"
         logs.mkdir(parents=True, exist_ok=True)
         (logs / "snapshot-restore-fallback.log").write_text(
-            f"Container backend retry restore unavailable: {exc}\n"
+            f"Container backend retry restore unavailable: {exc}\n",
+            encoding="utf-8",
         )
         return workspace
     _reposition_restored_workspace_head(restored, backend, ctx, prior_head)
@@ -2684,7 +2833,7 @@ def _latest_rescue_bundle_for_head(run_root: Path, head_sha: str) -> Path | None
     """Return the newest rescue bundle whose manifest recorded ``head_sha``."""
     index_path = run_root / "rescue" / "index.json"
     try:
-        entries = json.loads(index_path.read_text())
+        entries = json.loads(index_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     if not isinstance(entries, list):
@@ -3161,7 +3310,7 @@ def _diagnostic_note(message: str) -> str:
 
 def _test_gate_diagnostic_command(worktree_path: Path) -> list[str]:
     """Mirror `make test` by running pytest via the worktree virtualenv."""
-    return [str(worktree_path / ".venv" / "bin" / "python"), *TEST_GATE_DIAGNOSTIC_ARGS]
+    return [str(_worktree_venv_python(worktree_path)), *TEST_GATE_DIAGNOSTIC_ARGS]
 
 
 def _test_gate_targeted_diagnostic_command(
@@ -3169,7 +3318,7 @@ def _test_gate_targeted_diagnostic_command(
     nodeid: str,
 ) -> list[str]:
     return [
-        str(worktree_path / ".venv" / "bin" / "python"),
+        str(_worktree_venv_python(worktree_path)),
         "-m",
         "pytest",
         "--tb=short",
@@ -3534,7 +3683,7 @@ def _claude_credentials_preflight_error(
         # evidence of expiry.
         return ""
     try:
-        payload = json.loads(src.read_text())
+        payload = json.loads(src.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
     oauth = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
@@ -4346,7 +4495,7 @@ def _audit_intake_reset(
         "previous_intake": previous_payload,
     }
     (audit_dir / f"{run.run_id}-intake-reset-{ts}.json").write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
 
@@ -4381,10 +4530,32 @@ def run_subprocess(
     *,
     inherit_env: bool = True,
     input_text: str | None = None,
+    preserve_descendants: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess with optional env inheritance and timeout."""
     _raise_if_active_phase_lease_lost()
     merged_env = {**os.environ, **(env or {})} if inherit_env else dict(env or {})
+    if preserve_descendants:
+        result = run_local_command_preserving_descendants(
+            CommandRequest(
+                argv=cmd,
+                cwd=cwd or Path.cwd(),
+                env=merged_env,
+                inherit_env=False,
+                timeout=timeout,
+                input_text=input_text,
+                preserve_descendants=True,
+            ),
+            env=merged_env,
+        )
+        completed = subprocess.CompletedProcess(
+            cmd,
+            result.returncode,
+            result.stdout,
+            result.stderr,
+        )
+        completed.ownership_token = result.ownership_token
+        return completed
     with _ACTIVE_PHASE_LEASE_FAILURE_LOCK:
         active_lease_failure = _ACTIVE_PHASE_LEASE_FAILURE
     if active_lease_failure is None:
@@ -4392,14 +4563,15 @@ def run_subprocess(
             "cwd": cwd,
             "env": merged_env,
             "capture_output": True,
-            "text": True,
             "timeout": timeout,
+            **subprocess_text_kwargs(cmd),
         }
         if input_text is None:
             kwargs["stdin"] = subprocess.DEVNULL
         else:
             kwargs["input"] = input_text
-        return subprocess.run(
+        runner = run_supervised if timeout is not None else subprocess.run
+        return runner(
             cmd,
             **kwargs,
         )
@@ -4409,19 +4581,22 @@ def run_subprocess(
         "env": merged_env,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "text": True,
+        **subprocess_text_kwargs(cmd),
     }
     if input_text is None:
         kwargs["stdin"] = subprocess.DEVNULL
     else:
         kwargs["stdin"] = subprocess.PIPE
-    proc = subprocess.Popen(cmd, **kwargs)
+    proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(cmd, **kwargs)
     started_at = time.monotonic()
     communicate_input = input_text
     while True:
         failure_message = _active_phase_lease_failure_message()
         if failure_message:
-            proc.terminate()
+            # Losing the distributed lease revokes our authority to keep doing
+            # mutating work. Do not spend the normal graceful-stop window on a
+            # child that must cease immediately; terminate the owned tree now.
+            proc.terminate(grace_seconds=0)
             try:
                 proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
             except subprocess.TimeoutExpired:
@@ -4463,19 +4638,16 @@ def _run_local_review_subprocess(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
-        "start_new_session": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     proc: subprocess.Popen[str] | None = None
     try:
-        proc = subprocess.Popen(cmd, **popen_kwargs)
+        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(cmd, **popen_kwargs)
         process_identity = read_process_identity(proc.pid)
         process_started_at = process_identity.started_at if process_identity is not None else ""
-        pgid = 0
-        if os.name == "posix":
-            try:
-                pgid = os.getpgid(proc.pid)
-            except OSError:
-                pgid = 0
+        token = getattr(proc, "token", None)
+        pgid = int(getattr(token, "pgid", 0) or 0)
         logger.info(
             "Started local review subprocess pid=%s pgid=%s cwd=%s timeout=%ss",
             proc.pid,
@@ -4551,12 +4723,8 @@ def _run_local_review_subprocess(
         )
     except subprocess.TimeoutExpired as exc:
         pid = proc.pid if proc is not None else 0
-        pgid = 0
-        if proc is not None and os.name == "posix":
-            try:
-                pgid = os.getpgid(proc.pid)
-            except OSError:
-                pgid = 0
+        token = getattr(proc, "token", None) if proc is not None else None
+        pgid = int(getattr(token, "pgid", 0) or 0)
         logger.warning(
             "Local review subprocess pid=%s pgid=%s timed out after %ss; terminating process group",
             pid or "n/a",
@@ -4597,6 +4765,22 @@ def _run_local_review_subprocess(
                 )
         raise
     finally:
+        # Native Windows cannot symlink the operator's Codex auth into an
+        # isolated home without extra privileges, so local review/debugger
+        # launches temporarily copy it into their disposable checkout. Remove
+        # that credential at the process boundary instead of relying on the
+        # later best-effort worktree cleanup. Never touch an inherited operator
+        # CODEX_HOME that is outside this exact review checkout.
+        configured_codex_home = str(env.get("CODEX_HOME", "")).strip()
+        if configured_codex_home:
+            try:
+                expected_codex_home = codex_isolated_home(cwd).resolve()
+                actual_codex_home = Path(configured_codex_home).resolve()
+            except OSError:
+                pass
+            else:
+                if actual_codex_home == expected_codex_home:
+                    _remove_codex_isolated_auth(cwd)
         _prune_registered_worktree_processes(repo_root, cwd)
 
 
@@ -4640,11 +4824,29 @@ def _parse_exported_env(output: str) -> dict[str, str]:
     return parsed
 
 
-@contextmanager
+def _worktree_venv_executable_dir(
+    worktree_path: Path,
+    *,
+    windows: bool | None = None,
+) -> Path:
+    """Return the platform's executable directory for a worktree virtualenv."""
+    use_windows = os.name == "nt" if windows is None else windows
+    return worktree_path / ".venv" / ("Scripts" if use_windows else "bin")
+
+
+def _worktree_venv_python(
+    worktree_path: Path,
+    *,
+    windows: bool | None = None,
+) -> Path:
+    executable = "python.exe" if (os.name == "nt" if windows is None else windows) else "python"
+    return _worktree_venv_executable_dir(worktree_path, windows=windows) / executable
+
+
 def _inject_worktree_venv_into_env(env: dict[str, str], worktree_path: Path) -> None:
     """Prefer the worktree virtualenv for implement-agent subprocesses."""
     venv_dir = worktree_path / ".venv"
-    venv_bin = venv_dir / "bin"
+    venv_bin = _worktree_venv_executable_dir(worktree_path)
 
     current_path = env.get("PATH") or os.environ.get("PATH", "")
     path_entries = [entry for entry in current_path.split(os.pathsep) if entry]
@@ -4778,7 +4980,7 @@ def _backend_mcp_servers_for_workspace(worktree_path: Path) -> dict[str, dict[st
             )
         return {}
     try:
-        state = json.loads(state_path.read_text())
+        state = json.loads(state_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Could not read container backend state %s: %s", state_path, exc)
         return {}
@@ -4845,6 +5047,12 @@ def _write_claude_mcp_config(
     host paths or the agent will try to execute non-existent paths.
     """
     config_dir = worktree_path / ".claude"
+    if config_dir.is_symlink() or _is_windows_reparse_point(config_dir) or (
+        config_dir.exists() and not config_dir.is_dir()
+    ):
+        raise ValueError(
+            f"Refusing to write Claude config through non-directory path {config_dir}"
+        )
     config_dir.mkdir(parents=True, exist_ok=True)
     mcp_servers = _default_claude_mcp_servers(worktree_path)
     if extra_mcp_servers:
@@ -4858,14 +5066,17 @@ def _write_claude_mcp_config(
     if not host_subprocess:
         mcp_servers = _worker_mcp_servers_for_container(mcp_servers, worktree_path)
     mcp_servers = _enforce_playwright_browser_pin(mcp_servers)
-    _mcp_config_path(worktree_path).write_text(
-        json.dumps(
+    _replace_with_exclusive_file(
+        _mcp_config_path(worktree_path),
+        (
+            json.dumps(
             {
                 "mcpServers": mcp_servers,
             },
             indent=2,
         )
-        + "\n"
+            + "\n"
+        ).encode("utf-8"),
     )
 
 
@@ -4923,6 +5134,53 @@ def _user_codex_home() -> Path:
     return Path.home() / ".codex"
 
 
+def _is_windows_reparse_point(path: Path) -> bool:
+    """Return whether *path* is a Windows junction or other reparse point."""
+    if os.name != "nt":
+        return False
+    try:
+        attributes = int(getattr(os.lstat(path), "st_file_attributes", 0))
+    except OSError:
+        return False
+    return bool(attributes & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)))
+
+
+def _remove_path_entry_without_following(path: Path) -> None:
+    """Remove one untrusted path entry without traversing a Windows junction."""
+    if _is_windows_reparse_point(path):
+        attributes = int(getattr(os.lstat(path), "st_file_attributes", 0))
+        if attributes & int(getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0)):
+            os.rmdir(path)
+            return
+    path.unlink()
+
+
+def _replace_with_exclusive_file(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
+    """Replace an agent-controlled path without following links or hardlinks."""
+    if path.is_symlink() or _is_windows_reparse_point(path) or path.exists():
+        _remove_path_entry_without_following(path)
+    descriptor = os.open(
+        str(path),
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0),
+        mode,
+    )
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        path.chmod(mode)
+    except OSError:
+        # The containing user-profile/worktree ACL remains the Windows
+        # security boundary; chmod is an additional POSIX restriction.
+        if os.name != "nt":
+            raise
+
+
 def _user_mcp_servers_for_passthrough(
     agent_name: str,
     allow_from_user: tuple[str, ...] | Sequence[str],
@@ -4942,7 +5200,7 @@ def _user_mcp_servers_for_passthrough(
     if agent_name == "codex":
         source = _user_codex_home() / "config.toml"
         try:
-            payload = tomllib.loads(source.read_text())
+            payload = tomllib.loads(source.read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError) as exc:
             logger.warning(
                 "Could not read Codex MCP user config %s for [mcp].allow_from_user passthrough: %s",
@@ -4956,7 +5214,7 @@ def _user_mcp_servers_for_passthrough(
     elif agent_name == "claude":
         source = Path.home() / ".claude.json"
         try:
-            payload = json.loads(source.read_text())
+            payload = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             logger.warning(
                 "Could not read Claude MCP user config %s for [mcp].allow_from_user passthrough: %s",
@@ -4989,23 +5247,35 @@ def _write_codex_isolated_home(
     *,
     mcp_servers: dict[str, dict[str, object]] | None,
     source_home: Path | None = None,
-    copy_auth: bool = False,
+    copy_auth: bool | None = None,
 ) -> Path:
     """Materialize the per-worktree isolated ``CODEX_HOME``.
 
-    Writes ``config.toml`` containing only the supplied MCP servers and (by
-    default) symlinks ``auth.json`` from ``source_home`` (default ``~/.codex``)
-    so the Codex CLI keeps its credentials. The directory is created if missing
-    and the config file is rewritten on every call so it never goes stale. A
-    missing source ``auth.json`` is logged as a warning but does not raise —
-    Codex will surface the auth issue itself if it tries to use the network.
+    Writes ``config.toml`` containing only the supplied MCP servers and the
+    native-Windows sandbox fallback, then makes ``auth.json`` available from
+    ``source_home`` (defaulting to the operator's effective ``CODEX_HOME``).
+    The directory is created if missing and the config file is rewritten on
+    every call so it never goes stale. A missing source ``auth.json`` is logged
+    as a warning but does not raise — Codex will surface the auth issue itself
+    if it tries to use the network.
 
-    When *copy_auth* is true, copy the auth file instead of symlinking. This
-    is required for container backends: the worker bind-mounts the worktree
-    into ``/workspace/source`` but not the host's ``~/.codex``, so an absolute
-    symlink target is unreachable inside the container.
+    When *copy_auth* is true, copy the auth file instead of symlinking. This is
+    required for container backends and native Windows, where creating a
+    symlink normally requires Developer Mode or elevated privileges. ``None``
+    selects the safe platform default (copy on Windows, symlink elsewhere).
+    Callers that launch an agent must remove the materialized auth path after
+    the child exits via ``_remove_codex_isolated_auth``.
     """
     home = codex_isolated_home(worktree_path)
+    # A previous agent attempt controls the worktree and could have planted a
+    # directory symlink before the orchestrator stages credentials. Replace a
+    # link-like or non-directory home before writing any config or auth data.
+    # Staging happens while no agent for this worktree is running, so there is
+    # no legitimate concurrent writer to preserve here.
+    if home.is_symlink() or _is_windows_reparse_point(home):
+        _remove_path_entry_without_following(home)
+    elif home.exists() and not home.is_dir():
+        _remove_path_entry_without_following(home)
     home.mkdir(parents=True, exist_ok=True)
 
     # Make the directory self-ignoring so a copied auth.json (or any other
@@ -5013,28 +5283,47 @@ def _write_codex_isolated_home(
     # whose top-level .gitignore predates this change. A `.gitignore`
     # containing `*` here ignores every file in the directory, including
     # itself, regardless of the parent repo's .gitignore.
-    (home / ".gitignore").write_text("*\n")
+    gitignore_path = home / ".gitignore"
+    _replace_with_exclusive_file(gitignore_path, b"*\n")
 
     config_body = _render_codex_mcp_toml(mcp_servers or {})
-    (home / "config.toml").write_text(config_body)
+    if sys.platform == "win32":
+        # Codex's preferred elevated Windows sandbox needs administrator-
+        # approved, machine-local setup. Non-interactive Spec Butler sessions
+        # use an isolated CODEX_HOME and cannot complete or approve that setup;
+        # with `-a never`, a missing setup rejects every child process before
+        # it starts. The documented unelevated implementation remains a real
+        # restricted-token/ACL sandbox and works without an interactive UAC
+        # bootstrap, so select it explicitly for native Windows automation.
+        config_body = f'[windows]\nsandbox = "unelevated"\n\n{config_body}'
+    config_path = home / "config.toml"
+    _replace_with_exclusive_file(config_path, config_body.encode("utf-8"))
 
-    src_home = source_home if source_home is not None else Path.home() / ".codex"
+    src_home = source_home if source_home is not None else _user_codex_home()
     src_auth = src_home / "auth.json"
     dst_auth = home / "auth.json"
+    effective_copy_auth = sys.platform == "win32" if copy_auth is None else copy_auth
     if src_auth.exists():
         try:
-            if dst_auth.is_symlink() or dst_auth.exists():
-                dst_auth.unlink()
-            if copy_auth:
-                shutil.copy2(src_auth, dst_auth)
+            if effective_copy_auth:
+                # The destination is inside an agent-writable worktree. Open
+                # it exclusively and without following a final-component
+                # symlink so a racing planted link fails closed instead of
+                # redirecting the operator's credential material.
+                payload = src_auth.read_bytes()
+                _replace_with_exclusive_file(dst_auth, payload)
             else:
+                if (
+                    dst_auth.is_symlink()
+                    or _is_windows_reparse_point(dst_auth)
+                    or dst_auth.exists()
+                ):
+                    _remove_path_entry_without_following(dst_auth)
                 dst_auth.symlink_to(src_auth)
         except OSError as exc:
-            logger.warning(
-                "Could not materialize Codex auth.json in isolated home %s: %s",
-                home,
-                exc,
-            )
+            raise RuntimeError(
+                f"Could not securely materialize Codex auth.json in isolated home {home}: {exc}"
+            ) from exc
     else:
         logger.warning(
             "Codex source home %s is missing auth.json; the isolated session "
@@ -5042,6 +5331,27 @@ def _write_codex_isolated_home(
             src_home,
         )
     return home
+
+
+def _remove_codex_isolated_auth(worktree_path: Path) -> None:
+    """Remove transient Codex credentials after an agent launch.
+
+    The isolated config remains reusable, but copied credentials (and POSIX
+    links to operator credentials) must not become failed-run or cleanup
+    remnants. Cleanup is idempotent so prelaunch failures and normal process
+    finalizers can both call it.
+    """
+    home = codex_isolated_home(worktree_path)
+    try:
+        auth_path = home / "auth.json"
+        if auth_path.is_symlink() or _is_windows_reparse_point(auth_path) or auth_path.exists():
+            _remove_path_entry_without_following(auth_path)
+    except OSError as exc:
+        logger.error(
+            "Could not remove transient Codex auth.json from isolated home %s: %s",
+            home,
+            exc,
+        )
 
 
 def _subprocess_env_with_codex_home(
@@ -5086,18 +5396,20 @@ def _write_claude_isolated_home(
     # Staging always runs before the agent launches, so there is no live
     # writer to race with.
     for directory in (home, home / ".claude"):
-        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
-            directory.unlink()
+        if (
+            directory.is_symlink()
+            or _is_windows_reparse_point(directory)
+            or (directory.exists() and not directory.is_dir())
+        ):
+            _remove_path_entry_without_following(directory)
         directory.mkdir(parents=True, exist_ok=True)
-    (home / ".gitignore").write_text("*\n")
+    _replace_with_exclusive_file(home / ".gitignore", b"*\n")
 
     src_config = source_config if source_config is not None else Path.home() / ".claude.json"
     dst_config = home / ".claude.json"
     if src_config.exists():
         try:
-            if dst_config.is_symlink() or dst_config.exists():
-                dst_config.unlink()
-            shutil.copy2(src_config, dst_config)
+            _replace_with_exclusive_file(dst_config, src_config.read_bytes())
         except OSError as exc:
             logger.warning(
                 "Could not materialize Claude .claude.json in isolated home %s: %s",
@@ -5119,25 +5431,15 @@ def _write_claude_isolated_home(
     dst_creds = home / ".claude" / ".credentials.json"
     if src_creds.exists():
         try:
-            payload = json.loads(src_creds.read_text())
+            payload = json.loads(src_creds.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
                 oauth = payload.get("claudeAiOauth")
                 if isinstance(oauth, dict):
                     oauth.pop("refreshToken", None)
-            # The destination lives inside the (agent-writable) worktree, so a
-            # prior attempt could have left a symlink here to exfiltrate the
-            # token. Unlink whatever exists, then create exclusively without
-            # following symlinks so a race re-planting one fails the open
-            # instead of redirecting the write.
-            if dst_creds.is_symlink() or dst_creds.exists():
-                dst_creds.unlink()
-            fd = os.open(
-                str(dst_creds),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
+            _replace_with_exclusive_file(
+                dst_creds,
+                json.dumps(payload).encode("utf-8"),
             )
-            with os.fdopen(fd, "w") as handle:
-                handle.write(json.dumps(payload))
         except (OSError, ValueError) as exc:
             logger.warning(
                 "Could not materialize Claude credentials in isolated home %s: %s",
@@ -5191,13 +5493,15 @@ def _codex_isolated_home_requires_auth_copy(backend: ExecutionBackend) -> bool:
     """Return True when ``auth.json`` must be copied (not symlinked) into the
     isolated ``CODEX_HOME``.
 
-    Containerized worker backends bind-mount the worktree into the container
-    but not the host's ``~/.codex``, so an absolute symlink target is broken
-    inside the worker. Copy the auth file in that case so Codex can read it
-    through the worktree bind mount. All other backends keep the symlink so
-    Codex's atomic-rename token refreshes propagate back to the real home.
+    Native Windows does not grant ordinary users symlink privileges unless
+    Developer Mode is enabled. Containerized worker backends also bind-mount
+    the worktree but not the host's Codex home. Copy in either case; POSIX
+    host-process backends retain the link behavior so Codex token refreshes
+    propagate to the real home.
     """
-    return not _backend_uses_provider_sandbox_config(backend)
+    return sys.platform == "win32" or not _backend_uses_provider_sandbox_config(
+        backend
+    )
 
 
 def _sync_orchestrator_paths_into_workspace(
@@ -5362,7 +5666,12 @@ def _stop_worktree_local_postgres(
 
 def _count_sysv_shm_segments() -> int | None:
     """Return count of SysV shared-memory segments, or None when unavailable."""
-    result = run_subprocess(["ipcs", "-m"])
+    if os.name == "nt":
+        return None
+    try:
+        result = run_subprocess(["ipcs", "-m"])
+    except FileNotFoundError:
+        return None
     if result.returncode != 0:
         return None
     segment_count = 0
@@ -5625,7 +5934,7 @@ def _load_spec_creation_prompt(
 ) -> str:
     prompt_path = repo_root / SPEC_CREATION_PROMPT_FILE
     if prompt_path.exists():
-        prompt = prompt_path.read_text().strip()
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
         prompt = (
             "Author a focused spec for this repository. Read AGENTS.md and "
@@ -5731,6 +6040,17 @@ def _prepare_spec_authoring_worktree(
         resumed = True
     else:
         if worktree_path.exists():
+            try:
+                worktree_path = validate_owned_worktree_path(
+                    owner_root=_worktrees_root(repo_root),
+                    target=worktree_path,
+                    relative_to=resolve_common_root(repo_root),
+                    expected_names=(worktree_path.name,),
+                )
+            except UnsafeWorktreePathError as exc:
+                raise RuntimeError(
+                    f"Refusing unsafe stale spec-authoring worktree cleanup: {exc}"
+                ) from exc
             remove_tree(worktree_path)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -5808,6 +6128,64 @@ def _build_spec_authoring_command(
         "mcp_config_path": _mcp_config_path(worktree_path),
     }
     return adapter.build_authoring_command(**authoring_kwargs)
+
+
+def _windows_codex_authoring_env(agent: str) -> dict[str, str] | None:
+    """Return an environment that lets sandboxed Windows Codex use ``gh``.
+
+    The native Codex sandbox intentionally cannot read the operator's roaming
+    profile, which includes GitHub CLI's ``hosts.yml``. Spec authoring is
+    nevertheless required to push its branch and open a PR. Resolve the
+    already-authenticated host token before entering the sandbox and pass it
+    only in the child environment. This avoids granting the agent writable
+    access to the operator's GitHub CLI configuration and leaves no copied
+    credential file in the authoring worktree.
+
+    Other platforms and agents keep normal environment inheritance.
+    """
+    if sys.platform != "win32" or agent != "codex":
+        return None
+
+    env = os.environ.copy()
+    if env.get("GH_TOKEN", "").strip() or env.get("GITHUB_TOKEN", "").strip():
+        return env
+
+    try:
+        token = _forge().get_auth_token().strip()
+    except (FileNotFoundError, OSError, RuntimeError):
+        token = ""
+    if not token:
+        raise RuntimeError(
+            "Native Windows Codex authoring could not obtain a GitHub token "
+            "without exposing the operator's GitHub CLI profile to the sandbox. "
+            "Run `gh auth login`, verify `gh auth token` succeeds, then retry."
+        )
+    env["GH_TOKEN"] = token
+    return env
+
+
+def _isolate_windows_codex_authoring_gh_config(
+    env: dict[str, str] | None,
+    state_dir: Path,
+) -> Path | None:
+    """Keep sandboxed ``gh`` away from the operator profile on Windows.
+
+    GitHub CLI reads ``hosts.yml`` even when ``GH_TOKEN`` is already present.
+    Codex's restricted Windows token cannot read the roaming profile that owns
+    that file, so merely forwarding the token still makes every ``gh`` command
+    fail. Point the child at a fresh, credential-free config directory under
+    the state root, which authoring already grants to the sandbox. The caller
+    removes the directory as soon as the interactive session exits.
+    """
+    if env is None:
+        return None
+    state_dir.mkdir(parents=True, exist_ok=True)
+    config_dir = Path(
+        tempfile.mkdtemp(prefix="windows-authoring-gh-", dir=state_dir)
+    )
+    env["GH_CONFIG_DIR"] = str(config_dir)
+    env.setdefault("GH_HOST", "github.com")
+    return config_dir
 
 
 def _print_spec_authoring_summary(
@@ -5943,7 +6321,13 @@ def _resolve_completed_multi_spec_authoring_result(
 
 
 def _current_actor() -> str:
-    return os.getenv("SPEC_ACTOR") or os.getenv("USER") or os.getenv("LOGNAME") or "unknown"
+    return (
+        os.getenv("SPEC_ACTOR")
+        or os.getenv("USER")
+        or os.getenv("LOGNAME")
+        or os.getenv("USERNAME")
+        or "unknown"
+    )
 
 
 def _state_root(repo_root: Path) -> Path:
@@ -5973,7 +6357,7 @@ def _write_json_file_atomically(path: Path, payload: dict) -> None:
 
 def _read_json_dict(path: Path) -> dict | None:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return None
     return data if isinstance(data, dict) else None
@@ -5997,7 +6381,7 @@ def _worktree_registry_state_root(repo_root: Path, worktree_path: Path) -> Path:
 def _read_worktree_postgres_pid(worktree_path: Path) -> int:
     pid_file = worktree_path / ".local" / "postgres" / "data" / "postmaster.pid"
     try:
-        first_line = pid_file.read_text().splitlines()[0].strip()
+        first_line = pid_file.read_text(encoding="utf-8").splitlines()[0].strip()
     except (IndexError, OSError):
         return 0
     try:
@@ -6017,7 +6401,8 @@ def _register_worktree_process(
     command: str = "",
     termination_scope: str = "pid",
     pgid: int = 0,
-) -> None:
+    supervision_token: SupervisionToken | None = None,
+) -> bool:
     try:
         worktree_process_registry.register_process(
             _worktree_registry_state_root(repo_root, worktree_path),
@@ -6029,7 +6414,9 @@ def _register_worktree_process(
             command=command,
             termination_scope=termination_scope,
             pgid=pgid,
+            supervision_token=supervision_token,
         )
+        return True
     except Exception as exc:  # pragma: no cover - defensive best effort
         logger.warning(
             "Could not persist %s cleanup registration for %s: %s",
@@ -6037,31 +6424,77 @@ def _register_worktree_process(
             worktree_path,
             exc,
         )
+        return False
+
+
+def _register_setup_process_batch(
+    repo_root: Path,
+    worktree_path: Path,
+    registrations: Sequence[
+        tuple[ImplementManagedProcess, SupervisionToken | None]
+    ],
+) -> bool:
+    try:
+        worktree_process_registry.register_processes(
+            _worktree_registry_state_root(repo_root, worktree_path),
+            worktree_path,
+            tuple(
+                worktree_process_registry.RegisteredProcess(
+                    name=process.name,
+                    kind=process.kind,
+                    pid=process.pid,
+                    started_at=process.started_at,
+                    command=process.command,
+                    termination_scope=process.termination_scope,
+                    pgid=process.pgid,
+                    supervision_token=(
+                        token.to_dict() if token is not None else None
+                    ),
+                )
+                for process, token in registrations
+            ),
+        )
+        return True
+    except Exception as exc:  # pragma: no cover - defensive fail-closed path
+        names = ", ".join(process.name for process, _token in registrations)
+        logger.warning(
+            "Could not persist setup cleanup registrations (%s) for %s: %s",
+            names,
+            worktree_path,
+            exc,
+        )
+        return False
 
 
 def _register_worktree_process_from_popen(
     repo_root: Path,
     worktree_path: Path,
-    proc: subprocess.Popen[str] | subprocess.Popen[bytes] | None,
+    proc: subprocess.Popen[str] | subprocess.Popen[bytes] | object | None,
     *,
     name: str,
     kind: str,
 ) -> None:
     if proc is None:
         return
-    if type(proc).__module__ != "subprocess":
+    token = getattr(proc, "token", None)
+    if type(proc).__module__ != "subprocess" and token is None:
         return
-    try:
-        identity = read_process_identity(proc.pid)
-    except Exception as exc:  # pragma: no cover - defensive best effort
-        logger.warning(
-            "Could not inspect %s process %s for cleanup registration in %s: %s",
-            name,
-            proc.pid,
-            worktree_path,
-            exc,
-        )
+    if token is not None and token.identity.started_at == "test-double":
         return
+    if token is not None:
+        identity = token.identity
+    else:
+        try:
+            identity = read_process_identity(proc.pid)
+        except Exception as exc:  # pragma: no cover - defensive best effort
+            logger.warning(
+                "Could not inspect %s process %s for cleanup registration in %s: %s",
+                name,
+                proc.pid,
+                worktree_path,
+                exc,
+            )
+            return
     if identity is None:
         logger.warning(
             "Could not register %s process %s for cleanup in %s",
@@ -6080,6 +6513,7 @@ def _register_worktree_process_from_popen(
         command=identity.command,
         termination_scope="pgid",
         pgid=proc.pid if os.name == "posix" else 0,
+        supervision_token=token,
     )
 
 
@@ -6123,22 +6557,113 @@ def _register_worktree_postgres_process(
     )
 
 
+def _terminate_unregistered_setup_process(
+    process: ImplementManagedProcess,
+) -> bool:
+    identity = SupervisedProcessIdentity(
+        process.pid,
+        process.started_at,
+        command=process.command,
+    )
+    if os.name == "posix" and process.termination_scope == "pgid":
+        return terminate_supervision_token(
+            SupervisionToken(
+                LifetimeMode.RUN_OWNED,
+                identity,
+                os.getpid(),
+                "setup-handoff",
+                "unregistered-setup-process",
+                pgid=process.pgid,
+                version=1,
+            ),
+            grace_seconds=0,
+        )
+    if os.name == "posix" and process.termination_scope == "pid":
+        return terminate_exact_process(identity, grace_seconds=0)
+    return False
+
+
 def _register_setup_manifest_processes(
     repo_root: Path,
     worktree_path: Path,
     manifest: ImplementSetupManifest,
 ) -> None:
+    registrations: list[
+        tuple[ImplementManagedProcess, SupervisionToken | None]
+    ] = []
     for process in manifest.managed_processes:
-        _register_worktree_process(
-            repo_root,
-            worktree_path,
-            name=process.name,
-            kind=process.kind,
-            pid=process.pid,
-            started_at=process.started_at,
-            command=process.command,
-            termination_scope=process.termination_scope,
-            pgid=process.pgid,
+        supervision_token = None
+        if manifest.ownership_token is not None:
+            supervision_token = bind_held_windows_job_payload(
+                manifest.ownership_token,
+                SupervisedProcessIdentity(
+                    process.pid,
+                    process.started_at,
+                    command=process.command,
+                ),
+            )
+            if supervision_token is None:
+                supervision_token = bind_held_posix_group_payload(
+                    manifest.ownership_token,
+                    SupervisedProcessIdentity(
+                        process.pid,
+                        process.started_at,
+                        command=process.command,
+                    ),
+                )
+        registrations.append((process, supervision_token))
+
+    if registrations and not _register_setup_process_batch(
+        repo_root,
+        worktree_path,
+        registrations,
+    ):
+        # Batch persistence is the handoff commit point. Before it succeeds,
+        # every service remains setup-owned: terminate the retained boundary
+        # once, plus each explicitly declared process that escaped it.
+        cleanup_results: list[bool] = []
+        if manifest.ownership_token is not None:
+            cleanup_results.append(
+                terminate_supervision_token(
+                    manifest.ownership_token,
+                    grace_seconds=0,
+                )
+            )
+        cleanup_results.extend(
+            _terminate_unregistered_setup_process(process)
+            for process, token in registrations
+            if token is None
+        )
+        close_empty_held_posix_groups()
+        close_empty_held_windows_jobs()
+        cleanup_detail = (
+            ""
+            if cleanup_results and all(cleanup_results)
+            else "; cleanup of one or more live setup processes could not be proven"
+        )
+        names = ", ".join(process.name for process, _token in registrations)
+        raise RuntimeError(
+            f"Could not atomically persist cleanup ownership for setup services "
+            f"{names}{cleanup_detail}"
+        )
+
+    bound_services = sum(token is not None for _process, token in registrations)
+    if manifest.ownership_token is not None and not bound_services:
+        stopped = terminate_supervision_token(
+            manifest.ownership_token,
+            grace_seconds=0,
+        )
+        close_empty_held_posix_groups()
+        close_empty_held_windows_jobs()
+        if not stopped:
+            raise RuntimeError(
+                "Could not terminate setup descendants without an authenticated "
+                "managed_processes registration"
+            )
+        logger.warning(
+            "Implement setup left live descendants, but no managed_processes entry "
+            "was both authenticated and persisted; the retained setup boundary was "
+            "terminated before agent launch."
         )
 
 
@@ -6160,6 +6685,8 @@ def _prune_registered_worktree_processes(
         return ()
     for entry in removed:
         logger.info("Pruned stale registered helper for %s: %s", worktree_path, entry)
+    close_empty_held_posix_groups()
+    close_empty_held_windows_jobs()
     return removed
 
 
@@ -6181,7 +6708,11 @@ def _reap_registered_worktree_processes(
             worktree_path,
             exc,
         )
-        return worktree_process_registry.ReapReport()
+        return worktree_process_registry.ReapReport(
+            surviving=(
+                f"process reaper failed for {worktree_path}; refusing cleanup: {exc}",
+            )
+        )
     for entry in report.terminated:
         logger.info("Reaped registered helper for %s (reason=%s): %s", worktree_path, reason, entry)
     for entry in report.stale:
@@ -6193,6 +6724,8 @@ def _reap_registered_worktree_processes(
             reason,
             entry,
         )
+    close_empty_held_posix_groups()
+    close_empty_held_windows_jobs()
     return report
 
 
@@ -6224,64 +6757,19 @@ def _resolve_recorded_process_group(
 def read_process_identity(pid: int) -> ProcessIdentity | None:
     if pid <= 0:
         return None
-    try:
-        result = subprocess.run(
-            ["ps", "-ww", "-o", "pid=", "-o", "lstart=", "-o", "command=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    line = next((item.strip() for item in result.stdout.splitlines() if item.strip()), "")
-    if not line:
-        return None
-    parts = line.split(None, 6)
-    if len(parts) != 7:
-        return None
-    try:
-        live_pid = int(parts[0])
-    except ValueError:
+    identity = inspect_process(pid)
+    if identity is None:
         return None
     return ProcessIdentity(
-        pid=live_pid,
-        started_at=" ".join(parts[1:6]),
-        command=parts[6].strip(),
+        pid=identity.pid,
+        started_at=identity.started_at,
+        command=identity.command,
     )
 
 
-def _list_live_process_group_members(pgid: int) -> list[int] | None:
-    if pgid <= 0 or os.name != "posix":
-        return []
-    try:
-        result = subprocess.run(
-            ["ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-
-    members: list[int] = []
-    for line in result.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) != 3:
-            continue
-        try:
-            live_pid = int(parts[0])
-            live_pgid = int(parts[1])
-        except ValueError:
-            continue
-        stat = parts[2].strip().upper()
-        if live_pgid != pgid or not stat or stat.startswith("Z"):
-            continue
-        members.append(live_pid)
-    return members
+def is_process_group_alive(pgid: int) -> bool:
+    """Expose portable group liveness to the lazy CLI orchestration boundary."""
+    return _supervised_process_group_is_alive(pgid)
 
 
 def is_pid_alive(pid: int, expected_started_at: str = "") -> bool:
@@ -6290,26 +6778,6 @@ def is_pid_alive(pid: int, expected_started_at: str = "") -> bool:
         return False
     if expected_started_at and identity.started_at != expected_started_at:
         return False
-    return True
-
-
-def _is_process_group_alive(pgid: int, leader_pid: int, leader_started_at: str = "") -> bool:
-    if pgid <= 0 or os.name != "posix":
-        return False
-
-    members = _list_live_process_group_members(pgid)
-    if members is not None:
-        return bool(members)
-
-    if is_pid_alive(leader_pid, leader_started_at):
-        return True
-
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OSError):
-        return True
     return True
 
 
@@ -6398,33 +6866,10 @@ def _orchestrator_sigterm_guard(
 
 
 def _ensure_orchestrator_process_group(run: RunState, repo_root: Path) -> None:
-    if os.name != "posix":
-        run.pgid = None
-        run.process_started_at = ""
-        run.save(repo_root)
-        return
-
-    pid = os.getpid()
-    current_pgid = os.getpgrp()
-    if current_pgid != pid:
-        os.setpgrp()
-        current_pgid = os.getpgrp()
-        # Claim the foreground process group on the terminal so interactive
-        # child processes (e.g. claude in the scoping phase) can still use
-        # stdin/stdout without being stopped by SIGTTIN/SIGTTOU.
-        # We must ignore SIGTTOU first: after setpgrp() we are a background
-        # process group, and tcsetpgrp() would otherwise stop us with SIGTTOU.
-        old_sigttou = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
-        try:
-            fd = sys.stdin.fileno()
-            os.tcsetpgrp(fd, current_pgid)
-        except (OSError, AttributeError):
-            pass  # not a TTY or no stdin — non-interactive runs unaffected
-        finally:
-            signal.signal(signal.SIGTTOU, old_sigttou)
-
-    run.pgid = current_pgid
-    run.process_started_at = _current_process_started_at()
+    token = claim_current_process(f"orchestrator-{run.run_id}")
+    run.pgid = token.pgid or None
+    run.process_started_at = token.identity.started_at
+    run.supervision_token = token.to_dict()
     run.save(repo_root)
 
 
@@ -6514,7 +6959,10 @@ def _persist_pinned_spec(
     _set_pinned_spec_metadata(run, spec_path=spec_path, text=text)
     snapshot_path = _run_spec_snapshot_path(repo_root, run.run_id)
     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_path.write_text(text)
+    # Preserve the exact logical text, including existing CRLF sequences.
+    # Path.write_text uses platform newline translation and would turn CRLF
+    # input into CRCRLF on Windows, invalidating the pinned revision boundary.
+    atomic_write_text(snapshot_path, text)
 
 
 def _set_pinned_spec_metadata(
@@ -6539,7 +6987,7 @@ def _pin_run_spec_from_file(
         repo_root,
         run,
         spec_path=rel_path,
-        text=spec_file.read_text(),
+        text=spec_file.read_text(encoding="utf-8"),
     )
 
 
@@ -6551,7 +6999,7 @@ def _spec_path_matches_revision(spec_path: Path, spec_revision: str) -> bool:
     if not spec_revision:
         return True
     try:
-        return _spec_revision_for_text(spec_path.read_text()) == spec_revision
+        return _spec_revision_for_text(spec_path.read_text(encoding="utf-8")) == spec_revision
     except OSError:
         return False
 
@@ -6588,7 +7036,7 @@ def _ensure_run_spec_binding(run: RunState, repo_root: Path) -> RunState:
 
     snapshot_path = _run_spec_snapshot_path(repo_root, run.run_id)
     if snapshot_path.exists():
-        revision = _spec_revision_for_text(snapshot_path.read_text())
+        revision = _spec_revision_for_text(snapshot_path.read_text(encoding="utf-8"))
         if run.spec_revision != revision:
             run.spec_revision = revision
             changed = True
@@ -6596,7 +7044,7 @@ def _ensure_run_spec_binding(run: RunState, repo_root: Path) -> RunState:
         source_path = _existing_spec_source_path(repo_root, run)
         if source_path is not None:
             if source_path == _legacy_current_spec_path(repo_root, run):
-                source_text = source_path.read_text()
+                source_text = source_path.read_text(encoding="utf-8")
                 try:
                     _persist_pinned_spec(
                         repo_root,
@@ -6612,7 +7060,7 @@ def _ensure_run_spec_binding(run: RunState, repo_root: Path) -> RunState:
                     )
                 changed = True
             elif source_path != snapshot_path:
-                source_text = source_path.read_text()
+                source_text = source_path.read_text(encoding="utf-8")
                 try:
                     worktree_root = resolve_worktree_path(run, repo_root)
                     if source_path.is_relative_to(worktree_root):
@@ -6656,13 +7104,13 @@ def _restore_pinned_spec_into_worktree(
     if not snapshot_path.exists():
         raise FileNotFoundError(f"Pinned spec snapshot missing for run {run.run_id}: {snapshot_path}")
 
-    expected_text = snapshot_path.read_text()
+    expected_text = snapshot_path.read_text(encoding="utf-8")
     target_path = _spec_path_in_tree(worktree_path, run)
-    if target_path.exists() and target_path.read_text() == expected_text:
+    if target_path.exists() and target_path.read_text(encoding="utf-8") == expected_text:
         return target_path
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(expected_text)
+    target_path.write_text(expected_text, encoding="utf-8")
     return target_path
 
 
@@ -6755,7 +7203,7 @@ def _read_gate_status(repo_root: Path, run: RunState) -> tuple[Path, dict | None
         if not path.exists():
             continue
         try:
-            return path, json.loads(path.read_text())
+            return path, json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             return path, None
     return _gate_status_path(repo_root, run), None
@@ -7024,45 +7472,41 @@ def stop_run(spec_id: str, *, repo_root: Path | None = None) -> RunState:
     if latest is None:
         raise RuntimeError(f"No non-superseded run found for spec '{spec_id}'.")
 
-    process_group = _resolve_recorded_process_group(root, latest)
-    if process_group is None:
-        raise RuntimeError(f"Spec '{spec_id}' does not have a recorded orchestrator process group.")
-    pgid, leader_started_at = process_group
-    process_was_alive = is_pid_alive(pgid, leader_started_at)
-    group_was_alive = _is_process_group_alive(pgid, pgid, leader_started_at)
-    if not process_was_alive and group_was_alive:
-        raise RuntimeError(
-            f"Recorded leader {pgid} for spec '{spec_id}' has exited or changed identity, "
-            f"but process group {pgid} still has live members. Refusing to signal an "
-            "orphaned or reused process group without a verifiable leader; inspect and "
-            "terminate only the run-owned processes manually."
-        )
-    if process_was_alive:
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except ProcessLookupError as exc:
-            raise RuntimeError(f"No live process is currently running for spec '{spec_id}'.") from exc
-
-        deadline = time.monotonic() + RUN_STOP_GRACE_SECONDS
-        while time.monotonic() < deadline:
-            if not _is_process_group_alive(pgid, pgid, leader_started_at):
-                break
-            _poll_sleep(0.1)
-
-        if _is_process_group_alive(pgid, pgid, leader_started_at):
+    try:
+        if latest.supervision_token:
             try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline:
-                if not _is_process_group_alive(pgid, pgid, leader_started_at):
-                    break
-                _poll_sleep(0.1)
+                token = SupervisionToken.from_dict(latest.supervision_token)
+            except (TypeError, ValueError) as exc:
+                raise ProcessGroupOwnershipError(
+                    f"Spec '{spec_id}' has an unusable supervision token; refusing PID-only termination."
+                ) from exc
+            process_was_alive = stop_supervised_process(
+                token,
+                grace_seconds=RUN_STOP_GRACE_SECONDS,
+                hard_grace_seconds=1.0,
+            )
+        elif os.name == "posix":
+            process_group = _resolve_recorded_process_group(root, latest)
+            if process_group is None:
+                raise ProcessGroupOwnershipError(
+                    f"Spec '{spec_id}' does not have a recorded orchestrator process group."
+                )
+            pgid, leader_started_at = process_group
+            process_was_alive = terminate_legacy_process_group(
+                pgid,
+                pgid,
+                leader_started_at,
+                grace_seconds=RUN_STOP_GRACE_SECONDS,
+                hard_grace_seconds=1.0,
+            )
+        else:
+            raise ProcessGroupOwnershipError(
+                f"Spec '{spec_id}' does not have a usable supervision token; refusing PID-only termination."
+            )
+    except (ProcessGroupOwnershipError, ProcessGroupTerminationError) as exc:
+        raise RuntimeError(str(exc)) from exc
 
-        if _is_process_group_alive(pgid, pgid, leader_started_at):
-            raise RuntimeError(f"Failed to stop live process group for spec '{spec_id}'.")
-    elif latest.status != "running":
+    if not process_was_alive and latest.status != "running":
         raise RuntimeError(f"No live process is currently running for spec '{spec_id}'.")
 
     path = _run_state_path(root, latest.run_id)
@@ -7110,11 +7554,9 @@ def _branch_commits_ahead_of_base(repo_root: Path, branch: str, base_ref: str) -
     if not branch:
         return 0
     try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", f"{base_ref}..{branch}"],
+        result = run_git(
+            ["rev-list", "--count", f"{base_ref}..{branch}"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except OSError:
@@ -7457,6 +7899,7 @@ class RunState:
     retry_cap: int = RETRY_CAP
     pgid: int | None = None
     process_started_at: str = ""
+    supervision_token: dict[str, object] = field(default_factory=dict)
     intake_reset_requested: bool = False
     slug_was_provided: bool = False
     updated_at: str = field(default_factory=_now_iso)
@@ -7492,7 +7935,7 @@ class RunState:
     @classmethod
     def load(cls, repo_root: Path, run_id: str) -> RunState:
         p = _run_state_path(repo_root, run_id)
-        data = json.loads(p.read_text())
+        data = json.loads(p.read_text(encoding="utf-8"))
         return cls.from_dict(data)
 
     @classmethod
@@ -7559,6 +8002,7 @@ class RunState:
         )
         payload["pgid"] = _coerce_optional_int(payload.get("pgid"))
         payload.setdefault("process_started_at", "")
+        payload.setdefault("supervision_token", {})
         payload.setdefault("intake_reset_requested", False)
         payload.setdefault("slug_was_provided", False)
         payload.setdefault("input_question", "")
@@ -7603,7 +8047,7 @@ class RunState:
         runs: list[RunState] = []
         for candidate in sorted(runs_dir.glob("*.json"), key=lambda path: path.name):
             try:
-                data = json.loads(candidate.read_text())
+                data = json.loads(candidate.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
             runs.append(cls.from_dict(data))
@@ -7656,7 +8100,7 @@ class RunState:
         runs: list[RunState] = []
         for candidate in sorted(runs_dir.glob("*.json"), key=lambda path: path.name):
             try:
-                data = json.loads(candidate.read_text())
+                data = json.loads(candidate.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
             if data.get("spec_id") != spec_id:
@@ -7732,7 +8176,10 @@ class IntakeResult:
         d = _state_root(repo_root) / "runs" / run_id
         d.mkdir(parents=True, exist_ok=True)
         p = d / "intake.json"
-        p.write_text(json.dumps(asdict(self), indent=2, sort_keys=True) + "\n")
+        p.write_text(
+            json.dumps(asdict(self), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         return p
 
     @classmethod
@@ -7741,7 +8188,7 @@ class IntakeResult:
         if not p.exists():
             return None
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
             return cls(**data)
         except (json.JSONDecodeError, TypeError):
             return None
@@ -7828,7 +8275,7 @@ class ImplementContext:
         if not p.exists():
             return None
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
             data.pop("implement_dev_server_warning", None)
             return cls(**data)
         except (json.JSONDecodeError, TypeError):
@@ -7916,7 +8363,7 @@ class ImplementResult:
         if not p.exists():
             return None
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
             return cls(**data)
         except (json.JSONDecodeError, TypeError):
             return None
@@ -8108,7 +8555,7 @@ class ReviewResult:
         if not p.exists():
             return None
         try:
-            data = json.loads(p.read_text())
+            data = json.loads(p.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, TypeError):
             return None
 
@@ -8197,7 +8644,7 @@ class BlockDiagnosis:
         if not p.exists():
             return None
         try:
-            return _coerce_block_diagnosis(json.loads(p.read_text()))
+            return _coerce_block_diagnosis(json.loads(p.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -8334,9 +8781,9 @@ class OperatorSteering:
         payload = asdict(self)
         rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
         event_path = run_dir / _operator_steering_event_filename(self.event_id)
-        event_path.write_text(rendered)
+        event_path.write_text(rendered, encoding="utf-8")
         if update_latest:
-            (run_dir / OPERATOR_STEERING_FILENAME).write_text(rendered)
+            (run_dir / OPERATOR_STEERING_FILENAME).write_text(rendered, encoding="utf-8")
         return event_path
 
     @classmethod
@@ -8345,7 +8792,7 @@ class OperatorSteering:
         if not path.exists():
             return None
         try:
-            return _coerce_operator_steering(json.loads(path.read_text()))
+            return _coerce_operator_steering(json.loads(path.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -8357,7 +8804,7 @@ class OperatorSteering:
         events: list[OperatorSteering] = []
         for path in sorted(run_dir.glob("operator-steering.event-*.json")):
             try:
-                payload = json.loads(path.read_text())
+                payload = json.loads(path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 continue
             steering = _coerce_operator_steering(payload)
@@ -8512,7 +8959,7 @@ class OperatorRequest:
         if not p.exists():
             return None
         try:
-            return _coerce_operator_request(json.loads(p.read_text()))
+            return _coerce_operator_request(json.loads(p.read_text(encoding="utf-8")))
         except (json.JSONDecodeError, OSError):
             return None
 
@@ -9252,7 +9699,7 @@ def _latest_rescue_snapshot(run: RunState, repo_root: Path) -> dict | None:
         workspace_root = repo_root / workspace_root
     index_path = workspace_root / run.run_id / "rescue" / "index.json"
     try:
-        entries = json.loads(index_path.read_text())
+        entries = json.loads(index_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(entries, list) or not entries:
@@ -9573,7 +10020,7 @@ def _read_optional_json_payload(path: Path) -> object | None:
     if not path.is_file():
         return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
 
@@ -9871,7 +10318,9 @@ def _write_block_debugger_context(
         ],
     }
     artifact_paths["context"].parent.mkdir(parents=True, exist_ok=True)
-    artifact_paths["context"].write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    artifact_paths["context"].write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return artifact_paths["context"], head_sha, worktree_status
 
 
@@ -9989,13 +10438,12 @@ def _stage_block_debugger_isolated_config(
     if agent.name == "claude":
         empty_config = _mcp_config_path(debug_worktree)
         empty_config.parent.mkdir(parents=True, exist_ok=True)
-        empty_config.write_text('{"mcpServers": {}}\n')
+        empty_config.write_text('{"mcpServers": {}}\n', encoding="utf-8")
         return empty_config, None
     if agent.name == "codex":
         codex_home = _write_codex_isolated_home(
             debug_worktree,
             mcp_servers={},
-            copy_auth=False,
         )
         return None, codex_home
     return None, None
@@ -10039,6 +10487,7 @@ def _maybe_run_block_debugger(
         # a failed debugger must not erase the only useful recovery artifact.
         _clear_block_debugger_artifacts(artifact_paths, keep_diagnosis=True)
         try:
+            require_host_agent_available(debugger_agent)
             context_path, head_sha, worktree_status = _write_block_debugger_context(
                 run,
                 repo_root,
@@ -10063,7 +10512,7 @@ def _maybe_run_block_debugger(
                 run.last_error = original_last_error
                 raise ValueError(validation_error)
             if agent.capabilities.review_output_on_stdout and schema_path.is_file():
-                schema_text = schema_path.read_text().strip()
+                schema_text = schema_path.read_text(encoding="utf-8").strip()
                 prompt = (
                     f"{prompt}\n\n"
                     "You MUST output a single JSON object (no markdown wrapping) matching this schema:\n"
@@ -10074,7 +10523,7 @@ def _maybe_run_block_debugger(
                 # writable, and Claude has no equivalent read-only grant.
                 # Inline the complete evidence package for both agents.
                 try:
-                    context_content = context_path.read_text().strip()
+                    context_content = context_path.read_text(encoding="utf-8").strip()
                     prompt += (
                         "\n\nInlined evidence context "
                         f"(from {_try_relative_posix(context_path, repo_root)}):\n"
@@ -10082,7 +10531,7 @@ def _maybe_run_block_debugger(
                     )
                 except OSError:
                     pass
-            artifact_paths["prompt"].write_text(prompt)
+            artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
             # Always use a temporary worktree so the debugger cannot mutate
             # the real PR branch. At bootstrap-time
             # blocks no worktree/head SHA exists yet, so fall back to the
@@ -10175,7 +10624,7 @@ def _maybe_run_block_debugger(
                             brace_end = stdout_text.rfind("}")
                             if brace_start >= 0 and brace_end > brace_start:
                                 json_text = stdout_text[brace_start : brace_end + 1]
-                            artifact_paths["raw_output"].write_text(json_text)
+                            artifact_paths["raw_output"].write_text(json_text, encoding="utf-8")
                     if completed.returncode != 0:
                         raise ValueError(
                             f"Blocked-run debugger agent failed (exit_code={completed.returncode}): "
@@ -10193,7 +10642,13 @@ def _maybe_run_block_debugger(
             diagnosis.first_failed_test_nodeid = _diagnosis_first_failed_test_nodeid(repo_root, run)
             diagnosis.save(repo_root, run.run_id)
             _record_block_debugger_phase_audit(repo_root, run, result_status="passed")
-        except (ValueError, FileNotFoundError, OSError, subprocess.TimeoutExpired) as exc:
+        except (
+            HostAgentUnavailableError,
+            ValueError,
+            FileNotFoundError,
+            OSError,
+            subprocess.TimeoutExpired,
+        ) as exc:
             run.last_error = original_last_error
             _record_nonfatal_warning(
                 run,
@@ -10465,20 +10920,6 @@ def _parse_json_object(text: str) -> dict | None:
     return None
 
 
-def _normalize_review_decision(raw: object) -> str:
-    val = str(raw or "").strip().lower()
-    aliases = {
-        "approve": "approved",
-        "approved": "approved",
-        "changes_requested": "request_changes",
-        "request_changes": "request_changes",
-        "request-changes": "request_changes",
-        "blocked": "blocked",
-        "failed": "failed",
-    }
-    return aliases.get(val, "")
-
-
 def _normalize_review_finding(item: dict, index: int) -> ReviewFinding:
     start_line = _coerce_line_number(
         item.get("start_line", item.get("line", 1)),
@@ -10535,7 +10976,7 @@ def _normalize_review_payload(
     expected_base_sha: str,
     check_run: dict,
 ) -> ReviewResult:
-    decision = _normalize_review_decision(payload.get("status", payload.get("decision")))
+    decision = review_payload_decision(payload)
     if decision not in REVIEW_DECISION_VALUES:
         raise ValueError("review payload has invalid decision/status")
 
@@ -11191,12 +11632,11 @@ def _is_local_review_timeout_message(message: object) -> bool:
 def _format_gate_evidence_for_review(repo_root: Path, run: "RunState") -> str:
     """Summarize the orchestrator's own gate run for the reviewer.
 
-    The review agent runs under a read-only sandbox, so it cannot execute the
-    suite: reviews repeatedly reported "the read-only environment had no usable
-    temporary directory" and fell back to reading the diff. Meanwhile the
-    orchestrator has just run every required gate against this exact head.
-    Hand over that result instead of leaving the reviewer to guess -- or worse,
-    to assert coverage claims it had no way to check.
+    The review agent receives a read-only checkout plus one disposable writable
+    temporary directory, so it can run tests without being able to mutate the
+    source. The orchestrator has also just run every required gate against this
+    exact head. Hand over those authoritative results so the reviewer can focus
+    any additional execution on the changed behavior.
     """
     _, gate_data = _read_gate_status(repo_root, run)
     if not isinstance(gate_data, dict):
@@ -11221,11 +11661,13 @@ def _format_gate_evidence_for_review(repo_root: Path, run: "RunState") -> str:
         "These gates were run against this exact head commit by the orchestrator, "
         "outside your sandbox, before review started:\n\n"
         + "\n".join(lines)
-        + "\n\nTreat these as authoritative. You are running read-only and cannot "
-        "execute the suite yourself, so do not report an inability to run tests as "
-        "a finding, and do not assume a gate failed merely because you could not "
-        "run it. Judge the diff on correctness against the spec, and rely on the "
-        "results above for whether the suite passes.\n"
+        + "\n\nTreat these as authoritative. The source checkout is read-only, but "
+        "the standard temporary-directory environment variables point to a dedicated "
+        "writable scratch directory, so you may run targeted tests or the suite. Do "
+        "not report an inability to run tests as a product finding unless the changed "
+        "behavior itself prevents validation, and do not assume a gate failed merely "
+        "because your additional run could not start. Judge the diff on correctness "
+        "against the spec and rely on the results above for required-gate status.\n"
     )
 
 
@@ -11246,7 +11688,12 @@ def _render_local_review_prompt(
     if not template_path.is_file():
         template_path = repo_root / ".github" / "prompts" / "codex-review.md"
     if template_path.is_file():
-        rendered = template_path.read_text()
+        # Current ``spec init`` writes repository templates as UTF-8. Older
+        # native-Windows releases used the active ANSI code page, though, and
+        # the bundled em dash therefore became an invalid UTF-8 byte. Keep
+        # those initialized repositories reviewable while preserving every
+        # valid UTF-8 character in newly generated templates.
+        rendered = template_path.read_text(encoding="utf-8", errors="replace")
     else:
         import importlib.resources
 
@@ -11312,7 +11759,9 @@ def _write_local_review_process_diagnostics(
     debug_path = artifact_paths["process_debug"]
     existing = _read_json_dict(debug_path) or {}
     existing.update(payload)
-    debug_path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n")
+    debug_path.write_text(
+        json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _write_local_review_timeout_diagnostics(
@@ -11333,7 +11782,7 @@ def _write_local_review_timeout_diagnostics(
         raw_review_size_bytes = raw_review_path.stat().st_size
         if raw_review_text.strip():
             partial_path = artifact_paths["raw_review_partial"]
-            partial_path.write_text(raw_review_text)
+            partial_path.write_text(raw_review_text, encoding="utf-8")
             raw_review_excerpt = redact_sensitive(raw_review_text[:LOCAL_REVIEW_TIMEOUT_RAW_REVIEW_MAX_CHARS].strip())
 
     stdout_text = _coerce_subprocess_stream_text(
@@ -11365,7 +11814,9 @@ def _write_local_review_timeout_diagnostics(
         "timeout_seconds": timeout_exc.timeout,
     }
     debug_path = artifact_paths["timeout_debug"]
-    debug_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    debug_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return debug_path, partial_path
 
 
@@ -11401,10 +11852,19 @@ def _summarize_local_review_timeout(
 def _build_local_review_env(
     *,
     extra_git_configs: dict[str, str] | None = None,
+    temp_dir: Path | None = None,
 ) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key not in LOCAL_REVIEW_DISABLED_CREDENTIAL_ENV_VARS}
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GIT_ASKPASS"] = shutil.which("false") or "/usr/bin/false"
+    if temp_dir is not None:
+        rendered_temp_dir = str(temp_dir.resolve())
+        env["TMPDIR"] = rendered_temp_dir
+        env["TMP"] = rendered_temp_dir
+        env["TEMP"] = rendered_temp_dir
+        # Python's default bytecode cache lives beside imported source files,
+        # which is intentionally forbidden in a read-only review checkout.
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     try:
         config_count = int(env.get("GIT_CONFIG_COUNT", "0") or "0")
@@ -11443,6 +11903,7 @@ def _build_local_review_command(
     agent_name: str = "",
     reasoning_effort: str = LOCAL_REVIEW_REASONING_EFFORT,
     mcp_config_path: Path | None = None,
+    writable_temp_dir: Path | None = None,
 ) -> list[str]:
     from .agent_adapter import get_agent_adapter
 
@@ -11454,6 +11915,8 @@ def _build_local_review_command(
     }
     if _adapter_method_accepts_kwarg(agent.build_review_command, "mcp_config_path"):
         review_kwargs["mcp_config_path"] = mcp_config_path
+    if _adapter_method_accepts_kwarg(agent.build_review_command, "writable_temp_dir"):
+        review_kwargs["writable_temp_dir"] = writable_temp_dir
     return agent.build_review_command(**review_kwargs)
 
 
@@ -11568,7 +12031,7 @@ def _render_block_debugger_prompt(
 
 def _load_block_diagnosis_from_output(path: Path) -> BlockDiagnosis:
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Could not parse blocked-run debugger output {path}: line {exc.lineno} column {exc.colno}"
@@ -11599,7 +12062,9 @@ def _write_failed_local_review_payload(
         "reviewed_at": _now_iso(),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    output_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _is_local_review_timeout_result(review_result: ReviewResult) -> bool:
@@ -11608,7 +12073,7 @@ def _is_local_review_timeout_result(review_result: ReviewResult) -> bool:
 
 def _load_review_result_from_gate_output(result_path: Path) -> ReviewResult:
     try:
-        payload = json.loads(result_path.read_text())
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Could not parse local review gate output {result_path}: line {exc.lineno} column {exc.colno}"
@@ -11616,7 +12081,7 @@ def _load_review_result_from_gate_output(result_path: Path) -> ReviewResult:
     if not isinstance(payload, dict):
         raise ValueError(f"Local review gate output must be a JSON object: {result_path}")
 
-    status = str(payload.get("status", payload.get("decision", ""))).strip().lower()
+    status = review_payload_decision(payload)
     if status not in REVIEW_DECISION_VALUES:
         raise ValueError(f"Local review gate output has invalid status/decision: {status or '(missing)'}")
 
@@ -11974,6 +12439,7 @@ def _cleanup_stale_detached_temp_worktrees(
             repo_root,
             candidate,
             delete_branch=False,
+            temporary_prefix=prefix,
         )
         if cleanup_error:
             logger.warning(
@@ -11990,6 +12456,28 @@ def _cleanup_stale_review_worktrees(repo_root: Path) -> None:
         prefix=LOCAL_REVIEW_WORKTREE_PREFIX,
         label="review worktree",
     )
+
+
+@contextmanager
+def _temporary_local_review_scratch_dir() -> Iterator[Path]:
+    """Yield the only writable filesystem root exposed to a local reviewer."""
+    scratch_path = Path(
+        tempfile.mkdtemp(
+            prefix=LOCAL_REVIEW_SCRATCH_PREFIX,
+            dir=LOCAL_REVIEW_WORKTREE_ROOT,
+        )
+    ).resolve()
+    try:
+        yield scratch_path
+    finally:
+        try:
+            shutil.rmtree(scratch_path)
+        except OSError as exc:
+            logger.warning(
+                "Could not remove local review scratch directory %s: %s",
+                scratch_path,
+                exc,
+            )
 
 
 def _commit_present(repo_root: Path, head_sha: str) -> subprocess.CompletedProcess:
@@ -12081,6 +12569,7 @@ def _temporary_review_worktree(
             repo_root,
             worktree_path,
             delete_branch=False,
+            temporary_prefix=LOCAL_REVIEW_WORKTREE_PREFIX,
         )
         if cleanup_error:
             logger.warning(
@@ -12100,6 +12589,7 @@ def _temporary_review_worktree(
             repo_root,
             worktree_path,
             delete_branch=False,
+            temporary_prefix=LOCAL_REVIEW_WORKTREE_PREFIX,
         )
         if cleanup_error:
             logger.warning(
@@ -12155,6 +12645,7 @@ def _temporary_mergeability_worktree(
             repo_root,
             worktree_path,
             delete_branch=False,
+            temporary_prefix=LOCAL_MERGEABILITY_WORKTREE_PREFIX,
         )
         if cleanup_error:
             logger.warning(
@@ -12174,6 +12665,7 @@ def _temporary_mergeability_worktree(
             repo_root,
             worktree_path,
             delete_branch=False,
+            temporary_prefix=LOCAL_MERGEABILITY_WORKTREE_PREFIX,
         )
         if cleanup_error:
             logger.warning(
@@ -12195,7 +12687,7 @@ def _cleanup_stale_block_debugger_worktrees(repo_root: Path) -> None:
         if not candidate.is_dir() or not marker.is_file() or not (candidate / ".git").is_dir():
             continue
         try:
-            payload = json.loads(marker.read_text())
+            payload = json.loads(marker.read_text(encoding="utf-8"))
             owner = Path(str(payload.get("repo_root") or "")).resolve()
             marker_pid = int(payload.get("pid") or 0)
             marker_started_at = str(payload.get("process_started_at") or "").strip()
@@ -12211,7 +12703,12 @@ def _cleanup_stale_block_debugger_worktrees(repo_root: Path) -> None:
         if marker_pid > 0 and marker_started_at and is_pid_alive(marker_pid, marker_started_at):
             continue
         _restore_tree_writable(candidate)
-        remove_tree(candidate, ignore_errors=True)
+        cleanup_error = _remove_temporary_worktree_tree(
+            candidate,
+            prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+        )
+        if cleanup_error:
+            logger.warning("Could not remove stale private debugger clone: %s", cleanup_error)
 
 
 def _validated_block_debugger_surviving_workspace(
@@ -12275,7 +12772,12 @@ def _create_private_block_debugger_clone(
     )
     if clone_result.returncode != 0:
         detail = clone_result.stderr.strip() or clone_result.stdout.strip() or "git clone failed"
-        remove_tree(destination, ignore_errors=True)
+        cleanup_error = _remove_temporary_worktree_tree(
+            destination,
+            prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+        )
+        if cleanup_error:
+            logger.warning("Could not remove failed private debugger clone: %s", cleanup_error)
         raise ValueError(f"private debugger clone failed: {detail}")
 
     checkout_result = run_subprocess(
@@ -12284,7 +12786,12 @@ def _create_private_block_debugger_clone(
     )
     if checkout_result.returncode != 0:
         detail = checkout_result.stderr.strip() or checkout_result.stdout.strip() or "git checkout failed"
-        remove_tree(destination, ignore_errors=True)
+        cleanup_error = _remove_temporary_worktree_tree(
+            destination,
+            prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+        )
+        if cleanup_error:
+            logger.warning("Could not remove failed private debugger checkout: %s", cleanup_error)
         raise ValueError(f"private debugger checkout failed: {detail}")
 
     # The clone must have no path back to the authoritative workspace. The
@@ -12299,7 +12806,8 @@ def _create_private_block_debugger_clone(
                 "process_started_at": _current_process_started_at(),
             }
         )
-        + "\n"
+        + "\n",
+        encoding="utf-8",
     )
 
 
@@ -12309,7 +12817,7 @@ def _resolve_worktree_linked_gitdir(worktree_path: Path) -> Path | None:
     if not dot_git.is_file():
         return None
     try:
-        text = dot_git.read_text().strip()
+        text = dot_git.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     prefix = "gitdir: "
@@ -12405,7 +12913,7 @@ def _setup_debugger_common_dir_guard(
     temp_dirs.append(hooks_dir)
     for hook_name in ("pre-commit", "pre-merge-commit", "pre-push"):
         hook_path = hooks_dir / hook_name
-        hook_path.write_text("#!/bin/sh\nexit 1\n")
+        hook_path.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         hook_path.chmod(0o555)
     # Inject core.hooksPath via GIT_CONFIG_* env vars so it merges cleanly
     # with the caller's existing GIT_CONFIG entries.
@@ -12476,13 +12984,16 @@ def _temporary_block_debugger_worktree(
     if actual_head_sha and actual_head_sha != head_sha:
         if private_clone:
             _restore_tree_writable(worktree_path)
-            remove_tree(worktree_path, ignore_errors=True)
-            cleanup_error = ""
+            cleanup_error = _remove_temporary_worktree_tree(
+                worktree_path,
+                prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+            )
         else:
             cleanup_error = _cleanup_worktree_checkout(
                 repo_root,
                 worktree_path,
                 delete_branch=False,
+                temporary_prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
             )
         if cleanup_error:
             logger.warning(
@@ -12525,13 +13036,16 @@ def _temporary_block_debugger_worktree(
             _restore_tree_writable(temp_dir)
             remove_tree(temp_dir, ignore_errors=True)
         if private_clone:
-            remove_tree(worktree_path, ignore_errors=True)
-            cleanup_error = ""
+            cleanup_error = _remove_temporary_worktree_tree(
+                worktree_path,
+                prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
+            )
         else:
             cleanup_error = _cleanup_worktree_checkout(
                 repo_root,
                 worktree_path,
                 delete_branch=False,
+                temporary_prefix=LOCAL_BLOCK_DEBUGGER_WORKTREE_PREFIX,
             )
         if cleanup_error:
             logger.warning(
@@ -12552,7 +13066,9 @@ def _make_tree_readonly(root: Path, *, exclude: Path | None = None) -> None:
     """
     root_str = os.path.abspath(os.fspath(root))
     try:
-        if stat.S_ISLNK(os.lstat(root_str).st_mode):
+        if stat.S_ISLNK(os.lstat(root_str).st_mode) or _is_windows_reparse_point(
+            Path(root_str)
+        ):
             return
     except OSError:
         return
@@ -12578,26 +13094,32 @@ def _make_tree_readonly(root: Path, *, exclude: Path | None = None) -> None:
     def _remove_write_bits(path: str) -> None:
         try:
             mode = os.lstat(path).st_mode
-            if stat.S_ISLNK(mode):
+            if stat.S_ISLNK(mode) or _is_windows_reparse_point(Path(path)):
                 return
             os.chmod(path, mode & ~_write_bits)
         except OSError:
             pass
 
     _write_bits = stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH
-    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+    directories: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
         if _excluded(dirpath):
+            dirnames[:] = []
             continue
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not _is_windows_reparse_point(Path(dirpath) / name)
+        ]
+        directories.extend(os.path.join(dirpath, name) for name in dirnames)
         for name in filenames:
             p = os.path.join(dirpath, name)
             if _excluded(p):
                 continue
             _remove_write_bits(p)
-        for name in dirnames:
-            p = os.path.join(dirpath, name)
-            if _excluded(p):
-                continue
-            _remove_write_bits(p)
+    for directory in reversed(directories):
+        if not _excluded(directory):
+            _remove_write_bits(directory)
     if not _excluded(str(root)):
         _remove_write_bits(str(root))
 
@@ -12606,7 +13128,9 @@ def _restore_tree_writable(root: Path) -> None:
     """Restore owner-write permission so the tree can be removed."""
     root_str = os.path.abspath(os.fspath(root))
     try:
-        if stat.S_ISLNK(os.lstat(root_str).st_mode):
+        if stat.S_ISLNK(os.lstat(root_str).st_mode) or _is_windows_reparse_point(
+            Path(root_str)
+        ):
             return
     except OSError:
         return
@@ -12614,13 +13138,18 @@ def _restore_tree_writable(root: Path) -> None:
     def _restore_owner_write(path: str) -> None:
         try:
             mode = os.lstat(path).st_mode
-            if stat.S_ISLNK(mode):
+            if stat.S_ISLNK(mode) or _is_windows_reparse_point(Path(path)):
                 return
             os.chmod(path, mode | stat.S_IWUSR)
         except OSError:
             pass
 
     for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        dirnames[:] = [
+            name
+            for name in dirnames
+            if not _is_windows_reparse_point(Path(dirpath) / name)
+        ]
         _restore_owner_write(dirpath)
         for name in filenames:
             _restore_owner_write(os.path.join(dirpath, name))
@@ -12838,6 +13367,24 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
             return "blocked"
 
         worktree_path = resolve_worktree_path(run, repo_root)
+    if backend.identity.backend == "worktree":
+        expected_names = expected_run_worktree_names(run.spec_id, run.branch)
+        if not expected_names:
+            run.last_error = (
+                "Refusing worktree access because run branch/spec identity does not "
+                "authorize a worktree path"
+            )
+            return "failed"
+        try:
+            worktree_path = validate_owned_worktree_path(
+                owner_root=_worktrees_root(repo_root),
+                target=worktree_path,
+                relative_to=resolve_common_root(repo_root),
+                expected_names=expected_names,
+            )
+        except UnsafeWorktreePathError as exc:
+            run.last_error = f"Refusing unsafe persisted worktree path: {exc}"
+            return "failed"
     run.worktree_path = str(worktree_path)
     branch = run.branch
 
@@ -12930,6 +13477,23 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
     else:
         # Clean up stale directory if present
         if worktree_path.exists():
+            expected_names = expected_run_worktree_names(run.spec_id, branch)
+            if not expected_names:
+                run.last_error = (
+                    "Refusing stale worktree cleanup because run branch/spec identity "
+                    "does not authorize a worktree path"
+                )
+                return "failed"
+            try:
+                worktree_path = validate_owned_worktree_path(
+                    owner_root=_worktrees_root(repo_root),
+                    target=worktree_path,
+                    relative_to=resolve_common_root(repo_root),
+                    expected_names=expected_names,
+                )
+            except UnsafeWorktreePathError as exc:
+                run.last_error = f"Refusing unsafe stale worktree cleanup: {exc}"
+                return "failed"
             remove_tree(worktree_path)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -13040,6 +13604,21 @@ def _backend_uses_provider_sandbox_config(backend: ExecutionBackend) -> bool:
     return backend.__class__.__name__ == "WorktreeExecutionBackend"
 
 
+def _backend_launches_agent_on_host(backend: ExecutionBackend) -> bool:
+    """Return whether the provider CLI itself executes on the current host."""
+    identity = getattr(backend, "identity", None)
+    return getattr(identity, "backend", "") != "container"
+
+
+def _require_agent_available_for_backend(
+    agent_name: str,
+    backend: ExecutionBackend,
+) -> None:
+    """Apply host provider policy unless a Linux container runs the agent."""
+    if _backend_launches_agent_on_host(backend):
+        require_host_agent_available(agent_name)
+
+
 def _read_slug_from_spec(spec_path: Path) -> str:
     """Read a task slug from frontmatter `id:` or a legacy `slug:` line."""
     if not spec_path.exists():
@@ -13048,7 +13627,7 @@ def _read_slug_from_spec(spec_path: Path) -> str:
     frontmatter_id = str(frontmatter.get("id", "")).strip()
     if frontmatter_id:
         return frontmatter_id
-    for line in spec_path.read_text().splitlines():
+    for line in spec_path.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if stripped.lower().startswith("slug:"):
             return stripped.split(":", 1)[1].strip()
@@ -13066,7 +13645,7 @@ def _load_task_scoping_prompt(
     prompt_path = repo_root / TASK_SCOPING_PROMPT_FILE
     top_level_spec_pattern = f"{SPEC_RUNTIME_CONFIG.paths.specs_dir}/*.md"
     if prompt_path.exists():
-        prompt = prompt_path.read_text().strip()
+        prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
         prompt = (
             "You are a task-scoping assistant. Ask the user what they want to build, "
@@ -13338,6 +13917,12 @@ def phase_scoping(run: RunState, repo_root: Path) -> str:
         logger.info("%s already exists, skipping scoping.", spec_file)
         return "passed"
 
+    try:
+        require_host_agent_available(run.agent)
+    except HostAgentUnavailableError as exc:
+        run.last_error = str(exc)
+        return "failed"
+
     if not sys.stdin.isatty():
         run.last_error = "Task scoping requires an interactive terminal."
         return "failed"
@@ -13461,7 +14046,7 @@ def phase_intake(run: RunState, repo_root: Path) -> str:
             previous_payload = asdict(existing_intake)
         else:
             try:
-                previous_payload = json.loads(intake_path.read_text())
+                previous_payload = json.loads(intake_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 previous_payload = {}
         _audit_intake_reset(
@@ -13623,7 +14208,7 @@ def _write_sandbox_config(
     """Write agent-specific sandbox configuration."""
     if agent == "claude":
         config_dir = worktree_path / ".claude"
-        if config_dir.is_symlink() or (
+        if config_dir.is_symlink() or _is_windows_reparse_point(config_dir) or (
             config_dir.exists() and not config_dir.is_dir()
         ):
             raise ValueError(
@@ -13663,7 +14248,10 @@ def _write_sandbox_config(
                 ],
             },
         }
-        (config_dir / "settings.local.json").write_text(json.dumps(config, indent=2) + "\n")
+        _replace_with_exclusive_file(
+            config_dir / "settings.local.json",
+            (json.dumps(config, indent=2) + "\n").encode("utf-8"),
+        )
         _write_claude_mcp_config(
             worktree_path,
             extra_mcp_servers=extra_mcp_servers,
@@ -13674,18 +14262,21 @@ def _write_sandbox_config(
         # written here. Codex does not read this .codex/config.toml file for
         # MCP configuration, so ``extra_mcp_servers`` is intentionally ignored.
         config_dir = worktree_path / ".codex"
-        if config_dir.is_symlink() or (
+        if config_dir.is_symlink() or _is_windows_reparse_point(config_dir) or (
             config_dir.exists() and not config_dir.is_dir()
         ):
             raise ValueError(
                 f"Refusing to write Codex config through non-directory path {config_dir}"
             )
         config_dir.mkdir(parents=True, exist_ok=True)
-        (config_dir / "config.toml").write_text(
-            'sandbox_mode = "workspace-write"\n'
-            'approval_policy = "never"\n\n'
-            "[sandbox_workspace_write]\n"
-            "network_access = true\n"
+        _replace_with_exclusive_file(
+            config_dir / "config.toml",
+            (
+                'sandbox_mode = "workspace-write"\n'
+                'approval_policy = "never"\n\n'
+                "[sandbox_workspace_write]\n"
+                "network_access = true\n"
+            ).encode("utf-8"),
         )
 
 
@@ -14060,8 +14651,17 @@ def _prepare_implement_launch_plan(
     reason: str,
     use_stream_json: bool,
 ) -> ImplementLaunchPlan:
-    setup_manifest = _run_implement_setup_command(run, worktree_path)
     backend = _resolve_execution_backend()
+    _require_agent_available_for_backend(run.agent, backend)
+    setup_manifest = _run_implement_setup_command(run, worktree_path)
+    # Persist cleanup ownership immediately after setup returns. Later MCP or
+    # sandbox preparation may fail, but declared services must never become an
+    # undiscoverable side effect of that failure.
+    _register_setup_manifest_processes(
+        repo_root,
+        worktree_path,
+        setup_manifest,
+    )
     adapter = get_agent_adapter(run.agent)
     setup_mcp_servers = None
     if adapter.capabilities.supports_mcp:
@@ -14123,11 +14723,6 @@ def _prepare_implement_launch_plan(
             backend, worktree_path, (".spec-claude-home", ".claude/mcp-servers.json"),
         )
 
-    _register_setup_manifest_processes(
-        repo_root,
-        worktree_path,
-        setup_manifest,
-    )
     if adapter.capabilities.supports_mcp:
         ctx.visual_feedback_available = bool(setup_mcp_servers)
 
@@ -14188,8 +14783,9 @@ def _prepare_implement_launch_plan(
     popen_kwargs: dict[str, object] = {
         "cwd": worktree_path,
         "env": agent_env,
-        "start_new_session": True,
         "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
     }
     progress_tracker: AgentProgressTracker | None = None
     if run.agent == "claude" and use_stream_json:
@@ -14284,8 +14880,18 @@ def _launch_implement_attempt(
             _set_active_agent_process(None)
             _prune_registered_worktree_processes(repo_root, worktree_path)
 
-    result = backend.launch_agent(request, monitor=_supervise)
-    return result.returncode
+    try:
+        result = backend.launch_agent(request, monitor=_supervise)
+        return result.returncode
+    finally:
+        if run.agent == "codex":
+            _remove_codex_isolated_auth(worktree_path)
+            # Volume-mode containers received a staged copy before launch.
+            # Re-sync the credential-free home so a reusable workspace cannot
+            # retain auth after the provider process exits.
+            _sync_orchestrator_paths_into_workspace(
+                backend, worktree_path, (".spec-codex-home",),
+            )
 
 
 def _record_implement_attempt_outcome(
@@ -14807,6 +15413,12 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
     # First statement in the phase, ahead of every early return below, so a
     # prelaunch failure is never judged on the previous attempt's agent report.
     run.implement_agent_reported_failure = False
+    backend = _resolve_execution_backend()
+    try:
+        _require_agent_available_for_backend(run.agent, backend)
+    except HostAgentUnavailableError as exc:
+        run.last_error = str(exc)
+        return "failed"
     workspace = _resolve_workspace_handle(run, repo_root)
     worktree_path = workspace.path
     # Clone/container backends materialize their checkout outside the legacy
@@ -14833,7 +15445,6 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
     attempt_bundle = _build_implement_attempt_context(run, repo_root)
     reason = attempt_bundle.reason
     ctx = attempt_bundle.context
-    backend = _resolve_execution_backend()
     try:
         workspace = _restore_container_workspace_for_retry(workspace, backend, ctx)
     except ValueError as exc:
@@ -14904,7 +15515,11 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
             return "failed"
 
     # Probe Claude CLI for stream-json support (graceful fallback)
-    use_stream_json = run.agent == "claude" and _claude_supports_stream_json()
+    use_stream_json = (
+        run.agent == "claude"
+        and _backend_launches_agent_on_host(backend)
+        and _claude_supports_stream_json()
+    )
     logger.info(
         "Launching %s in %s (run_id=%s, attempt=%d)",
         run.agent,
@@ -15013,6 +15628,8 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
             )
         return result
     finally:
+        if run.agent == "codex":
+            _remove_codex_isolated_auth(worktree_path)
         if should_run_teardown:
             _run_implement_teardown_command(run, worktree_path)
             _prune_registered_worktree_processes(repo_root, worktree_path)
@@ -15133,6 +15750,12 @@ def _attempt_no_handshake_recovery(
     ctx: ImplementContext,
     use_stream_json: bool,
 ) -> str | None:
+    backend = _resolve_execution_backend()
+    try:
+        _require_agent_available_for_backend(run.agent, backend)
+    except HostAgentUnavailableError as exc:
+        run.last_error = str(exc)
+        return "failed"
     if run.agent == "claude":
         credentials_error = _claude_credentials_preflight_error()
         if credentials_error:
@@ -15146,7 +15769,7 @@ def _attempt_no_handshake_recovery(
     # attempt. Remove mutable aliases from the failed launch before starting
     # it; immutable attempt/launch histories remain available for diagnosis.
     _discard_prelaunch_completion_artifacts(repo_root, worktree_path, run.run_id)
-    _seed_recovery_commit_excludes(worktree_path, _resolve_execution_backend())
+    _seed_recovery_commit_excludes(worktree_path, backend)
     recovery_ctx = ImplementContext(
         implement_reason="recovery",
         objective=ctx.objective,
@@ -15179,7 +15802,11 @@ def _attempt_no_handshake_recovery(
         recovery_env = _build_implement_agent_env(run, worktree_path)
         recovery_env_redactions: tuple[str, ...] = ()
         setup_manifest = _run_implement_setup_command(run, worktree_path)
-        backend = _resolve_execution_backend()
+        _register_setup_manifest_processes(
+            repo_root,
+            worktree_path,
+            setup_manifest,
+        )
         adapter = get_agent_adapter(run.agent)
         setup_mcp_servers = None
         if adapter.capabilities.supports_mcp:
@@ -15234,11 +15861,6 @@ def _attempt_no_handshake_recovery(
             _sync_orchestrator_paths_into_workspace(
                 backend, worktree_path, (".spec-claude-home", ".claude/mcp-servers.json"),
             )
-        _register_setup_manifest_processes(
-            repo_root,
-            worktree_path,
-            setup_manifest,
-        )
         if adapter.capabilities.supports_mcp:
             recovery_ctx.visual_feedback_available = bool(setup_mcp_servers)
 
@@ -15291,8 +15913,9 @@ def _attempt_no_handshake_recovery(
         popen_kwargs: dict[str, object] = {
             "cwd": worktree_path,
             "env": recovery_env,
-            "start_new_session": True,
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
         }
         if run.agent == "claude" and use_stream_json:
             popen_kwargs["stdout"] = subprocess.PIPE
@@ -15367,6 +15990,8 @@ def _attempt_no_handshake_recovery(
         run.last_error = impl_result.summary or "Agent reported failure during handshake recovery"
         return "failed"
     finally:
+        if run.agent == "codex":
+            _remove_codex_isolated_auth(worktree_path)
         _run_implement_teardown_command(run, worktree_path)
         _prune_registered_worktree_processes(repo_root, worktree_path)
 
@@ -15662,7 +16287,7 @@ def _load_container_outbox_completion_result(
     if result_path is None or not result_path.is_file():
         return None
     try:
-        payload = json.loads(result_path.read_text())
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(payload, dict) or payload.get("run_id") != run_id:
@@ -15967,18 +16592,55 @@ def _start_codex_progress_thread(
     return thread
 
 
-def _terminate_agent_process(proc: subprocess.Popen[str]) -> None:
-    """Terminate an agent process group, escalating to SIGKILL if needed."""
+def _terminate_agent_process(proc: subprocess.Popen[str] | ManagedProcess) -> None:
+    """Terminate an owned agent tree, escalating after a bounded wait."""
     pid = getattr(proc, "pid", None)
-    terminated = False
-    if pid is not None:
+    if isinstance(proc, ManagedProcess):
         try:
-            os.killpg(pid, signal.SIGTERM)
-            terminated = True
+            proc.terminate(grace_seconds=AGENT_TERMINATE_TIMEOUT_SECONDS)
         except (OSError, ProcessLookupError, PermissionError):
-            terminated = False
-    if not terminated:
+            pass
+
+        try:
+            proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+        try:
+            proc.kill()
+        except (OSError, ProcessLookupError, PermissionError):
+            pass
+
+        try:
+            proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.error("Agent process %s did not terminate after hard termination", pid)
+        return
+
+    try:
+        terminated = terminate_legacy_popen_tree(
+            proc,
+            grace_seconds=AGENT_TERMINATE_TIMEOUT_SECONDS,
+        )
+    except TypeError:
+        # Bounded compatibility for lightweight Popen-like test doubles. Real
+        # custom-backend processes must prove an owned boundary above.
+        terminated = None
+    if terminated is not None:
+        if not terminated:
+            logger.error("Refusing to terminate unowned legacy agent process %s", pid)
+            return
+        try:
+            proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.error("Legacy agent process %s remained after tree termination", pid)
+        return
+
+    try:
         proc.terminate()
+    except (OSError, ProcessLookupError, PermissionError):
+        pass
 
     try:
         proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
@@ -15986,20 +16648,15 @@ def _terminate_agent_process(proc: subprocess.Popen[str]) -> None:
     except subprocess.TimeoutExpired:
         pass
 
-    killed = False
-    if pid is not None:
-        try:
-            os.killpg(pid, signal.SIGKILL)
-            killed = True
-        except (OSError, ProcessLookupError, PermissionError):
-            killed = False
-    if not killed:
+    try:
         proc.kill()
+    except (OSError, ProcessLookupError, PermissionError):
+        pass
 
     try:
         proc.wait(timeout=AGENT_TERMINATE_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        logger.error("Agent process %s did not terminate after SIGKILL", pid)
+        logger.error("Agent process %s did not terminate after hard termination", pid)
 
 
 def _wait_for_agent_exit(
@@ -17277,7 +17934,7 @@ def _record_gate_result(
 ) -> None:
     """Record gate result in gate-status.json (same format as spec_workflow.sh)."""
     if state_file.exists():
-        data = json.loads(state_file.read_text())
+        data = json.loads(state_file.read_text(encoding="utf-8"))
     else:
         data = {"spec_id": spec_id, "gates": {}}
 
@@ -17348,7 +18005,9 @@ def _record_gate_result(
         "history": history[-GATE_HISTORY_LIMIT:],
     }
     state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    state_file.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _check_spec_authoring_policy(worktree_path: Path, branch: str) -> str:
@@ -17786,7 +18445,7 @@ def _extract_markdown_section_items(
     if not spec_path.exists():
         return []
 
-    text = spec_path.read_text()
+    text = spec_path.read_text(encoding="utf-8")
     in_section = False
     items: list[str] = []
     heading_pattern = f"## {heading}"
@@ -17840,7 +18499,7 @@ def _known_issues_markdown(state_file: Path) -> str:
     if not state_file.exists():
         return "- Gate status file is missing; required gates have not been recorded."
     try:
-        data = json.loads(state_file.read_text())
+        data = json.loads(state_file.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, TypeError):
         return "- Gate status file is corrupt."
     gates = data.get("gates", {})
@@ -18553,7 +19212,7 @@ def _emit_retry_cap_escalation_summary(
     )
     summary_path = _retry_cap_escalation_summary_path(repo_root, run)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(summary)
+    summary_path.write_text(summary, encoding="utf-8")
 
     if pr_number is not None:
         try:
@@ -18662,18 +19321,15 @@ def _bootstrap_review_worktree(
     (and anything it references) is attacker-controlled. The bootstrap command
     is therefore sourced from trusted configuration — the orchestrator host's
     own ``SPEC_RUNTIME_CONFIG`` (loaded from the base checkout), never the tree
-    under review — and it runs with review-scoped credentials stripped (see
-    ``_build_local_review_env``). Even so, ``pip install -e .`` executes the PR
-    head's build hooks, so this is treated as untrusted code execution.
+    under review. Even so, ``pip install -e .`` executes the PR head's build
+    hooks, so this is hostile code rather than an ordinary trusted setup step.
 
-    Stripping named credential *env vars* (forge tokens, agent auth keys) is
-    not sufficient on its own: build hooks run as the same OS user with the
-    same ``$HOME``, so they can read credential files straight off disk
-    (``~/.ssh``, ``~/.codex/auth.json``, ``~/.aws/credentials``, ``~/.netrc``,
-    ``~/.config/gh``, ...) regardless of which env vars are set. So the
-    bootstrap subprocess additionally gets an isolated, empty ``HOME`` (and
-    the credential-path overrides that could point back at the real one) for
-    the duration of the install command, then the temp dir is removed.
+    Environment scrubbing, a temporary profile, chmod, and process supervision
+    are not filesystem security boundaries. The command therefore runs only
+    through :func:`isolated_review_bootstrap_sandbox`, with write access scoped
+    to this temporary review worktree and a separate ephemeral runtime root,
+    minimal system reads, operator-home reads denied, and network disabled. If
+    that policy cannot be enforced, the command is not run at all.
 
     Bootstrap is best-effort: on failure (or timeout) the failure is recorded as
     a review-environment warning and the empty string is returned so review
@@ -18695,30 +19351,6 @@ def _bootstrap_review_worktree(
     if SPEC_RUNTIME_CONFIG.bootstrap_install.select() is None:
         install_display = str(SPEC_RUNTIME_CONFIG.bootstrap_install_command).strip()
 
-    # Credentials stripped (no forge tokens) — reuse the hardened env the
-    # reviewer subprocess runs with, then additionally drop the portable agent
-    # auth keys. The reviewer subprocess legitimately keeps those (it launches
-    # an agent), but the bootstrap runs the PR head's untrusted build hooks
-    # (``pip install -e .``), so it must not inherit any agent auth.
-    env = _build_local_review_env()
-    for key in _CLAUDE_PORTABLE_AUTH_ENV_KEYS:
-        env.pop(key, None)
-
-    isolated_home = tempfile.mkdtemp(prefix="spec-review-bootstrap-home-")
-    env["HOME"] = isolated_home
-    for key in (
-        "CODEX_HOME",
-        "NETRC",
-        "XDG_CONFIG_HOME",
-        "XDG_CACHE_HOME",
-        "XDG_DATA_HOME",
-        "AWS_SHARED_CREDENTIALS_FILE",
-        "AWS_CONFIG_FILE",
-        "DOCKER_CONFIG",
-        "KUBECONFIG",
-    ):
-        env.pop(key, None)
-
     def _record_warning(summary: str, detail: str) -> str:
         payload = {
             "recorded_at": _now_iso(),
@@ -18729,7 +19361,10 @@ def _bootstrap_review_worktree(
         }
         try:
             warning_path.parent.mkdir(parents=True, exist_ok=True)
-            warning_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            warning_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
         except OSError:
             pass
         logger.warning(
@@ -18739,53 +19374,65 @@ def _bootstrap_review_worktree(
         )
         return summary
 
-    # The install command is untrusted PR-head code (build hooks can fork
-    # children that outlive the shell, e.g. a detached PEP 517 build
-    # backend). Run it in its own process group and, on timeout, kill the
-    # whole group — killing only the ``sh`` process (as a plain
-    # ``subprocess.run(..., timeout=...)`` would) leaves those descendants
-    # holding the stdout/stderr pipes open, so draining them to EOF after
-    # the kill blocks forever and defeats the timeout entirely.
+    # The outer sandbox launcher remains supervised as one owned process tree:
+    # build hooks can fork descendants that outlive their immediate parent and
+    # keep stdout/stderr open after a timeout.
     try:
-        try:
-            proc = subprocess.Popen(
-                install_command.argv(),
-                cwd=review_worktree,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            return _record_warning(
-                "Review worktree bootstrap could not be launched; reviewer may not be "
-                "able to run tests (falling back to diff-only review).",
-                str(exc),
-            )
-        try:
-            stdout_text, stderr_text = proc.communicate(timeout=REVIEW_BOOTSTRAP_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
-            _terminate_agent_process(proc)
-            return _record_warning(
-                "Review worktree bootstrap timed out; reviewer may not be able to run "
-                "tests (falling back to diff-only review).",
-                f"Timed out after {REVIEW_BOOTSTRAP_TIMEOUT_SECONDS:.0f}s",
-            )
-        if proc.returncode != 0:
-            detail = (stderr_text or "").strip() or (stdout_text or "").strip()
-            return _record_warning(
-                "Review worktree bootstrap failed; reviewer may not be able to run "
-                "tests (falling back to diff-only review).",
-                detail or f"exit_code={proc.returncode}",
-            )
-        return ""
-    finally:
-        remove_tree(isolated_home, ignore_errors=True)
+        launch_argv = install_command.launch_argv(
+            cwd=review_worktree,
+            temp_dir=review_worktree,
+        )
+        with launch_argv as argv:
+            with isolated_review_bootstrap_sandbox(review_worktree, argv) as sandbox:
+                proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+                    sandbox.wrap(argv),
+                    cwd=review_worktree,
+                    env=sandbox.env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                try:
+                    stdout_text, stderr_text = proc.communicate(
+                        timeout=REVIEW_BOOTSTRAP_TIMEOUT_SECONDS
+                    )
+                except subprocess.TimeoutExpired:
+                    _terminate_agent_process(proc)
+                    return _record_warning(
+                        "Review worktree bootstrap timed out; reviewer may not be able to run "
+                        "tests (falling back to diff-only review).",
+                        f"Timed out after {REVIEW_BOOTSTRAP_TIMEOUT_SECONDS:.0f}s",
+                    )
+    except ReviewBootstrapSandboxUnavailable as exc:
+        return _record_warning(
+            "Review worktree bootstrap skipped because an enforceable sandbox is unavailable; "
+            "continuing with diff-only review.",
+            str(exc),
+        )
+    except OSError as exc:
+        return _record_warning(
+            "Review worktree bootstrap could not be launched; reviewer may not be "
+            "able to run tests (falling back to diff-only review).",
+            str(exc),
+        )
+    if proc.returncode != 0:
+        detail = (stderr_text or "").strip() or (stdout_text or "").strip()
+        return _record_warning(
+            "Review worktree bootstrap failed; reviewer may not be able to run "
+            "tests (falling back to diff-only review).",
+            detail or f"exit_code={proc.returncode}",
+        )
+    return ""
 
 
-def _review_env_prompt_note(review_worktree: Path) -> str:
+def _review_env_prompt_note(
+    review_worktree: Path,
+    *,
+    windows: bool | None = None,
+) -> str:
     """Return a prompt suffix telling the reviewer how to run the bootstrapped gates.
 
     Putting the worktree venv on the reviewer subprocess ``PATH`` (see
@@ -18799,17 +19446,46 @@ def _review_env_prompt_note(review_worktree: Path) -> str:
     any PATH reset. When there is no venv (bootstrap skipped or failed), return
     an empty string so the prompt does not falsely promise a runnable project.
     """
-    venv_bin = review_worktree / ".venv" / "bin"
+    use_windows = os.name == "nt" if windows is None else windows
+    venv_bin = _worktree_venv_executable_dir(
+        review_worktree,
+        windows=use_windows,
+    )
     if not venv_bin.is_dir():
         return ""
+    if use_windows:
+        tool_examples = (
+            r"`.venv\Scripts\python.exe -m pytest` and "
+            r"`.venv\Scripts\python.exe -m ruff check .`"
+        )
+        executable_dir_name = "Scripts"
+    else:
+        tool_examples = "`.venv/bin/pytest` and `.venv/bin/ruff check .`"
+        executable_dir_name = "bin"
     return (
         "\n\nReview environment: the project under review has been installed "
-        "into a local virtualenv at `.venv` in this worktree. Its `bin` is on "
+        "into a local virtualenv at `.venv` in this worktree. Its "
+        f"`{executable_dir_name}` is on "
         "PATH, but because some shells reset PATH, prefer invoking gate tools by "
-        "absolute path — e.g. `.venv/bin/pytest` and `.venv/bin/ruff check .` — "
+        f"an explicit virtualenv path — e.g. {tool_examples} — "
         "to actually exercise the changed behavior. If a gate command still "
         "cannot be found or run, note that and continue with diff-only review "
         "rather than returning `blocked`."
+    )
+
+
+def _codex_review_sandbox_prompt_note(
+    review_worktree: Path,
+    scratch_dir: Path,
+) -> str:
+    """Describe the inverted Codex review sandbox without granting source writes."""
+    return (
+        "\n\nCodex review sandbox layout: your shell starts in the dedicated "
+        f"writable scratch directory `{scratch_dir}`. The PR checkout is read-only "
+        f"at `{review_worktree}`. Run repository commands after changing to that "
+        "checkout (or use `git -C <checkout> ...`); standard temporary-directory "
+        "environment variables continue to point at the writable scratch directory. "
+        "Do not copy the checkout into scratch or modify its files."
     )
 
 
@@ -18827,6 +19503,7 @@ def _run_local_review(
     artifact_paths = _local_review_artifact_paths(repo_root, run.run_id)
     _clear_local_review_artifacts(artifact_paths)
     review_agent = _effective_review_agent(run)
+    require_host_agent_available(review_agent)
     reasoning_effort = (
         LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT if run.review_changes == 0 else LOCAL_REVIEW_REASONING_EFFORT
     )
@@ -18848,7 +19525,7 @@ def _run_local_review(
         review_changes=run.review_changes,
         gate_evidence=_format_gate_evidence_for_review(repo_root, run),
     )
-    artifact_paths["prompt"].write_text(prompt)
+    artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
 
     # Resolve schema: repo-level override, then bundled
     schema_path = repo_root / ".github" / "schemas" / "codex-review.schema.json"
@@ -18866,16 +19543,19 @@ def _run_local_review(
     # For agents that write to stdout (no --output-schema), embed the
     # expected JSON structure in the prompt so the agent knows the format.
     if agent.capabilities.review_output_on_stdout and schema_path.is_file():
-        schema_text = schema_path.read_text().strip()
+        schema_text = schema_path.read_text(encoding="utf-8").strip()
         prompt = (
             f"{prompt}\n\n"
             "You MUST output a single JSON object (no markdown wrapping) matching this schema:\n"
             f"```json\n{schema_text}\n```"
         )
 
-    with _temporary_review_worktree(
-        repo_root, head_sha=expected_head_sha, branch=run.branch
-    ) as review_worktree:
+    with (
+        _temporary_review_worktree(
+            repo_root, head_sha=expected_head_sha, branch=run.branch
+        ) as review_worktree,
+        _temporary_local_review_scratch_dir() as review_scratch_dir,
+    ):
         review_exec_failed_summary = ""
         review_mcp_config_path: Path | None = None
         review_codex_home: Path | None = None
@@ -18896,10 +19576,19 @@ def _run_local_review(
         # there and how to invoke it by absolute path (PATH injection alone is
         # not enough if the agent's shell resets PATH). Recorded to the prompt
         # artifact so the effective prompt is reproducible.
-        env_note = _review_env_prompt_note(review_worktree)
-        if env_note:
-            prompt = f"{prompt}{env_note}"
-            artifact_paths["prompt"].write_text(prompt)
+        # A failed installer can leave a partial ``.venv`` behind. Do not
+        # advertise it or put it ahead of the operator's working toolchain:
+        # doing so turns the promised diff-only fallback into a broken
+        # environment where even an already-installed pytest disappears.
+        env_note = "" if bootstrap_warning else _review_env_prompt_note(review_worktree)
+        sandbox_note = (
+            _codex_review_sandbox_prompt_note(review_worktree, review_scratch_dir)
+            if agent.name == "codex"
+            else ""
+        )
+        if env_note or sandbox_note:
+            prompt = f"{prompt}{env_note}{sandbox_note}"
+            artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
         if agent.capabilities.supports_mcp:
             # The reviewer subprocess is launched on the host via
             # ``_run_local_review_subprocess``, never through the container
@@ -18930,13 +19619,17 @@ def _run_local_review(
             agent_name=review_agent,
             reasoning_effort=reasoning_effort,
             mcp_config_path=review_mcp_config_path,
+            writable_temp_dir=review_scratch_dir,
         )
-        review_env = _build_local_review_env()
+        review_env = _build_local_review_env(temp_dir=review_scratch_dir)
         # Put the review worktree's venv on the reviewer's PATH so bootstrap
         # actually pays off: the reviewer can run bare ``pytest`` / ``ruff``
         # against the installed project instead of falling back to diff-only.
-        # A missing ``.venv/bin`` (bootstrap skipped or failed) is harmless.
-        _inject_worktree_venv_into_env(review_env, review_worktree)
+        # A missing ``.venv/bin`` after a skipped bootstrap is harmless, but a
+        # partial environment left by a failed bootstrap must not shadow the
+        # operator's working PATH.
+        if not bootstrap_warning:
+            _inject_worktree_venv_into_env(review_env, review_worktree)
         if review_codex_home is not None:
             review_env = _subprocess_env_with_codex_home(review_env, review_codex_home)
         try:
@@ -18972,7 +19665,7 @@ def _run_local_review(
                     if brace_start >= 0 and brace_end > brace_start:
                         json_text = stdout_text[brace_start : brace_end + 1]
                     artifact_paths["raw_review"].parent.mkdir(parents=True, exist_ok=True)
-                    artifact_paths["raw_review"].write_text(json_text)
+                    artifact_paths["raw_review"].write_text(json_text, encoding="utf-8")
 
             if review_exec.returncode != 0:
                 detail = _format_subprocess_failure(review_exec)
@@ -18988,7 +19681,9 @@ def _run_local_review(
                 expected_base_sha=expected_base_sha,
                 reviewer_agent=review_agent,
             )
-        elif not artifact_paths["raw_review"].is_file() or not artifact_paths["raw_review"].read_text().strip():
+        elif not artifact_paths["raw_review"].is_file() or not artifact_paths[
+            "raw_review"
+        ].read_text(encoding="utf-8", errors="replace").strip():
             _write_failed_local_review_payload(
                 artifact_paths["raw_review"],
                 summary="Missing review output artifact.",
@@ -19008,11 +19703,19 @@ def _run_local_review(
         check_name=REVIEW_GATE_CHECK_NAME,
     )
     artifact_paths["review_result"].parent.mkdir(parents=True, exist_ok=True)
-    artifact_paths["review_result"].write_text(json.dumps(evaluation.result_payload, indent=2, sort_keys=True) + "\n")
+    artifact_paths["review_result"].write_text(
+        json.dumps(evaluation.result_payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     artifact_paths["summary"].parent.mkdir(parents=True, exist_ok=True)
-    artifact_paths["summary"].write_text(json.dumps(evaluation.machine_summary, indent=2, sort_keys=True) + "\n")
+    artifact_paths["summary"].write_text(
+        json.dumps(evaluation.machine_summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     artifact_paths["job_summary"].parent.mkdir(parents=True, exist_ok=True)
-    artifact_paths["job_summary"].write_text(evaluation.human_summary.rstrip() + "\n")
+    artifact_paths["job_summary"].write_text(
+        evaluation.human_summary.rstrip() + "\n", encoding="utf-8"
+    )
 
     if not artifact_paths["review_result"].is_file():
         raise ValueError("Local review gate did not produce review output")
@@ -19034,6 +19737,11 @@ def _phase_review_local(
     expected_base_sha: str,
 ) -> str:
     review_agent = _effective_review_agent(run)
+    try:
+        require_host_agent_available(review_agent)
+    except HostAgentUnavailableError as exc:
+        run.last_error = str(exc)
+        return "failed"
     if not shutil.which(review_agent):
         run.last_error = (
             f"Review agent '{review_agent}' not found on PATH. Install it or configure a different agent in .spec.toml."
@@ -19101,7 +19809,10 @@ def _phase_review_local(
     review_result.source_check_name = REVIEW_GATE_CHECK_NAME
     review_result.source_check_url = str(latest_pr.get("url", "")).strip()
     review_result.attempt_number = _current_attempt_number(run)
-    review_result_path.write_text(json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n")
+    review_result_path.write_text(
+        json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     review_result.save(repo_root, run.run_id)
 
     if _is_local_review_timeout_result(review_result):
@@ -19123,7 +19834,10 @@ def _phase_review_local(
         else:
             if check_url:
                 review_result.source_check_url = check_url
-                review_result_path.write_text(json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n")
+                review_result_path.write_text(
+                    json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
                 review_result.save(repo_root, run.run_id)
 
         run.review_decision_status = "blocked"
@@ -19161,7 +19875,10 @@ def _phase_review_local(
 
     if check_url:
         review_result.source_check_url = check_url
-        review_result_path.write_text(json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n")
+        review_result_path.write_text(
+            json.dumps(asdict(review_result), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
     conclusion = "success" if review_result.status == "approved" else "failure"
     return _apply_review_result(
@@ -20323,6 +21040,7 @@ def phase_cleanup(run: RunState, repo_root: Path) -> str:
         worktree_path,
         branch=run.branch,
         delete_branch=True,
+        expected_spec_id=run.spec_id,
     )
     if cleanup_error:
         run.last_error = cleanup_error
@@ -20943,7 +21661,11 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
     metadata = _classify_phase_result(run, phase, result_status)
     if result_status == "passed":
         # A successful phase clears any prior failure classification so the
-        # retryable hint / circuit breaker resets on forward progress.
+        # retryable hint / circuit breaker resets on forward progress. The
+        # historical detail remains in per-phase audit records; keeping it in
+        # ``last_error`` makes a fully successful resumed run misleadingly
+        # display a resolved failure as current.
+        run.last_error = ""
         run.last_failure_retryable = None
         run.last_failure_type = ""
         run.last_failure_subtype = ""
@@ -20996,7 +21718,9 @@ def _persist_audit(
         "phase": phase,
         "result": asdict(result),
     }
-    audit_path.write_text(json.dumps(audit_data, indent=2, sort_keys=True) + "\n")
+    audit_path.write_text(
+        json.dumps(audit_data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _convergence_attempts(run: RunState) -> int:
@@ -21368,13 +22092,16 @@ def run_full_workflow(
     _normalize_logger_state()
     run.retry_cap = retry_cap
     try:
-        _ensure_orchestrator_process_group(run, repo_root)
-        if not run.worktree_path:
-            try:
-                run.worktree_path = str(resolve_worktree_path(run, repo_root))
-            except Exception:
-                pass
         with _orchestrator_sigterm_guard(run, repo_root):
+            # Install the graceful cleanup path before publishing a Windows
+            # control token. A concurrent `spec stop` may act as soon as the
+            # token reaches disk.
+            _ensure_orchestrator_process_group(run, repo_root)
+            if not run.worktree_path:
+                try:
+                    run.worktree_path = str(resolve_worktree_path(run, repo_root))
+                except Exception:
+                    pass
             phase_order = list(PHASES)
             phase_idx = phase_order.index(run.phase) if run.phase in phase_order else 0
             merge_race_retries = 0
@@ -21609,6 +22336,11 @@ def cmd_spec(args: argparse.Namespace) -> int:
     if agent not in VALID_AGENTS:
         print(f"Error: AGENT must be one of {VALID_AGENTS}", file=sys.stderr)
         return 1
+    try:
+        require_host_agent_available(agent)
+    except HostAgentUnavailableError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     if raw_spec_id and not SPEC_ID_RE.fullmatch(raw_spec_id):
         print(
             "Error: SPEC must be a lowercase slug matching `[a-z0-9][a-z0-9-]*`.",
@@ -21620,6 +22352,12 @@ def cmd_spec(args: argparse.Namespace) -> int:
             "Error: spec authoring requires an interactive terminal.",
             file=sys.stderr,
         )
+        return 1
+
+    try:
+        authoring_env = _windows_codex_authoring_env(agent)
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     spec_id = raw_spec_id or None
@@ -21647,11 +22385,27 @@ def cmd_spec(args: argparse.Namespace) -> int:
 
     print(f"{'Resuming' if resumed else 'Launching'} spec authoring in {worktree_path}")
 
+    authoring_gh_config_dir = None
+    if authoring_env is not None:
+        # Resolving the common state root shells out to Git. Keep that extra
+        # dependency inside the native-Windows Codex path that actually needs
+        # the disposable GitHub CLI profile; normal POSIX authoring should not
+        # do Windows-only setup before launching its agent.
+        authoring_gh_config_dir = _isolate_windows_codex_authoring_gh_config(
+            authoring_env,
+            _common_state_root(repo_root),
+        )
     try:
-        completed = subprocess.run(author_cmd, cwd=worktree_path)
+        launch_kwargs: dict[str, object] = {"cwd": worktree_path}
+        if authoring_env is not None:
+            launch_kwargs["env"] = authoring_env
+        completed = subprocess.run(author_cmd, **launch_kwargs)
     except FileNotFoundError as exc:
         print(f"Error: Agent binary not found: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if authoring_gh_config_dir is not None:
+            shutil.rmtree(authoring_gh_config_dir, ignore_errors=True)
 
     if completed.returncode != 0:
         print(
@@ -21789,12 +22543,17 @@ def cmd_input(args: argparse.Namespace) -> int:
 
     requested_agent = getattr(args, "agent", None)
     agent = requested_agent or run.agent or SPEC_RUNTIME_CONFIG.agents.default
+    try:
+        require_host_agent_available(agent)
+    except HostAgentUnavailableError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     # Build context for the interactive prompt
     spec_file = worktree_path / _spec_path_for_run(run)
     spec_content = ""
     if spec_file.exists():
-        spec_content = spec_file.read_text()
+        spec_content = spec_file.read_text(encoding="utf-8")
 
     request_label = "agent question" if request.kind == "agent_question" else "debugger guidance"
     question = request.prompt or "No specific request recorded."
@@ -21990,6 +22749,14 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 1
     if review_agent not in VALID_AGENTS:
         print(f"Error: REVIEW_AGENT must be one of {VALID_AGENTS}", file=sys.stderr)
+        return 1
+
+    # Task scoping is an interactive host launch even when implementation is
+    # configured to use the Linux container backend.
+    try:
+        require_host_agent_available(agent)
+    except HostAgentUnavailableError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
     try:
@@ -23013,7 +23780,7 @@ def _compute_orchestrator_analytics(
 
     for audit_path in sorted(audit_dir.glob("*.json")) if audit_dir.exists() else []:
         try:
-            payload = json.loads(audit_path.read_text())
+            payload = json.loads(audit_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         if not isinstance(payload, dict):
@@ -23253,7 +24020,9 @@ def _cmd_report_completion_to_outbox(
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     except OSError as exc:
         print(f"Error: failed to write container completion outbox {path}: {exc}", file=sys.stderr)
         return 1

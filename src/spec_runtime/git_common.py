@@ -1,7 +1,8 @@
-"""Shared git helpers for resolving the common root of a repository.
+"""Shared subprocess text boundaries and Git repository helpers.
 
-The common root is the parent directory of the ``.git`` common dir — in a
-worktree layout this is the main checkout, not the worktree itself.
+Git and GitHub CLI share an explicit UTF-8 decoding boundary. The common Git
+root is the parent directory of the ``.git`` common dir — in a worktree layout
+this is the main checkout, not the worktree itself.
 
 All modules that need to resolve the common root should import from here
 instead of duplicating the logic.
@@ -10,7 +11,76 @@ instead of duplicating the logic.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+
+from .process_supervisor import run as run_supervised
+
+
+def _command_executable(command: Sequence[str]) -> str:
+    """Return a case-normalized executable basename for *command*."""
+    if not command:
+        return ""
+    return str(command[0]).replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
+def is_git_command(command: Sequence[str]) -> bool:
+    """Return whether *command* launches Git, including a resolved git.exe."""
+    return _command_executable(command) in {"git", "git.exe"}
+
+
+def is_github_cli_command(command: Sequence[str]) -> bool:
+    """Return whether *command* launches GitHub CLI, including a resolved gh.exe."""
+    return _command_executable(command) in {"gh", "gh.exe"}
+
+
+def subprocess_text_kwargs(command: Sequence[str]) -> dict[str, object]:
+    """Return safe text-mode kwargs for command-line tool output.
+
+    Git for Windows and GitHub CLI emit UTF-8 independently of the active
+    Windows ANSI code page. Letting :mod:`subprocess` choose the locale decoder
+    can therefore corrupt paths, JSON, and user-authored text. Replacement on
+    malformed bytes keeps diagnostics available instead of turning an
+    otherwise recoverable command failure into ``UnicodeDecodeError``.
+
+    Other commands retain Python's normal locale decoder, with replacement for
+    bytes that decoder cannot represent.
+    """
+    # Arbitrary project commands may emit bytes that do not match the host's
+    # active locale. Diagnostics should degrade visibly instead of raising from
+    # ``subprocess`` and masking the command's real exit status.
+    kwargs: dict[str, object] = {"text": True, "errors": "replace"}
+    if is_git_command(command) or is_github_cli_command(command):
+        kwargs["encoding"] = "utf-8"
+    return kwargs
+
+
+def git_text_kwargs(command: Sequence[str]) -> dict[str, object]:
+    """Backward-compatible alias for :func:`subprocess_text_kwargs`."""
+    return subprocess_text_kwargs(command)
+
+
+def run_git(
+    args: Sequence[str],
+    *,
+    cwd: str | Path | None = None,
+    check: bool = False,
+    timeout: float | None = None,
+    env: Mapping[str, str] | None = None,
+    capture_output: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run Git through the shared UTF-8 stdout/stderr decoding boundary."""
+    command = ["git", *args]
+    runner = run_supervised if timeout is not None else subprocess.run
+    return runner(
+        command,
+        cwd=cwd,
+        check=check,
+        timeout=timeout,
+        env=env,
+        capture_output=capture_output,
+        **subprocess_text_kwargs(command),
+    )
 
 
 def _resolve_common_root_fallback(repo_root: Path) -> Path:
@@ -77,11 +147,9 @@ def resolve_common_root(repo_root: Path | None = None) -> Path:
     """
     fallback_root = repo_root.resolve() if repo_root is not None else Path.cwd().resolve()
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        result = run_git(
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):

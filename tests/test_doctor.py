@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -29,12 +30,27 @@ def _config_text(
     worktrees_dir: str = ".worktrees",
     workspace_root: str = ".spec-workspaces",
     bootstrap_command: str = "python -m pip --version",
+    bootstrap_command_windows: str = "",
     verify_command: str = "python -m pytest --version",
+    verify_argv_windows: tuple[str, ...] = (),
     backend: str = "worktree",
     safety_mode: str = "",
     container_block: str = "",
 ) -> str:
     allowed = ", ".join(f'"{agent}"' for agent in allowed_agents)
+    bootstrap_windows = (
+        f'install_command_windows = "{bootstrap_command_windows}"\n'
+        'install_shell_windows = "powershell"\n'
+        if bootstrap_command_windows
+        else ""
+    )
+    verify_windows = (
+        "argv_windows = ["
+        + ", ".join(f'"{item}"' for item in verify_argv_windows)
+        + "]\n"
+        if verify_argv_windows
+        else ""
+    )
     return f"""
 base_ref = "{base_ref}"
 
@@ -48,11 +64,13 @@ allowed = [{allowed}]
 
 [bootstrap]
 install_command = "{bootstrap_command}"
+{bootstrap_windows}
 
 [verify]
 [[verify.gates]]
 name = "test"
 command = "{verify_command}"
+{verify_windows}
 
 [execution]
 backend = "{backend}"
@@ -92,12 +110,15 @@ def _resolver(
     claude: bool = False,
     claude_sandbox: bool = False,
     docker: bool = False,
+    powershell: bool = False,
 ):
     paths = {
         "codex": "/usr/bin/codex",
         "gh": "/usr/bin/gh",
         "python": sys.executable,
     }
+    if powershell:
+        paths["powershell.exe"] = sys.executable
     if claude:
         paths["claude"] = "/usr/bin/claude"
     if claude_sandbox:
@@ -167,6 +188,56 @@ teardown_shell_windows = "pwsh"
     assert "pwsh" in by_name["implement teardown command"].detail
 
 
+@pytest.mark.parametrize(
+    ("drive_type", "filesystem", "expected_detail"),
+    [
+        (4, "NTFS", "network NTFS"),
+        (2, "NTFS", "removable NTFS"),
+        (3, "ReFS", "fixed ReFS"),
+        (3, "exFAT", "fixed exFAT"),
+    ],
+)
+def test_doctor_rejects_unsupported_windows_volume_before_git(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    drive_type: int,
+    filesystem: str,
+    expected_detail: str,
+) -> None:
+    monkeypatch.setattr(doctor, "is_windows", lambda: True)
+    runner = _Runner()
+
+    report = doctor.run_doctor_checks(
+        tmp_path,
+        runner=runner,
+        windows_volume_probe=lambda _path: doctor.WindowsVolumeProfile(
+            root="Z:\\",
+            drive_type=drive_type,
+            filesystem=filesystem,
+        ),
+    )
+
+    assert report.exit_code == 1
+    assert report.checks == (
+        doctor.DoctorCheck(
+            "local filesystem",
+            "error",
+            f"unsupported repository volume: Z:\\ is a {expected_detail} volume",
+            ("Move the checkout to a fixed local NTFS volume and rerun `spec doctor`.",),
+        ),
+    )
+    assert runner.calls == []
+
+
+def test_supported_windows_volume_is_reported() -> None:
+    check = doctor._windows_volume_check(
+        doctor.WindowsVolumeProfile(root="C:\\", drive_type=3, filesystem="NTFS")
+    )
+
+    assert check.status == "ok"
+    assert check.detail == "C:\\ is a fixed NTFS volume"
+
+
 def test_windows_command_checks_target_posix_hook_migration(tmp_path: Path) -> None:
     config_text = _config_text().replace(
         "[execution]",
@@ -185,6 +256,37 @@ setup_shell = "sh"
     assert setup.status == "error"
     assert "clearly POSIX" in setup.detail
     assert "setup" in " ".join(setup.remediation)
+
+
+def test_windows_command_checks_allow_gate_executable_created_by_bootstrap(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(
+        tmp_path,
+        _config_text(
+            bootstrap_command=(
+                "python -m venv .venv && "
+                ".venv/bin/python -m pip install -e . pytest"
+            ),
+            bootstrap_command_windows=(
+                "python -m venv .venv; "
+                "& ./.venv/Scripts/python.exe -m pip install -e . pytest"
+            ),
+            verify_command=".venv/bin/python -m pytest",
+            verify_argv_windows=(
+                ".venv/Scripts/python.exe",
+                "-m",
+                "pytest",
+            ),
+        ),
+    )
+    config = load_repo_spec_runtime_config(repo, require=True)
+
+    checks = doctor._windows_command_checks(repo, config, _resolver(powershell=True))
+    verify = next(check for check in checks if check.name == "verify command (test)")
+
+    assert verify.status == "ok"
+    assert "pending bootstrap: .venv/Scripts/python.exe" in verify.detail
 
 
 def test_doctor_happy_path_has_no_blockers_or_warnings(tmp_path: Path) -> None:
@@ -234,20 +336,26 @@ def test_required_claude_without_sandbox_dependencies_is_blocked(
         _config_text(default_agent="claude", allowed_agents=("claude",)),
     )
 
-    report = doctor.run_doctor_checks(
-        repo,
-        runner=_Runner(),
-        which=_resolver(claude=True, claude_sandbox=False),
-    )
+    # This scenario is specifically the Linux bubblewrap/socat prerequisite
+    # policy.  macOS has native Claude sandbox support and must not inherit the
+    # Linux expectation merely because the hosted suite runs there.
+    with patch(
+        "spec_runtime.agent_adapter.claude_sandbox_unavailability_reason",
+        return_value=(
+            "Claude sandbox prerequisites are missing on Linux: `bwrap`, `socat`. "
+            "Install `bubblewrap` and `socat`, then rerun `spec doctor`."
+        ),
+    ):
+        report = doctor.run_doctor_checks(
+            repo,
+            runner=_Runner(),
+            which=_resolver(claude=True, claude_sandbox=False),
+        )
 
     check = _checks_by_name(report)["agent runtime (claude)"]
     assert check.status == "error"
     assert "bubblewrap" in " ".join(check.remediation)
-    if sys.platform == "win32":
-        assert "host sandbox is not supported" in check.detail
-        assert "socat" in " ".join(check.remediation)
-    else:
-        assert "socat" in check.detail
+    assert "socat" in check.detail
     assert report.exit_code == 1
 
 
@@ -259,11 +367,18 @@ def test_optional_claude_without_sandbox_dependencies_warns(
         _config_text(allowed_agents=("codex", "claude")),
     )
 
-    report = doctor.run_doctor_checks(
-        repo,
-        runner=_Runner(),
-        which=_resolver(claude=True, claude_sandbox=False),
-    )
+    with patch(
+        "spec_runtime.agent_adapter.claude_sandbox_unavailability_reason",
+        return_value=(
+            "Claude sandbox prerequisites are missing on Linux: `bwrap`, `socat`. "
+            "Install `bubblewrap` and `socat`, then rerun `spec doctor`."
+        ),
+    ):
+        report = doctor.run_doctor_checks(
+            repo,
+            runner=_Runner(),
+            which=_resolver(claude=True, claude_sandbox=False),
+        )
 
     check = _checks_by_name(report)["agent runtime (claude)"]
     assert check.status == "warning"
@@ -307,13 +422,17 @@ def test_bootstrap_only_requires_the_initial_launcher_before_first_run(
                 "python -m venv .venv && "
                 ".venv/bin/pip install -e ."
             ),
+            bootstrap_command_windows=(
+                "python -m venv .venv; "
+                "& ./.venv/Scripts/python.exe -m pip install -e ."
+            ),
         ),
     )
 
     report = doctor.run_doctor_checks(
         repo,
         runner=_Runner(),
-        which=_resolver(),
+        which=_resolver(powershell=True),
     )
 
     check = _checks_by_name(report)["bootstrap command"]
@@ -332,19 +451,31 @@ def test_verify_executable_created_by_bootstrap_is_ready_before_first_run(
                 "python -m venv .venv && "
                 ".venv/bin/python -m pip install -e . pytest"
             ),
+            bootstrap_command_windows=(
+                "python -m venv .venv; "
+                "& ./.venv/Scripts/python.exe -m pip install -e . pytest"
+            ),
             verify_command=".venv/bin/python -m pytest",
+            verify_argv_windows=(
+                ".venv/Scripts/python.exe",
+                "-m",
+                "pytest",
+            ),
         ),
     )
 
     report = doctor.run_doctor_checks(
         repo,
         runner=_Runner(),
-        which=_resolver(),
+        which=_resolver(powershell=True),
     )
 
     check = _checks_by_name(report)["verify command (test)"]
     assert check.status == "ok"
-    assert "pending bootstrap: .venv/bin/python" in check.detail
+    expected_python = (
+        ".venv/Scripts/python.exe" if sys.platform == "win32" else ".venv/bin/python"
+    )
+    assert f"pending bootstrap: {expected_python}" in check.detail
     assert report.exit_code == 0
 
 

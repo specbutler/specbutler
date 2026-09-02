@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spec_runtime import cli
+from spec_runtime import cli, orchestrator
 from spec_runtime.config import ExecutionConfig, SpecPathConfig, SpecRuntimeConfig
 
 
@@ -24,9 +24,13 @@ class _SpecLock:
         return None
 
 
-def _config(*, backend: str = "worktree") -> SpecRuntimeConfig:
+def _config(
+    *,
+    backend: str = "worktree",
+    worktrees_dir: str = ".worktrees",
+) -> SpecRuntimeConfig:
     return SpecRuntimeConfig(
-        paths=SpecPathConfig(),
+        paths=SpecPathConfig(worktrees_dir=worktrees_dir),
         execution=ExecutionConfig(backend=backend, workspace_root=".spec-workspaces"),
     )
 
@@ -56,7 +60,7 @@ def _orch(
         SpecLock=_SpecLock,
         _resolve_recorded_process_group=MagicMock(return_value=process_group),
         read_process_identity=MagicMock(return_value=identity),
-        _is_process_group_alive=MagicMock(return_value=group_alive),
+        is_process_group_alive=MagicMock(return_value=group_alive),
     )
 
 
@@ -70,6 +74,21 @@ def _git_read_only(cmd: list[str], **_kwargs: object) -> subprocess.CompletedPro
     raise AssertionError(f"unexpected subprocess: {cmd}")
 
 
+def test_recorded_group_liveness_uses_current_orchestrator_surface() -> None:
+    started_at = "Fri Aug 14 12:00:00 2026"
+    with (
+        patch.object(
+            orchestrator,
+            "read_process_identity",
+            return_value=SimpleNamespace(started_at=started_at),
+        ),
+        patch.object(orchestrator, "is_process_group_alive", return_value=True) as group_alive,
+    ):
+        assert cli._recorded_group_is_live(orchestrator, 4321, started_at)
+
+    group_alive.assert_called_once_with(4321)
+
+
 @pytest.mark.parametrize("spec_id", ["*", "[x]", "../other", "x/y", "UPPER"])
 def test_clean_rejects_invalid_spec_id_before_any_lookup_or_mutation(
     spec_id: str,
@@ -79,7 +98,7 @@ def test_clean_rejects_invalid_spec_id_before_any_lookup_or_mutation(
         patch("spec_runtime.git_common.resolve_common_root") as resolve_root,
         patch.object(cli, "_lazy_config") as load_config,
         patch.object(cli, "_lazy_orchestrator") as load_orchestrator,
-        patch.object(cli.subprocess, "run") as run_subprocess,
+        patch("spec_runtime.git_common.subprocess.run") as run_subprocess,
         patch.object(shutil, "rmtree") as remove_tree,
     ):
         result = cli._cmd_clean(argparse.Namespace(spec=spec_id))
@@ -91,6 +110,125 @@ def test_clean_rejects_invalid_spec_id_before_any_lookup_or_mutation(
     load_orchestrator.assert_not_called()
     run_subprocess.assert_not_called()
     remove_tree.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "worktrees_dir",
+    ("../outside", "/var/tmp/spec-worktrees", r"C:\outside\spec-worktrees"),
+)
+def test_clean_rejects_unsafe_configured_worktree_root_before_mutation(
+    tmp_path: Path,
+    worktrees_dir: str,
+    capsys,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    orch = _orch([])
+
+    with (
+        patch("spec_runtime.git_common.resolve_common_root", return_value=repo),
+        patch.object(cli, "_lazy_config", return_value=_config(worktrees_dir=worktrees_dir)),
+        patch.object(cli, "_lazy_orchestrator", return_value=orch),
+        patch(
+            "spec_runtime.git_common.subprocess.run",
+            side_effect=AssertionError("unsafe root must fail before Git mutation"),
+        ),
+        patch.object(shutil, "rmtree", side_effect=AssertionError("unsafe root must not be removed")),
+    ):
+        result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
+
+    assert result == 1
+    assert "unsafe worktree cleanup configuration" in capsys.readouterr().err
+
+
+def test_clean_preserves_valid_nested_repo_relative_worktree_root(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    target = repo / ".cache" / "worktrees" / "spec-my-feature"
+    target.mkdir(parents=True)
+    (target / "draft.md").write_text("draft\n", encoding="utf-8")
+    orch = _orch([])
+
+    with (
+        patch("spec_runtime.git_common.resolve_common_root", return_value=repo),
+        patch.object(
+            cli,
+            "_lazy_config",
+            return_value=_config(worktrees_dir=".cache/worktrees"),
+        ),
+        patch.object(cli, "_lazy_orchestrator", return_value=orch),
+        patch("spec_runtime.git_common.subprocess.run", side_effect=_git_read_only),
+    ):
+        result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
+
+    assert result == 0
+    assert not target.exists()
+
+
+def test_clean_rejects_matching_branch_registered_outside_owned_root(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    outside = tmp_path / "outside" / "code-my-feature--token"
+    outside.mkdir(parents=True)
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    listing = (
+        f"worktree {outside}\n"
+        f"HEAD {'a' * 40}\n"
+        "branch refs/heads/code/my-feature--token\n\n"
+    )
+    commands: list[list[str]] = []
+
+    def fake_git(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+        commands.append(cmd)
+        if cmd[:3] == ["git", "worktree", "list"]:
+            return subprocess.CompletedProcess(cmd, 0, listing, "")
+        raise AssertionError(f"unexpected destructive command: {cmd}")
+
+    with (
+        patch("spec_runtime.git_common.resolve_common_root", return_value=repo),
+        patch.object(cli, "_lazy_config", return_value=_config()),
+        patch.object(cli, "_lazy_orchestrator", return_value=_orch([])),
+        patch("spec_runtime.git_common.subprocess.run", side_effect=fake_git),
+    ):
+        result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
+
+    assert result == 1
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
+    assert commands == [["git", "worktree", "list", "--porcelain"]]
+    assert "not a direct child" in capsys.readouterr().err
+
+
+def test_remove_worktree_refuses_raw_delete_when_git_registration_check_fails(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    root = repo / ".worktrees"
+    target = root / "code-my-feature--token"
+    target.mkdir(parents=True)
+    sentinel = target / "keep.txt"
+    sentinel.write_text("keep\n", encoding="utf-8")
+    failure = subprocess.CompletedProcess([], 1, "", "git worktree list failed")
+
+    with (
+        patch.object(cli, "run_git", return_value=failure),
+        patch(
+            "spec_runtime.platform_fs.remove_tree",
+            side_effect=AssertionError("registration failure must not fall back to raw removal"),
+        ),
+        pytest.raises(RuntimeError, match="registration could not be inspected"),
+    ):
+        cli._remove_worktree_path(
+            target,
+            common_root=repo,
+            worktrees_root=root,
+            expected_names=(target.name,),
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "keep\n"
 
 
 def test_clean_refuses_live_identity_matched_process_group_before_any_deletion(
@@ -112,7 +250,10 @@ def test_clean_refuses_live_identity_matched_process_group_before_any_deletion(
         patch("spec_runtime.git_common.resolve_common_root", return_value=repo),
         patch.object(cli, "_lazy_config", return_value=_config(backend="container")),
         patch.object(cli, "_lazy_orchestrator", return_value=orch),
-        patch.object(cli.subprocess, "run", side_effect=AssertionError("no subprocess after refusal")),
+        patch(
+            "spec_runtime.git_common.subprocess.run",
+            side_effect=AssertionError("no subprocess after refusal"),
+        ),
         patch.object(shutil, "rmtree", side_effect=AssertionError("no rmtree after refusal")),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature", force=True))
@@ -171,12 +312,12 @@ def test_clean_treats_reused_pid_with_different_start_time_as_stale(
         patch.object(cli, "_lazy_config", return_value=_config(backend="clone")),
         patch.object(cli, "_lazy_orchestrator", return_value=orch),
         patch("spec_runtime.execution_backend.get_execution_backend", return_value=backend),
-        patch.object(cli.subprocess, "run", side_effect=_git_read_only),
+        patch("spec_runtime.git_common.subprocess.run", side_effect=_git_read_only),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
 
     assert result == 0
-    orch._is_process_group_alive.assert_not_called()
+    orch.is_process_group_alive.assert_not_called()
     backend.cleanup.assert_called_once()
     assert backend.cleanup.call_args.kwargs["allow_unpushed_work"] is True
 
@@ -201,7 +342,7 @@ def test_clean_routes_container_workspace_and_volumes_through_backend_only(
         patch.object(cli, "_lazy_config", return_value=_config(backend="container")),
         patch.object(cli, "_lazy_orchestrator", return_value=orch),
         patch("spec_runtime.execution_backend.get_execution_backend", return_value=backend),
-        patch.object(cli.subprocess, "run", side_effect=_git_read_only),
+        patch("spec_runtime.git_common.subprocess.run", side_effect=_git_read_only),
         patch.object(shutil, "rmtree", side_effect=AssertionError("CLI must not raw-delete backend resources")),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
@@ -231,7 +372,7 @@ def test_clean_missing_container_state_preserves_workspace_and_recommends_gc(
         patch.object(cli, "_lazy_config", return_value=_config(backend="container")),
         patch.object(cli, "_lazy_orchestrator", return_value=orch),
         patch("spec_runtime.execution_backend.get_execution_backend", backend_factory),
-        patch.object(cli.subprocess, "run", side_effect=_git_read_only),
+        patch("spec_runtime.git_common.subprocess.run", side_effect=_git_read_only),
         patch.object(shutil, "rmtree", side_effect=AssertionError("workspace must survive")),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
@@ -263,7 +404,10 @@ def test_clean_refuses_live_registered_agent_with_pid_start_identity(
             return_value=[entry],
         ),
         patch("spec_runtime.worktree_process_registry.is_process_alive", return_value=True),
-        patch.object(cli.subprocess, "run", side_effect=AssertionError("no destructive subprocess")),
+        patch(
+            "spec_runtime.git_common.subprocess.run",
+            side_effect=AssertionError("no destructive subprocess"),
+        ),
     ):
         result = cli._cmd_clean(argparse.Namespace(spec="my-feature"))
 

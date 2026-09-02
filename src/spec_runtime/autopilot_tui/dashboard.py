@@ -109,7 +109,7 @@ def _read_active_data(repo_root: Path) -> dict:
     if not active_path.exists():
         return {}
     try:
-        payload = json.loads(active_path.read_text())
+        payload = json.loads(active_path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return {}
     return payload if isinstance(payload, dict) else {}
@@ -442,7 +442,7 @@ def resolve_log_path(repo_root: Path, spec_id: str, *, run_id: str = "") -> Path
     if run_id:
         alias_path = autopilot.run_log_alias_path(repo_root, run_id)
         try:
-            aliased_log_path = alias_path.read_text().strip()
+            aliased_log_path = alias_path.read_text(encoding="utf-8").strip()
         except OSError:
             aliased_log_path = ""
         if aliased_log_path:

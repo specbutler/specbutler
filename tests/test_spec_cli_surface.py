@@ -8,6 +8,8 @@ no git repos, no subprocesses.
 
 from __future__ import annotations
 
+import argparse
+import io
 import json
 import subprocess
 import sys
@@ -21,9 +23,12 @@ from spec_runtime.agent_adapter import (
     AgentAdapter,
     ClaudeAgent,
     CodexAgent,
+    HostAgentUnavailableError,
     _codex_git_metadata_dirs,
     get_agent_adapter,
+    host_agent_unavailability_reason,
     register_agent_adapter,
+    require_host_agent_available,
 )
 from spec_runtime.config import SpecConfigNotFoundError
 from spec_runtime.forge import (
@@ -205,6 +210,19 @@ class TestGitHubForgeProtocol:
         """GitHubForge must satisfy the ForgeAdapter protocol."""
         assert isinstance(GitHubForge(), ForgeAdapter)
 
+    def test_required_checks_treats_gh_no_required_prose_as_empty(self, tmp_path):
+        def run_fn(cmd, cwd=None, **kw):  # noqa: ARG001
+            return subprocess.CompletedProcess(
+                cmd,
+                1,
+                stdout="",
+                stderr="no required checks reported on the 'code/example' branch\n",
+            )
+
+        checks = GitHubForge(run_fn=run_fn).get_required_checks(12, cwd=tmp_path)
+
+        assert checks == []
+
     def test_mark_pr_ready_uses_gh_pr_ready(self, tmp_path):
         captured = {}
 
@@ -234,20 +252,25 @@ class TestGitHubForgeProtocol:
         assert captured["cwd"] == tmp_path
 
     def test_merge_pr_can_match_expected_head(self, tmp_path):
-        captured = {}
+        calls = []
 
         def run_fn(cmd, cwd=None, **kw):
-            captured["cmd"] = cmd
-            captured["cwd"] = cwd
-            captured["timeout"] = kw.get("timeout")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            calls.append((cmd, cwd, kw))
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"state":"MERGED","headRefOid":"abc123","autoMergeRequest":null}',
+                stderr="",
+            )
 
         forge = GitHubForge(run_fn=run_fn)
 
         result = forge.merge_pr(12, method="squash", auto=True, expected_head_sha="abc123", cwd=tmp_path)
 
         assert result.ok is True
-        assert captured["cmd"] == [
+        assert calls[0][0] == [
             "gh",
             "pr",
             "merge",
@@ -257,8 +280,38 @@ class TestGitHubForgeProtocol:
             "--match-head-commit",
             "abc123",
         ]
-        assert captured["cwd"] == tmp_path
-        assert captured["timeout"] == AUTO_MERGE_ARM_TIMEOUT_SECONDS
+        assert calls[0][1] == tmp_path
+        assert calls[0][2]["timeout"] == AUTO_MERGE_ARM_TIMEOUT_SECONDS
+        assert calls[1][0] == [
+            "gh",
+            "pr",
+            "view",
+            "12",
+            "--json",
+            "state,autoMergeRequest,headRefOid",
+        ]
+
+    def test_merge_pr_auto_success_without_recorded_request_falls_back(self, tmp_path):
+        def run_fn(cmd, cwd=None, **kw):  # noqa: ARG001
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout='{"state":"OPEN","headRefOid":"abc123","autoMergeRequest":null}',
+                stderr="",
+            )
+
+        result = GitHubForge(run_fn=run_fn).merge_pr(
+            12,
+            auto=True,
+            expected_head_sha="abc123",
+            cwd=tmp_path,
+        )
+
+        assert result.ok is False
+        assert "auto-merge is not enabled" in result.message
+        assert "no auto-merge request" in result.message
 
     def test_merge_pr_auto_timeout_returns_after_confirming_auto_merge_is_armed(self, tmp_path):
         calls = []
@@ -369,6 +422,32 @@ class TestForgeFactory:
 
 
 class TestClaudeAgent:
+    def test_native_macos_host_does_not_require_linux_sandbox_tools(self):
+        assert host_agent_unavailability_reason(
+            "claude",
+            platform="darwin",
+            which=lambda _name: None,
+        ) == ""
+        require_host_agent_available(
+            "claude",
+            platform="darwin",
+            which=lambda _name: None,
+        )
+
+    def test_native_windows_host_launch_fails_closed_with_alternatives(self):
+        reason = host_agent_unavailability_reason("claude", platform="win32")
+
+        assert "not supported" in reason
+        assert "Codex" in reason
+        assert "WSL2" in reason
+        assert "Linux container" in reason
+        with pytest.raises(HostAgentUnavailableError, match="WSL2"):
+            require_host_agent_available("claude", platform="win32")
+
+    def test_codex_is_not_subject_to_claude_host_sandbox_policy(self):
+        assert host_agent_unavailability_reason("codex", platform="win32") == ""
+        require_host_agent_available("codex", platform="win32")
+
     def test_name(self):
         assert ClaudeAgent().name == "claude"
 
@@ -511,9 +590,10 @@ class TestCodexAgent:
             for value in config_overrides
             if value.startswith("sandbox_workspace_write.writable_roots=")
         )
-        assert f'"{tmp_path / ".spec-state"}"' in writable_roots
-        assert f'"{gitdir.resolve()}"' in writable_roots
-        assert f'"{common_git.resolve()}"' in writable_roots
+        roots = json.loads(writable_roots.partition("=")[2])
+        assert str(tmp_path / ".spec-state") in roots
+        assert str(gitdir.resolve()) in roots
+        assert str(common_git.resolve()) in roots
 
     def test_build_authoring_command_adds_git_metadata(self, tmp_path):
         worktree = tmp_path / "checkout"
@@ -538,8 +618,9 @@ class TestCodexAgent:
             for value in config_overrides
             if value.startswith("sandbox_workspace_write.writable_roots=")
         )
-        assert f'"{tmp_path / ".spec-state"}"' in writable_roots
-        assert f'"{gitdir.resolve()}"' in writable_roots
+        roots = json.loads(writable_roots.partition("=")[2])
+        assert str(tmp_path / ".spec-state") in roots
+        assert str(gitdir.resolve()) in roots
 
     def test_codex_git_metadata_dirs_ignores_non_git_directory(self, tmp_path):
         assert _codex_git_metadata_dirs(tmp_path) == []
@@ -554,14 +635,28 @@ class TestCodexAgent:
         assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "workspace-write"
         assert "features.use_legacy_landlock=true" not in cmd
 
-    def test_build_review_command_uses_codex_default_linux_sandbox(self, tmp_path):
+    def test_build_review_command_uses_scratch_as_only_writable_root(self, tmp_path):
         agent = CodexAgent()
+        scratch_dir = tmp_path / "review-scratch"
         cmd = agent.build_review_command(
             prompt="Review the work",
             output_path=tmp_path / "review.json",
+            writable_temp_dir=scratch_dir,
         )
-        assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "read-only"
+        assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "workspace-write"
+        assert cmd[cmd.index("-C") + 1] == str(scratch_dir)
+        assert "--skip-git-repo-check" in cmd
+        assert "--add-dir" not in cmd
         assert "features.use_legacy_landlock=true" not in cmd
+
+    def test_build_review_command_without_scratch_remains_read_only(self, tmp_path):
+        cmd = CodexAgent().build_review_command(
+            prompt="Review the work",
+            output_path=tmp_path / "review.json",
+        )
+
+        assert cmd[cmd.index("-s") + 1] == "read-only"
+        assert "-C" not in cmd
 
     def test_build_implement_command_keeps_default_sandbox(self, tmp_path):
         agent = CodexAgent()
@@ -709,6 +804,18 @@ class TestCLIMain:
 
         return cli
 
+    def test_windows_redirected_stdio_is_reconfigured_to_utf8(self):
+        cli = self._import_cli()
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="cp1252")
+
+        cli._configure_windows_stdio(platform="win32", streams=(stream,))
+        stream.write("snow-雪")
+        stream.flush()
+
+        assert stream.encoding.lower().replace("-", "") == "utf8"
+        assert raw.getvalue() == "snow-雪".encode()
+
     def test_version_flag_prints_version_without_config(self, capsys):
         cli = self._import_cli()
         with patch.object(cli, "_lazy_config") as mock_config:
@@ -716,6 +823,54 @@ class TestCLIMain:
                 rc = cli.main(["--version"])
         assert rc == 0
         assert capsys.readouterr().out.strip() == "1.2.3"
+        mock_config.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "argv",
+        (
+            ["--help"],
+            ["implement", "--help"],
+            ["review", "--help"],
+            ["auto", "run", "--help"],
+        ),
+    )
+    def test_help_surfaces_do_not_load_repository_config(self, argv):
+        cli = self._import_cli()
+        with patch.object(
+            cli,
+            "_lazy_config",
+            side_effect=SpecConfigNotFoundError(
+                "Expected config file: C:\\venv\\Lib\\site-packages\\.spec.toml"
+            ),
+        ) as mock_config:
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main(argv)
+
+        assert exc_info.value.code == 0
+        mock_config.assert_not_called()
+
+    def test_root_help_lists_init_with_bootstrap_description(self, capsys):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config") as mock_config:
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main(["--help"])
+
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "init" in output
+        assert "Bootstrap a Git repository for spec-driven development" in output
+        mock_config.assert_not_called()
+
+    def test_init_help_uses_canonical_options_without_config(self, capsys):
+        cli = self._import_cli()
+        with patch.object(cli, "_lazy_config") as mock_config:
+            with pytest.raises(SystemExit) as exc_info:
+                cli.main(["init", "--help"])
+
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert "--force" in output
+        assert "--yolo" in output
         mock_config.assert_not_called()
 
     def test_source_id_flag_prints_identity_without_config(self, capsys):
@@ -744,7 +899,7 @@ class TestCLIMain:
         mock_update.assert_called_once()
         mock_config.assert_not_called()
 
-    def test_init_runs_update_notice_before_dispatch(self):
+    def test_init_runs_update_notice_only_after_successful_dispatch(self):
         cli = self._import_cli()
         with (
             patch.object(cli, "_maybe_print_update_notice_for_init") as mock_notice,
@@ -754,6 +909,20 @@ class TestCLIMain:
             rc = cli.main(["init"])
         assert rc == 0
         mock_notice.assert_called_once_with()
+        mock_init.assert_called_once()
+        mock_config.assert_not_called()
+
+    def test_failed_init_has_no_update_notice_side_effect(self):
+        cli = self._import_cli()
+        with (
+            patch.object(cli, "_maybe_print_update_notice_for_init") as mock_notice,
+            patch.object(cli, "_cmd_init", return_value=1) as mock_init,
+            patch.object(cli, "_lazy_config") as mock_config,
+        ):
+            rc = cli.main(["init"])
+
+        assert rc == 1
+        mock_notice.assert_not_called()
         mock_init.assert_called_once()
         mock_config.assert_not_called()
 
@@ -944,6 +1113,33 @@ class TestCLIMain:
         assert rc == 0
         mock_orch.cmd_status.assert_called_once()
 
+    def test_review_command_dispatches_with_pull_request_number(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_cmd_review", return_value=0) as mock_review,
+        ):
+            rc = cli.main(["review", "--pr", "42"])
+
+        assert rc == 0
+        forwarded_args = mock_review.call_args.args[0]
+        assert forwarded_args.pr == 42
+
+    def test_review_command_uses_review_feedback_cli(self):
+        cli = self._import_cli()
+        args = argparse.Namespace(pr=42)
+        with patch("spec_runtime.review_feedback.main", return_value=0) as review_main:
+            rc = cli._cmd_review(args)
+
+        assert rc == 0
+        review_main.assert_called_once_with(["--pr", "42"])
+
     def test_report_command_dispatches_to_orchestrator(self):
         cli = self._import_cli()
         mock_config = MagicMock(
@@ -1090,7 +1286,7 @@ class TestResolveRepoRoot:
         )
 
         with (
-            patch.object(cli.subprocess, "run", return_value=result),
+            patch("spec_runtime.git_common.subprocess.run", return_value=result),
             patch("spec_runtime.git_common.resolve_common_root", return_value=repo) as mock_common_root,
         ):
             assert cli._resolve_repo_root() == repo

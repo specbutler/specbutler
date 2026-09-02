@@ -128,6 +128,7 @@ ruff check .            # lint gate
 | `spec create [--spec ID]` | Author a new spec interactively |
 | `spec implement --spec ID [--agent A] [--review-agent R]` | Start/resume implementation workflow |
 | `spec status --spec ID` | Show run state and gate status |
+| `spec review --pr NUMBER` | Inspect full machine-readable PR review feedback |
 | `spec list [--all]` | List specs with status and dependencies |
 | `spec show --spec ID` | Display a spec's content |
 | `spec report --status ok\|blocked\|error\|needs-input` | Report implement-phase completion |

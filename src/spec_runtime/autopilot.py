@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -53,7 +54,7 @@ from spec_runtime.execution_backend import (
     get_execution_backend,
     inspect_container_capacity,
 )
-from spec_runtime.git_common import resolve_common_root
+from spec_runtime.git_common import resolve_common_root, run_git, subprocess_text_kwargs
 from spec_runtime.orchestrator import (
     BASE_REF,
     BLOCK_DEBUGGER_AUTO_RESUME_LIMIT,
@@ -67,6 +68,21 @@ from spec_runtime.orchestrator import (
     _select_default_run,
     format_attempt_progress,
     read_spec_lock_owner,
+)
+from spec_runtime.platform_fs import FileLock, atomic_write_text
+from spec_runtime.process_supervisor import (
+    LifetimeMode,
+    ProcessGroupOwnershipError,
+    ProcessGroupTerminationError,
+    ProcessSupervisor,
+    SupervisionToken,
+    adopt,
+    available_memory_bytes,
+    durable_metadata_path,
+    inspect_process,
+    iter_processes,
+    process_cwd,
+    request_legacy_process_shutdown,
 )
 from spec_runtime.spec_merge_tags import (
     MergeTagProvenance,
@@ -112,14 +128,6 @@ UI_HEURISTIC_RE = re.compile(
     r"\b(react|component|wizard|modal|css|frontend|page|form|ui|ux|layout|responsive)\b",
     re.IGNORECASE,
 )
-VM_STAT_PAGE_SIZE_RE = re.compile(r"page size of (?P<bytes>\d+) bytes", re.IGNORECASE)
-VM_STAT_RECLAIMABLE_KEYS = (
-    "pages free",
-    "pages inactive",
-    "pages speculative",
-)
-
-
 SPEC_RUNTIME_CONFIG = load_spec_runtime_config(require=False)
 
 
@@ -470,6 +478,12 @@ class ActiveRunProcess:
     run_id: str = ""
     phase: str = "launching"
     process_started_at: str = ""
+    supervision_token: dict[str, object] = field(default_factory=dict)
+    launch_state: str = "ready"
+    supervision_id: str = ""
+    ready_path: str = ""
+    adoption_generation: int = 0
+    adopted_by: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -496,6 +510,8 @@ class PidFileRecord:
     pid: int
     started_at: str = ""
     command: str = ""
+    instance_id: str = ""
+    nonce: str = ""
 
 
 @dataclass(frozen=True)
@@ -1005,10 +1021,8 @@ def _annotate_candidate_with_dispatch_discipline(
 def resolve_repo_root(explicit: str | None = None) -> Path:
     if explicit:
         return Path(explicit).resolve()
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
+    result = run_git(
+        ["rev-parse", "--show-toplevel"],
         check=True,
     )
     return Path(result.stdout.strip())
@@ -1033,7 +1047,7 @@ def write_run_log_alias(repo_root: Path, run_id: str, log_path: str) -> None:
         return
     alias_path = run_log_alias_path(repo_root, normalized_run_id)
     alias_path.parent.mkdir(parents=True, exist_ok=True)
-    alias_path.write_text(normalized_log_path + "\n")
+    alias_path.write_text(normalized_log_path + "\n", encoding="utf-8")
 
 
 def maybe_write_run_log_alias(repo_root: Path, proc: ActiveRunProcess, run_record: dict) -> None:
@@ -1060,7 +1074,7 @@ def load_run_record_index(repo_root: Path, *, config: SpecRuntimeConfig | None =
 
     for path in rd.glob("*.json"):
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         all_records.append(data)
@@ -1121,7 +1135,7 @@ def read_spec_status_overrides(repo_root: Path) -> dict[str, dict[str, str]]:
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return {}
     if not isinstance(payload, dict):
@@ -1164,7 +1178,9 @@ def write_spec_status_override(
         entry["worktree_path"] = str(worktree_path)
     overrides[spec_id] = entry
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(overrides, indent=2, sort_keys=True) + "\n")
+    path.write_text(
+        json.dumps(overrides, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def select_agent(spec: SpecMetadata, *, override: str = "", config: SpecRuntimeConfig | None = None) -> str:
@@ -1487,76 +1503,6 @@ def is_retryable_failed_implement_run(run_record: dict) -> bool:
     return True
 
 
-def _meminfo_available_bytes() -> int | None:
-    """Linux MemAvailable — the kernel's estimate of memory usable by new
-    workloads INCLUDING reclaimable page cache. SC_AVPHYS_PAGES reports only
-    free pages, which on a warm-cache box underreports by an order of
-    magnitude and silently throttled autopilot concurrency to 1 on a 60GB
-    host with 53GB available."""
-    try:
-        with open("/proc/meminfo") as fh:
-            for line in fh:
-                if line.startswith("MemAvailable:"):
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1].isdigit():
-                        return int(parts[1]) * 1024
-                    break
-    except OSError:
-        pass
-    return None
-
-
-def available_memory_bytes() -> int | None:
-    meminfo = _meminfo_available_bytes()
-    if meminfo is not None:
-        return meminfo
-
-    def read_sysconf(name: str) -> int | None:
-        try:
-            value = os.sysconf(name)
-        except (AttributeError, OSError, ValueError):
-            return None
-        if not isinstance(value, int) or value < 0:
-            return None
-        return value
-
-    pages = read_sysconf("SC_AVPHYS_PAGES")
-    page_size = read_sysconf("SC_PAGE_SIZE") or read_sysconf("SC_PAGESIZE")
-    if pages is not None and page_size is not None:
-        return pages * page_size
-
-    try:
-        result = subprocess.run(
-            ["vm_stat"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-
-    page_size_match = VM_STAT_PAGE_SIZE_RE.search(result.stdout)
-    if page_size_match is None:
-        return None
-
-    reclaimable_pages = 0
-    for line in result.stdout.splitlines():
-        if ":" not in line:
-            continue
-        key, raw_value = line.split(":", 1)
-        normalized_key = key.strip().lower()
-        if normalized_key not in VM_STAT_RECLAIMABLE_KEYS:
-            continue
-        digits = "".join(ch for ch in raw_value if ch.isdigit())
-        if not digits:
-            continue
-        reclaimable_pages += int(digits)
-
-    return reclaimable_pages * int(page_size_match.group("bytes"))
-
-
 def format_status_line(event: str, detail: str) -> str:
     return f"[{timestamp_token()}] {event}: {detail}"
 
@@ -1654,12 +1600,18 @@ def write_active_state(repo_root: Path, active: dict[str, ActiveRunProcess]) -> 
             "run_id": proc.run_id,
             "log_path": proc.log_path,
             "process_started_at": proc.process_started_at,
+            "supervision_token": proc.supervision_token,
+            "launch_state": proc.launch_state,
+            "supervision_id": proc.supervision_id,
+            "ready_path": proc.ready_path,
+            "adoption_generation": proc.adoption_generation,
+            "adopted_by": proc.adopted_by,
         }
         for spec_id, proc in sorted(active.items())
     }
     path = autopilot_active_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def read_log_tail(log_path: str, n: int = ERROR_TAIL_LINES) -> list[str]:
@@ -1679,12 +1631,17 @@ def is_pid_alive(pid: int, expected_started_at: str) -> bool:
     return True
 
 
+def _requires_authenticated_process_adoption() -> bool:
+    """Whether restart needs the durable Windows Job/control capability."""
+    return os.name == "nt"
+
+
 def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
     path = autopilot_active_path(repo_root)
     if not path.exists():
         return {}
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return {}
     if not isinstance(payload, dict):
@@ -1697,6 +1654,18 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
         pid = int(item.get("pid", 0))
         process_started_at = str(item.get("process_started_at", "")).strip()
         run_id = str(item.get("run_id", "")).strip()
+        token_data = item.get("supervision_token", {})
+        supervision_token = dict(token_data) if isinstance(token_data, dict) else {}
+        ready_path = str(item.get("ready_path", "")).strip()
+        if not supervision_token and ready_path:
+            try:
+                ready_payload = json.loads(Path(ready_path).read_text(encoding="utf-8"))
+                parsed_ready = SupervisionToken.from_dict(ready_payload)
+                supervision_token = parsed_ready.to_dict()
+                pid = parsed_ready.payload.pid
+                process_started_at = parsed_ready.payload.started_at
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
         if pid <= 0:
             continue
         if not process_started_at:
@@ -1711,7 +1680,53 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
         process_alive = is_pid_alive(pid, process_started_at)
         live_identity = read_process_identity(pid) if process_alive else None
         live_started_at = live_identity.started_at if live_identity is not None else ""
+        parsed_token: SupervisionToken | None = None
+        if supervision_token:
+            try:
+                parsed_token = SupervisionToken.from_dict(supervision_token)
+                if (
+                    parsed_token.mode is not LifetimeMode.ADOPTABLE
+                    or parsed_token.payload.pid != pid
+                    or parsed_token.payload.started_at != process_started_at
+                    or (
+                        str(item.get("supervision_id", "")).strip()
+                        and parsed_token.token != str(item["supervision_id"]).strip()
+                    )
+                ):
+                    continue
+                if _requires_authenticated_process_adoption():
+                    # Parsing proves that this record names a plausible durable
+                    # boundary; the one-way ownership claim is intentionally
+                    # deferred until the PID and lease decision below accepts
+                    # the run. A stale or conflicting lease must not make the
+                    # current dispatcher the Job's logical owner.
+                    pass
+                elif os.name == "posix":
+                    # POSIX ADOPTABLE children are session leaders, not
+                    # durable-helper payloads, so there is intentionally no
+                    # Windows-style control record to transfer. Validate the
+                    # exact persisted session-leader identity and continue to
+                    # the existing live PID + lease decision below.
+                    if (
+                        parsed_token.identity != parsed_token.payload
+                        or parsed_token.pgid != pid
+                    ):
+                        continue
+                    supervision_token = parsed_token.to_dict()
+                else:
+                    continue
+            except (KeyError, TypeError, ValueError, ProcessLookupError):
+                continue
+        elif _requires_authenticated_process_adoption():
+            print(
+                format_status_line(
+                    "stale",
+                    f"{spec_id} pid={pid} has no authenticated supervision token; skipping",
+                )
+            )
+            continue
 
+        adoption_suffix = ""
         if not run_id:
             # Newly dispatched spec: the child `spec implement` has not yet
             # created a run record (and therefore no lease) but the process
@@ -1721,44 +1736,35 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
             if not process_alive:
                 print(format_status_line("stale", f"{spec_id} pid={pid} no longer alive"))
                 continue
-            adopted[spec_id] = ActiveRunProcess(
-                spec_id=spec_id,
-                agent=str(item.get("agent", "")),
-                pid=pid,
-                started_at=str(item.get("started_at", "")),
-                started_monotonic=0.0,
-                log_path=str(item.get("log_path", "")),
-                run_id="",
-                phase=str(item.get("phase", "unknown")),
-                process_started_at=process_started_at,
+            adoption_suffix = " (pre-lease)"
+        else:
+            lease = load_run_lease(state_runs_dir, run_id)
+            outcome = evaluate_process_adoption(
+                expected_run_id=run_id,
+                expected_spec_id=spec_id,
+                lease=lease,
+                recorded_pid=pid,
+                recorded_process_started_at=process_started_at,
+                process_alive=process_alive,
+                live_process_started_at=live_started_at,
             )
-            print(
-                format_status_line(
-                    "adopt",
-                    f"{spec_id} pid={pid} phase={adopted[spec_id].phase} (pre-lease)",
+            if not outcome.should_wait:
+                reason = outcome.reason or outcome.decision.value
+                print(
+                    format_status_line(
+                        "stale",
+                        f"{spec_id} pid={pid} not adopted ({outcome.decision.value}): {reason}",
+                    )
                 )
-            )
-            continue
+                continue
 
-        lease = load_run_lease(state_runs_dir, run_id)
-        outcome = evaluate_process_adoption(
-            expected_run_id=run_id,
-            expected_spec_id=spec_id,
-            lease=lease,
-            recorded_pid=pid,
-            recorded_process_started_at=process_started_at,
-            process_alive=process_alive,
-            live_process_started_at=live_started_at,
-        )
-        if not outcome.should_wait:
-            reason = outcome.reason or outcome.decision.value
-            print(
-                format_status_line(
-                    "stale",
-                    f"{spec_id} pid={pid} not adopted ({outcome.decision.value}): {reason}",
-                )
-            )
-            continue
+        if _requires_authenticated_process_adoption():
+            if parsed_token is None:
+                continue
+            try:
+                supervision_token = adopt(parsed_token).to_dict()
+            except (KeyError, TypeError, ValueError, ProcessLookupError):
+                continue
         adopted[spec_id] = ActiveRunProcess(
             spec_id=spec_id,
             agent=str(item.get("agent", "")),
@@ -1769,8 +1775,19 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
             run_id=run_id,
             phase=str(item.get("phase", "unknown")),
             process_started_at=process_started_at,
+            supervision_token=supervision_token,
+            launch_state="ready",
+            supervision_id=str(item.get("supervision_id", "")),
+            ready_path=ready_path,
+            adoption_generation=int(item.get("adoption_generation", 0) or 0) + 1,
+            adopted_by={"pid": os.getpid()},
         )
-        print(format_status_line("adopt", f"{spec_id} pid={pid} phase={adopted[spec_id].phase}"))
+        print(
+            format_status_line(
+                "adopt",
+                f"{spec_id} pid={pid} phase={adopted[spec_id].phase}{adoption_suffix}",
+            )
+        )
     return adopted
 
 
@@ -1783,7 +1800,7 @@ def cleanup_unadopted_container_runs(
     if not path.exists():
         return
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return
     if not isinstance(payload, dict):
@@ -1803,7 +1820,7 @@ def cleanup_unadopted_container_runs(
         handled_run_ids.add(run_id)
         run_path = state_runs_dir / f"{run_id}.json"
         try:
-            run_record = json.loads(run_path.read_text())
+            run_record = json.loads(run_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         if not isinstance(run_record, dict):
@@ -1870,10 +1887,20 @@ def _notify_macos(title: str, message: str) -> None:
         message=message.replace("\\", "\\\\").replace('"', '\\"'),
         title=title.replace("\\", "\\\\").replace('"', '\\"'),
     )
-    subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
     sound = Path("/System/Library/Sounds/Glass.aiff")
     if sound.exists():
-        subprocess.run(["afplay", str(sound)], capture_output=True, text=True)
+        subprocess.run(
+            ["afplay", str(sound)],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
 
 
 def _notify_ntfy(topic: str, message: str) -> None:
@@ -1885,6 +1912,7 @@ def _notify_ntfy(topic: str, message: str) -> None:
         ["curl", "-fsS", "-d", message, f"{server}/{topic}"],
         capture_output=True,
         text=True,
+        errors="replace",
     )
 
 
@@ -2051,6 +2079,8 @@ def start_candidate(
     candidate: DispatchCandidate,
     *,
     preallocated_run_id: str = "",
+    supervision_id: str = "",
+    ready_path: str = "",
 ) -> ActiveRunProcess:
     state_root = autopilot_runs_root(repo_root)
     state_root.mkdir(parents=True, exist_ok=True)
@@ -2070,17 +2100,33 @@ def start_candidate(
     child_env["SPEC_ACTOR"] = "autopilot"
     if preallocated_run_id and not candidate.run_id:
         child_env["SPEC_PREALLOCATED_RUN_ID"] = preallocated_run_id
-    process = subprocess.Popen(
+    supervisor_kwargs: dict[str, object] = {
+        "supervision_id": supervision_id or None,
+    }
+    if ready_path:
+        if not supervision_id or Path(ready_path) != durable_metadata_path(supervision_id):
+            log_handle.close()
+            raise ValueError("ready_path must be the durable metadata path for supervision_id")
+        # Publish the exact session-leader token before spawn() returns. This
+        # closes the dispatcher crash window between child launch and the
+        # second active-state write on POSIX; Windows already publishes from
+        # its durable helper through the same cross-platform path.
+        supervisor_kwargs["publish_durable_token"] = True
+    process = ProcessSupervisor(
+        LifetimeMode.ADOPTABLE,
+        **supervisor_kwargs,
+    ).spawn(
         command,
         cwd=repo_root,
         stdin=subprocess.DEVNULL,
         stdout=log_handle,
         stderr=subprocess.STDOUT,
         env=child_env,
-        start_new_session=True,
     )
     log_handle.close()
-    identity = read_process_identity(process.pid)
+    identity = process.token.payload
+    if identity.started_at == "test-double":
+        identity = read_process_identity(process.pid)
     if identity is None:
         raise RuntimeError(
             f"Could not read process identity for pid {process.pid} ({candidate.spec_id}); cannot track child safely.",
@@ -2088,12 +2134,16 @@ def start_candidate(
     proc = ActiveRunProcess(
         spec_id=candidate.spec_id,
         agent=candidate.agent,
-        pid=process.pid,
+        pid=identity.pid,
         started_at=now_iso(),
         started_monotonic=time.monotonic(),
         log_path=str(log_path),
         run_id=candidate.run_id or preallocated_run_id,
         process_started_at=identity.started_at,
+        supervision_token=process.token.to_dict(),
+        launch_state="ready",
+        supervision_id=process.token.token,
+        ready_path=ready_path,
     )
     if proc.run_id:
         write_run_log_alias(repo_root, proc.run_id, proc.log_path)
@@ -2103,38 +2153,17 @@ def start_candidate(
 def read_process_identity(pid: int) -> ProcessIdentity | None:
     if pid <= 0:
         return None
-    try:
-        result = subprocess.run(
-            ["ps", "-ww", "-o", "pid=", "-o", "lstart=", "-o", "command=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
+    identity = inspect_process(pid)
+    if identity is None:
         return None
-    if result.returncode != 0:
-        return None
-    line = next((item.strip() for item in result.stdout.splitlines() if item.strip()), "")
-    if not line:
-        return None
-    parts = line.split(None, 6)
-    if len(parts) != 7:
-        return None
-    try:
-        live_pid = int(parts[0])
-    except ValueError:
-        return None
-    return ProcessIdentity(
-        pid=live_pid,
-        started_at=" ".join(parts[1:6]),
-        command=parts[6].strip(),
-    )
+    return ProcessIdentity(pid=identity.pid, started_at=identity.started_at, command=identity.command)
 
 
 def current_process_identity() -> ProcessIdentity:
     identity = read_process_identity(os.getpid())
     if identity is None:
         raise RuntimeError("Could not determine autopilot process identity.")
-    return identity
+    return ProcessIdentity(identity.pid, identity.started_at, " ".join(shlex.quote(arg) for arg in sys.argv))
 
 
 def _command_tokens(command: str) -> list[str]:
@@ -2186,7 +2215,7 @@ def _is_autopilot_run_command(command: str) -> bool:
 
 def _read_pid_file(path: Path) -> PidFileRecord | None:
     try:
-        raw = path.read_text().strip()
+        raw = path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
     if not raw:
@@ -2210,17 +2239,55 @@ def _read_pid_file(path: Path) -> PidFileRecord | None:
         pid=pid,
         started_at=str(payload.get("started_at", "")).strip(),
         command=str(payload.get("command", "")).strip(),
+        instance_id=str(payload.get("instance_id", "")).strip(),
+        nonce=str(payload.get("nonce", "")).strip(),
     )
 
 
-def _pid_record_matches_process(record: PidFileRecord, identity: ProcessIdentity) -> bool:
+def _pid_record_has_live_dispatcher_generation(repo_root: Path, record: PidFileRecord) -> bool:
+    """Validate a V2 pid record against its exact control-plane generation.
+
+    Native Windows process inspection intentionally exposes the executable, not
+    the full argv.  The unforgeable per-launch nonce and the shutdown state are
+    therefore the authoritative ownership proof there.  COMPLETE is excluded
+    so a delayed stop request cannot target a later process through stale state.
+    """
+    if not record.instance_id or not record.nonce or not record.started_at:
+        return False
+    state = ShutdownTracker(
+        autopilot_state_root(repo_root),
+        instance_id=record.instance_id,
+        pid=record.pid,
+        process_started_at=record.started_at,
+        nonce=record.nonce,
+    ).state()
+    return (
+        state.phase is not ShutdownPhase.COMPLETE
+        and state.instance_id == record.instance_id
+        and state.pid == record.pid
+        and state.process_started_at == record.started_at
+        and state.nonce == record.nonce
+    )
+
+
+def _pid_record_matches_process(
+    record: PidFileRecord,
+    identity: ProcessIdentity,
+    *,
+    repo_root: Path | None = None,
+) -> bool:
     if record.pid != identity.pid:
         return False
-    if not _is_autopilot_run_command(identity.command):
+    native_v2 = (
+        os.name == "nt"
+        and repo_root is not None
+        and _pid_record_has_live_dispatcher_generation(repo_root, record)
+    )
+    if not native_v2 and not _is_autopilot_run_command(identity.command):
         return False
     if record.started_at and record.started_at != identity.started_at:
         return False
-    if record.command and record.command != identity.command:
+    if not native_v2 and record.command and record.command != identity.command:
         return False
     return True
 
@@ -2245,31 +2312,7 @@ def read_process_cwd(pid: int) -> Path | None:
     Used only to scope process scans to this repository. Callers must treat None
     as "unknown, do not touch" — never as a match.
     """
-    if pid <= 0:
-        return None
-    try:
-        return Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
-    except OSError:
-        pass
-    try:
-        result = subprocess.run(
-            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    for line in result.stdout.splitlines():
-        if line.startswith("n"):
-            candidate = line[1:].strip()
-            if candidate:
-                try:
-                    return Path(candidate).resolve()
-                except OSError:
-                    return None
-    return None
+    return process_cwd(pid)
 
 
 def _cwd_belongs_to_repo(cwd: Path, repo_root: Path) -> bool:
@@ -2308,61 +2351,48 @@ def find_autopilot_processes_for_repo(repo_root: Path) -> list[ProcessIdentity]:
     inside this repo.
     """
     repo_root = repo_root.resolve()
-    try:
-        result = subprocess.run(
-            ["ps", "-ww", "-e", "-o", "pid=", "-o", "lstart=", "-o", "command="],
-            capture_output=True,
-            text=True,
-        )
-    except OSError:
-        return []
-    if result.returncode != 0:
-        return []
     own_pid = os.getpid()
     matches: list[ProcessIdentity] = []
-    for line in result.stdout.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        parts = stripped.split(None, 6)
-        if len(parts) != 7:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
+    for identity in iter_processes():
+        pid = identity.pid
         if pid == own_pid:
             continue
-        command = parts[6].strip()
+        command = identity.command
         if not _is_autopilot_run_command(command):
             continue
         if _process_belongs_to_repo(pid, repo_root) is not True:
             continue
-        matches.append(
-            ProcessIdentity(pid=pid, started_at=" ".join(parts[1:6]), command=command)
-        )
+        matches.append(ProcessIdentity(pid=pid, started_at=identity.started_at, command=command))
     return matches
 
 
-def _write_pid_file(path: Path, identity: ProcessIdentity) -> None:
+def _write_pid_file(path: Path, identity: ProcessIdentity, *, instance_id: str = "", nonce: str = "") -> None:
     payload = {
         "pid": identity.pid,
         "started_at": identity.started_at,
         "command": identity.command,
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    if instance_id:
+        payload["instance_id"] = instance_id
+    if nonce:
+        payload["nonce"] = nonce
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def ensure_pid_file(repo_root: Path) -> None:
+def ensure_pid_file(repo_root: Path, *, instance_id: str = "", nonce: str = "") -> None:
     path = autopilot_pid_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         record = _read_pid_file(path)
         if record is not None and record.pid != os.getpid():
             live_identity = read_process_identity(record.pid)
-            if live_identity is not None and _pid_record_matches_process(record, live_identity):
+            if live_identity is not None and _pid_record_matches_process(
+                record,
+                live_identity,
+                repo_root=repo_root,
+            ):
                 raise RuntimeError(f"Autopilot already running with pid {record.pid}.")
-    _write_pid_file(path, current_process_identity())
+    _write_pid_file(path, current_process_identity(), instance_id=instance_id, nonce=nonce)
 
 
 def remove_pid_file(repo_root: Path) -> None:
@@ -2382,7 +2412,22 @@ def run_loop(args: argparse.Namespace) -> int:
         print(format_status_line("error", backend_error), file=sys.stderr)
         return 1
     args.concurrency = concurrency_policy.cap
-    ensure_pid_file(repo_root)
+    dispatcher_lock = FileLock(autopilot_state_root(repo_root) / "dispatcher.lock", blocking=False)
+    if not dispatcher_lock.acquire():
+        raise RuntimeError("Autopilot already running for this repository.")
+    dispatcher_instance_id = uuid.uuid4().hex
+    dispatcher_nonce = uuid.uuid4().hex
+    dispatcher_identity = current_process_identity()
+    try:
+        try:
+            ensure_pid_file(repo_root, instance_id=dispatcher_instance_id, nonce=dispatcher_nonce)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            ensure_pid_file(repo_root)
+    except Exception:
+        dispatcher_lock.release()
+        raise
     print(
         format_status_line(
             "config",
@@ -2406,20 +2451,32 @@ def run_loop(args: argparse.Namespace) -> int:
             )
         )
 
-    shutdown_tracker = ShutdownTracker(autopilot_state_root(repo_root))
-    reconciled = shutdown_tracker.reconcile_stale()
-    if reconciled.phase is ShutdownPhase.COMPLETE and reconciled.requested_at:
-        print(
-            format_status_line(
-                "resume",
-                f"reconciled stale shutdown from {reconciled.requested_at}",
-            )
-        )
+    legacy_tracker = ShutdownTracker(autopilot_state_root(repo_root))
+    legacy_state = legacy_tracker.state()
+    if not legacy_state.instance_id and legacy_state.phase in {ShutdownPhase.GRACEFUL, ShutdownPhase.FORCED}:
+        reconciled = legacy_tracker.reconcile_stale()
+        print(format_status_line("resume", f"reconciled stale shutdown from {reconciled.requested_at}"))
+    shutdown_tracker = ShutdownTracker(
+        autopilot_state_root(repo_root),
+        instance_id=dispatcher_instance_id,
+        pid=dispatcher_identity.pid,
+        process_started_at=dispatcher_identity.started_at,
+        nonce=dispatcher_nonce,
+    )
+    if not args.dry_run:
+        shutdown_tracker.initialize()
 
     stop_requested = False
     force_shutdown = False
     active = adopt_active_processes(repo_root)
     cleanup_unadopted_container_runs(repo_root, active)
+    # Commit recovered helper tokens to active.json before removing their
+    # ready records. A crash on either side of this atomic write therefore
+    # leaves at least one complete recovery source.
+    write_active_state(repo_root, active)
+    for recovered in active.values():
+        if recovered.ready_path and recovered.supervision_token:
+            Path(recovered.ready_path).unlink(missing_ok=True)
     last_queue_signature: tuple[tuple[str, str, str], ...] = ()
     last_refresh_error = ""
     low_memory_active = False
@@ -2464,11 +2521,32 @@ def run_loop(args: argparse.Namespace) -> int:
                 )
             )
 
+    def wait_for_next_poll(seconds: float) -> None:
+        """Wait responsively so an out-of-process stop is observed promptly."""
+        nonlocal stop_requested, force_shutdown
+        if seconds <= 0:
+            # Preserve a scheduler yield for zero-interval operation and tests.
+            time.sleep(0)
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            requested = shutdown_tracker.state()
+            if requested.phase in {ShutdownPhase.GRACEFUL, ShutdownPhase.FORCED}:
+                stop_requested = True
+                force_shutdown = requested.phase is ShutdownPhase.FORCED
+                return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.25))
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
     try:
         while True:
+            requested = shutdown_tracker.state()
+            if requested.phase in {ShutdownPhase.GRACEFUL, ShutdownPhase.FORCED}:
+                stop_requested = True
+                force_shutdown = requested.phase is ShutdownPhase.FORCED
             stale_source_warning = source_staleness.check()
             if stale_source_warning:
                 print(format_status_line("stale-source", stale_source_warning))
@@ -2580,7 +2658,7 @@ def run_loop(args: argparse.Namespace) -> int:
             if stop_requested:
                 if not active or force_shutdown:
                     break
-                time.sleep(args.poll_interval)
+                time.sleep(min(args.poll_interval, 0.25))
                 continue
 
             if len(active) < args.concurrency or args.dry_run:
@@ -2691,7 +2769,7 @@ def run_loop(args: argparse.Namespace) -> int:
                             )
                         )
                         low_memory_active = True
-                    time.sleep(args.poll_interval)
+                    wait_for_next_poll(args.poll_interval)
                     continue
                 if low_memory_active:
                     print(format_status_line("resume", "memory recovered; scheduling resumes"))
@@ -2831,20 +2909,69 @@ def run_loop(args: argparse.Namespace) -> int:
                         lease_backoff_until[candidate.spec_id] = time.monotonic() + max(args.poll_interval * 3, 30)
                         print(format_status_line("warning", f"{candidate.spec_id} coordinator unavailable: {exc}"))
                         continue
-                    active_run = start_candidate(repo_root, candidate, preallocated_run_id=leased_run_id)
+                    supervision_id = uuid.uuid4().hex
+                    ready_path = str(durable_metadata_path(supervision_id))
+                    # Persist the reservation before spawning the durable
+                    # helper. A replacement dispatcher can recover from the
+                    # helper ready record if this process exits at any point
+                    # between spawn and the committed active payload record.
+                    active[candidate.spec_id] = ActiveRunProcess(
+                        spec_id=candidate.spec_id,
+                        agent=candidate.agent,
+                        pid=0,
+                        started_at=now_iso(),
+                        started_monotonic=time.monotonic(),
+                        log_path="",
+                        run_id=candidate.run_id or leased_run_id,
+                        launch_state="launching",
+                        supervision_id=supervision_id,
+                        ready_path=ready_path,
+                    )
+                    write_active_state(repo_root, active)
+                    try:
+                        try:
+                            active_run = start_candidate(
+                                repo_root,
+                                candidate,
+                                preallocated_run_id=leased_run_id,
+                                supervision_id=supervision_id,
+                                ready_path=ready_path,
+                            )
+                        except TypeError as exc:
+                            # Preserve the lightweight monkeypatch seam used by
+                            # older adapters/tests while production launchers
+                            # receive the stable reservation identity.
+                            if "unexpected keyword argument" not in str(exc):
+                                raise
+                            active_run = start_candidate(
+                                repo_root,
+                                candidate,
+                                preallocated_run_id=leased_run_id,
+                            )
+                    except BaseException:
+                        # Leave a reservation with a durable ready record in
+                        # place for restart recovery; remove only if no helper
+                        # ever published ownership.
+                        if not Path(ready_path).exists():
+                            active.pop(candidate.spec_id, None)
+                            write_active_state(repo_root, active)
+                        raise
                     active[candidate.spec_id] = active_run
                     write_active_state(repo_root, active)
+                    if active_run.ready_path and active_run.supervision_token:
+                        Path(active_run.ready_path).unlink(missing_ok=True)
                     detail = f"{candidate.spec_id} agent={candidate.agent} mode={candidate.reason}"
                     if candidate.run_id:
                         detail += f" run={candidate.run_id}"
                     print(format_status_line("start", detail))
 
-            time.sleep(args.poll_interval)
+            wait_for_next_poll(args.poll_interval)
     finally:
         write_active_state(repo_root, active)
         remove_pid_file(repo_root)
         if stop_requested:
             shutdown_tracker.mark_complete()
+        dispatcher_lock.release()
 
     return 0
 
@@ -2927,27 +3054,28 @@ def _is_stale_run(data: dict, state_runs_dir: Path | None = None) -> bool:
 def _merged_pr_for_branch(repo_root: Path, branch: str) -> dict | None:
     """Return merged PR metadata for a branch when GitHub CLI can resolve it."""
     repo_config = load_repo_spec_runtime_config(repo_root)
+    command = [
+        "gh",
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--base",
+        repo_config.pr_base_branch,
+        "--state",
+        "merged",
+        "--json",
+        "number,headRefName,mergeCommit,mergedAt,mergedBy",
+        "--jq",
+        ".[0] // empty",
+    ]
     try:
         result = subprocess.run(
-            [
-                "gh",
-                "pr",
-                "list",
-                "--head",
-                branch,
-                "--base",
-                repo_config.pr_base_branch,
-                "--state",
-                "merged",
-                "--json",
-                "number,headRefName,mergeCommit,mergedAt,mergedBy",
-                "--jq",
-                ".[0] // empty",
-            ],
+            command,
             cwd=repo_root,
             capture_output=True,
-            text=True,
             timeout=15,
+            **subprocess_text_kwargs(command),
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None
@@ -2990,24 +3118,22 @@ def _create_merge_tag(repo_root: Path, spec_id: str, branch: str) -> bool:
         merge_commit_sha=merge_commit_sha,
         pr_number=pr_data.get("number") if isinstance(pr_data.get("number"), int) else None,
         source_branch=str(pr_data.get("headRefName", "") or "").strip() or branch,
-        actor=merged_by or os.getenv("USER") or "autopilot",
+        actor=merged_by or os.getenv("USER") or os.getenv("USERNAME") or "autopilot",
         timestamp=str(pr_data.get("mergedAt", "") or "").strip() or utc_timestamp_now(),
     )
 
-    tag_result = subprocess.run(
-        annotated_tag_command(tag_name, merge_commit_sha, build_tag_message(provenance)),
+    tag_command = annotated_tag_command(tag_name, merge_commit_sha, build_tag_message(provenance))
+    tag_result = run_git(
+        tag_command[1:],
         cwd=repo_root,
-        capture_output=True,
-        text=True,
     )
     if tag_result.returncode != 0:
         print(f"  WARNING: git tag {tag_name} failed: {tag_result.stderr.strip()}")
         return False
-    push_result = subprocess.run(
-        push_tag_command(tag_name),
+    push_command = push_tag_command(tag_name)
+    push_result = run_git(
+        push_command[1:],
         cwd=repo_root,
-        capture_output=True,
-        text=True,
     )
     if push_result.returncode != 0:
         print(f"  WARNING: git push tag {tag_name} failed: {push_result.stderr.strip()}")
@@ -3370,7 +3496,7 @@ def watch_command(args: argparse.Namespace) -> int:
         active_path = autopilot_active_path(repo_root)
         if active_path.exists():
             try:
-                return json.loads(active_path.read_text())
+                return json.loads(active_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 pass
         return {}
@@ -3435,12 +3561,55 @@ def watch_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def _signal_autopilot(pid: int) -> int:
+def _signal_autopilot(
+    pid: int,
+    repo_root: Path | None = None,
+    *,
+    legacy_identity: ProcessIdentity | None = None,
+) -> int:
+    if repo_root is not None:
+        record = _read_pid_file(autopilot_pid_path(repo_root))
+        if (
+            record is not None
+            and record.pid == pid
+            and _pid_record_has_live_dispatcher_generation(repo_root, record)
+        ):
+            tracker = ShutdownTracker(
+                autopilot_state_root(repo_root),
+                instance_id=record.instance_id,
+                pid=record.pid,
+                process_started_at=record.started_at,
+                nonce=record.nonce,
+            )
+            tracker.record_interrupt(reason=f"stop-command:{os.getpid()}")
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if tracker.is_complete() or read_process_identity(pid) is None:
+                    print(f"Autopilot pid {pid} acknowledged shutdown request.")
+                    return 0
+                time.sleep(0.05)
+            print(f"Autopilot pid {pid} did not acknowledge shutdown request.", file=sys.stderr)
+            return 1
+
+    # Compatibility for pid files and repo scans written before dispatcher
+    # generations existed. The process boundary revalidates the exact creation
+    # identity immediately before the signal and refuses this path on Windows.
+    target = legacy_identity or read_process_identity(pid)
+    if target is None or target.pid != pid:
+        print(f"Autopilot pid {pid} has no targetable shutdown identity.", file=sys.stderr)
+        return 1
     try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as exc:
+        requested = request_legacy_process_shutdown(target)
+    except (ProcessGroupOwnershipError, ProcessGroupTerminationError) as exc:
         print(f"Failed to stop autopilot pid {pid}: {exc}", file=sys.stderr)
-        print(f"Stop it manually with: kill -TERM {pid}", file=sys.stderr)
+        if os.name == "posix":
+            print(f"Stop it manually with: kill -TERM {pid}", file=sys.stderr)
+        return 1
+    if not requested:
+        print(
+            f"Autopilot pid {pid} changed identity before shutdown; refusing to signal it.",
+            file=sys.stderr,
+        )
         return 1
     print(f"Sent SIGTERM to autopilot pid {pid}.")
     return 0
@@ -3474,7 +3643,7 @@ def _stop_via_repo_scan(repo_root: Path, *, why: str) -> int:
         f"is running in {repo_root}: {found.command}",
         file=sys.stderr,
     )
-    return _signal_autopilot(found.pid)
+    return _signal_autopilot(found.pid, repo_root, legacy_identity=found)
 
 
 def stop_command(args: argparse.Namespace) -> int:
@@ -3493,6 +3662,9 @@ def stop_command(args: argparse.Namespace) -> int:
             repo_root,
             why=f"Autopilot pid {record.pid} (recorded start {record.started_at or 'unknown'}) is no longer running.",
         )
+    targeted_generation = _pid_record_has_live_dispatcher_generation(repo_root, record)
+    if targeted_generation:
+        return _signal_autopilot(record.pid, repo_root)
     if not _is_autopilot_run_command(live_identity.command):
         # Live, but it is not an autopilot at all — almost certainly a recycled
         # pid. Refuse to signal it, and keep the pid file: deleting it could
@@ -3516,7 +3688,7 @@ def stop_command(args: argparse.Namespace) -> int:
         # runs with a working directory outside the repo, and demanding a cwd
         # match would reintroduce the very "cannot stop my own daemon" failure
         # this path exists to fix.
-        return _signal_autopilot(record.pid)
+        return _signal_autopilot(record.pid, repo_root, legacy_identity=live_identity)
 
     # Relaxed path. `started_at`/`command` equality is a nice-to-have, not a
     # gate: the pid file is written once at launch, while `spec auto stop` runs
@@ -3562,7 +3734,7 @@ def stop_command(args: argparse.Namespace) -> int:
     )
     for reason in reasons:
         print(f"  {reason}", file=sys.stderr)
-    return _signal_autopilot(record.pid)
+    return _signal_autopilot(record.pid, repo_root, legacy_identity=live_identity)
 
 
 def gc_command(args: argparse.Namespace) -> int:
@@ -3582,7 +3754,7 @@ def gc_command(args: argparse.Namespace) -> int:
 
     for path in sorted(runs_dir.glob("*.json")):
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         spec_id = str(data.get("spec_id", "")).strip()
@@ -3655,7 +3827,10 @@ def gc_command(args: argparse.Namespace) -> int:
             changes.append(f"  {action} {run_id}: {reason}")
             if apply:
                 data["updated_at"] = datetime.now(UTC).isoformat()
-                path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+                path.write_text(
+                    json.dumps(data, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
 
         final_status = str(data.get("status", "")).strip()
         raw_worktree_path = str(data.get("worktree_path", "")).strip()

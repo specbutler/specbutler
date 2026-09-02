@@ -25,6 +25,12 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from spec_runtime.platform_fs import remove_tree
+from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+from spec_runtime.worktree_safety import (
+    UnsafeWorktreePathError,
+    expected_branch_worktree_names,
+    validate_owned_worktree_path,
+)
 
 from .bridge import (
     AgentEvent,
@@ -224,9 +230,28 @@ def _cleanup_chat_worktree(
     branch: str | None,
 ) -> None:
     """Remove the worktree directory and local branch created for a chat session."""
-    from spec_runtime.orchestrator import run_subprocess
+    from spec_runtime.orchestrator import _worktrees_root, run_subprocess
 
     if worktree_path:
+        # Browser chat always creates the current generated layout.  Legacy
+        # run names are accepted by lifecycle cleanup, but are not valid for a
+        # newly created in-memory chat session.
+        expected_names = expected_branch_worktree_names(branch or "")[:1]
+        if not expected_names:
+            raise RuntimeError(
+                "Refusing chat worktree cleanup because its branch has no recognized identity"
+            )
+        try:
+            worktree_path = str(
+                validate_owned_worktree_path(
+                    owner_root=_worktrees_root(repo_root),
+                    target=worktree_path,
+                    relative_to=repo_root,
+                    expected_names=expected_names,
+                )
+            )
+        except UnsafeWorktreePathError as exc:
+            raise RuntimeError(f"Refusing unsafe chat worktree cleanup: {exc}") from exc
         run_subprocess(
             ["git", "worktree", "remove", "--force", str(worktree_path)],
             cwd=repo_root,
@@ -314,11 +339,11 @@ def _available_backends(repo_root: Path | None = None) -> dict[str, bool]:
     codex_ok = False
 
     try:
-        from spec_runtime.agent_adapter import claude_sandbox_unavailability_reason
+        from spec_runtime.agent_adapter import host_agent_unavailability_reason
 
         from .bridge_claude import _sdk_available
 
-        claude_ok = _sdk_available() and not claude_sandbox_unavailability_reason()
+        claude_ok = _sdk_available() and not host_agent_unavailability_reason("claude")
     except Exception:
         pass
 
@@ -347,7 +372,7 @@ def _available_backends(repo_root: Path | None = None) -> dict[str, bool]:
 def _backend_unavailability_reason(agent: str, repo_root: Path) -> str:
     """Explain a known provider preflight failure without starting a process."""
     if agent == "claude":
-        from spec_runtime.agent_adapter import claude_sandbox_unavailability_reason
+        from spec_runtime.agent_adapter import host_agent_unavailability_reason
 
         from .bridge_claude import _sdk_available
 
@@ -356,7 +381,7 @@ def _backend_unavailability_reason(agent: str, repo_root: Path) -> str:
                 "Claude backend unavailable — install the `web` extra and "
                 "authenticate Claude Code."
             )
-        reason = claude_sandbox_unavailability_reason()
+        reason = host_agent_unavailability_reason("claude")
         if reason:
             return reason
     elif agent == "codex":
@@ -1254,7 +1279,10 @@ async def implement_chat_task(request: Request) -> Response:
     from .api import _spec_executable
 
     try:
-        proc = subprocess.Popen(
+        # This is a durable ownership transfer, not a web-owned child. The
+        # implementation must survive a web-server restart and remain
+        # stoppable through its persisted supervision token.
+        proc = ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
             [
                 _spec_executable(),
                 "implement",
@@ -1264,11 +1292,10 @@ async def implement_chat_task(request: Request) -> Response:
                 *(["--review-agent", review_agent] if review_agent else []),
             ],
             cwd=str(repo_root),
-            start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         _cleanup_orphaned_run()
         session.status = "active"
         return _json(
@@ -1326,7 +1353,9 @@ async def implement_chat_task(request: Request) -> Response:
     import json as _json_mod
 
     try:
-        run_state = _json_mod.loads(_run_state_path(repo_root, run_id).read_text())
+        run_state = _json_mod.loads(
+            _run_state_path(repo_root, run_id).read_text(encoding="utf-8")
+        )
     except (OSError, _json_mod.JSONDecodeError):
         run_state = {
             "spec_id": spec_id,

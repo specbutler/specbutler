@@ -11,6 +11,7 @@ requires-python = ">=3.11"
 dependencies = [
     "packaging>=24.0",
     "PyYAML>=6.0",
+    "tzdata>=2024.1; platform_system == 'Windows'",
 ]
 readme = "README.md"
 license = "MIT"
@@ -20,6 +21,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
     "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
@@ -73,6 +75,11 @@ spec_runtime = ["templates/*.md", "templates/*.json", "examples/*.toml", "web/st
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "host_agent_preflight: exercise the real host provider availability policy",
+  "linux_claude_real_provider: opt-in Linux web chat proof using an authenticated real Claude provider",
+  "windows_real_provider: opt-in Windows 11 lab proof using real Codex and a disposable GitHub repository",
+]
 
 [tool.ruff]
 target-version = "py311"

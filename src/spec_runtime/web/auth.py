@@ -38,12 +38,12 @@ def generate_token() -> str:
 def load_or_create_token(repo_root: Path) -> str:
     path = _token_path(repo_root)
     if path.exists():
-        token = path.read_text().strip()
+        token = path.read_text(encoding="utf-8").strip()
         if token:
             return token
     path.parent.mkdir(parents=True, exist_ok=True)
     token = generate_token()
-    path.write_text(token)
+    path.write_text(token, encoding="utf-8")
     os.chmod(path, 0o600)
     return token
 
@@ -52,7 +52,7 @@ def reset_token(repo_root: Path) -> str:
     path = _token_path(repo_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     token = generate_token()
-    path.write_text(token)
+    path.write_text(token, encoding="utf-8")
     os.chmod(path, 0o600)
     return token
 
@@ -60,7 +60,7 @@ def reset_token(repo_root: Path) -> str:
 def read_token(repo_root: Path) -> str | None:
     path = _token_path(repo_root)
     if path.exists():
-        token = path.read_text().strip()
+        token = path.read_text(encoding="utf-8").strip()
         return token if token else None
     return None
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -733,6 +734,64 @@ def test_shutdown_running_state_when_no_file(tmp_path: Path) -> None:
     assert not tracker.is_graceful_requested()
 
 
+def test_shutdown_tracker_targets_one_dispatcher_generation(tmp_path: Path) -> None:
+    first = ShutdownTracker(
+        tmp_path, instance_id="first", pid=101, process_started_at="one", nonce="nonce-one"
+    )
+    first.initialize()
+    assert first.record_interrupt().phase is ShutdownPhase.GRACEFUL
+
+    second = ShutdownTracker(
+        tmp_path, instance_id="second", pid=202, process_started_at="two", nonce="nonce-two"
+    )
+    second.initialize()
+    assert second.state().phase is ShutdownPhase.RUNNING
+    assert first.is_graceful_requested() is False
+
+    requested = second.record_interrupt()
+    assert requested.phase is ShutdownPhase.GRACEFUL
+    assert requested.instance_id == "second"
+    assert requested.pid == 202
+    assert requested.process_started_at == "two"
+    assert requested.nonce == "nonce-two"
+
+
+def test_shutdown_tracker_second_targeted_request_forces(tmp_path: Path) -> None:
+    tracker = ShutdownTracker(tmp_path, instance_id="dispatcher", pid=303, nonce="secret")
+    tracker.initialize()
+    assert tracker.record_interrupt().phase is ShutdownPhase.GRACEFUL
+    assert tracker.record_interrupt().phase is ShutdownPhase.FORCED
+
+
+def test_shutdown_tracker_repeated_interrupts_keep_forced_latched(tmp_path: Path) -> None:
+    tracker = ShutdownTracker(tmp_path, instance_id="dispatcher", pid=303, nonce="secret")
+    tracker.initialize()
+    assert tracker.record_interrupt(now=_utc("2026-01-01T00:00:00")).phase is ShutdownPhase.GRACEFUL
+    forced = tracker.record_interrupt(now=_utc("2026-01-01T00:00:01"))
+
+    third = tracker.record_interrupt(now=_utc("2026-01-01T00:00:02"))
+    fourth = tracker.record_interrupt(now=_utc("2026-01-01T00:00:03"))
+
+    assert third.phase is ShutdownPhase.FORCED
+    assert fourth.phase is ShutdownPhase.FORCED
+    assert third.forced_at == forced.forced_at
+    assert fourth.forced_at == forced.forced_at
+    assert fourth.interrupt_count == 4
+
+
+def test_shutdown_tracker_interrupt_does_not_reopen_complete_state(tmp_path: Path) -> None:
+    tracker = ShutdownTracker(tmp_path, instance_id="dispatcher", pid=303, nonce="secret")
+    tracker.initialize()
+    tracker.record_interrupt(now=_utc("2026-01-01T00:00:00"))
+    complete = tracker.mark_complete(now=_utc("2026-01-01T00:00:01"))
+
+    repeated = tracker.record_interrupt(now=_utc("2026-01-01T00:00:02"))
+
+    assert repeated.phase is ShutdownPhase.COMPLETE
+    assert repeated.completed_at == complete.completed_at
+    assert repeated.interrupt_count == complete.interrupt_count + 1
+
+
 # --------------------------------------------------------------------------- #
 # Status projection tests
 # --------------------------------------------------------------------------- #
@@ -961,14 +1020,19 @@ def test_old_run_lease_can_be_validated_for_adoption() -> None:
 
 def test_fetch_timeout_kills_whole_process_group(tmp_path):
     """A hung transport child must die with the fetch, not become orphaned."""
-    import subprocess
     import time as _time
-    from pathlib import Path
 
     from spec_runtime.control_plane.git_timeouts import _run_fetch_process_group
+    from spec_runtime.process_supervisor import inspect_process
 
     pidfile = tmp_path / "child.pid"
-    cmd = ["bash", "-c", f"sleep 30 & echo $! > {pidfile}; wait"]
+    child_code = "import time; time.sleep(30)"
+    parent_code = (
+        "import subprocess,sys,time; "
+        "child=subprocess.Popen([sys.executable,'-c',sys.argv[2]]); "
+        "open(sys.argv[1],'w').write(str(child.pid)); time.sleep(30)"
+    )
+    cmd = [sys.executable, "-c", parent_code, str(pidfile), child_code]
     started = _time.monotonic()
     try:
         _run_fetch_process_group(cmd, timeout=0.5)
@@ -977,13 +1041,12 @@ def test_fetch_timeout_kills_whole_process_group(tmp_path):
         pass
     assert _time.monotonic() - started < 5.0
     child_pid = int(pidfile.read_text().strip())
-    # killpg must have taken the backgrounded child down too.
     deadline = _time.monotonic() + 2.0
     while _time.monotonic() < deadline:
-        if not Path(f"/proc/{child_pid}").exists():
+        if inspect_process(child_pid) is None:
             break
         _time.sleep(0.05)
-    assert not Path(f"/proc/{child_pid}").exists()
+    assert inspect_process(child_pid) is None
 
 
 def test_consumed_operator_request_projects_retryable_not_needs_input(tmp_path):

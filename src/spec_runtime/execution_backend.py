@@ -16,12 +16,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import locale
 import os
 import platform
 import re
 import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
+import time
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,7 +42,20 @@ from .config import (
     ExecutionConfig,
     SpecRuntimeConfig,
 )
+from .git_common import run_git, subprocess_text_kwargs
 from .platform_fs import FileLock, remove_tree
+from .process_supervisor import (
+    LifetimeMode,
+    ManagedProcess,
+    ProcessSupervisor,
+    SupervisionToken,
+    hold_posix_setup_group,
+    list_live_process_group_members,
+)
+from .process_supervisor import run as run_supervised
+from .process_supervisor import (
+    terminate as terminate_supervision_token,
+)
 
 CONTAINER_WORKER_ENV_DENYLIST = frozenset(
     {
@@ -171,7 +188,7 @@ def _is_adjacent_spec_runtime_checkout(source_root: Path) -> bool:
     try:
         if source_module.resolve() != Path(__file__).resolve():
             return False
-        raw = tomllib.loads(pyproject.read_text())
+        raw = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         project = raw.get("project", {})
         return isinstance(project, dict) and project.get("name") == "specbutler"
     except (OSError, tomllib.TOMLDecodeError):
@@ -189,7 +206,11 @@ def host_spec_runtime_version() -> str:
         source_root = Path(__file__).resolve().parents[2]
         pyproject = source_root / "pyproject.toml"
         if _is_adjacent_spec_runtime_checkout(source_root):
-            match = re.search(r'^version\s*=\s*"([^"]+)"', pyproject.read_text(), re.MULTILINE)
+            match = re.search(
+                r'^version\s*=\s*"([^"]+)"',
+                pyproject.read_text(encoding="utf-8"),
+                re.MULTILINE,
+            )
             if match:
                 return match.group(1)
     except OSError:
@@ -211,6 +232,8 @@ def host_spec_runtime_source_id() -> str:
         from importlib import metadata
 
         dist = metadata.distribution("specbutler")
+        # ``importlib.metadata.Distribution.read_text`` handles package
+        # metadata as UTF-8 and accepts only the resource name.
         direct_url_text = dist.read_text("direct_url.json")
         if direct_url_text:
             direct_url = json.loads(direct_url_text)
@@ -223,11 +246,9 @@ def host_spec_runtime_source_id() -> str:
     try:
         source_root = Path(__file__).resolve().parents[2]
         if _is_adjacent_spec_runtime_checkout(source_root):
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
+            result = run_git(
+                ["rev-parse", "HEAD"],
                 cwd=source_root,
-                capture_output=True,
-                text=True,
                 timeout=5,
                 check=False,
             )
@@ -235,11 +256,9 @@ def host_spec_runtime_source_id() -> str:
                 # Editable installs can retain stale direct_url metadata after a pull.
                 # The checkout containing the imported module is authoritative.
                 commit_id = result.stdout.strip()
-                status = subprocess.run(
-                    ["git", "status", "--porcelain", "--untracked-files=normal"],
+                status = run_git(
+                    ["status", "--porcelain", "--untracked-files=normal"],
                     cwd=source_root,
-                    capture_output=True,
-                    text=True,
                     timeout=5,
                     check=False,
                 )
@@ -350,6 +369,10 @@ class CommandRequest:
       default-True behavior).
     * ``stdin_devnull`` ensures commands cannot accidentally inherit the
       orchestrator's stdin when no ``input_text`` is provided.
+    * ``preserve_descendants`` is reserved for setup hooks that intentionally
+      hand declared background services to the orchestrator. It waits for the
+      command leader without waiting on inherited output handles and returns a
+      live Windows Job ownership token when descendants remain.
     """
 
     argv: list[str]
@@ -360,6 +383,7 @@ class CommandRequest:
     input_text: str | None = None
     stdin_devnull: bool = True
     redactions: Sequence[str] = ()
+    preserve_descendants: bool = False
 
 
 @dataclass(frozen=True)
@@ -370,17 +394,22 @@ class CommandResult:
     stdout: str
     stderr: str
     argv: list[str]
+    ownership_token: SupervisionToken | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
 class AgentRequest:
     """Request to launch an agent in a workspace.
 
-    ``popen_kwargs`` carries any extra keyword arguments the orchestrator
-    needs the backend to forward to ``subprocess.Popen`` (for example
-    ``start_new_session=True``, ``text=True``, or ``stdout=PIPE``). The
-    backend owns the actual process spawn so future backends can swap the
-    transport (Docker exec, remote shell) without the orchestrator caring.
+    ``popen_kwargs`` carries transport-neutral stream configuration the
+    orchestrator needs the backend to forward (for example ``text=True`` or
+    ``stdout=PIPE``). The backend owns process-group and platform launch policy
+    so future backends can swap the transport (Docker exec, remote shell)
+    without the orchestrator caring.
     """
 
     argv: list[str]
@@ -400,7 +429,27 @@ class AgentResult:
     stderr: str = ""
 
 
-AgentMonitor = Callable[["subprocess.Popen[Any]"], int]
+AgentMonitor = Callable[["ManagedProcess | subprocess.Popen[Any]"], int]
+
+
+def _run_agent_monitor(
+    proc: ManagedProcess | subprocess.Popen[Any],
+    monitor: AgentMonitor,
+) -> int:
+    """Run an agent monitor and release its retained ownership handle.
+
+    Native Windows run-owned processes retain a Job Object until ``close``.
+    Monitors commonly finish by polling the leader rather than calling
+    ``wait``, so the backend owns this final release. Closing the Job also
+    terminates any descendants that outlived the provider leader.
+    """
+
+    try:
+        return monitor(proc)
+    finally:
+        close = getattr(proc, "close", None)
+        if callable(close):
+            close()
 
 
 @dataclass(frozen=True)
@@ -478,8 +527,11 @@ class ExecutionBackend(Protocol):
         is provided the backend starts the process and hands the live
         ``Popen`` to the caller, who supervises completion (process
         registration, progress streaming, idle timeouts) and returns the
-        final exit code. When ``monitor`` is ``None`` the backend runs the
-        command to completion and returns the captured result.
+        final exit code. Built-in backends provide a ``ManagedProcess`` that
+        owns its POSIX group or Windows Job; legacy custom backends may still
+        provide a raw ``Popen`` only when they establish an equivalent owned
+        boundary. When ``monitor`` is ``None`` the backend runs the command to
+        completion and returns the captured result.
         """
         ...
 
@@ -643,7 +695,7 @@ def _read_outbox_metadata(outbox_path: Path) -> OutboxMetadata | None:
     if not candidate.is_file():
         return None
     try:
-        payload = json.loads(candidate.read_text())
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(payload, dict):
@@ -661,6 +713,311 @@ def _read_outbox_metadata(outbox_path: Path) -> OutboxMetadata | None:
         head_sha=str(payload.get("head_sha", "") or "").strip(),
         raw=payload,
     )
+
+
+def _close_fd(control_fd: int) -> None:
+    try:
+        os.close(control_fd)
+    except OSError:
+        pass
+
+
+def _wait_for_posix_setup_status(
+    managed: ManagedProcess,
+    status_path: Path,
+    *,
+    argv: Sequence[str],
+    timeout: float | None,
+) -> dict[str, object]:
+    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            payload = None
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("POSIX setup keeper published invalid status") from exc
+        if isinstance(payload, dict):
+            if payload.get("schema") != 1:
+                raise RuntimeError("POSIX setup keeper published an unknown status schema")
+            return payload
+        if managed.process.poll() is not None:
+            raise RuntimeError("POSIX setup keeper exited before publishing command status")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(list(argv), timeout)
+        time.sleep(0.02)
+
+
+def _stop_posix_setup_keeper(managed: ManagedProcess, control_fd: int) -> bool:
+    """Stop one live keeper boundary and close its parent-death descriptor."""
+    try:
+        stopped = terminate_supervision_token(managed.token, grace_seconds=0)
+    finally:
+        _close_fd(control_fd)
+    try:
+        managed.process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        stopped = False
+    finally:
+        managed.close()
+    return stopped
+
+
+def _release_empty_posix_setup_keeper(
+    managed: ManagedProcess,
+    control_fd: int,
+) -> None:
+    """Tell an empty retained boundary to exit without a group signal."""
+    try:
+        os.write(control_fd, b"R")
+    except OSError as exc:
+        _stop_posix_setup_keeper(managed, control_fd)
+        raise RuntimeError("Could not release empty POSIX setup keeper") from exc
+    _close_fd(control_fd)
+    try:
+        returncode = managed.process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired as exc:
+        terminate_supervision_token(managed.token, grace_seconds=0)
+        managed.process.wait(timeout=5.0)
+        raise RuntimeError("POSIX setup keeper did not acknowledge release") from exc
+    finally:
+        managed.close()
+    if returncode != 0:
+        raise RuntimeError(
+            f"POSIX setup keeper failed while releasing an empty boundary: {returncode}"
+        )
+
+
+def _read_command_output(
+    stdout_file: Any,
+    stderr_file: Any,
+    *,
+    encoding: str,
+) -> tuple[str, str]:
+    stdout_file.seek(0)
+    stderr_file.seek(0)
+    return (
+        stdout_file.read().decode(encoding, errors="replace"),
+        stderr_file.read().decode(encoding, errors="replace"),
+    )
+
+
+def _run_posix_command_preserving_descendants(
+    request: CommandRequest,
+    *,
+    env: dict[str, str] | None,
+) -> CommandResult:
+    """Run setup beneath a live group keeper and retain its complete boundary."""
+    encoding = str(
+        subprocess_text_kwargs(request.argv).get("encoding")
+        or locale.getpreferredencoding(False)
+    )
+    keeper_path = Path(__file__).with_name("setup_process_keeper.py")
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_file,
+        tempfile.TemporaryFile(mode="w+b") as stderr_file,
+        tempfile.TemporaryDirectory(prefix="spec-setup-keeper-") as keeper_dir,
+    ):
+        status_path = Path(keeper_dir) / "status.json"
+        control_read_fd, control_write_fd = os.pipe()
+        managed: ManagedProcess | None = None
+        try:
+            managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+                [
+                    sys.executable,
+                    str(keeper_path),
+                    str(status_path),
+                    str(control_read_fd),
+                    "--",
+                    *request.argv,
+                ],
+                cwd=request.cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                pass_fds=(control_read_fd,),
+            )
+        except BaseException:
+            _close_fd(control_write_fd)
+            raise
+        finally:
+            _close_fd(control_read_fd)
+
+        control_fd: int | None = control_write_fd
+        try:
+            status = _wait_for_posix_setup_status(
+                managed,
+                status_path,
+                argv=request.argv,
+                timeout=request.timeout,
+            )
+            stdout, stderr = _read_command_output(
+                stdout_file,
+                stderr_file,
+                encoding=encoding,
+            )
+            launch_error = status.get("launch_error")
+            if isinstance(launch_error, dict):
+                release_fd = control_fd
+                control_fd = None
+                _release_empty_posix_setup_keeper(managed, release_fd)
+                raw_errno = launch_error.get("errno")
+                error_number = int(raw_errno) if isinstance(raw_errno, int) else None
+                filename = launch_error.get("filename")
+                raise OSError(
+                    error_number,
+                    str(launch_error.get("message") or "setup command launch failed"),
+                    str(filename) if filename else None,
+                )
+            returncode = status.get("returncode")
+            if not isinstance(returncode, int):
+                raise RuntimeError("POSIX setup keeper omitted the command return code")
+
+            members = list_live_process_group_members(managed.token.pgid)
+            if members is None:
+                raise RuntimeError("Could not inventory the retained POSIX setup group")
+            descendants = tuple(
+                pid for pid in members if pid != managed.token.identity.pid
+            )
+            ownership_token: SupervisionToken | None = None
+            if descendants:
+                ownership_token = hold_posix_setup_group(managed.token, control_fd)
+                if ownership_token is None:
+                    raise RuntimeError("Could not retain the POSIX setup-group keeper")
+                # Ownership of this descriptor moved into process_supervisor's
+                # held-group registry and its atexit parent-death backstop.
+                control_fd = None
+            else:
+                release_fd = control_fd
+                control_fd = None
+                _release_empty_posix_setup_keeper(managed, release_fd)
+            return CommandResult(
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                argv=list(request.argv),
+                ownership_token=ownership_token,
+            )
+        except subprocess.TimeoutExpired as exc:
+            if control_fd is not None:
+                _stop_posix_setup_keeper(managed, control_fd)
+                control_fd = None
+            stdout, stderr = _read_command_output(
+                stdout_file,
+                stderr_file,
+                encoding=encoding,
+            )
+            exc.output = stdout
+            exc.stdout = stdout
+            exc.stderr = stderr
+            raise
+        except BaseException:
+            if control_fd is not None:
+                _stop_posix_setup_keeper(managed, control_fd)
+                control_fd = None
+            raise
+
+
+def run_local_command_preserving_descendants(
+    request: CommandRequest,
+    *,
+    env: dict[str, str] | None,
+) -> CommandResult:
+    """Run a setup leader while retaining descendants for an agent handoff.
+
+    Pipes are deliberately not used: a background service can inherit them and
+    keep ``communicate()`` waiting forever. Temporary files let us wait for only
+    the setup leader. On Windows the retained Job handle remains the cleanup
+    capability for descendants; on POSIX a dedicated live group leader plus a
+    parent-death pipe retain the setup boundary until the manifest handoff is
+    accepted or rejected.
+    """
+    if request.input_text is not None:
+        raise ValueError("descendant-preserving commands do not accept input_text")
+    if os.name == "posix":
+        return _run_posix_command_preserving_descendants(request, env=env)
+
+    encoding = str(
+        subprocess_text_kwargs(request.argv).get("encoding")
+        or locale.getpreferredencoding(False)
+    )
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_file,
+        tempfile.TemporaryFile(mode="w+b") as stderr_file,
+    ):
+        managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+            request.argv,
+            cwd=request.cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        try:
+            returncode = int(managed.process.wait(timeout=request.timeout))
+        except subprocess.TimeoutExpired as exc:
+            try:
+                managed.kill()
+                managed.process.wait(timeout=5.0)
+            finally:
+                managed.close()
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read().decode(encoding, errors="replace")
+            stderr = stderr_file.read().decode(encoding, errors="replace")
+            exc.output = stdout
+            exc.stdout = stdout
+            exc.stderr = stderr
+            raise
+        except BaseException:
+            try:
+                managed.kill()
+            except BaseException:
+                pass
+            try:
+                managed.close()
+            except BaseException:
+                pass
+            raise
+
+        try:
+            stdout_file.seek(0)
+            stderr_file.seek(0)
+            stdout = stdout_file.read().decode(encoding, errors="replace")
+            stderr = stderr_file.read().decode(encoding, errors="replace")
+            ownership_token: SupervisionToken | None = None
+            if managed.owned_tree_active():
+                if os.name == "nt":
+                    # The Job is already retained in process_supervisor's live
+                    # Job registry. Do not close it until manifest registration
+                    # gives the orchestrator an identity-checked teardown path.
+                    ownership_token = managed.token
+                else:
+                    managed.close()
+            else:
+                managed.close()
+        except BaseException:
+            # Once the setup leader has exited, a Job inventory or output-read
+            # failure must still close the kill-on-close ownership boundary.
+            # Otherwise a retained setup service could become an undiscoverable
+            # side effect of a command whose manifest was never consumed.
+            try:
+                managed.kill()
+            except BaseException:
+                pass
+            try:
+                managed.close()
+            except BaseException:
+                pass
+            raise
+        return CommandResult(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            argv=list(request.argv),
+            ownership_token=ownership_token,
+        )
 
 
 class WorktreeExecutionBackend:
@@ -721,12 +1078,15 @@ class WorktreeExecutionBackend:
             kwargs["inherit_env"] = False
         if request.input_text is not None:
             kwargs["input_text"] = request.input_text
+        if request.preserve_descendants:
+            kwargs["preserve_descendants"] = True
         completed = orchestrator.run_subprocess(list(request.argv), **kwargs)
         return CommandResult(
             returncode=completed.returncode,
             stdout=completed.stdout or "",
             stderr=completed.stderr or "",
             argv=list(request.argv),
+            ownership_token=getattr(completed, "ownership_token", None),
         )
 
     def launch_agent(
@@ -741,18 +1101,19 @@ class WorktreeExecutionBackend:
             popen_kwargs.setdefault("env", request.env)
         if monitor is None:
             popen_kwargs.setdefault("text", True)
+            popen_kwargs.setdefault("errors", "replace")
             if request.capture_stdout:
                 popen_kwargs.setdefault("stdout", subprocess.PIPE)
                 popen_kwargs.setdefault("stderr", subprocess.PIPE)
-            proc = subprocess.Popen(request.argv, **popen_kwargs)
+            proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
             stdout, stderr = proc.communicate()
             return AgentResult(
                 returncode=proc.returncode,
                 stdout=stdout or "",
                 stderr=stderr or "",
             )
-        proc = subprocess.Popen(request.argv, **popen_kwargs)
-        returncode = monitor(proc)
+        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
+        returncode = _run_agent_monitor(proc, monitor)
         return AgentResult(returncode=returncode)
 
     def collect_outbox_metadata(self, workspace: WorkspaceHandle) -> OutboxMetadata | None:
@@ -867,13 +1228,16 @@ class CloneExecutionBackend:
                 env.update(request.env)
         elif request.env is not None:
             env = dict(request.env)
+        if request.preserve_descendants:
+            return run_local_command_preserving_descendants(request, env=env)
         stdin = subprocess.DEVNULL if request.stdin_devnull and request.input_text is None else None
-        completed = subprocess.run(
+        completed = run_supervised(
             request.argv,
             cwd=request.cwd,
             env=env,
             input=request.input_text,
             text=True,
+            errors="replace",
             capture_output=True,
             timeout=request.timeout,
             stdin=stdin,
@@ -907,10 +1271,11 @@ class CloneExecutionBackend:
             popen_kwargs.setdefault("env", request.env)
         if monitor is None:
             popen_kwargs.setdefault("text", True)
+            popen_kwargs.setdefault("errors", "replace")
             if request.capture_stdout:
                 popen_kwargs.setdefault("stdout", subprocess.PIPE)
                 popen_kwargs.setdefault("stderr", subprocess.PIPE)
-            proc = subprocess.Popen(request.argv, **popen_kwargs)
+            proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
             stdout, stderr = proc.communicate()
             self._write_command_log(
                 kind="agent",
@@ -932,8 +1297,8 @@ class CloneExecutionBackend:
                 stdout=stdout or "",
                 stderr=stderr or "",
             )
-        proc = subprocess.Popen(request.argv, **popen_kwargs)
-        returncode = monitor(proc)
+        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(request.argv, **popen_kwargs)
+        returncode = _run_agent_monitor(proc, monitor)
         self._write_command_log(
             kind="agent",
             cwd=request.cwd,
@@ -971,7 +1336,8 @@ class CloneExecutionBackend:
             },
         )
         (snapshots / f"{target.name}.json").write_text(
-            json.dumps(ref.metadata | {"label": label, "path": str(target)}, indent=2, sort_keys=True)
+            json.dumps(ref.metadata | {"label": label, "path": str(target)}, indent=2, sort_keys=True),
+            encoding="utf-8",
         )
         return ref
 
@@ -1058,7 +1424,7 @@ class CloneExecutionBackend:
                 f"reason: {reason}",
             ]
         )
-        with path.open("a") as handle:
+        with path.open("a", encoding="utf-8") as handle:
             if path.stat().st_size:
                 handle.write("\n---\n")
             handle.write(entry)
@@ -1151,9 +1517,9 @@ class CloneExecutionBackend:
             common_dir = repo_root / common_dir
         exclude = common_dir / "info" / "exclude"
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        existing = exclude.read_text().splitlines() if exclude.exists() else []
+        existing = exclude.read_text(encoding="utf-8").splitlines() if exclude.exists() else []
         if rel not in existing:
-            with exclude.open("a") as handle:
+            with exclude.open("a", encoding="utf-8") as handle:
                 if existing and existing[-1].strip():
                     handle.write("\n")
                 handle.write(f"{rel}\n")
@@ -1274,7 +1640,8 @@ class CloneExecutionBackend:
                     f"$ git status --short --branch\n{status.stdout}{status.stderr}",
                     f"$ git rev-parse HEAD\n{rev.stdout}{rev.stderr}",
                 ]
-            )
+            ),
+            encoding="utf-8",
         )
 
     def _next_log_path(self, logs: Path, kind: str, argv: list[str]) -> Path:
@@ -1321,7 +1688,7 @@ class CloneExecutionBackend:
             "stderr:",
             _redact_log_text(stderr, redactions),
         ]
-        path.write_text("\n".join(payload))
+        path.write_text("\n".join(payload), encoding="utf-8")
 
     def _write_agent_result(
         self,
@@ -1345,7 +1712,9 @@ class CloneExecutionBackend:
             "stdout": stdout,
             "stderr": stderr,
         }
-        (outbox / "agent-result.json").write_text(json.dumps(payload, indent=2, sort_keys=True))
+        (outbox / "agent-result.json").write_text(
+            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        )
         self._write_completion_artifacts(source=run_root / "source", outbox=outbox)
 
     def _write_completion_artifacts(self, *, source: Path, outbox: Path) -> None:
@@ -1383,9 +1752,11 @@ class CloneExecutionBackend:
                 "final_patch": diff.stderr if diff.returncode != 0 else "",
             },
         }
-        (outbox / "commit-metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True))
+        (outbox / "commit-metadata.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
+        )
         if diff.returncode == 0:
-            (outbox / "final.patch").write_text(diff.stdout)
+            (outbox / "final.patch").write_text(diff.stdout, encoding="utf-8")
 
     _BASE_REF_FILENAME = "base-ref"
 
@@ -1404,14 +1775,14 @@ class CloneExecutionBackend:
         if not sha:
             return
         try:
-            (run_root / self._BASE_REF_FILENAME).write_text(f"{sha}\n")
+            (run_root / self._BASE_REF_FILENAME).write_text(f"{sha}\n", encoding="utf-8")
         except OSError:
             pass
 
     def _read_persisted_base_sha(self, run_root: Path, source: Path) -> str:
         """Return the recorded base SHA if it still resolves in ``source``."""
         try:
-            sha = (run_root / self._BASE_REF_FILENAME).read_text().strip()
+            sha = (run_root / self._BASE_REF_FILENAME).read_text(encoding="utf-8").strip()
         except OSError:
             return ""
         if not sha:
@@ -1558,7 +1929,7 @@ class CloneExecutionBackend:
             diff = self._run_git(["diff", "HEAD", "--binary"], cwd=source)
             if diff.returncode == 0:
                 try:
-                    patch_path.write_text(diff.stdout)
+                    patch_path.write_text(diff.stdout, encoding="utf-8")
                 except OSError as exc:
                     manifest.setdefault("errors", {})["uncommitted_patch"] = str(exc)
                     unpreserved.append("uncommitted tracked changes")
@@ -1611,18 +1982,26 @@ class CloneExecutionBackend:
             manifest["unpreserved"] = unpreserved
 
         manifest_path = rescue_dir / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+        )
         manifest["manifest_path"] = str(manifest_path)
 
         index_path = rescue_root / self.RESCUE_INDEX_FILENAME
         try:
-            existing = json.loads(index_path.read_text()) if index_path.exists() else []
+            existing = (
+                json.loads(index_path.read_text(encoding="utf-8"))
+                if index_path.exists()
+                else []
+            )
             if not isinstance(existing, list):
                 existing = []
         except (json.JSONDecodeError, OSError):
             existing = []
         existing.append(manifest)
-        index_path.write_text(json.dumps(existing, indent=2, sort_keys=True))
+        index_path.write_text(
+            json.dumps(existing, indent=2, sort_keys=True), encoding="utf-8"
+        )
         return manifest
 
     def _assert_workspace_deletable(self, source: Path, *, allow_unpushed_work: bool) -> None:
@@ -1647,11 +2026,9 @@ class CloneExecutionBackend:
 
     @staticmethod
     def _run_git(argv: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", *argv],
+        return run_git(
+            argv,
             cwd=cwd,
-            capture_output=True,
-            text=True,
             check=False,
         )
 
@@ -1684,9 +2061,42 @@ def _is_container_worker_env_allowed(key: str) -> bool:
 def _replace_host_path_reference(value: str, *, host_path: str, container_path: str) -> str:
     if not host_path:
         return value
-    path_boundary = r"A-Za-z0-9_~/-"
-    pattern = re.compile(rf"(?<![{path_boundary}]){re.escape(host_path)}(?=$|/|[^{path_boundary}])")
-    return pattern.sub(container_path, value)
+    path_boundary = r"A-Za-z0-9_~\\/-"
+    # A mapped path may be embedded in an argv value such as a JSON document
+    # or path-list environment variable.  Normalize separators only through
+    # the end of that path reference; replacing every backslash in ``value``
+    # would also rewrite unrelated regexes, JSON escapes, or later values.
+    reference_terminators = "\"'`,;{}[]\r\n"
+    # Whitespace can be part of a Windows path, so it is not an unconditional
+    # terminator.  It does end the reference when the next token is visibly a
+    # command option or environment-style assignment.  Without this boundary,
+    # a composite value such as ``C:\repo\a.txt --regex=\d+`` treats the
+    # regex as part of the path and rewrites its backslash.
+    token_start = r"(?:-{1,2}[A-Za-z0-9]|[A-Za-z_][A-Za-z0-9_]*=)"
+    suffix_stop = rf"(?:[{re.escape(reference_terminators)}]|\s+(?={token_start}))"
+    suffix_pattern = rf"(?P<suffix>(?:[\\/](?:(?!{suffix_stop}).)*)?)"
+    variants = sorted(
+        {
+            host_path,
+            host_path.replace("\\", "/"),
+            host_path.replace("/", "\\"),
+        },
+        key=len,
+        reverse=True,
+    )
+    translated = value
+    for variant in variants:
+        pattern = re.compile(
+            rf"(?<![{path_boundary}]){re.escape(variant)}"
+            rf"(?=$|[\\/]|[^{path_boundary}]){suffix_pattern}"
+        )
+
+        def replace_match(match: re.Match[str]) -> str:
+            suffix = match.group("suffix") or ""
+            return container_path + suffix.replace("\\", "/")
+
+        translated = pattern.sub(replace_match, translated)
+    return translated
 
 
 def _redact_log_text(text: str, redactions: Sequence[str]) -> str:
@@ -1718,9 +2128,9 @@ class ContainerCliRunner:
             env=env,
             input=input_text,
             timeout=timeout,
-            text=True,
             capture_output=True,
             check=False,
+            **subprocess_text_kwargs(argv),
         )
 
     def popen(
@@ -1735,7 +2145,7 @@ class ContainerCliRunner:
         kwargs.setdefault("cwd", str(cwd))
         if env is not None:
             kwargs.setdefault("env", env)
-        return subprocess.Popen(argv, **kwargs)
+        return ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(argv, **kwargs)
 
 
 class ContainerExecutionBackend(CloneExecutionBackend):
@@ -2051,7 +2461,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             env=client_env,
             popen_kwargs=popen_kwargs,
         )
-        returncode = monitor(proc)
+        returncode = _run_agent_monitor(proc, monitor)
         self._remember_container_id(run_root, state)
         self._sync_volume_workspace_to_host(run_root, state)
         self._write_command_log(
@@ -2097,7 +2507,12 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 "service_volume_snapshots": state.get("service_volume_snapshots", {}).get(label, {}),
             }
             (ref.path.parent / f"{ref.path.name}.json").write_text(
-                json.dumps(metadata | {"label": label, "path": str(ref.path)}, indent=2, sort_keys=True)
+                json.dumps(
+                    metadata | {"label": label, "path": str(ref.path)},
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
             )
             return SnapshotRef(label=ref.label, path=ref.path, metadata=metadata)
         finally:
@@ -2366,7 +2781,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     f"logged_at: {datetime.now(timezone.utc).isoformat()}",
                     reason,
                 ]
-            )
+            ),
+            encoding="utf-8",
         )
 
     def _write_teardown_failure_log(self, logs: Path, container_id: str, detail: str) -> None:
@@ -2380,7 +2796,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             ]
         )
         has_content = path.exists() and path.stat().st_size > 0
-        with path.open("a") as handle:
+        with path.open("a", encoding="utf-8") as handle:
             if has_content:
                 handle.write("\n---\n")
             handle.write(entry)
@@ -2446,7 +2862,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                         "after teardown):",
                         *removed,
                     ]
-                )
+                ),
+                encoding="utf-8",
             )
 
     def _clear_stale_volume_postmaster_pids(
@@ -2649,7 +3066,9 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             # only run when the tag is new (one per spec upgrade), so forcing
             # --no-cache for those Dockerfiles buys correctness at bounded cost;
             # template-generated Dockerfiles cache normally via the ARG reference.
-            if "SPEC_BUTLER_VERSION" not in dockerfile.read_text(errors="replace"):
+            if "SPEC_BUTLER_VERSION" not in dockerfile.read_text(
+                encoding="utf-8", errors="replace"
+            ):
                 build_argv.append("--no-cache")
             if self._container.build_ssh:
                 build_argv.extend(["--ssh", self._container.build_ssh])
@@ -2720,7 +3139,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, target)
         self._copy_build_source(repo_root=repo_root, context=context)
-        source_dockerfile = dockerfile.read_text()
+        source_dockerfile = dockerfile.read_text(encoding="utf-8")
         wrapper = [
             source_dockerfile.rstrip(),
             "",
@@ -2738,14 +3157,15 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 ]
             )
         wrapper.append(f"COPY . {CONTAINER_BOOTSTRAP_SOURCE}/")
-        (context / "Dockerfile").write_text("\n".join(wrapper) + "\n")
+        (context / "Dockerfile").write_text("\n".join(wrapper) + "\n", encoding="utf-8")
         (context / "README.txt").write_text(
             "Generated by spec container backend. Dependency manifests are copied "
             "with their repo-relative paths before the optional bootstrap cache "
             "layer, and full source is copied after that layer so dependency "
             "installs can be cached across ordinary source edits. Runtime source "
             "is mounted at /workspace/source so it does not hide the cached "
-            "bootstrap layer under /workspace/bootstrap.\n"
+            "bootstrap layer under /workspace/bootstrap.\n",
+            encoding="utf-8",
         )
         return context
 
@@ -2958,7 +3378,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     },
                     indent=2,
                     sort_keys=True,
-                )
+                ),
+                encoding="utf-8",
             )
             raise RuntimeError(
                 "Playwright MCP browser/runtime version mismatch: "
@@ -3044,7 +3465,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             if not package_path.is_file():
                 continue
             try:
-                payload = json.loads(package_path.read_text())
+                payload = json.loads(package_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 continue
             if not isinstance(payload, dict):
@@ -3157,7 +3578,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 },
                 indent=2,
                 sort_keys=True,
-            )
+            ),
+            encoding="utf-8",
         )
 
     def _remove_playwright_mcp_sidecar(
@@ -3332,7 +3754,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     },
                     indent=2,
                     sort_keys=True,
-                )
+                ),
+                encoding="utf-8",
             )
             raise RuntimeError(
                 "Container backend sidecar service startup failed "
@@ -3349,7 +3772,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         labels = state.get("resource_labels", {})
 
         try:
-            compose = yaml.safe_load(compose_file.read_text()) or {}
+            compose = yaml.safe_load(compose_file.read_text(encoding="utf-8")) or {}
         except (OSError, yaml.YAMLError):
             compose = {}
         services = compose.get("services", {}) if isinstance(compose, dict) else {}
@@ -3377,7 +3800,9 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 if not isinstance(value, dict) or not value.get("external")
             }
         path = run_root / "container-compose-labels.json"
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         return path
 
     def _stop_sidecar_services(self, run_root: Path, state: dict[str, Any]) -> None:
@@ -3578,7 +4003,11 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         argv.extend([state["image"], "sh", "-lc", "sleep infinity"])
         result = self._runner.run(argv, cwd=run_root)
         self._write_image_log(run_root / "logs", "in-worker-services.log", result)
-        container_id = cidfile.read_text().strip() if cidfile.is_file() else result.stdout.strip()
+        container_id = (
+            cidfile.read_text(encoding="utf-8").strip()
+            if cidfile.is_file()
+            else result.stdout.strip()
+        )
         if container_id:
             state["worker_container"] = container_id
             state["containers"] = list(dict.fromkeys([*state.get("containers", []), container_id]))
@@ -3606,7 +4035,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     },
                     indent=2,
                     sort_keys=True,
-                )
+                ),
+                encoding="utf-8",
             )
             if container_id:
                 # ``docker run -d`` failed but a container id was captured
@@ -3863,7 +4293,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     },
                     indent=2,
                     sort_keys=True,
-                )
+                ),
+                encoding="utf-8",
             )
             raise ExecutionBackendImportError(
                 f"Container backend import failed: could not import source volume {volume}.",
@@ -4085,7 +4516,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         if cp.returncode != 0 or not dest_path.is_file():
             return None
         try:
-            return dest_path.read_text()
+            return dest_path.read_text(encoding="utf-8")
         except OSError:
             return None
 
@@ -4115,7 +4546,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     result.stderr or "",
                 ]
             )
-        (logs / name).write_text("\n".join(sections))
+        (logs / name).write_text("\n".join(sections), encoding="utf-8")
 
     @staticmethod
     def _passwd_line_has_id(line: str, target_id: int) -> bool:
@@ -4172,8 +4603,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         shim_dir.mkdir(parents=True, exist_ok=True)
         passwd_path = shim_dir / "passwd"
         group_path = shim_dir / "group"
-        passwd_path.write_text("\n".join(passwd_lines) + "\n")
-        group_path.write_text("\n".join(group_lines) + "\n")
+        passwd_path.write_text("\n".join(passwd_lines) + "\n", encoding="utf-8")
+        group_path.write_text("\n".join(group_lines) + "\n", encoding="utf-8")
         os.chmod(passwd_path, 0o644)
         os.chmod(group_path, 0o644)
         return passwd_path, group_path
@@ -4216,7 +4647,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         containers = list(state.get("containers", []))
         for cidfile in logs.glob("container-*.cid"):
             try:
-                container_id = cidfile.read_text().strip()
+                container_id = cidfile.read_text(encoding="utf-8").strip()
             except OSError:
                 continue
             if container_id and container_id not in containers:
@@ -4240,7 +4671,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 return {}
             raise RuntimeError(f"Container backend state is missing: {path}")
         try:
-            payload = json.loads(path.read_text())
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Container backend state is invalid: {path}") from exc
         return payload if isinstance(payload, dict) else {}
@@ -4248,7 +4679,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
     def _write_container_state(self, run_root: Path, state: dict[str, Any]) -> None:
         path = self._container_state_path(run_root)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2, sort_keys=True))
+        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
     @staticmethod
     def _write_image_log(
@@ -4277,7 +4708,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     "stderr:",
                     ContainerExecutionBackend._redact_log_text(result.stderr or "", redactions),
                 ]
-            )
+            ),
+            encoding="utf-8",
         )
 
     @staticmethod

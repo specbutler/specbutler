@@ -4,21 +4,24 @@ import hashlib
 import json
 import os
 import re
-import signal
-import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .platform_fs import atomic_write_text
+from .process_supervisor import (
+    LifetimeMode,
+    ProcessIdentity,
+    SupervisionToken,
+    inspect_process,
+    supervision_boundary_is_inactive,
+    terminate,
+    terminate_exact_process,
+)
+
 PROCESS_TERMINATION_TIMEOUT_SECONDS = 5.0
-
-
-@dataclass(frozen=True)
-class ProcessIdentity:
-    pid: int
-    started_at: str
-    command: str
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ class RegisteredProcess:
     termination_scope: str = "pid"
     pgid: int = 0
     registered_at: str = ""
+    supervision_token: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -66,51 +70,18 @@ def _registry_path(state_root: Path, worktree_path: Path) -> Path:
 
 def _read_json_dict(path: Path) -> dict | None:
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return None
     return data if isinstance(data, dict) else None
 
 
 def _write_json_file_atomically(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        os.replace(tmp_path, path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def read_process_identity(pid: int) -> ProcessIdentity | None:
-    if pid <= 0:
-        return None
-    try:
-        result = subprocess.run(
-            ["ps", "-ww", "-o", "pid=", "-o", "lstart=", "-o", "command=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    line = next((item.strip() for item in result.stdout.splitlines() if item.strip()), "")
-    if not line:
-        return None
-    parts = line.split(None, 6)
-    if len(parts) != 7:
-        return None
-    try:
-        live_pid = int(parts[0])
-    except ValueError:
-        return None
-    return ProcessIdentity(
-        pid=live_pid,
-        started_at=" ".join(parts[1:6]),
-        command=parts[6].strip(),
-    )
+    return inspect_process(pid)
 
 
 def is_process_alive(pid: int, expected_started_at: str = "") -> bool:
@@ -154,6 +125,11 @@ def load_registered_processes(state_root: Path, worktree_path: Path) -> list[Reg
                 termination_scope=str(item.get("termination_scope", "pid")).strip() or "pid",
                 pgid=pgid if pgid > 0 else 0,
                 registered_at=str(item.get("registered_at", "")).strip(),
+                supervision_token=(
+                    dict(item["supervision_token"])
+                    if isinstance(item.get("supervision_token"), dict)
+                    else None
+                ),
             )
         )
     return loaded
@@ -192,32 +168,77 @@ def register_process(
     command: str = "",
     termination_scope: str = "pid",
     pgid: int = 0,
+    supervision_token: SupervisionToken | None = None,
 ) -> None:
-    if pid <= 0:
+    if pid <= 0 or not started_at.strip():
         return
-    started_at = started_at.strip()
-    if not started_at:
+    register_processes(
+        state_root,
+        worktree_path,
+        (
+            RegisteredProcess(
+                name=name,
+                kind=kind,
+                pid=pid,
+                started_at=started_at,
+                command=command,
+                termination_scope=termination_scope,
+                pgid=pgid if pgid > 0 else 0,
+                supervision_token=(
+                    supervision_token.to_dict()
+                    if supervision_token is not None
+                    else None
+                ),
+            ),
+        ),
+    )
+
+
+def register_processes(
+    state_root: Path,
+    worktree_path: Path,
+    processes: Sequence[RegisteredProcess],
+) -> None:
+    """Persist one setup manifest's cleanup entries in a single replacement."""
+    if not processes:
         return
+    seen_identities: set[tuple[int, str]] = set()
+    seen_names: set[tuple[str, str]] = set()
+    for process in processes:
+        if process.pid <= 0 or not process.started_at.strip():
+            raise ValueError("registered processes require a positive pid and start identity")
+        identity_key = (process.pid, process.started_at.strip())
+        name_key = (process.name, process.kind)
+        if identity_key in seen_identities or name_key in seen_names:
+            raise ValueError("registered process batches require unique identities and names")
+        seen_identities.add(identity_key)
+        seen_names.add(name_key)
 
     normalized_worktree = _normalize_worktree_path(worktree_path)
     path = _registry_path(state_root, normalized_worktree)
-    entries = [
-        entry
-        for entry in load_registered_processes(state_root, normalized_worktree)
-        if (entry.pid, entry.started_at) != (pid, started_at) and (entry.name, entry.kind) != (name, kind)
-    ]
-    entries.append(
-        RegisteredProcess(
-            name=name,
-            kind=kind,
-            pid=pid,
-            started_at=started_at,
-            command=command,
-            termination_scope=termination_scope,
-            pgid=pgid if pgid > 0 else 0,
-            registered_at=_now_iso(),
+    entries = load_registered_processes(state_root, normalized_worktree)
+    registered_at = _now_iso()
+    for process in processes:
+        started_at = process.started_at.strip()
+        entries = [
+            entry
+            for entry in entries
+            if (entry.pid, entry.started_at) != (process.pid, started_at)
+            and (entry.name, entry.kind) != (process.name, process.kind)
+        ]
+        entries.append(
+            RegisteredProcess(
+                name=process.name,
+                kind=process.kind,
+                pid=process.pid,
+                started_at=started_at,
+                command=process.command,
+                termination_scope=process.termination_scope,
+                pgid=process.pgid if process.pgid > 0 else 0,
+                registered_at=process.registered_at or registered_at,
+                supervision_token=process.supervision_token,
+            )
         )
-    )
     payload = {
         "updated_at": _now_iso(),
         "worktree_path": str(normalized_worktree),
@@ -241,6 +262,33 @@ def prune_dead_processes(state_root: Path, worktree_path: Path) -> tuple[str, ..
     alive: list[RegisteredProcess] = []
     removed: list[str] = []
     for entry in entries:
+        if entry.supervision_token is not None:
+            # The registered payload may exit while other members remain in
+            # its owned Job/process group. Reaping must consult the boundary
+            # token before this entry can be classified as stale. Conversely,
+            # retaining every token forever strands normally completed agents
+            # and setup services after their empty Job/group disappears.
+            try:
+                token = SupervisionToken.from_dict(entry.supervision_token)
+            except (KeyError, TypeError, ValueError):
+                alive.append(entry)
+                continue
+            if (
+                token.payload.pid != entry.pid
+                or token.payload.started_at != entry.started_at
+            ):
+                alive.append(entry)
+                continue
+            if (
+                not is_process_alive(entry.pid, entry.started_at)
+                and supervision_boundary_is_inactive(token)
+            ):
+                removed.append(
+                    f"{entry.name} pid={entry.pid} owned boundary already inactive"
+                )
+                continue
+            alive.append(entry)
+            continue
         if is_process_alive(entry.pid, entry.started_at):
             alive.append(entry)
             continue
@@ -256,14 +304,6 @@ def prune_dead_processes(state_root: Path, worktree_path: Path) -> tuple[str, ..
     else:
         path.unlink(missing_ok=True)
     return tuple(removed)
-
-
-def _signal_entry(entry: RegisteredProcess, sig: int) -> None:
-    if entry.termination_scope == "pgid" and os.name == "posix":
-        target_pgid = entry.pgid or entry.pid
-        os.killpg(target_pgid, sig)
-        return
-    os.kill(entry.pid, sig)
 
 
 def _wait_for_exit(entry: RegisteredProcess, timeout_seconds: float) -> bool:
@@ -285,7 +325,35 @@ def reap_registered_processes(
     del reason
     normalized_worktree = _normalize_worktree_path(worktree_path)
     path = _registry_path(state_root, normalized_worktree)
+    if not path.exists():
+        return ReapReport()
+    payload = _read_json_dict(path)
+    items = payload.get("processes") if payload is not None else None
+    recorded_worktree = str(payload.get("worktree_path", "")).strip() if payload else ""
+    if (
+        payload is None
+        or not isinstance(items, list)
+        or not recorded_worktree
+        or _normalize_worktree_path(Path(recorded_worktree)) != normalized_worktree
+    ):
+        return ReapReport(
+            surviving=(f"process registry for {normalized_worktree} is malformed; refusing cleanup",)
+        )
+    malformed_supervision_token = any(
+        isinstance(item, dict)
+        and "supervision_token" in item
+        and item["supervision_token"] is not None
+        and not isinstance(item["supervision_token"], dict)
+        for item in items
+    )
     entries = load_registered_processes(state_root, normalized_worktree)
+    if len(entries) != len(items) or malformed_supervision_token:
+        return ReapReport(
+            surviving=(
+                f"process registry for {normalized_worktree} contains malformed entries; "
+                "refusing cleanup",
+            )
+        )
     if not entries:
         path.unlink(missing_ok=True)
         return ReapReport()
@@ -294,38 +362,94 @@ def reap_registered_processes(
     stale: list[str] = []
     surviving: list[str] = []
     still_alive: list[RegisteredProcess] = []
+    terminated_boundaries: set[tuple[str, int, str]] = set()
 
     for entry in entries:
-        if not is_process_alive(entry.pid, entry.started_at):
+        entry_alive = is_process_alive(entry.pid, entry.started_at)
+        stopped = False
+        if entry.supervision_token is not None:
+            try:
+                token = SupervisionToken.from_dict(entry.supervision_token)
+            except (KeyError, TypeError, ValueError):
+                surviving.append(f"{entry.name} pid={entry.pid} has an invalid supervision token")
+                still_alive.append(entry)
+                continue
+            if (
+                token.payload.pid != entry.pid
+                or token.payload.started_at != entry.started_at
+            ):
+                surviving.append(
+                    f"{entry.name} pid={entry.pid} supervision token does not match "
+                    "the registered process"
+                )
+                still_alive.append(entry)
+                continue
+            boundary_key = (
+                token.token,
+                token.identity.pid,
+                token.identity.started_at,
+            )
+            if boundary_key in terminated_boundaries:
+                terminated.append(
+                    f"{entry.name} pid={entry.pid} owned boundary terminated"
+                )
+                continue
+            if not entry_alive and supervision_boundary_is_inactive(token):
+                stale.append(
+                    f"{entry.name} pid={entry.pid} owned boundary already inactive"
+                )
+                continue
+            stopped = terminate(token, grace_seconds=timeout_seconds)
+            if not stopped and not entry_alive:
+                # The boundary may have completed between the preflight proof
+                # and the termination attempt. Recheck before preserving a
+                # registry entry that would otherwise block worktree cleanup.
+                if supervision_boundary_is_inactive(token):
+                    stale.append(
+                        f"{entry.name} pid={entry.pid} owned boundary became inactive"
+                    )
+                    continue
+                # A dead payload does not prove its complete owned boundary is
+                # empty. Preserve the cleanup entry/workspace rather than
+                # silently orphaning a worker after its declared service exits.
+                surviving.append(
+                    f"{entry.name} pid={entry.pid} exited but its owned boundary "
+                    "could not be reaped"
+                )
+                still_alive.append(entry)
+                continue
+        elif not entry_alive:
             stale.append(f"{entry.name} pid={entry.pid} already exited")
             continue
-
-        try:
-            _signal_entry(entry, signal.SIGTERM)
-        except ProcessLookupError:
-            stale.append(f"{entry.name} pid={entry.pid} already exited")
-            continue
-        except OSError as exc:
-            surviving.append(f"{entry.name} pid={entry.pid} could not terminate: {exc}")
+        elif os.name == "posix" and entry.termination_scope == "pid":
+            identity = ProcessIdentity(entry.pid, entry.started_at, command=entry.command)
+            stopped = terminate_exact_process(identity, grace_seconds=timeout_seconds)
+        elif os.name == "posix" and entry.termination_scope == "pgid":
+            identity = ProcessIdentity(entry.pid, entry.started_at, command=entry.command)
+            token = SupervisionToken(
+                LifetimeMode.RUN_OWNED,
+                identity,
+                os.getpid(),
+                "registry-reaper",
+                f"registry-{entry.pid}-{entry.started_at}",
+                entry.pgid,
+            )
+            stopped = terminate(token, grace_seconds=timeout_seconds)
+        elif os.name == "posix":
+            surviving.append(
+                f"{entry.name} pid={entry.pid} has unknown termination scope "
+                f"{entry.termination_scope!r}"
+            )
             still_alive.append(entry)
             continue
-
-        if _wait_for_exit(entry, timeout_seconds):
-            terminated.append(f"{entry.name} pid={entry.pid} terminated")
-            continue
-
-        try:
-            _signal_entry(entry, signal.SIGKILL)
-        except ProcessLookupError:
-            terminated.append(f"{entry.name} pid={entry.pid} terminated")
-            continue
-        except OSError as exc:
-            surviving.append(f"{entry.name} pid={entry.pid} could not kill: {exc}")
+        else:
+            surviving.append(f"{entry.name} pid={entry.pid} has no Windows supervision token")
             still_alive.append(entry)
             continue
-
-        if _wait_for_exit(entry, 1.0):
-            terminated.append(f"{entry.name} pid={entry.pid} killed")
+        if stopped and _wait_for_exit(entry, 1.0):
+            terminated.append(f"{entry.name} pid={entry.pid} terminated")
+            if entry.supervision_token is not None:
+                terminated_boundaries.add(boundary_key)
             continue
 
         surviving.append(f"{entry.name} pid={entry.pid} survived reap")

@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -41,15 +42,18 @@ def test_claude_chat_provider_uses_oauth_compatible_safe_argv(
     tmp_path: Path,
 ) -> None:
     calls: list[list[str]] = []
+    spawn_kwargs: list[dict[str, object]] = []
 
-    def fake_popen(command, **_kwargs):
+    def fake_spawn(_supervisor, command, **kwargs):
         calls.append(command)
+        spawn_kwargs.append(kwargs)
         return _CompletedChatProcess(
             '{"type":"assistant","message":{"content":'
             '[{"type":"text","text":"claude-ok"}]}}\n'
         )
 
-    monkeypatch.setattr(tui_app.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tui_app.ProcessSupervisor, "spawn", fake_spawn)
+    monkeypatch.setattr(tui_app, "require_host_agent_available", lambda _agent: None)
     provider = tui_app.CliChatProvider(agent="claude", repo_root=tmp_path)
 
     assert list(provider._stream_claude_output("provider prompt")) == ["claude-ok"]
@@ -59,6 +63,47 @@ def test_claude_chat_provider_uses_oauth_compatible_safe_argv(
     assert calls[0][-2:] == ["--", "provider prompt"]
     tools_index = calls[0].index("--tools")
     assert calls[0][tools_index + 1] == ""
+    assert spawn_kwargs[0]["encoding"] == "utf-8"
+    assert spawn_kwargs[0]["errors"] == "replace"
+
+
+def test_native_windows_hides_claude_chat_when_host_sandbox_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".spec.toml").write_text(
+        '[agents]\ndefault = "claude"\nallowed = ["claude", "codex"]\n'
+    )
+    reason = tui_app.host_agent_unavailability_reason("claude", platform="win32")
+    assert reason
+    monkeypatch.setattr(tui_app.shutil, "which", lambda _agent: "C:/Tools/agent.exe")
+    monkeypatch.setattr(
+        tui_app,
+        "host_agent_unavailability_reason",
+        lambda agent: reason if agent == "claude" else "",
+    )
+
+    assert tui_app._available_chat_agents(tmp_path) == ("codex",)
+
+
+def test_native_windows_direct_claude_stream_fails_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    reason = tui_app.host_agent_unavailability_reason("claude", platform="win32")
+    spawn = MagicMock()
+    monkeypatch.setattr(tui_app.ProcessSupervisor, "spawn", spawn)
+    monkeypatch.setattr(
+        tui_app,
+        "require_host_agent_available",
+        MagicMock(side_effect=tui_app.HostAgentUnavailableError(reason)),
+    )
+    provider = tui_app.CliChatProvider(agent="claude", repo_root=tmp_path)
+
+    with pytest.raises(RuntimeError, match="WSL2"):
+        list(provider._stream_claude_output("provider prompt"))
+
+    spawn.assert_not_called()
 
 
 def test_codex_chat_provider_uses_read_only_ephemeral_argv(
@@ -66,15 +111,17 @@ def test_codex_chat_provider_uses_read_only_ephemeral_argv(
     tmp_path: Path,
 ) -> None:
     calls: list[list[str]] = []
+    spawn_kwargs: list[dict[str, object]] = []
 
-    def fake_popen(command, **_kwargs):
+    def fake_spawn(_supervisor, command, **kwargs):
         calls.append(command)
+        spawn_kwargs.append(kwargs)
         return _CompletedChatProcess(
             '{"type":"item.completed","item":{"type":"agent_message",'
             '"id":"assistant-1","text":"codex-ok"}}\n'
         )
 
-    monkeypatch.setattr(tui_app.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(tui_app.ProcessSupervisor, "spawn", fake_spawn)
     provider = tui_app.CliChatProvider(agent="codex", repo_root=tmp_path)
 
     assert list(provider._stream_codex_output("provider prompt")) == ["codex-ok"]
@@ -82,6 +129,8 @@ def test_codex_chat_provider_uses_read_only_ephemeral_argv(
     assert "--ephemeral" in calls[0]
     assert calls[0][calls[0].index("-s") + 1] == "read-only"
     assert calls[0][-1] == "provider prompt"
+    assert spawn_kwargs[0]["encoding"] == "utf-8"
+    assert spawn_kwargs[0]["errors"] == "replace"
 
 
 def _stream_synthetic_chat_provider(tmp_path: Path, script: str):
@@ -126,7 +175,9 @@ def test_chat_provider_silent_hang_times_out_and_reaps_process(
 
     def recording_popen(*args, **kwargs):
         proc = real_popen(*args, **kwargs)
-        started.append(proc)
+        command = args[0] if args else kwargs.get("args", ())
+        if command and command[0] == sys.executable:
+            started.append(proc)
         return proc
 
     monkeypatch.setattr(tui_app.subprocess, "Popen", recording_popen)
@@ -156,7 +207,9 @@ def test_chat_provider_generator_cancel_terminates_and_reaps_process(
 
     def recording_popen(*args, **kwargs):
         proc = real_popen(*args, **kwargs)
-        started.append(proc)
+        command = args[0] if args else kwargs.get("args", ())
+        if command and command[0] == sys.executable:
+            started.append(proc)
         return proc
 
     monkeypatch.setattr(tui_app.subprocess, "Popen", recording_popen)

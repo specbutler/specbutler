@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .platform_fs import atomic_write_text
+
 VALID_DECISIONS = ("approved", "request_changes", "blocked", "failed")
 DEFAULT_CHECK_NAME = "review-decision-gate"
 
@@ -235,7 +237,7 @@ def evaluate_review_gate(
         )
 
     try:
-        schema_payload = json.loads(schema_path.read_text())
+        schema_payload = json.loads(schema_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         return _build_failed_evaluation(
             summary=(f"Could not parse review schema JSON: {schema_path} (line {exc.lineno}, column {exc.colno})"),
@@ -264,7 +266,7 @@ def evaluate_review_gate(
         )
 
     try:
-        raw_text = input_path.read_text()
+        raw_text = input_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return _build_failed_evaluation(
             summary=f"Could not read review output artifact: {input_path} ({exc})",
@@ -392,12 +394,12 @@ def evaluate_review_gate(
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text.rstrip() + "\n")
+    atomic_write_text(path, text.rstrip() + "\n")
 
 
 def build_parser() -> argparse.ArgumentParser:

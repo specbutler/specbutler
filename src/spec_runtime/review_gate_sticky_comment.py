@@ -15,6 +15,8 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
+from .review_decision import review_payload_decision
+
 STICKY_MARKER = "<!-- review-decision-gate-sticky-comment -->"
 EMBEDDED_REVIEW_RESULT_MARKER = "review-decision-gate-review-result"
 MAX_COMMENT_FINDINGS = 5
@@ -208,7 +210,7 @@ def render_sticky_comment(
     pr_number: int | None = None,
     marker: str = STICKY_MARKER,
 ) -> str:
-    decision = str(review_result.get("decision", "failed")).strip().lower() or "failed"
+    decision = review_payload_decision(review_result) or "failed"
     summary = str(review_result.get("summary", "")).strip() or f"Review decision: {decision}"
     source_check_name = (
         str(review_result.get("source_check_name", "review-decision-gate")).strip() or "review-decision-gate"
@@ -302,7 +304,7 @@ def publish_sticky_comment(
 
 def load_review_result(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
         raise ValueError(f"Could not read review result file: {path} ({exc})") from exc
     except json.JSONDecodeError as exc:

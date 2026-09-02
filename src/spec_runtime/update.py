@@ -7,6 +7,9 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from importlib import metadata
@@ -20,6 +23,7 @@ from packaging.version import InvalidVersion, Version
 
 from .config import SpecRuntimeConfig
 from .git_common import resolve_common_root as _resolve_common_root_base
+from .git_common import run_git, subprocess_text_kwargs
 from .source_repository import runtime_repository_https_url
 
 LOGGER = logging.getLogger(__name__)
@@ -134,7 +138,7 @@ def _is_pipx_environment(dist_name: str) -> bool:
     """
     metadata_path = Path(sys.prefix) / "pipx_metadata.json"
     try:
-        payload = json.loads(metadata_path.read_text())
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
     if not isinstance(payload, dict):
@@ -321,6 +325,8 @@ def _display_command(command: tuple[str, ...]) -> str:
 def detect_installation(dist_name: str = PACKAGE_NAME) -> InstallInfo:
     dist = _read_distribution(dist_name)
     current_version = metadata.version(dist_name)
+    # ``importlib.metadata.Distribution.read_text`` defines its own UTF-8
+    # resource boundary and accepts only the resource name.
     direct_url = _read_json_text(dist.read_text("direct_url.json"))
     installer = str(dist.read_text("INSTALLER") or "").strip().lower()
     source_urls = _distribution_source_urls(dist)
@@ -412,11 +418,9 @@ def _parse_github_repo(url: str) -> str | None:
 
 def _origin_remote_url(repo_root: Path) -> str:
     try:
-        result = subprocess.run(
-            ["git", "config", "--get", "remote.origin.url"],
+        result = run_git(
+            ["config", "--get", "remote.origin.url"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except OSError:
@@ -499,12 +503,13 @@ def _github_token() -> str:
         if value:
             return value
 
+    command = ["gh", "auth", "token"]
     try:
         result = subprocess.run(
-            ["gh", "auth", "token"],
+            command,
             capture_output=True,
-            text=True,
             check=False,
+            **subprocess_text_kwargs(command),
         )
     except OSError:
         return ""
@@ -577,10 +582,8 @@ def fetch_latest_version(
 
 def _discover_repo_root() -> Path | None:
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
+        result = run_git(
+            ["rev-parse", "--show-toplevel"],
             check=False,
         )
     except OSError:
@@ -601,11 +604,9 @@ def resolve_common_root(repo_root: Path) -> Path:
 
     fallback_root = repo_root.resolve()
     try:
-        toplevel = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+        toplevel = run_git(
+            ["rev-parse", "--show-toplevel"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -633,7 +634,7 @@ def update_cache_lock_path(repo_root: Path, config: SpecRuntimeConfig) -> Path:
 
 def read_update_cache(cache_path: Path) -> UpdateCacheEntry | None:
     try:
-        payload = json.loads(cache_path.read_text())
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
 
@@ -656,12 +657,12 @@ def write_update_cache(cache_path: Path, latest_version: str | None, *, checked_
         "latest_version": _normalize_version(latest_version) if latest_version is not None else None,
         "checked_at": _format_utc(checked_at or _now_utc()),
     }
-    cache_path.write_text(json.dumps(payload, indent=2) + "\n")
+    cache_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def _parse_refresh_lock(lock_path: Path) -> datetime | None:
     try:
-        payload = json.loads(lock_path.read_text())
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
@@ -776,25 +777,123 @@ def _background_refresh_entry(repo_root: Path, cache_path: Path, lock_path: Path
         _release_refresh_lock(lock_path)
 
 
+def _refresh_supervision_token_path(lock_path: Path) -> Path:
+    return lock_path.with_suffix(lock_path.suffix + ".supervision.json")
+
+
+def _matching_refresh_supervision_token(
+    token_path: Path,
+    supervision_id: str,
+) -> bool:
+    """Validate the domain token before a refresh consumes or removes it."""
+    from .process_supervisor import SupervisionToken
+
+    try:
+        payload = json.loads(token_path.read_text(encoding="utf-8"))
+        token = SupervisionToken.from_dict(payload)
+    except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return token.token == supervision_id
+
+
+def _await_refresh_supervision_token(
+    token_path: Path,
+    supervision_id: str,
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """Wait until the launcher has durably published this refresh identity.
+
+    A detached payload can otherwise finish before ``spawn()`` returns and the
+    launcher writes its domain token, leaving a stale token after completion.
+    The random supervision id ties the handshake to this exact launch.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        if _matching_refresh_supervision_token(token_path, supervision_id):
+            return True
+        time.sleep(0.02)
+    return _matching_refresh_supervision_token(token_path, supervision_id)
+
+
+def _remove_refresh_supervision_token(
+    token_path: Path,
+    supervision_id: str,
+) -> None:
+    """Remove only the token belonging to the completing refresh."""
+    if not _matching_refresh_supervision_token(token_path, supervision_id):
+        return
+    try:
+        token_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        LOGGER.debug("Failed to remove update refresh supervision token %s", token_path, exc_info=True)
+
+
+def _background_supervised_refresh_entry(
+    repo_root: Path,
+    cache_path: Path,
+    lock_path: Path,
+    token_path: Path,
+    supervision_id: str,
+) -> None:
+    """Run a refresh only after its durable domain identity is visible."""
+    try:
+        # Failure to observe the token means the launcher crashed before
+        # publication. The refresh remains safe to perform, but there is no
+        # domain token to retire afterward.
+        _await_refresh_supervision_token(token_path, supervision_id)
+        _background_refresh_entry(repo_root, cache_path, lock_path)
+    finally:
+        _remove_refresh_supervision_token(token_path, supervision_id)
+
+
 def _start_refresh_subprocess(repo_root: Path, cache_path: Path, lock_path: Path) -> None:
     """Launch a detached subprocess to refresh the update cache.
 
     The subprocess survives parent process exit so short-lived CLI
     commands do not kill the refresh mid-write.
     """
+    supervision_id = f"update-refresh-{uuid.uuid4().hex}"
+    token_path = _refresh_supervision_token_path(lock_path)
     script = (
         "import sys; from pathlib import Path; "
-        "from spec_runtime.update import _background_refresh_entry; "
-        "_background_refresh_entry(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))"
+        "from spec_runtime.update import _background_supervised_refresh_entry; "
+        "_background_supervised_refresh_entry("
+        "Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), "
+        "Path(sys.argv[4]), sys.argv[5])"
     )
-    subprocess.Popen(
-        [sys.executable, "-I", "-c", script, str(repo_root), str(cache_path), str(lock_path)],
-        start_new_session=True,
+    from .platform_fs import atomic_write_text
+    from .process_supervisor import LifetimeMode, ProcessSupervisor
+
+    managed = ProcessSupervisor(
+        LifetimeMode.DETACHED,
+        supervision_id=supervision_id,
+    ).spawn(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            script,
+            str(repo_root),
+            str(cache_path),
+            str(lock_path),
+            str(token_path),
+            supervision_id,
+        ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
-        cwd="/",
+        cwd=tempfile.gettempdir(),
     )
+    try:
+        atomic_write_text(token_path, json.dumps(managed.token.to_dict(), sort_keys=True) + "\n")
+    except BaseException:
+        # Publication is the recovery/control handoff. Do not leave an
+        # undiscoverable detached refresh running when it fails.
+        managed.terminate(grace_seconds=0)
+        raise
 
 
 def _spawn_cache_refresh(repo_root: Path, config: SpecRuntimeConfig) -> None:
@@ -876,9 +975,11 @@ def _check_template_drift(repo_root: Path, old_templates: dict[str, str]) -> boo
             new_bundled = subprocess.check_output(
                 [
                     sys.executable, "-I", "-c",
-                    f"from spec_runtime.init import _read_bundled_template; print(_read_bundled_template({template_name!r}), end='')",
+                    "import sys; from spec_runtime.init import _read_bundled_template; "
+                    f"sys.stdout.buffer.write(_read_bundled_template({template_name!r}).encode('utf-8'))",
                 ],
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 stderr=subprocess.DEVNULL,
             )
         except (subprocess.CalledProcessError, OSError):
@@ -934,9 +1035,12 @@ def cmd_update(_args: Any) -> int:
         latest_version,
     )
     print(_display_command(upgrade_command))
-    # Run from a safe cwd (/) so repo-local modules (e.g. pip.py) cannot
-    # shadow real packages via sys.path including ".".
-    completed = subprocess.run(upgrade_command, check=False, cwd="/")
+    # Run from a fresh, platform-valid cwd so repo-local modules (e.g. pip.py)
+    # and project configuration cannot influence the installer. ``/`` is not
+    # a portable Windows working directory and can resolve to an unwritable
+    # drive root for an ordinary user.
+    with tempfile.TemporaryDirectory(prefix="specbutler-update-") as safe_cwd:
+        completed = subprocess.run(upgrade_command, check=False, cwd=safe_cwd)
     if completed.returncode == 0:
         try:
             installed_version = metadata.version(PACKAGE_NAME)

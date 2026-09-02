@@ -18,9 +18,10 @@ import json
 import logging
 import os
 import shutil
-import signal
 import uuid
 from typing import AsyncIterator
+
+from spec_runtime.process_supervisor import LifetimeMode, ManagedAsyncProcess, ProcessSupervisor
 
 from .bridge import AgentEvent
 
@@ -34,31 +35,10 @@ def _codex_available() -> bool:
     return shutil.which("codex") is not None
 
 
-def _signal_process_group(
-    proc: asyncio.subprocess.Process,
-    sig: signal.Signals,
-) -> None:
-    """Signal the app-server session, including any command subprocesses."""
-    pid = getattr(proc, "pid", 0)
-    if os.name == "posix" and isinstance(pid, int) and pid > 0:
-        try:
-            os.killpg(pid, sig)
-            return
-        except (OSError, ProcessLookupError, PermissionError):
-            pass
-    try:
-        if sig == signal.SIGKILL:
-            proc.kill()
-        else:
-            proc.terminate()
-    except ProcessLookupError:
-        pass
-
-
-async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
+async def _terminate_process(proc: ManagedAsyncProcess) -> None:
     """Terminate, escalate when necessary, and always wait for the leader."""
     if getattr(proc, "returncode", None) is None:
-        _signal_process_group(proc, signal.SIGTERM)
+        proc.terminate()
     try:
         await asyncio.wait_for(
             proc.wait(),
@@ -66,7 +46,7 @@ async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
         )
         return
     except asyncio.TimeoutError:
-        _signal_process_group(proc, signal.SIGKILL)
+        proc.kill()
 
     try:
         await asyncio.wait_for(
@@ -147,7 +127,7 @@ class _CodexSession:
     ) -> None:
         self._cwd = cwd
         self._allowed_tools = allowed_tools
-        self._proc: asyncio.subprocess.Process | None = None
+        self._proc: ManagedAsyncProcess | None = None
         self._stderr_task: asyncio.Task | None = None
         self._stderr_lines: list[str] = []
         self._request_id = 0
@@ -166,14 +146,13 @@ class _CodexSession:
             )
         cmd = [codex_bin, "app-server"]
         env = {**os.environ, "CODEX_APP_SERVER": "1"}
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd,
+        self._proc = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+            cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self._cwd,
             env=env,
-            start_new_session=True,
         )
 
         # Drain stderr in the background so the pipe buffer never fills

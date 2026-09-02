@@ -4,6 +4,11 @@ The optional web interface provides a local dashboard, run controls, server-sent
 event updates, and isolated Claude or Codex chat sessions for creating specs
 and scoping tasks.
 
+On the supported native Windows tier, chat uses Codex only. Native Claude is
+unavailable and fails closed; run Spec Butler in WSL2 or a supported Linux/macOS
+container when Claude is required. See [Native Windows support](windows.md) for
+the exact support matrix.
+
 ## Install and start
 
 ```bash
@@ -86,16 +91,58 @@ Use `--verbose` while diagnosing provider startup or event-protocol problems:
 spec web start --verbose
 ```
 
+### Credentialed Linux Claude regression
+
+Maintainers can opt into a real-provider regression that creates a temporary
+Git repository, starts the actual authenticated web server, and uses one real
+Claude session for three context-dependent HTTP/SSE turns. The second turn must
+recall a random marker supplied only in turn one; the third must recall that
+marker and a second marker supplied only in turn two. The test also stops the
+session and server and verifies that their exact provider processes are gone.
+
+Install the development and web dependencies, authenticate Claude Code, and
+install the Linux sandbox prerequisites (`bubblewrap` and `socat`). Then run:
+
+```bash
+SPEC_LINUX_CLAUDE_REAL_PROVIDER=1 \
+pytest -m linux_claude_real_provider \
+  tests/test_linux_claude_real_provider.py -v
+```
+
+The test is skipped unless the opt-in variable is exactly `1`. It inherits the
+operator's existing Claude authentication without copying credentials into the
+fixture repository. It discards server/provider output rather than recording
+the authenticated startup URL, prompts, model responses, or provider output,
+and removes the temporary web token during cleanup.
+
+For retained release evidence, use the checked-in runner from a completely
+clean checkout and name the revision independently:
+
+```bash
+revision="$(git rev-parse HEAD)"
+python tools/linux_claude_web_evidence.py \
+  --expected-revision "$revision" \
+  --output /path/to/evidence/linux-claude-web-result.json
+```
+
+The runner selects the one marked real-provider test itself. The test writes a
+private, single-run receipt only after all three dependent HTTP/SSE turns prove
+their random context markers and both the Claude provider and web-server
+processes are reaped. The runner binds that receipt to the clean checkout's
+exact commit before atomically publishing the result. A failure, skip, dirty
+checkout, revision mismatch, or incomplete receipt removes any stale output and
+leaves no passing artifact.
+
 ## Troubleshooting
 
 - **The page shows the login form:** run `spec web token` and paste the token,
   or restart with `--open`.
 - **A provider is unavailable:** verify `claude --version` or `codex --version`
   in the same environment that launches `spec web` and complete the provider's
-  login flow. On Linux, Claude web chat also requires `bubblewrap` and `socat`;
-  install both and rerun `spec doctor`. Spec configures Claude to fail closed
-  when its sandbox cannot start instead of silently running commands without
-  isolation.
+  login flow. Native Windows supports Codex only. On Linux, Claude web chat
+  also requires `bubblewrap` and `socat`; install both and rerun `spec doctor`.
+  Spec configures Claude to fail closed when its sandbox cannot start instead
+  of silently running commands without isolation.
 - **Codex reports that `.codex/config.toml` is not a directory:** an older tool
   left a project-root `.codex` file. Inspect and rename or remove that file so
   current Codex can use `.codex/` as a directory, then rerun `spec doctor`.

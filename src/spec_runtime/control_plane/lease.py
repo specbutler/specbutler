@@ -17,6 +17,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from ..platform_fs import atomic_write_text
+
 DEFAULT_LEASE_HEARTBEAT_TIMEOUT_SECONDS = 600.0
 
 
@@ -137,7 +139,7 @@ def load_run_lease(state_runs_dir: Path, run_id: str) -> RunLease | None:
     if not path.exists():
         return None
     try:
-        payload = json.loads(path.read_text())
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
     if not isinstance(payload, dict):
@@ -152,13 +154,10 @@ def save_run_lease(state_runs_dir: Path, lease: RunLease) -> Path:
     if not lease.run_id:
         raise ValueError("lease.run_id must be set to save a lease")
     path = lease_path_for_run(state_runs_dir, lease.run_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        tmp_path.write_text(json.dumps(lease.to_dict(), indent=2, sort_keys=True) + "\n")
-        os.replace(tmp_path, path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    atomic_write_text(
+        path,
+        json.dumps(lease.to_dict(), indent=2, sort_keys=True) + "\n",
+    )
     return path
 
 

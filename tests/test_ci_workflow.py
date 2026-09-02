@@ -216,7 +216,17 @@ def test_ci_workflow_has_blocking_aggregate_job():
     jobs = _workflow_jobs()
     ci_job = jobs["ci"]
     assert ci_job["if"] == "${{ always() }}"
-    assert ci_job["needs"] == ["skip-check", "lint", "test", "package", "security"]
+    assert ci_job["needs"] == [
+        "skip-check",
+        "lint",
+        "test",
+        "macos-test",
+        "package",
+        "security",
+        "windows-package",
+        "windows-probe",
+        "ci-evidence",
+    ]
 
     steps = [step for step in ci_job.get("steps", []) if isinstance(step, dict)]
     enforce_step = next(step for step in steps if step.get("name") == "Enforce required job results")
@@ -225,7 +235,169 @@ def test_ci_workflow_has_blocking_aggregate_job():
     assert "TEST_RESULT" in script
     assert "PACKAGE_RESULT" in script
     assert "SECURITY_RESULT" in script
+    assert "WINDOWS_PACKAGE_RESULT" in script
+    assert "WINDOWS_RESULT" in script
+    assert "CI_EVIDENCE_RESULT" in script
+    assert enforce_step["env"]["WINDOWS_PACKAGE_RESULT"] == "${{ needs.windows-package.result }}"
+    assert enforce_step["env"]["WINDOWS_RESULT"] == "${{ needs.windows-probe.result }}"
+    assert enforce_step["env"]["CI_EVIDENCE_RESULT"] == "${{ needs.ci-evidence.result }}"
+    assert '[ "$WINDOWS_PACKAGE_RESULT" != "success" ]' in script
+    assert '[ "$WINDOWS_RESULT" != "success" ]' in script
+    assert '[ "$CI_EVIDENCE_RESULT" != "success" ]' in script
     assert "exit 1" in script
+
+
+def test_ci_windows_job_is_a_required_product_gate_with_diagnostics():
+    jobs = _workflow_jobs()
+    package = jobs["windows-package"]
+    windows = jobs["windows-probe"]
+    package_steps = {
+        step.get("name"): step
+        for step in package["steps"]
+        if isinstance(step, dict) and step.get("name")
+    }
+    parse_step = package_steps["Parse Windows lab PowerShell"]
+    assert "Language.Parser]::ParseFile" in parse_step["run"]
+    assert "*.ps1.template" in parse_step["run"]
+    assert "Add-Type -Path tools/windows-lab/job-supervisor.cs" in parse_step["run"]
+    supervisor_probe = package_steps["Run Windows PowerShell 5.1 supervisor probe"]
+    assert supervisor_probe["shell"] == "powershell"
+    assert "job-supervisor-selftest.ps1" in supervisor_probe["run"]
+    supervisor_upload = package_steps["Upload Windows supervisor probe diagnostics"]
+    assert supervisor_upload["if"] == "always()"
+    assert supervisor_upload["with"]["if-no-files-found"] == "error"
+    supervisor_enforcement = package_steps["Enforce Windows supervisor probe result"]
+    assert supervisor_enforcement["if"] == "always()"
+    assert supervisor_enforcement["shell"] == "powershell"
+    assert "job-supervisor-selftest.json" in supervisor_enforcement["run"]
+    assert "status -ne 'passed'" in supervisor_enforcement["run"]
+    package_steps = [step for step in package["steps"] if isinstance(step, dict)]
+    steps = [step for step in windows["steps"] if isinstance(step, dict)]
+
+    assert package["runs-on"] == "windows-latest"
+    assert "continue-on-error" not in windows
+    assert all("continue-on-error" not in step for step in package_steps)
+    assert all("continue-on-error" not in step for step in steps)
+
+    package_commands = {
+        step.get("name"): str(step.get("run", ""))
+        for step in package_steps
+        if step.get("name")
+    }
+    commands = {
+        step.get("name"): str(step.get("run", ""))
+        for step in steps
+        if step.get("name")
+    }
+    assert "python -m build --wheel --sdist" in package_commands[
+        "Build wheel and source distribution"
+    ]
+    assert "python -m twine check dist/*" in package_commands[
+        "Build wheel and source distribution"
+    ]
+    assert "$requirement" in commands[
+        "Install release distribution with all test surfaces"
+    ]
+    assert "-m ruff check ." in commands["Run lint"]
+    assert '-m pytest -o "pythonpath=" tests -v --ignore=tests/test_windows_probe.py' in commands[
+        "Run full portable test suite"
+    ]
+    assert '-m pytest -o "pythonpath=" tests/test_windows_probe.py -v' in commands[
+        "Run Windows integration probes"
+    ]
+    assert (
+        "tests/test_windows_probe.py::test_installed_artifact_cli_matrix"
+        in commands["Run installed-artifact Windows CLI matrix"]
+    )
+    assert '-o "pythonpath=" --import-mode=importlib' in commands[
+        "Run installed-artifact Windows CLI matrix"
+    ]
+    assert "Remove-Item Env:PYTHONPATH" in commands[
+        "Run installed-artifact Windows CLI matrix"
+    ]
+    cli_matrix_step = next(
+        step
+        for step in steps
+        if step.get("name") == "Run installed-artifact Windows CLI matrix"
+    )
+    assert cli_matrix_step["if"] == "${{ matrix.cli_matrix }}"
+    assert cli_matrix_step["env"]["SPEC_WINDOWS_INSTALLED_CLI_MATRIX"] == "1"
+
+    summary = next(step for step in steps if step.get("name") == "Summarize Windows gate")
+    upload = next(step for step in steps if step.get("name") == "Upload Windows probe logs")
+    assert summary["if"] == "${{ always() }}"
+    assert upload["if"] == "${{ always() }}"
+    assert upload["with"]["path"] == "artifacts/"
+
+
+def test_ci_windows_matrix_covers_supported_python_and_both_distribution_types():
+    jobs = _workflow_jobs()
+    windows = jobs["windows-probe"]
+    include = windows["strategy"]["matrix"]["include"]
+
+    wheel_versions = {
+        str(entry["python-version"])
+        for entry in include
+        if entry["distribution"] == "wheel" and entry["full_suite"] is True
+    }
+    assert wheel_versions == {"3.11", "3.12", "3.13"}
+    assert any(
+        entry["distribution"] == "sdist" and str(entry["python-version"]) == "3.12"
+        for entry in include
+    )
+    cli_matrix_entries = [entry for entry in include if entry["cli_matrix"] is True]
+    assert cli_matrix_entries == [
+        {
+            "python-version": "3.12",
+            "distribution": "wheel",
+            "full_suite": True,
+            "cli_matrix": True,
+        }
+    ]
+    assert windows["strategy"]["fail-fast"] is False
+    assert "windows-package" in windows["needs"]
+
+
+def test_ci_linux_matrix_reports_every_supported_version_failure():
+    jobs = _workflow_jobs()
+
+    assert jobs["test"]["strategy"]["fail-fast"] is False
+
+
+def test_ci_windows_tests_cannot_import_checkout_via_pytest_pythonpath():
+    jobs = _workflow_jobs()
+    steps = [step for step in jobs["windows-probe"]["steps"] if isinstance(step, dict)]
+    commands = {
+        step.get("name"): str(step.get("run", ""))
+        for step in steps
+        if step.get("name")
+    }
+
+    provenance = commands["Verify imports resolve outside the checkout"]
+    assert 'Path(os.environ["GITHUB_WORKSPACE"]).resolve()' in provenance
+    assert "imported.relative_to(checkout)" in provenance
+    assert "Remove-Item Env:PYTHONPATH" in commands["Run full portable test suite"]
+    assert '-o "pythonpath="' in commands["Run full portable test suite"]
+    assert '-o "pythonpath="' in commands["Run Windows integration probes"]
+
+
+def test_ci_windows_jobs_do_not_expose_repository_credentials_to_tested_code():
+    jobs = _workflow_jobs()
+    for job_name in ("windows-package", "windows-probe"):
+        job = jobs[job_name]
+        assert "GH_TOKEN" not in job.get("env", {})
+        action_steps = [step for step in job["steps"] if step.get("uses")]
+        assert action_steps
+        assert all(
+            re.fullmatch(r"[^@]+@[0-9a-f]{40}", str(step["uses"]))
+            for step in action_steps
+        )
+        checkout = next(
+            step
+            for step in job["steps"]
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        )
+        assert checkout["with"]["persist-credentials"] is False
 
 
 def test_ci_installs_optional_surfaces_and_smokes_built_wheel():
@@ -299,11 +471,20 @@ def test_gitleaks_allowlist_is_limited_to_audited_fixture_matches():
 # ---------- ci.yml version-bump skip path ----------
 
 
-def test_ci_skip_check_gates_lint_and_test():
-    """lint and test jobs depend on skip-check and are skipped for version bumps."""
+def test_ci_skip_check_gates_product_jobs():
+    """Product jobs depend on skip-check and are skipped for version bumps."""
     jobs = _workflow_jobs()
     assert "skip-check" in jobs
-    for job_name in ("lint", "test", "package", "security"):
+    for job_name in (
+        "lint",
+        "test",
+        "package",
+        "security",
+        "macos-test",
+        "windows-package",
+        "windows-probe",
+        "ci-evidence",
+    ):
         job = jobs[job_name]
         assert "skip-check" in job["needs"]
         condition = str(job["if"])
@@ -321,6 +502,33 @@ def test_ci_aggregate_handles_version_bump():
     )
     script = str(enforce_step.get("run", ""))
     assert "IS_VERSION_BUMP" in script
+
+
+def test_ci_evidence_waits_for_every_required_product_gate():
+    """A downloadable passing bundle cannot outlive a later package/security failure."""
+    evidence_job = _workflow_jobs()["ci-evidence"]
+
+    assert evidence_job["needs"] == [
+        "skip-check",
+        "lint",
+        "test",
+        "macos-test",
+        "package",
+        "security",
+        "windows-package",
+        "windows-probe",
+    ]
+    condition = str(evidence_job["if"])
+    for job_name in (
+        "lint",
+        "test",
+        "macos-test",
+        "package",
+        "security",
+        "windows-package",
+        "windows-probe",
+    ):
+        assert f"needs.{job_name}.result == 'success'" in condition
 
 
 def test_ci_skip_check_verifies_same_repo():

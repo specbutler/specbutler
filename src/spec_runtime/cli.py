@@ -12,6 +12,7 @@ Primary commands (happy-path)::
     spec implement   — start or resume an implementation workflow
     spec stop        — stop the active workflow process group for a spec
     spec status      — show run state and gate status
+    spec review      — inspect full machine-readable PR review feedback
     spec list        — list specs with status and dependencies
     spec show        — display a spec's content
     spec report      — report implement-phase completion
@@ -39,9 +40,17 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
-import subprocess
 import sys
 from pathlib import Path
+
+from .git_common import run_git
+from .worktree_safety import (
+    UnsafeWorktreePathError,
+    configured_worktrees_root,
+    expected_run_worktree_names,
+    paths_equal,
+    validate_owned_worktree_path,
+)
 
 
 def _lazy_config():
@@ -49,6 +58,33 @@ def _lazy_config():
     from .config import load_spec_runtime_config
 
     return load_spec_runtime_config()
+
+
+def _configure_windows_stdio(
+    *,
+    platform: str | None = None,
+    streams: tuple[object, ...] | None = None,
+) -> None:
+    """Keep Unicode CLI output lossless in redirected native Windows shells.
+
+    Python uses the active ANSI code page for redirected Windows streams. A
+    repository path can therefore work internally and still crash a command
+    such as ``spec doctor`` when it is printed through OpenSSH or a pipe.
+    UTF-8 is also the native path boundary used by Git for Windows.
+    """
+    if (platform or sys.platform) != "win32":
+        return
+    effective_streams = streams if streams is not None else (sys.stdout, sys.stderr)
+    for stream in effective_streams:
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, OSError, ValueError):
+            # Embedded/captured streams may not be reconfigurable. They must
+            # remain usable rather than making every CLI command unavailable.
+            continue
 
 
 def _lazy_orchestrator():
@@ -66,10 +102,8 @@ def _lazy_orchestrator():
 def _resolve_repo_root() -> Path:
     from .git_common import resolve_common_root
 
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
+    result = run_git(
+        ["rev-parse", "--show-toplevel"],
     )
     if result.returncode == 0:
         return resolve_common_root(Path(result.stdout.strip()))
@@ -198,7 +232,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             print(f"Error: Spec not found: {spec_path}", file=sys.stderr)
             return 1
 
-    print(spec_path.read_text())
+    print(spec_path.read_text(encoding="utf-8"))
     return 0
 
 
@@ -273,7 +307,7 @@ def _recorded_group_is_live(orch: object, pgid: int, started_at: str) -> bool:
     identity = orch.read_process_identity(pgid)
     if identity is not None and started_at and identity.started_at != started_at:
         return False
-    return bool(orch._is_process_group_alive(pgid, pgid, started_at))
+    return bool(orch.is_process_group_alive(pgid))
 
 
 def _live_clean_blockers(
@@ -338,60 +372,100 @@ def _clean_inactive_spec_artifacts(
     config: object,
     runs: list[object],
 ) -> int:
-    worktrees_root = common_root / config.paths.worktrees_dir
+    try:
+        worktrees_root = configured_worktrees_root(
+            common_root,
+            config.paths.worktrees_dir,
+        )
+    except UnsafeWorktreePathError as exc:
+        print(f"Error: Refusing unsafe worktree cleanup configuration: {exc}", file=sys.stderr)
+        return 1
 
-    # Remove matching worktree directories
-    patterns = [
-        f"spec-{spec_id}",
-        spec_id,
-    ]
+    # Resolve and validate every path before starting the destructive half.
+    # This prevents a tampered Git worktree record from being discovered only
+    # after valid local artifacts have already been removed.
+    patterns = [f"spec-{spec_id}", spec_id]
     glob_patterns = [
         f"code-{spec_id}--*",
         f"task-{spec_id}--*",
         f"specrun-{spec_id}--*",
     ]
+    candidates: dict[str, tuple[Path, tuple[str, ...], bool]] = {}
+    try:
+        for pattern in patterns:
+            target = worktrees_root / pattern
+            if target.exists():
+                validated = validate_owned_worktree_path(
+                    owner_root=worktrees_root,
+                    target=target,
+                    relative_to=common_root,
+                    expected_names=(pattern,),
+                )
+                candidates[str(validated)] = (validated, (pattern,), False)
+
+        for glob_pattern in glob_patterns:
+            for target in worktrees_root.glob(glob_pattern):
+                from .spec_identity import parse_worktree_name
+
+                identity = parse_worktree_name(target.name)
+                if identity is None or identity.spec_id != spec_id:
+                    raise UnsafeWorktreePathError(
+                        f"worktree name does not match spec identity: {target.name}"
+                    )
+                expected_names = (target.name,)
+                validated = validate_owned_worktree_path(
+                    owner_root=worktrees_root,
+                    target=target,
+                    relative_to=common_root,
+                    expected_names=expected_names,
+                )
+                candidates[str(validated)] = (validated, expected_names, False)
+
+        wt_path = ""
+        wt_list = run_git(["worktree", "list", "--porcelain"])
+        if wt_list.returncode != 0:
+            detail = wt_list.stderr.strip() or wt_list.stdout.strip() or "unknown Git error"
+            raise UnsafeWorktreePathError(
+                f"could not prove worktree registration before cleanup: {detail}"
+            )
+        for line in wt_list.stdout.splitlines():
+            if line.startswith("worktree "):
+                wt_path = line[len("worktree ") :]
+                continue
+            if not line.startswith("branch refs/heads/") or not wt_path:
+                continue
+            branch_ref = line[len("branch refs/heads/") :]
+            expected_names = expected_run_worktree_names(spec_id, branch_ref)
+            if not expected_names:
+                continue
+            validated = validate_owned_worktree_path(
+                owner_root=worktrees_root,
+                target=wt_path,
+                relative_to=common_root,
+                expected_names=expected_names,
+            )
+            candidates[str(validated)] = (validated, expected_names, True)
+    except UnsafeWorktreePathError as exc:
+        print(f"Error: Refusing unsafe worktree cleanup target: {exc}", file=sys.stderr)
+        return 1
 
     removed_worktrees = 0
-    for pattern in patterns:
-        target = worktrees_root / pattern
-        if target.exists():
-            removed_worktrees += _remove_worktree_path(target)
-
-    for gp in glob_patterns:
-        for target in worktrees_root.glob(gp):
-            removed_worktrees += _remove_worktree_path(target)
+    for target, expected_names, by_branch in candidates.values():
+        removed = _remove_worktree_path(
+            target,
+            common_root=common_root,
+            worktrees_root=worktrees_root,
+            expected_names=expected_names,
+        )
+        if removed and by_branch:
+            print(f"Removed worktree {target} (by branch)")
+        removed_worktrees += removed
 
     removed_workspaces, workspace_failures = _cleanup_run_owned_workspaces(
         common_root=common_root,
         config=config,
         runs=runs,
     )
-
-    # Remove worktrees discovered by branch name
-    wt_path = ""
-    wt_list = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
-    )
-    for line in wt_list.stdout.splitlines():
-        if line.startswith("worktree "):
-            wt_path = line[len("worktree ") :]
-        elif line.startswith("branch refs/heads/"):
-            branch_ref = line[len("branch refs/heads/") :]
-            if (
-                branch_ref.startswith(f"code/{spec_id}--")
-                or branch_ref.startswith(f"task/{spec_id}--")
-                or branch_ref.startswith(f"specrun/{spec_id}--")
-            ) and wt_path:
-                result = subprocess.run(
-                    ["git", "worktree", "remove", wt_path, "--force"],
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode == 0:
-                    print(f"Removed worktree {wt_path} (by branch)")
-                    removed_worktrees += 1
 
     # Remove local branches
     branch_patterns = [
@@ -401,10 +475,8 @@ def _clean_inactive_spec_artifacts(
     ]
 
     # Find code/task/specrun branches
-    branch_result = subprocess.run(
-        ["git", "branch", "--format=%(refname:short)"],
-        capture_output=True,
-        text=True,
+    branch_result = run_git(
+        ["branch", "--format=%(refname:short)"],
     )
     if branch_result.returncode == 0:
         for branch in branch_result.stdout.strip().splitlines():
@@ -420,15 +492,12 @@ def _clean_inactive_spec_artifacts(
     for branch in branch_patterns:
         if not branch:
             continue
-        check = subprocess.run(
-            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
-            capture_output=True,
+        check = run_git(
+            ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
         )
         if check.returncode == 0:
-            delete_result = subprocess.run(
-                ["git", "branch", "-D", branch],
-                capture_output=True,
-                text=True,
+            delete_result = run_git(
+                ["branch", "-D", branch],
             )
             if delete_result.returncode == 0:
                 print(f"Deleted local branch {branch}")
@@ -524,25 +593,40 @@ def _cleanup_run_owned_workspaces(
     return removed, failures
 
 
-def _remove_worktree_path(target: Path) -> int:
+def _remove_worktree_path(
+    target: Path,
+    *,
+    common_root: Path,
+    worktrees_root: Path,
+    expected_names: tuple[str, ...],
+) -> int:
     """Remove a worktree or stale directory. Returns 1 if removed, 0 otherwise."""
-    # Check if it's a registered worktree
-    wt_list = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"],
-        capture_output=True,
-        text=True,
+    target = validate_owned_worktree_path(
+        owner_root=worktrees_root,
+        target=target,
+        relative_to=common_root,
+        expected_names=expected_names,
     )
+    # Check if it's a registered worktree
+    wt_list = run_git(
+        ["worktree", "list", "--porcelain"],
+    )
+    if wt_list.returncode != 0:
+        detail = wt_list.stderr.strip() or wt_list.stdout.strip() or "unknown Git error"
+        raise RuntimeError(
+            f"refusing raw worktree cleanup because Git registration could not be inspected: {detail}"
+        )
     registered = False
     for line in wt_list.stdout.splitlines():
-        if line.startswith("worktree ") and line[len("worktree ") :] == str(target):
-            registered = True
-            break
+        if line.startswith("worktree "):
+            listed = Path(line[len("worktree ") :]).expanduser().resolve(strict=False)
+            if paths_equal(listed, target):
+                registered = True
+                break
 
     if registered:
-        result = subprocess.run(
-            ["git", "worktree", "remove", str(target), "--force"],
-            capture_output=True,
-            text=True,
+        result = run_git(
+            ["worktree", "remove", str(target), "--force"],
         )
         if result.returncode == 0:
             print(f"Removed worktree {target}")
@@ -550,6 +634,12 @@ def _remove_worktree_path(target: Path) -> int:
     elif target.is_dir():
         from .platform_fs import remove_tree
 
+        target = validate_owned_worktree_path(
+            owner_root=worktrees_root,
+            target=target,
+            relative_to=common_root,
+            expected_names=expected_names,
+        )
         remove_tree(target)
         print(f"Removed stale directory {target}")
         return 1
@@ -602,6 +692,13 @@ def _cmd_report(args: argparse.Namespace) -> int:
     """Report implement-phase completion."""
     orch = _lazy_orchestrator()
     return orch.cmd_report(args)
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    """Inspect the full review-decision payload for a pull request."""
+    from .review_feedback import main as review_main
+
+    return review_main(["--pr", str(args.pr)])
 
 
 def _cmd_task(args: argparse.Namespace) -> int:
@@ -840,6 +937,26 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return cmd_init(args)
 
 
+def _configure_init_parser(parser: argparse.ArgumentParser) -> None:
+    """Register the canonical ``spec init`` options on any parser surface."""
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Refresh managed templates while preserving existing .spec.toml",
+    )
+    parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="Use agent-assisted detection for build/test config",
+    )
+    parser.add_argument(
+        "--base",
+        default="",
+        help="Explicit base ref when the repository default cannot be inferred locally",
+    )
+
+
 def _emit_startup_update_notice(config: object | None = None) -> None:
     from .config import SpecRuntimeConfig
     from .update import maybe_print_update_notice
@@ -861,7 +978,9 @@ def _maybe_print_update_notice_for_init() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``spec`` CLI."""
+    _configure_windows_stdio()
     effective_argv = argv if argv is not None else sys.argv[1:]
+    help_requested = any(arg in {"-h", "--help"} for arg in effective_argv)
 
     # Pre-detect "init" — it must bypass config loading since there's no
     # .spec.toml yet.  Do a lightweight scan for the first positional arg.
@@ -889,25 +1008,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if first_positional == "init":
-        _maybe_print_update_notice_for_init()
-        init_parser = argparse.ArgumentParser(prog="spec init")
-        init_parser.add_argument("-v", "--verbose", action="store_true")
-        init_parser.add_argument(
-            "--force",
-            action="store_true",
-            help="Refresh managed templates while preserving existing .spec.toml",
+        init_parser = argparse.ArgumentParser(
+            prog="spec init",
+            description="Bootstrap a Git repository for spec-driven development",
         )
-        init_parser.add_argument(
-            "--yolo",
-            action="store_true",
-            help="Use agent-assisted detection for build/test config",
-        )
+        _configure_init_parser(init_parser)
         init_args = init_parser.parse_args([a for a in effective_argv if a != "init"])
         if init_args.verbose:
             import logging
 
             logging.basicConfig(level=logging.DEBUG)
-        return _cmd_init(init_args)
+        exit_code = _cmd_init(init_args)
+        if exit_code == 0 and not help_requested:
+            _maybe_print_update_notice_for_init()
+        return exit_code
 
     if first_positional == "update":
         update_parser = argparse.ArgumentParser(prog="spec update")
@@ -939,22 +1053,26 @@ def main(argv: list[str] | None = None) -> int:
             logging.basicConfig(level=logging.DEBUG)
         return _cmd_doctor(doctor_args)
 
-    # All other commands require config.
-    from .config import SpecConfigNotFoundError
+    # Help is documentation, not a repository operation. Build its parser
+    # from inert defaults so every help surface remains available before
+    # ``spec init`` and from a globally installed console entry point. Actual
+    # command dispatch still takes the strict configuration path below.
+    from .config import SpecConfigNotFoundError, SpecRuntimeConfig
 
     config_error: Exception | None = None
-    try:
-        config = _lazy_config()
-    except Exception as exc:
-        config = None
-        config_error = exc
+    if help_requested:
+        config = SpecRuntimeConfig()
+    else:
+        try:
+            config = _lazy_config()
+        except Exception as exc:
+            config = None
+            config_error = exc
 
-    from .config import SpecRuntimeConfig
-
-    if isinstance(config, SpecRuntimeConfig):
-        _emit_startup_update_notice(config)
-    elif config_error is not None:
-        _emit_startup_update_notice()
+        if isinstance(config, SpecRuntimeConfig):
+            _emit_startup_update_notice(config)
+        elif config_error is not None:
+            _emit_startup_update_notice()
 
     if config_error is not None:
         if isinstance(config_error, SpecConfigNotFoundError):
@@ -979,6 +1097,13 @@ def main(argv: list[str] | None = None) -> int:
     subparsers = parser.add_subparsers(dest="command")
 
     # ----- Primary commands (happy-path) -----
+
+    p_init = subparsers.add_parser(
+        "init",
+        help="Bootstrap a Git repository for spec-driven development",
+        description="Bootstrap a Git repository for spec-driven development",
+    )
+    _configure_init_parser(p_init)
 
     raw_review_default = getattr(config.agents, "review_default", "")
     review_default = raw_review_default.strip() if isinstance(raw_review_default, str) else ""
@@ -1040,6 +1165,13 @@ def main(argv: list[str] | None = None) -> int:
     p_status = subparsers.add_parser("status", help="Show run state and gate status")
     p_status.add_argument("--spec", required=True, help="Spec ID")
     p_status.add_argument("--run", default="", help="Show a specific run id")
+
+    # review
+    p_review = subparsers.add_parser(
+        "review",
+        help="Inspect full machine-readable review feedback for a pull request",
+    )
+    p_review.add_argument("--pr", required=True, type=int, help="Pull request number")
 
     # list
     p_list = subparsers.add_parser("list", help="List specs with status and dependencies")
@@ -1363,6 +1495,7 @@ def main(argv: list[str] | None = None) -> int:
         "implement": _cmd_implement,
         "stop": _cmd_stop,
         "status": _cmd_status,
+        "review": _cmd_review,
         "list": _cmd_list,
         "show": _cmd_show,
         "report": _cmd_report,

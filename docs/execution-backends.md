@@ -17,6 +17,12 @@ The default is `worktree`. Existing projects do not need an `[execution]`
 section unless they want a different backend or an explicit opt-out from
 future rollout policy.
 
+On native Windows, the supported tier is limited to Windows 11, a local fixed
+NTFS repository, Codex, PowerShell, and the `worktree` backend. The clone and
+Docker Desktop container combinations are not release-qualified on Windows;
+see the [Windows support matrix](windows.md). WSL2 is a Linux-mode alternative
+when the repository and orchestrator live inside the WSL Linux filesystem.
+
 ```toml
 [execution]
 backend = "worktree"             # worktree, clone, or container
@@ -72,6 +78,10 @@ is suspected but a container is unnecessary.
 
 Container mode supports Docker and Docker-compatible engines. Start with the
 generated repo-local baseline, then adapt it to the project's actual build:
+
+This section describes supported Linux/macOS hosts. A working Docker Desktop
+installation on Windows does not extend the native Windows support claim to the
+container backend.
 
 ```bash
 spec container init

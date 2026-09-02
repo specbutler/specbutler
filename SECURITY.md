@@ -15,6 +15,14 @@ repository content. Inspect untrusted pull requests before starting a run;
 `safety_mode = "safe"` is currently a recorded compatibility label, not a
 security boundary.
 
+The dependency-install step performed for a detached local-review checkout is
+handled differently because package build hooks come from the change under
+review. That one command runs in a no-network sandbox with writes scoped to the
+disposable review checkout and operator-home reads denied. If Spec Butler cannot
+establish that boundary, it skips the install and continues with a diff-only
+review. This narrow control does not extend to implementation bootstrap, verify
+commands, or other lifecycle hooks.
+
 The host orchestrator owns forge authentication, publication, review, merge,
 and run state. Non-interactive agent sessions receive an isolated MCP set, and
 container workers should not receive host GitHub credentials, SSH keys, or a

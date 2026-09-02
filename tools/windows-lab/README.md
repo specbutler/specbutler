@@ -1,0 +1,403 @@
+# Windows 11 release lab
+
+This directory is a secret-free controller for a disposable, KVM-backed
+Windows 11 VM. It exists to reproduce the native Spec Butler release proof; it
+is not part of the installed `specbutler` package and it does not distribute
+Windows or third-party tools.
+
+The controller keeps all mutable or machine-specific material outside Git:
+the Windows ISO, qcow2 disks, VM identity, unattended-install output, generated
+password, SSH keys, downloaded installers, provider login, raw logs, and proof
+artifacts. The adjacent `.gitignore` is defense in depth; never force-add those
+paths.
+
+## Host requirements
+
+- A Linux x86-64 host with hardware virtualization enabled and `/dev/kvm`
+  readable and writable by the operator.
+- Docker Engine with Compose v2, SSH/SCP, Git, Python 3, `sha256sum`, and at
+  least 40 GiB of free disk space (80 GiB is a practical minimum).
+- A properly licensed or time-limited Windows 11 x64 ISO obtained from
+  Microsoft. This repository does not supply an ISO or a license.
+- Current Windows x64 artifacts for Git, GitHub CLI, uv, and Codex. Populate
+  the manifest from the publishers' release pages, including independently
+  verified SHA-256 hashes. For Codex installation and authentication options,
+  use the [official Codex CLI documentation](https://developers.openai.com/codex/cli).
+
+## First-time setup
+
+```bash
+cd tools/windows-lab
+cp lab.env.example lab.env
+cp toolchain.json.example toolchain.json
+# Replace every angle-bracket placeholder in both local files.
+
+./labctl init
+./labctl up
+./labctl wait                 # first Windows installation can take 15–45 minutes
+./labctl provision
+```
+
+`init` verifies the ISO hash before creating an 80 GiB qcow2 disk, generates a
+fresh local VM identity/password/SSH key, renders the unattended templates into
+ignored state, builds the QEMU container, and creates the unattended media.
+`provision` downloads only the HTTPS artifacts named in `toolchain.json`, checks
+their pinned hashes on both host and guest, then installs the Windows toolchain.
+
+Provider and forge authentication are deliberately manual and remain inside
+the VM. Use the loopback-only noVNC console or SSH:
+
+```bash
+./labctl ssh
+gh auth login
+codex                         # complete the normal interactive sign-in
+exit
+./labctl shutdown
+./labctl snapshot provisioned
+```
+
+The unattended lab user logs into the loopback-only console so interactive
+scheduled jobs can use provider login. Before each job, the controller verifies
+an exact-user Explorer desktop session. If an older baseline's finite unattend
+logon count has expired, the controller passes the generated password only over
+SSH standard input. Before arming a single finite autologon, it installs a
+SYSTEM logon-triggered cleanup from an administrator-only directory, so cleanup
+does not depend on the host controller surviving the reboot. The controller
+then verifies the recovered session, independently removes the temporary
+Winlogon password and cleanup task, and disables autologon before launching
+source.
+Set `LAB_INTERACTIVE_SESSION_REPAIR=0` to require a manual noVNC sign-in instead.
+Treat the VM as sensitive local test infrastructure: during the bounded recovery
+window Windows necessarily holds an autologon credential, and anyone with
+administrative or console access can reach the provider/forge login. Do not
+expose the SSH, RDP, or noVNC ports, reuse its generated password, or run
+untrusted source inside it.
+
+## One-command release proof
+
+After the baseline, provider/forge sign-in, and independently produced external
+evidence for the same revision exist, one command resets the VM, stages the
+configured tracked source revision, reprovisions idempotently, runs the proof in
+the console session, imports that evidence, and performs the final audit:
+
+```bash
+./labctl proof
+```
+
+The proof:
+
+1. builds and installs both the candidate wheel and source distribution with
+   the `dev`, `tui`, and `web` surfaces;
+2. runs the full native test suite on Windows, then runs the installed-wheel
+   CLI matrix again with its opt-in guard explicitly enabled;
+3. creates a uniquely named private repository under `LAB_GITHUB_OWNER`;
+4. runs a real Codex worktree lifecycle through implementation, local review,
+   pull-request merge, and cleanup;
+5. starts the native web service in foreground and background modes, then uses
+   its authenticated HTTP/SSE API for three context-dependent real Codex turns,
+   stream reconnect/history, two concurrent isolated chats, and live
+   cancellation with exact descendant-process checks; native Claude remains
+   explicitly unavailable;
+6. runs a real native three-level timeout tree and proves every process identity
+   is gone after bounded cleanup;
+7. launches two dependency-ready specs under autopilot with a deterministic
+   provider double, crashes the dispatcher while both implementation processes
+   are live, proves a replacement adopts each exact child once without launching
+   the blocked dependent, then exercises `spec auto stop` graceful draining;
+8. compiles the checked-in Win32 harness and launches the installed wheel's
+   isolated `spec_runtime.cli watch` module through its own venv interpreter
+   and the native ConPTY API in the logged-on desktop
+   session, assigns the suspended watch root to a kill-on-close Job before its
+   first instruction runs, observes the dashboard, live status, selected-run
+   detail, and chat screen, obtains a retained marker from a real Codex child,
+   exits through the `q` binding, and verifies every exact provider/owned process
+   identity drains while the input pipe, ConPTY, and emergency Job backstop all
+   remain open and unused;
+9. retains the exact staged Git revision and sanitized logs under
+   `tools/windows-lab/artifacts/<run-name>/`, then evaluates every one of the
+   26 acceptance criteria in the three Windows specs against the checked-in
+   evidence contract. The command fails before claiming completion if the
+   external bundle is missing, belongs to another revision/run, or would
+   overwrite a local result.
+
+Before the controller audit, `local_acceptance.py` parses the two JUnit reports
+and requires exact, unskipped test names for each local claim. It also validates
+the real lifecycle, web, and interactive watch result fields and actively probes
+executable discovery, Windows path behavior, the retained ConPTY transcript,
+launch ordering, graceful-versus-emergency cleanup, and Codex process identity,
+wheel/sdist imports,
+`pip check`, warning-free `spec doctor`, documentation, and credential cleanup.
+It writes each machine-readable local result only after that result's complete
+prerequisite set passes. The host controller adds its own result only after the
+clean-snapshot reset, staging, nonce-bound interactive launch receipt, job
+execution, collection, and guest-side static harness audit have all completed.
+A Task Scheduler start request is not treated as execution: the runner must
+atomically acknowledge the exact nonce, user SID, and preflight desktop session
+within 30 seconds, then pause. The host captures that receipt in private state
+and only then releases candidate source. Final evidence verifies the exact host
+nonce, receipt hash, guest receipt, and proof user/session. Ready or missing
+tasks without completion records fail immediately and are unregistered; if
+teardown cannot be verified, the controller performs an authoritative guest
+shutdown and fails the run.
+The scheduled-task runner launches the complete proof suspended inside a
+kill-on-close Windows Job before resuming it. Stopping or crashing that runner
+therefore terminates its provider, Git, and test descendants; a successful
+completion record is emitted only after the Job reports no active processes.
+
+The proof configures `gh` as Git's credential helper before creating its
+disposable lifecycle repository. Git terminal prompts, Git Credential Manager
+UI, and `gh` prompts are disabled for the proof and inherited agent sessions;
+authentication failures therefore fail closed instead of waiting at an unseen
+dialog. Every native command is bounded, and a timeout terminates its Windows
+process tree before evidence collection continues.
+
+Before it stops, resets, prunes, or launches the VM, `labctl proof` resolves the
+requested source commit and requires it to be the controller checkout's exact
+`HEAD`. Every tracked file under `tools/windows-lab/` must match its committed
+blob exactly or through one whole-file LF-to-CRLF checkout transform, and the
+directory must have no staged or untracked changes. Mutable Git filters and
+replacement objects are excluded from the proof boundary. The retained
+`exact-harness.json` records a SHA-256 for each verified controller/helper file.
+The controller then materializes those committed blobs into a private snapshot
+and routes VM control, guest staging, redaction, evidence import, and final audit
+through that snapshot. A concurrent worktree edit therefore cannot change the
+code attributed to the proof revision.
+
+Interactive-job diagnostics and shutdown requests are individually bounded. If
+the Windows Job cannot prove that its descendants are gone, the controller does
+not attempt an unbounded scheduled-task cleanup: it preserves what it can,
+forces the Compose guest down after the graceful deadline, verifies that the VM
+is no longer active, and only then records authoritative shutdown. The Docker
+CLI call is itself bounded; Compose's `--timeout` controls only the container
+stop grace period and is not treated as a host-side wall-clock deadline.
+
+If the interactive harness fails, it terminates the Job/root while its output
+reader is still draining, closes ConPTY only afterward, and retains
+`watch-interactive-failure.json` plus a failed transcript. Successful acceptance
+rejects that emergency-cleanup artifact rather than allowing it to coexist with
+a nominal pass.
+
+The deterministic autopilot provider is intentionally distinct from the real
+Codex evidence: adoption must hold children at a reproducible boundary across a
+forced dispatcher crash, while the lifecycle and chat portions independently
+prove the candidate against the authenticated provider. The proof records this
+distinction in `autopilot-result.json` and `web-chat-result.json`.
+
+The disposable GitHub repository is retained so its merged PR is auditable;
+delete it manually after retaining the release evidence. `proof` is intentionally
+opt-in because it creates that external repository and consumes real provider
+capacity. Microsoft and provider authentication may need renewal between runs.
+
+Each automated proof preflights at least 40 GiB of free space on the filesystem
+that contains `SPEC_WINDOWS_LAB_STATE_ROOT` before starting the VM. While the
+VM is stopped, proof validates existing trash, performs the cold reset, checks
+the replacement overlay, and then retains only the newest retired overlay by
+default before running that preflight. This ordering lets proof reclaim older
+reset predecessors when they caused the low-space condition. Reset only
+needs the negligible headroom for a new sparse qcow2 overlay and copies of the
+small NVRAM and TPM state. Set the positive integer `LAB_PROOF_TRASH_KEEP` in
+`lab.env` to retain more predecessors. The retention pass derives recency from
+the controller-owned timestamp/PID directory name, validates every direct trash
+child before deleting anything, and fails closed on partial directories,
+unknown entries, symlinks, nested mounts, or an unavailable or ambiguous Docker
+state query. Sanitized evidence and raw collected logs are outside the overlay
+trash and are not affected.
+
+Clean shutdown allows 600 seconds by default because Windows may need more than
+three minutes even when it exits successfully. Set the positive integer
+`LAB_SHUTDOWN_TIMEOUT_SECONDS` in `lab.env` to tune that fail-closed deadline;
+the controller never resets or prunes after an unconfirmed shutdown.
+`LAB_COMPOSE_DOWN_TIMEOUT_SECONDS` separately bounds an unresponsive Docker
+client or daemon (180 seconds by default), while
+`LAB_DOCKER_QUERY_TIMEOUT_SECONDS` bounds each state query (30 seconds by
+default). A timed-out query is never interpreted as proof that the VM stopped.
+
+Provisioning uses the administrative SSH control plane. Interactive proof jobs
+use the logged-on account's filtered, non-elevated token and fail unless they are
+in a real desktop session; this matches the documented day-to-day Windows tier.
+`LAB_INTERACTIVE_SESSION_GRACE_SECONDS` controls the initial bounded wait before
+automatic recovery (30 seconds by default).
+
+Raw artifacts remain under ignored `state/raw/`; the publishable copy passes
+through `redact.py`. The sanitized directory contains
+`_redaction-report.json`, including the replacement count and a post-redaction
+scan for every recognized credential shape. Redaction is a backstop, not
+permission to print secrets.
+
+To reuse one provisioned lab from multiple source worktrees, point the controller
+at its absolute state directory instead of copying the VM disks:
+
+```bash
+SPEC_WINDOWS_LAB_STATE_ROOT=/absolute/path/to/windows-lab/state \
+SPEC_WINDOWS_LAB_CONFIG=/absolute/path/to/lab.env \
+SPEC_WINDOWS_TOOLCHAIN_CONFIG=/absolute/path/to/toolchain.json \
+SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT=/absolute/path/to/exact-revision-evidence \
+./labctl proof
+```
+
+The override is intentionally environment-only: it keeps the reusable disk,
+identity, SSH key, and authentication state outside every source checkout while
+each agent stages the exact commit from its own worktree.
+
+### Fail-closed acceptance audit
+
+`acceptance-manifest.json` is the release evidence contract. It repeats the
+exact text and numbering from all three Windows specs and maps each criterion
+to concrete retained artifacts and machine-evaluated assertions. The auditor
+rejects criterion drift, missing or extra criteria, unsafe artifact paths,
+malformed evidence, and any source revision other than the exact 40-character
+commit staged into the guest.
+
+The authoritative output is `acceptance-audit.json`, not the runtime summary
+in `result.json`. A missing artifact is reported as `unproven`; a present
+artifact that contradicts its assertion is `failed`. Both states produce a
+nonzero exit status, and the final audit criterion is derived from the other
+25 rather than asserted by the proof script. Therefore partial proof runs
+cannot be mistaken for release approval.
+
+The controller must run this audit after collection and redaction; a
+`labctl proof` run is not release-passing unless the resulting
+`acceptance-audit.json` has `status: passed`. To re-audit retained evidence
+manually, check out its recorded source commit and run:
+
+```bash
+revision="$(git rev-parse HEAD)"
+python3 tools/windows-lab/audit_acceptance.py \
+  --manifest tools/windows-lab/acceptance-manifest.json \
+  --source-root . \
+  --evidence-root "tools/windows-lab/artifacts/<run-name>" \
+  --expected-revision "$revision" \
+  --output "tools/windows-lab/artifacts/<run-name>/acceptance-audit.json"
+```
+
+The caller must supply the revision independently from the collected evidence;
+the auditor cross-checks it against both configured and staged revision values
+in `source-provenance.json`. Retain CI result JSON files named by the manifest
+alongside VM artifacts before the final audit. Do not synthesize a passing
+result for unavailable hosted, provider, or platform evidence.
+
+Hosted CI publishes those result files only after its complete Linux, macOS,
+Windows wheel, Windows source-distribution, native integration, lint, and
+installed-CLI matrices pass and a fail-closed aggregation job confirms every
+fragment belongs to one workflow run and one exact checkout SHA. This includes
+the static documentation and hermetic-test coverage reports; it does not claim
+that the separately marked real-provider test passed. Assemble the hosted
+artifact and independently produced Linux Claude result in one external
+directory before invoking the proof:
+
+```bash
+run_id=<github-actions-run-id>
+ci_evidence="$(mktemp -d)"
+gh run download "$run_id" \
+  --pattern 'hosted-ci-acceptance-evidence-*' \
+  --dir "$ci_evidence"
+ci_index="$(find "$ci_evidence" -type f -name hosted-ci-evidence-index.json -print -quit)"
+test -n "$ci_index"
+python3 - "$ci_index" "$(git rev-parse HEAD)" <<'PY'
+import json
+import sys
+
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+if payload.get("status") != "passed" or payload.get("source_revision") != sys.argv[2]:
+    raise SystemExit("hosted CI evidence does not match this checkout")
+PY
+cp /path/to/linux-claude-web-result.json "$ci_evidence/"
+export SPEC_WINDOWS_ACCEPTANCE_EVIDENCE_ROOT="$ci_evidence"
+./labctl proof
+```
+
+`labctl proof` locates exactly one required result and one hosted evidence index
+under that root, verifies every result's exact source revision and the common
+hosted workflow identity, and imports only the five non-local result files. It
+never overwrites locally produced evidence. This removes the prior manual
+copy-and-re-audit step while preserving independent evidence provenance.
+
+GitHub pull-request workflows normally test GitHub's synthetic merge commit;
+that exact revision is recorded in every report. It cannot be combined with VM
+evidence from the pull-request head or a later squash commit. For final release
+evidence, use the successful `main` push run for the same commit staged in the
+VM, or deliberately stage the exact tested pull-request merge SHA.
+
+If only per-job fragments were retained, the same strict aggregation can be
+repeated from a checkout at their revision:
+
+```bash
+gh run download "$run_id" --pattern 'ci-evidence-*' --dir ci-fragments
+python3 tools/ci_evidence.py aggregate \
+  --input ci-fragments \
+  --output hosted-ci-evidence \
+  --source-root . \
+  --expected-revision "$(git rev-parse HEAD)"
+```
+
+The local VM job deliberately does not create
+`hosted-windows-ci-result.json`, `hosted-windows-smoke-result.json`,
+`cross-platform-lifecycle-result.json`, `cross-platform-web-result.json`, or
+`linux-claude-web-result.json`. Those claims require their named hosted,
+macOS/Linux, or real-Claude runs. The host-side `labctl proof` therefore requires
+them as its external evidence input and imports them only after the local run is
+collected and redacted.
+
+Produce the real-Claude artifact on an authenticated Linux host from the same
+clean revision, then retain it beside the collected VM evidence:
+
+```bash
+revision="$(git rev-parse HEAD)"
+python tools/linux_claude_web_evidence.py \
+  --expected-revision "$revision" \
+  --output "tools/windows-lab/artifacts/<run-name>/linux-claude-web-result.json"
+```
+
+This command runs the marked test rather than translating an operator claim
+into JSON. It publishes only after the live HTTP/SSE context and process-reap
+checks pass, and its `source_revision` must match the revision supplied to the
+final acceptance audit.
+
+## Controller commands
+
+| Command | Purpose |
+|---|---|
+| `labctl init` | Validate inputs, render private state, and create the VM disk |
+| `labctl up`, `down`, `shutdown`, `wait` | Start the VM, perform an emergency container stop, cleanly shut Windows down, or wait for SSH |
+| `labctl provision` | Download, verify, and install the pinned guest toolchain |
+| `labctl snapshot NAME` | Turn the stopped run disk into a read-only cold baseline and create a new overlay |
+| `labctl reset NAME` | Replace the stopped run overlay; retain the prior overlay under ignored trash |
+| `labctl stage [REF]` | Export tracked files from an exact Git commit into `C:\SpecHarness\source` |
+| `labctl exec -- 'COMMAND'` | Run a foreground PowerShell command over SSH |
+| `labctl job submit NAME FILE` | Run a PowerShell script in the logged-on console session |
+| `labctl job wait NAME`, `job logs NAME` | Wait for or inspect a named job |
+| `labctl collect NAME [DEST]` | Retrieve job/evidence files and apply redaction |
+| `labctl proof` | Execute the complete reset-to-evidence release proof |
+| `labctl logs`, `status`, `ssh` | Inspect the QEMU container or guest |
+
+Snapshots are cold: shut Windows down before creating or resetting one. The
+controller moves replaced overlays into ignored `state/trash/` instead of
+deleting them. Explicit `labctl reset` remains conservative and never prunes
+those predecessors. The automated `labctl proof` flow bounds its own retained
+predecessors according to `LAB_PROOF_TRASH_KEEP` only after the replacement
+overlay passes `qemu-img check`.
+
+## Development checks
+
+The normal test suite statically verifies required commands, placeholders,
+ignored state, executable bits, documentation claims, and common credential
+patterns. When available, also run:
+
+```bash
+shellcheck tools/windows-lab/labctl tools/windows-lab/entrypoint.sh
+bash -n tools/windows-lab/labctl
+sh -n tools/windows-lab/entrypoint.sh
+pytest tests/test_windows_lab_harness.py
+pytest tests/test_windows_acceptance_audit.py
+pytest tests/test_ci_evidence.py
+```
+
+The real-provider pytest entrypoint is separately marked and skipped unless
+both `SPEC_WINDOWS_REAL_PROVIDER=1` and an explicit
+`SPEC_WINDOWS_LAB_CONFIG=/absolute/path/to/lab.env` are present:
+
+```bash
+SPEC_WINDOWS_REAL_PROVIDER=1 \
+SPEC_WINDOWS_LAB_CONFIG="$PWD/tools/windows-lab/lab.env" \
+pytest -m windows_real_provider tests/test_windows_real_provider.py
+```

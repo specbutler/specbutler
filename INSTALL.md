@@ -1,9 +1,11 @@
 # Installing Spec Butler
 
-`spec` requires Linux or macOS, Python 3.11+, Git, an authenticated GitHub CLI
-(`gh`), and at least one supported coding-agent CLI (`claude` or `codex`).
-Native Windows is not supported; WSL provides a Linux environment but is not
-currently covered by the project's CI matrix.
+`spec` requires Python 3.11+, Git, an authenticated GitHub CLI (`gh`), and at
+least one supported coding-agent CLI. Linux and macOS support Claude and Codex.
+The supported native tier is Windows 11 on a local fixed NTFS repository using
+the `worktree` backend, Codex, and PowerShell. Native Claude is unavailable;
+UNC/network workspaces and Docker Desktop container mode are not claimed. See
+[Native Windows support](docs/windows.md) for the exact matrix and limitations.
 
 ## Stable install
 
@@ -22,6 +24,17 @@ Install pipx using your operating system's package manager or the [official
 pipx instructions](https://pipx.pypa.io/stable/how-to/install-pipx.html).
 `spec update` advances a tagged install to the newest non-prerelease version
 tag.
+
+On Windows 11, use PowerShell syntax:
+
+```powershell
+py -3.12 -m pip install --user pipx
+py -3.12 -m pipx ensurepath
+# Open a new PowerShell, then:
+$SpecRelease = gh release view --repo specbutler/specbutler --json tagName --jq .tagName
+pipx install "specbutler @ git+https://github.com/specbutler/specbutler.git@$SpecRelease"
+pipx install --force "specbutler[tui,web] @ git+https://github.com/specbutler/specbutler.git@$SpecRelease"
+```
 
 ## Development channel
 
@@ -46,13 +59,17 @@ python -m venv .venv
 python -m pip install -e ".[dev,tui,web]"
 ```
 
+The native Windows editable-install equivalents are
+`.\.venv\Scripts\Activate.ps1` and
+`.\.venv\Scripts\python.exe -m pip install -e ".[dev,tui,web]"`.
+
 Verify both the package and external tools before initializing a project:
 
 ```bash
 spec --version
 git --version
 gh auth status
-claude --version  # or: codex --version
+claude --version  # or: codex --version; use Codex for native Windows
 ```
 
 The project can also be installed from a wheel built with `python -m build`.

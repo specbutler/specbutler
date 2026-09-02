@@ -22,6 +22,7 @@ from pathlib import Path
 
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config, load_spec_runtime_config, resolve_spec_path
 from .git_common import resolve_common_root as _resolve_common_root
+from .git_common import run_git
 from .spec_identity import SPEC_ID_RE, implementation_branch_identity, parse_worktree_name
 from .spec_metadata import SpecMetadata, parse_spec_metadata
 
@@ -87,11 +88,9 @@ def _git(
     *args: str,
     cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args],
+    return run_git(
+        args,
         cwd=cwd,
-        capture_output=True,
-        text=True,
     )
 
 
@@ -139,7 +138,7 @@ def _load_active_runs(
     active: dict[str, list[ActiveRunRecord]] = {}
     for candidate in runs_dir.glob("*.json"):
         try:
-            data = json.loads(candidate.read_text())
+            data = json.loads(candidate.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
 
@@ -236,7 +235,7 @@ def _load_runs_for_spec(
     runs: list[StoredRunRecord] = []
     for candidate in runs_dir.glob("*.json"):
         try:
-            data = json.loads(candidate.read_text())
+            data = json.loads(candidate.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
 
@@ -304,7 +303,7 @@ def _load_run_payload(
     if not payload.exists():
         return None
     try:
-        data = json.loads(payload.read_text())
+        data = json.loads(payload.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError, TypeError):
         return None
     return data if isinstance(data, dict) else None
@@ -608,11 +607,9 @@ def refresh_merge_completion_state(
     tag_refspec = "+refs/tags/spec/merged/*:refs/tags/spec/merged/*"
     action = f"git fetch {remote_name} {branch_refspec} {tag_refspec}"
     try:
-        result = subprocess.run(
-            ["git", "fetch", remote_name, branch_refspec, tag_refspec],
+        result = run_git(
+            ["fetch", remote_name, branch_refspec, tag_refspec],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -822,7 +819,7 @@ def project_run_record_status(
         request_path = state_run_dir / "operator-request.json"
         try:
             operator_request_state = str(
-                json.loads(request_path.read_text()).get("status", "")
+                json.loads(request_path.read_text(encoding="utf-8")).get("status", "")
             ).strip().lower()
         except (OSError, json.JSONDecodeError, TypeError, AttributeError):
             operator_request_state = ""
@@ -863,7 +860,7 @@ def project_canonical_spec_status(
     is_merged = is_spec_merged(repo_root, spec_id, git_state=git_state, config=runtime_config)
     for candidate in runs_dir.glob("*.json"):
         try:
-            data = json.loads(candidate.read_text())
+            data = json.loads(candidate.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         if str(data.get("spec_id", "")).strip() != spec_id:

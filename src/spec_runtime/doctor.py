@@ -14,12 +14,35 @@ from typing import Literal
 
 from .command_runtime import CommandSpec, looks_posix_script
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config
+from .git_common import subprocess_text_kwargs
 from .platform import is_unc_path, is_windows
 
 DoctorStatus = Literal["ok", "warning", "error"]
 CommandRunner = Callable[[list[str], Path, float], subprocess.CompletedProcess[str]]
 ExecutableResolver = Callable[[str], str | None]
 ConfigLoader = Callable[[Path], SpecRuntimeConfig]
+
+
+@dataclass(frozen=True)
+class WindowsVolumeProfile:
+    """Read-only Windows volume facts needed by the supported-tier preflight."""
+
+    root: str
+    drive_type: int
+    filesystem: str
+
+
+WindowsVolumeProbe = Callable[[Path], WindowsVolumeProfile]
+
+_WINDOWS_DRIVE_TYPES = {
+    0: "unknown",
+    1: "invalid",
+    2: "removable",
+    3: "fixed",
+    4: "network",
+    5: "optical",
+    6: "RAM disk",
+}
 
 
 @dataclass(frozen=True)
@@ -74,10 +97,10 @@ def _run_command(
         return subprocess.run(
             argv,
             cwd=cwd,
-            text=True,
             capture_output=True,
             timeout=timeout,
             check=False,
+            **subprocess_text_kwargs(argv),
         )
     except FileNotFoundError as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
@@ -108,12 +131,72 @@ def _load_config(repo_root: Path) -> SpecRuntimeConfig:
     return load_repo_spec_runtime_config(repo_root, require=True)
 
 
+def _probe_windows_volume(path: Path) -> WindowsVolumeProfile:
+    """Read the containing volume through Win32 without invoking a shell."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_volume_path = kernel32.GetVolumePathNameW
+    get_volume_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    get_volume_path.restype = wintypes.BOOL
+    get_volume_information = kernel32.GetVolumeInformationW
+    get_volume_information.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    get_volume_information.restype = wintypes.BOOL
+    get_drive_type = kernel32.GetDriveTypeW
+    get_drive_type.argtypes = [wintypes.LPCWSTR]
+    get_drive_type.restype = wintypes.UINT
+
+    root_buffer = ctypes.create_unicode_buffer(32768)
+    if not get_volume_path(str(path), root_buffer, len(root_buffer)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    filesystem_buffer = ctypes.create_unicode_buffer(256)
+    if not get_volume_information(
+        root_buffer.value,
+        None,
+        0,
+        None,
+        None,
+        None,
+        filesystem_buffer,
+        len(filesystem_buffer),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return WindowsVolumeProfile(
+        root=root_buffer.value,
+        drive_type=int(get_drive_type(root_buffer.value)),
+        filesystem=filesystem_buffer.value,
+    )
+
+
+def _windows_volume_check(profile: WindowsVolumeProfile) -> DoctorCheck:
+    drive_name = _WINDOWS_DRIVE_TYPES.get(profile.drive_type, f"type {profile.drive_type}")
+    detail = f"{profile.root} is a {drive_name} {profile.filesystem or 'unknown-filesystem'} volume"
+    if profile.drive_type != 3 or profile.filesystem.casefold() != "ntfs":
+        return _error(
+            "local filesystem",
+            f"unsupported repository volume: {detail}",
+            "Move the checkout to a fixed local NTFS volume and rerun `spec doctor`.",
+        )
+    return _ok("local filesystem", detail)
+
+
 def run_doctor_checks(
     requested_root: Path,
     *,
     runner: CommandRunner | None = None,
     which: ExecutableResolver | None = None,
     config_loader: ConfigLoader | None = None,
+    windows_volume_probe: WindowsVolumeProbe | None = None,
 ) -> DoctorReport:
     """Inspect project readiness without changing files, refs, or services."""
     run = runner or _run_command
@@ -131,6 +214,22 @@ def run_doctor_checks(
             )
         )
         return DoctorReport(tuple(checks))
+    if is_windows():
+        try:
+            profile = (windows_volume_probe or _probe_windows_volume)(requested_root)
+        except OSError as exc:
+            checks.append(
+                _error(
+                    "local filesystem",
+                    f"could not verify the repository volume: {_one_line(str(exc))}",
+                    "Move the checkout to a fixed local NTFS volume and rerun `spec doctor`.",
+                )
+            )
+            return DoctorReport(tuple(checks))
+        volume_check = _windows_volume_check(profile)
+        checks.append(volume_check)
+        if volume_check.blocker:
+            return DoctorReport(tuple(checks))
 
     repo_result = run(
         ["git", "rev-parse", "--show-toplevel"],
@@ -628,9 +727,10 @@ def _windows_command_checks(
     which: ExecutableResolver,
 ) -> list[DoctorCheck]:
     """Validate exactly the typed command variants native Windows will run."""
+    bootstrap_command = config.bootstrap_install.select(windows=True)
     configured: list[tuple[str, CommandSpec | None, str, str]] = [
         (
-            "bootstrap command", config.bootstrap_install.select(windows=True),
+            "bootstrap command", bootstrap_command,
             "[bootstrap]", "install_",
         ),
         (
@@ -680,9 +780,31 @@ def _windows_command_checks(
             continue
         executable = argv[0]
         if _resolve_command_executable(executable, repo_root, which) is None:
-            checks.append(
-                _error(name, f"missing executable: `{executable}`", f"Install it or update `{location}`.")
-            )
+            normalized_executable = executable.replace("\\", "/").casefold()
+            bootstrap_value = ""
+            if bootstrap_command is not None:
+                bootstrap_value = (
+                    " ".join(bootstrap_command.value)
+                    if isinstance(bootstrap_command.value, tuple)
+                    else bootstrap_command.value
+                )
+            bootstrap_value = bootstrap_value.replace("\\", "/").casefold()
+            if (
+                name.startswith("verify command (")
+                and "/" in normalized_executable
+                and normalized_executable in bootstrap_value
+            ):
+                checks.append(
+                    _ok(
+                        name,
+                        f"selected command: {command.display(windows=True)}; "
+                        f"pending bootstrap: {executable}",
+                    )
+                )
+            else:
+                checks.append(
+                    _error(name, f"missing executable: `{executable}`", f"Install it or update `{location}`.")
+                )
         else:
             checks.append(_ok(name, f"selected command: {command.display(windows=True)}"))
     return checks

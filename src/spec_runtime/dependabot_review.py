@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Sequence
 
+from .git_common import run_git
+
 _ACTION_LINE_RE = re.compile(
     r"^(?P<prefix>\s*(?:-\s+)?uses:\s+)"
     r"(?P<action>(?:actions/[A-Za-z0-9_.-]+|openai/codex-action))"
@@ -37,12 +39,10 @@ class DependabotPolicyError(ValueError):
 
 
 def _git(repo: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args],
+    result = run_git(
+        args,
         cwd=repo,
         check=True,
-        capture_output=True,
-        text=True,
     )
     return result.stdout
 
@@ -260,7 +260,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
-        json.dumps(build_review_payload(args.base_sha, args.head_sha), indent=2) + "\n"
+        json.dumps(build_review_payload(args.base_sha, args.head_sha), indent=2) + "\n",
+        encoding="utf-8",
     )
     print(f"Validated Dependabot dependency update: {', '.join(changed_files)}")
     return 0

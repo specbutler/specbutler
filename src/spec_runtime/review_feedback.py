@@ -16,14 +16,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_spec_runtime_config
+from .git_common import subprocess_text_kwargs
+from .review_decision import REVIEW_DECISION_VALUES, review_payload_decision
 from .review_gate_sticky_comment import STICKY_MARKER, extract_embedded_review_result
 from .spec_identity import pr_body_uses_local_review
 
 REVIEW_GATE_CHECK_NAME = "review-decision-gate"
 REVIEW_GATE_ARTIFACT_NAME = "review-decision-gate-result"
 REVIEW_GATE_ARTIFACT_FILE = "review-decision.json"
-REVIEW_DECISION_VALUES = ("approved", "request_changes", "blocked", "failed")
-
 RunSubprocess = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactPayloadLoader = Callable[[Path, dict], dict | None]
 
@@ -48,8 +48,8 @@ def default_run_subprocess(
         cwd=cwd,
         env=merged_env,
         capture_output=True,
-        text=True,
         timeout=timeout,
+        **subprocess_text_kwargs(cmd),
     )
 
 
@@ -94,10 +94,10 @@ class ReviewResult:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / "review-result.json"
         rendered = json.dumps(asdict(self), indent=2, sort_keys=True) + "\n"
-        output_path.write_text(rendered)
+        output_path.write_text(rendered, encoding="utf-8")
         if self.attempt_number is not None and self.attempt_number > 0:
             attempt_path = output_dir / f"review-result.attempt-{self.attempt_number}.json"
-            attempt_path.write_text(rendered)
+            attempt_path.write_text(rendered, encoding="utf-8")
         return output_path
 
     @classmethod
@@ -106,7 +106,7 @@ class ReviewResult:
         if not input_path.exists():
             return None
         try:
-            data = json.loads(input_path.read_text())
+            data = json.loads(input_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, TypeError):
             return None
 
@@ -225,20 +225,6 @@ def parse_json_object(text: str) -> dict | None:
     return None
 
 
-def _normalize_review_decision(raw: object) -> str:
-    value = str(raw or "").strip().lower()
-    aliases = {
-        "approve": "approved",
-        "approved": "approved",
-        "changes_requested": "request_changes",
-        "request_changes": "request_changes",
-        "request-changes": "request_changes",
-        "blocked": "blocked",
-        "failed": "failed",
-    }
-    return aliases.get(value, "")
-
-
 def _normalize_review_finding(item: dict, index: int) -> ReviewFinding:
     start_line = _coerce_line_number(
         item.get("start_line", item.get("line", 1)),
@@ -285,7 +271,7 @@ def normalize_review_payload(
     expected_base_sha: str,
     check_run: dict,
 ) -> ReviewResult:
-    decision = _normalize_review_decision(payload.get("status", payload.get("decision")))
+    decision = review_payload_decision(payload)
     if decision not in REVIEW_DECISION_VALUES:
         raise ValueError("review payload has invalid decision/status")
 
@@ -491,7 +477,7 @@ def load_review_payload_from_gate_artifact(
         if not candidate_paths:
             raise ValueError(f"artifact {REVIEW_GATE_ARTIFACT_NAME} does not contain {REVIEW_GATE_ARTIFACT_FILE}")
 
-        parsed = parse_json_object(candidate_paths[0].read_text())
+        parsed = parse_json_object(candidate_paths[0].read_text(encoding="utf-8"))
         if parsed is None:
             raise ValueError(f"artifact {REVIEW_GATE_ARTIFACT_NAME} contains invalid JSON payload")
 

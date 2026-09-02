@@ -16,9 +16,9 @@ Describe what this spec achieves and why it matters. Keep it to 2-3 sentences.
 
 ## Acceptance Criteria
 
-1. First concrete, testable requirement
-2. Second requirement
-3. Third requirement
+- [ ] First concrete, testable requirement
+- [ ] Second requirement
+- [ ] Third requirement
 
 ## Out of Scope
 

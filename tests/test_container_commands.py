@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
-import socket as _socket
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -383,35 +381,29 @@ def test_doctor_warns_when_build_ssh_set_without_agent(tmp_path: Path) -> None:
 
 def test_doctor_passes_when_build_ssh_set_with_agent(tmp_path: Path) -> None:
     sock_path = tmp_path / "agent.sock"
-    server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    try:
-        # AF_UNIX sun_path is capped at 104 bytes on macOS; pytest's tmp_path
-        # can exceed that, so bind via a short relative path from tmp_path.
-        with contextlib.chdir(tmp_path):
-            server.bind("agent.sock")
-        config = _config(
-            execution=ExecutionConfig(
-                backend="container",
-                backend_explicit=True,
-                container=ContainerExecutionConfig(
-                    image="example/spec-worker:latest",
-                    build_ssh="default",
-                ),
-            )
+    sock_path.touch()
+    config = _config(
+        execution=ExecutionConfig(
+            backend="container",
+            backend_explicit=True,
+            container=ContainerExecutionConfig(
+                image="example/spec-worker:latest",
+                build_ssh="default",
+            ),
         )
+    )
 
-        with patch("shutil.which", return_value="/usr/bin/docker"):
-            checks = container.run_doctor_checks(
-                tmp_path,
-                config,
-                runner=FakeRunner(),
-                system_name="Darwin",
-                env={"SSH_AUTH_SOCK": str(sock_path)},
-            )
-    finally:
-        server.close()
-        if sock_path.exists():
-            sock_path.unlink()
+    with (
+        patch("shutil.which", return_value="/usr/bin/docker"),
+        patch.object(container.stat, "S_ISSOCK", return_value=True),
+    ):
+        checks = container.run_doctor_checks(
+            tmp_path,
+            config,
+            runner=FakeRunner(),
+            system_name="Darwin",
+            env={"SSH_AUTH_SOCK": str(sock_path)},
+        )
 
     ssh_check = next(check for check in checks if check.name == "build SSH agent")
     assert ssh_check.ok is True
@@ -808,11 +800,18 @@ def test_smoke_rejects_same_version_from_different_source(
 
     backend = StaleSourceBackend()
 
-    code = container.run_smoke(
-        Path("/tmp/repo"),
-        _config(),
-        backend=backend,  # type: ignore[arg-type]
-    )
+    # Installed wheels legitimately have no Git commit in their source ID.
+    # Pin an editable-checkout identity explicitly so this unit test exercises
+    # commit drift independent of how the test runner installed Spec Butler.
+    with patch(
+        "spec_runtime.container.host_spec_runtime_source_id",
+        return_value=f"{host_spec_runtime_version()}@{'1' * 40}",
+    ):
+        code = container.run_smoke(
+            Path("/tmp/repo"),
+            _config(),
+            backend=backend,  # type: ignore[arg-type]
+        )
 
     assert code == 1
     assert backend.cleaned is True
@@ -828,7 +827,8 @@ def test_host_source_identity_marks_dirty_editable_checkout() -> None:
     with (
         patch("spec_runtime.execution_backend.host_spec_runtime_version", return_value="1.2.3"),
         patch("importlib.metadata.distribution", side_effect=RuntimeError("no metadata")),
-        patch("spec_runtime.execution_backend.subprocess.run", side_effect=completed),
+        patch("spec_runtime.execution_backend._is_adjacent_spec_runtime_checkout", return_value=True),
+        patch("spec_runtime.execution_backend.run_git", side_effect=completed),
     ):
         source_id = host_spec_runtime_source_id()
 

@@ -16,6 +16,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -28,24 +29,58 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spec_runtime import autopilot, git_common, spec_status, spec_table
+from spec_runtime import autopilot, git_common, process_supervisor, spec_status, spec_table
 from spec_runtime import backfill_merge_tags as spec_backfill
 from spec_runtime import execution_backend as eb
 from spec_runtime import orchestrator as orch
 from spec_runtime import spec_merge_tags as merge_tags
 from spec_runtime import worktree_process_registry as process_registry
+from spec_runtime.agent_adapter import (
+    HostAgentUnavailableError,
+    host_agent_unavailability_reason,
+)
 from spec_runtime.command_runtime import CommandVariants
 from spec_runtime.config import CoordinationConfig, VerifyGateConfig
 from spec_runtime.control_plane import save_run_lease
 from spec_runtime.control_plane.lease import build_lease
 from spec_runtime.coordination import CoordinatorError, CoordinatorLeaseConflictError
+from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
+from spec_runtime.review_bootstrap import (
+    PreparedReviewBootstrapSandbox,
+    build_review_bootstrap_environment,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(autouse=True)
+def _make_host_agent_availability_hermetic(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Do not make lifecycle unit tests depend on the pytest host sandbox.
+
+    Tests marked ``host_agent_preflight`` exercise the production policy
+    explicitly. Every other orchestrator test uses fake provider processes and
+    should remain portable across Linux, macOS, and native Windows runners.
+    """
+    if request.node.get_closest_marker("host_agent_preflight") is not None:
+        return
+    monkeypatch.setattr(orch, "require_host_agent_available", lambda _agent: None)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_windows_username_is_actor_fallback(monkeypatch: pytest.MonkeyPatch):
+    for name in ("SPEC_ACTOR", "USER", "LOGNAME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("USERNAME", "specadmin")
+
+    assert orch._current_actor() == "specadmin"
+    assert spec_backfill._current_actor() == "specadmin"
 
 
 def _run_git(*args: str, cwd: Path) -> None:
@@ -84,6 +119,47 @@ def _run_make_dry_run(*args: str, cwd: Path) -> str:
         env=env,
     )
     return result.stdout
+
+
+def _managed_process_double(
+    *,
+    pid: int = 4321,
+    started_at: str = "Mon Mar 17 12:00:00 2026",
+    command: str = "spec implement",
+    mode: LifetimeMode = LifetimeMode.ADOPTABLE,
+) -> SimpleNamespace:
+    identity = ProcessIdentity(pid=pid, started_at=started_at, command=command)
+    return SimpleNamespace(
+        pid=identity.pid,
+        token=SupervisionToken(
+            mode,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "test-supervision-id",
+        ),
+    )
+
+
+def _minimal_process_environment(**overrides: str) -> dict[str, str]:
+    """Keep only platform roots required by pathlib and process creation."""
+    keys = (
+        "COMSPEC",
+        "HOME",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "PATH",
+        "PATHEXT",
+        "SPEC_PROCESS_CONTROL_ROOT",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "WINDIR",
+    )
+    env = {key: os.environ[key] for key in keys if key in os.environ}
+    env.update(overrides)
+    return env
 
 
 def _create_annotated_merge_tag(
@@ -1265,6 +1341,68 @@ def _make_fake_popen(
     return FakePopen
 
 
+class _FakeManagedProcess:
+    """Managed-process test double that never enters native launch policy."""
+
+    def __init__(self, process: object):
+        self.process = process
+        identity = ProcessIdentity(
+            pid=int(getattr(process, "pid", 43210)),
+            started_at="test-double",
+            executable="test-agent",
+            command="test-agent",
+        )
+        self.token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            os.getpid(),
+            "test-double",
+            f"test-double-{identity.pid}",
+            pgid=identity.pid if os.name == "posix" else 0,
+            version=1 if os.name == "posix" else 2,
+        )
+
+    def terminate(self, grace_seconds: float = 5.0) -> None:
+        del grace_seconds
+        self.process.terminate()
+
+    def kill(self) -> None:
+        self.process.kill()
+
+    def __getattr__(self, name: str):
+        return getattr(self.process, name)
+
+
+def _managed_test_process(process: object) -> _FakeManagedProcess:
+    return _FakeManagedProcess(process)
+
+
+def _make_fake_managed_spawn(
+    returncode: int = 0,
+    captured_env: dict | None = None,
+    captured_proc: dict | None = None,
+    stdout_lines: list[str] | None = None,
+    poll_sequence: list[int | None] | None = None,
+):
+    """Return a ProcessSupervisor.spawn side effect for implement tests."""
+    fake_popen = _make_fake_popen(
+        returncode=returncode,
+        captured_env=captured_env,
+        captured_proc=captured_proc,
+        stdout_lines=stdout_lines,
+        poll_sequence=poll_sequence,
+    )
+
+    def spawn(cmd, cwd=None, env=None, **kwargs):
+        return _managed_test_process(fake_popen(cmd, cwd=cwd, env=env, **kwargs))
+
+    return spawn
+
+
+def _portable_success_command() -> list[str]:
+    return [sys.executable, "-c", "raise SystemExit(0)"]
+
+
 class TestPhaseImplementHandshake:
     @pytest.fixture(autouse=True)
     def _materialize_legacy_result_fixtures_after_prelaunch_clear(
@@ -1321,7 +1459,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -1337,7 +1475,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -1466,7 +1604,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["reviewhead", "reviewhead", "mergehead"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "_review_retry_allows_inferred_success", return_value=False),
@@ -1500,7 +1638,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["reviewhead", "reviewhead", "mergehead"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "_review_retry_allows_inferred_success", return_value=False),
@@ -1540,7 +1678,7 @@ class TestPhaseImplementHandshake:
             **kwargs: object,
         ) -> list[str]:
             captured_kwargs.update(kwargs)
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -1571,7 +1709,7 @@ class TestPhaseImplementHandshake:
             **kwargs: object,
         ) -> list[str]:
             captured_kwargs.update(kwargs)
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -1698,7 +1836,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -1743,7 +1881,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_launch_implement_attempt", side_effect=_launch_and_replace_steering),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
@@ -1770,7 +1908,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "def456"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -1802,7 +1940,7 @@ class TestPhaseImplementHandshake:
                 "_merge_origin_master",
                 return_value=orch.MergeOriginMasterResult(status="success"),
             ) as merge_mock,
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -1825,7 +1963,7 @@ class TestPhaseImplementHandshake:
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
             patch.object(orch, "_fetch_origin_master", return_value="") as fetch_mock,
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -1853,7 +1991,7 @@ class TestPhaseImplementHandshake:
             **_kwargs: object,
         ) -> list[str]:
             captured_retry_context["ctx"] = retry_context
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -1940,7 +2078,7 @@ class TestPhaseImplementHandshake:
             **_kwargs: object,
         ) -> list[str]:
             captured_retry_context["ctx"] = retry_context
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -2022,8 +2160,10 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen(captured_env=captured_env)),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.object(
+                orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn(captured_env=captured_env)
+            ),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2045,7 +2185,9 @@ class TestPhaseImplementHandshake:
         )
         register_setup_processes.assert_called_once_with(repo, worktree, manifest)
         assert captured_env["VIRTUAL_ENV"] == str(worktree / ".venv")
-        assert captured_env["PATH"].split(os.pathsep)[0] == str(worktree / ".venv" / "bin")
+        assert captured_env["PATH"].split(os.pathsep)[0] == str(
+            orch._worktree_venv_python(worktree).parent
+        )
         assert (
             captured_env["DATABASE_URL"] == "postgresql://example:secret@/example_app?host=/tmp/example-pg&port=55433"
         )
@@ -2096,8 +2238,8 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2167,8 +2309,8 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2237,8 +2379,8 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2314,8 +2456,8 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2381,7 +2523,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2453,7 +2595,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2524,7 +2666,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2688,7 +2830,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "def456"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -2713,7 +2855,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -2734,7 +2876,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2763,7 +2905,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
             patch.object(orch, "_run_implement_teardown_command", side_effect=fake_teardown),
@@ -2802,11 +2944,10 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.os, "killpg", side_effect=OSError("no process group")),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(
                     captured_proc=captured_proc,
                     poll_sequence=[None, None, None],
                 ),
@@ -2826,6 +2967,7 @@ class TestPhaseImplementHandshake:
 
         proc = MagicMock(pid=777)
         proc.poll.return_value = None
+        managed = _managed_test_process(proc)
 
         def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None):  # noqa: ANN001, ARG001
             if cmd[:2] == ["git", "log"]:
@@ -2847,7 +2989,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
-            patch.object(orch.subprocess, "Popen", return_value=proc),
+            patch.object(orch.ProcessSupervisor, "spawn", return_value=managed),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -2856,7 +2998,7 @@ class TestPhaseImplementHandshake:
         register_process.assert_called_once_with(
             repo,
             worktree,
-            proc,
+            managed,
             name="agent",
             kind="agent",
         )
@@ -2888,7 +3030,7 @@ class TestPhaseImplementHandshake:
             **kwargs: object,
         ) -> list[str]:
             captured_kwargs.update(kwargs)
-            return ["/bin/sh", "-c", "exit 0"]
+            return _portable_success_command()
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -2970,7 +3112,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3059,7 +3201,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3103,9 +3245,9 @@ class TestPhaseImplementHandshake:
                 ),
             ),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(poll_sequence=[None, None, None, 0]),
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(poll_sequence=[None, None, None, 0]),
             ),
             caplog.at_level("WARNING"),
         ):
@@ -3149,7 +3291,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3166,7 +3308,7 @@ class TestPhaseImplementHandshake:
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
-            patch.object(orch, "_build_agent_command", return_value=["/bin/sh", "-c", "exit 0"]),
+            patch.object(orch, "_build_agent_command", return_value=_portable_success_command()),
             patch.object(orch, "_head_sha", side_effect=["abc123", "def456"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
         ):
@@ -3272,7 +3414,7 @@ class TestPhaseImplementHandshake:
             call_order.append("recovery-build" if kwargs.get("retry_context") is not None else "initial-build")
             return ["agent"]
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cwd, env, kwargs
             if len(build_calls) >= 2:
                 orch.ImplementResult(
@@ -3281,7 +3423,7 @@ class TestPhaseImplementHandshake:
                     attempt=run.attempts,
                     launch_number=run.implement_launches,
                 ).save(repo, run.run_id)
-            return _make_fake_popen(returncode=0)(cmd)
+            return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -3302,7 +3444,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3367,8 +3509,8 @@ class TestPhaseImplementHandshake:
                 patch.object(orch, "_write_sandbox_config"),
                 patch.object(orch, "_build_agent_command", return_value=["agent", "recover"]),
                 patch.object(
-                    orch.subprocess,
-                    "Popen",
+                    orch.ProcessSupervisor,
+                    "spawn",
                     side_effect=AssertionError("recovery bypassed execution backend"),
                 ),
             ):
@@ -3388,6 +3530,7 @@ class TestPhaseImplementHandshake:
         assert isinstance(request, eb.AgentRequest)
         assert request.argv == ["agent", "recover"]
         assert request.cwd == worktree
+        assert "start_new_session" not in request.popen_kwargs
 
     def test_no_handshake_after_recovery_fails_deterministically(self, repo: Path):
         run = self._make_run()
@@ -3403,9 +3546,9 @@ class TestPhaseImplementHandshake:
             build_calls.append(kwargs)
             return ["agent"]
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cwd, env, kwargs
-            return _make_fake_popen(returncode=0)(cmd)
+            return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -3415,7 +3558,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3453,9 +3596,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CODEX_IDLE_TIMEOUT_SECONDS", 0),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(
                     captured_proc=captured_proc,
                     poll_sequence=[None, None, None, None],
                 ),
@@ -3494,9 +3637,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CODEX_IDLE_TIMEOUT_SECONDS", 0),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(poll_sequence=[None, None, None, None]),
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(poll_sequence=[None, None, None, None]),
             ),
         ):
             status = orch.phase_implement(run, repo)
@@ -3534,9 +3677,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CLAUDE_IDLE_TIMEOUT_SECONDS", 0),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(
                     captured_proc=captured_proc,
                     poll_sequence=[None, None, None, None],
                 ),
@@ -3575,9 +3718,9 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CLAUDE_IDLE_TIMEOUT_SECONDS", 0),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(poll_sequence=[None, None, None, None]),
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(poll_sequence=[None, None, None, None]),
             ),
         ):
             status = orch.phase_implement(run, repo)
@@ -3602,7 +3745,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "AGENT_COMPLETION_POLL_SECONDS", 0),
             patch.object(orch, "CLAUDE_IDLE_TIMEOUT_SECONDS", 0),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3658,7 +3801,9 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen(captured_env=captured_env)),
+            patch.object(
+                orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn(captured_env=captured_env)
+            ),
             patch.dict(orch.os.environ, {}, clear=True),
         ):
             status = orch.phase_implement(run, repo)
@@ -3725,7 +3870,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3783,7 +3928,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3854,7 +3999,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3899,7 +4044,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen()),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
         ):
             orch.phase_implement(run, repo)
 
@@ -3953,7 +4098,7 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", _make_fake_popen(0)),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn(0)),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3974,7 +4119,7 @@ class TestPhaseImplementHandshake:
             calls.append("recovery-build" if kwargs.get("retry_context") is not None else "initial-build")
             return ["agent"]
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cwd, env, kwargs
             if calls.count("recovery-build") == 1:
                 orch.ImplementResult(
@@ -3983,7 +4128,7 @@ class TestPhaseImplementHandshake:
                     attempt=run.attempts,
                     launch_number=run.implement_launches,
                 ).save(repo, run.run_id)
-            return _make_fake_popen(returncode=0)(cmd)
+            return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -4001,7 +4146,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4031,7 +4176,7 @@ class TestPhaseImplementHandshake:
                 )
             return orch.ImplementSetupManifest()
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cmd, cwd, kwargs
             launch_env = dict(env or {})
             popen_envs.append(launch_env)
@@ -4043,7 +4188,7 @@ class TestPhaseImplementHandshake:
                     attempt=run.attempts,
                     launch_number=run.implement_launches,
                 ).save(repo, run.run_id)
-            return _make_fake_popen(returncode=0)(["agent"])
+            return _managed_test_process(_make_fake_popen(returncode=0)(["agent"]))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -4052,9 +4197,14 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_write_sandbox_config"),
             patch.object(orch, "_build_agent_command", return_value=["agent"]),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
+            patch.object(orch, "_recent_commit_lines", return_value=[]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
-            patch.dict(orch.os.environ, {"BASE_ENV": "present"}, clear=True),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
+            patch.dict(
+                orch.os.environ,
+                _minimal_process_environment(BASE_ENV="present"),
+                clear=True,
+            ),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4130,7 +4280,7 @@ class TestPhaseImplementHandshake:
                 recovery_call_index.append(len(captured_kwargs) - 1)
             return ["agent"]
 
-        def fake_popen(cmd, cwd=None, env=None, **kwargs):
+        def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cwd, kwargs
             captured_envs.append(dict(env or {}))
             if recovery_call_index:
@@ -4140,7 +4290,7 @@ class TestPhaseImplementHandshake:
                     attempt=run.attempts,
                     launch_number=run.implement_launches,
                 ).save(repo, run.run_id)
-            return _make_fake_popen(returncode=0)(cmd)
+            return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
@@ -4150,7 +4300,7 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
             patch.object(orch, "_head_sha", side_effect=["abc123", "abc123"]),
             patch.object(orch, "_worktree_dirty_files", return_value=[" M file.py"]),
-            patch.object(orch.subprocess, "Popen", side_effect=fake_popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=fake_spawn),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4204,7 +4354,11 @@ class TestPhaseImplementHandshake:
                     stderr="",
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", side_effect=FileNotFoundError("agent missing")),
+            patch.object(
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=FileNotFoundError("agent missing"),
+            ),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4254,11 +4408,11 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_validate_codex_exec", return_value=True),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(
-                orch.subprocess,
-                "Popen",
-                _make_fake_popen(returncode=0, captured_env=captured_env),
+                orch.ProcessSupervisor,
+                "spawn",
+                side_effect=_make_fake_managed_spawn(returncode=0, captured_env=captured_env),
             ),
-            patch.dict(orch.os.environ, {"PATH": "/usr/bin:/bin"}, clear=True),
+            patch.dict(orch.os.environ, _minimal_process_environment(), clear=True),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4266,7 +4420,9 @@ class TestPhaseImplementHandshake:
         assert calls == ["setup", "teardown"]
         assert captured_env["DATABASE_URL"] == "postgres://db"
         assert captured_env["VIRTUAL_ENV"] == str(worktree / ".venv")
-        assert captured_env["PATH"].split(os.pathsep)[0] == str(worktree / ".venv" / "bin")
+        assert captured_env["PATH"].split(os.pathsep)[0] == str(
+            orch._worktree_venv_python(worktree).parent
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5297,21 +5453,69 @@ class TestBootstrapGuards:
 class TestReviewWorktreeBootstrap:
     """Bootstrap of the local review worktree before launching the reviewer."""
 
+    @pytest.fixture(autouse=True)
+    def _hermetic_sandbox_boundary(self, monkeypatch: pytest.MonkeyPatch):
+        """Keep command-behavior tests independent of the installed Codex CLI.
+
+        Enforcement and fail-closed construction are covered in the dedicated
+        review-bootstrap boundary tests. These tests exercise orchestration,
+        environment contents, timeout handling, and warning artifacts.
+        """
+
+        @contextmanager
+        def passthrough(review_worktree: Path, command_argv: list[str]):  # noqa: ARG001
+            runtime_root = Path(
+                tempfile.mkdtemp(prefix=".spec-review-bootstrap-test-", dir=review_worktree)
+            )
+            env = build_review_bootstrap_environment(
+                inherited_env=os.environ,
+                runtime_root=runtime_root,
+                codex_home=runtime_root / "codex-home",
+                windows=os.name == "nt",
+            )
+            try:
+                yield PreparedReviewBootstrapSandbox((), env, runtime_root)
+            finally:
+                shutil.rmtree(runtime_root, ignore_errors=True)
+
+        monkeypatch.setattr(orch, "isolated_review_bootstrap_sandbox", passthrough)
+
     @staticmethod
-    def _config_with_install(command: str):
-        return replace(orch.SPEC_RUNTIME_CONFIG, bootstrap_install_command=command)
+    def _config_with_install(
+        command: str,
+        *,
+        windows_argv: tuple[str, ...] = (),
+    ):
+        return replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            bootstrap_install_command=command,
+            bootstrap_install=CommandVariants(
+                command=command,
+                windows_argv=windows_argv,
+                source="test review bootstrap",
+            ),
+        )
 
     def test_runs_trusted_bootstrap_command_with_stripped_env(self, tmp_path: Path):
         worktree = tmp_path / "review-worktree"
         worktree.mkdir()
         warning_path = tmp_path / "warning.json"
         marker = worktree / "env-dump.txt"
+        dump_env = (
+            "import os, sys; "
+            "from pathlib import Path; "
+            "Path(sys.argv[1]).write_text('\\n'.join(f'{key}={value}' "
+            "for key, value in sorted(os.environ.items())), encoding='utf-8')"
+        )
 
         with (
             patch.object(
                 orch,
                 "SPEC_RUNTIME_CONFIG",
-                self._config_with_install(f"env > {marker}"),
+                self._config_with_install(
+                    f"env > {marker}",
+                    windows_argv=(sys.executable, "-c", dump_env, str(marker)),
+                ),
             ),
             patch.dict(
                 os.environ,
@@ -5320,7 +5524,10 @@ class TestReviewWorktreeBootstrap:
                     "GH_TOKEN": "secret",
                     "ANTHROPIC_API_KEY": "sk-secret",
                     "CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret",
-                    "PATH": "/usr/bin",
+                    # Keep the environment deliberately minimal while
+                    # retaining the platform's standard shell search path.
+                    # macOS installs sh in /bin, not /usr/bin.
+                    "PATH": os.defpath,
                 },
                 clear=False,
             ),
@@ -5342,6 +5549,7 @@ class TestReviewWorktreeBootstrap:
         assert "ANTHROPIC_API_KEY" not in dumped_env
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in dumped_env
 
+    @pytest.mark.skipif(os.name != "posix", reason="exercises the legacy POSIX shell path")
     def test_legacy_posix_bootstrap_preserves_login_shell_launch(self, tmp_path: Path):
         worktree = tmp_path / "review-worktree"
         worktree.mkdir()
@@ -5355,10 +5563,18 @@ class TestReviewWorktreeBootstrap:
 
         def popen(argv, **kwargs):
             captured["argv"] = argv
+            captured.update(kwargs)
             return Process()
 
         with (
-            patch.object(orch, "SPEC_RUNTIME_CONFIG", self._config_with_install("echo ok")),
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    "echo ok",
+                    windows_argv=(sys.executable, "-c", "print('ok')"),
+                ),
+            ),
             patch.object(orch.subprocess, "Popen", side_effect=popen),
         ):
             warning = orch._bootstrap_review_worktree(
@@ -5367,6 +5583,8 @@ class TestReviewWorktreeBootstrap:
 
         assert warning == ""
         assert captured["argv"] == ["sh", "-lc", "echo ok"]
+        assert captured["encoding"] == "utf-8"
+        assert captured["errors"] == "replace"
 
     def test_bootstrap_cannot_read_real_home_credentials(self, tmp_path: Path):
         """Stripping named credential env vars is not enough on its own: build
@@ -5391,9 +5609,30 @@ class TestReviewWorktreeBootstrap:
             f'echo "$HOME" > {observed_home}; '
             f'[ -f "$HOME/.codex/auth.json" ] && cp "$HOME/.codex/auth.json" {found_marker} || true'
         )
+        windows_probe = (
+            "import shutil, sys; "
+            "from pathlib import Path; "
+            "home = Path.home(); "
+            "Path(sys.argv[1]).write_text(str(home), encoding='utf-8'); "
+            "secret = home / '.codex' / 'auth.json'; "
+            "shutil.copy2(secret, sys.argv[2]) if secret.is_file() else None"
+        )
 
         with (
-            patch.object(orch, "SPEC_RUNTIME_CONFIG", self._config_with_install(install_cmd)),
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    install_cmd,
+                    windows_argv=(
+                        sys.executable,
+                        "-c",
+                        windows_probe,
+                        str(observed_home),
+                        str(found_marker),
+                    ),
+                ),
+            ),
             patch.dict(
                 os.environ,
                 {"HOME": str(real_home), "CODEX_HOME": str(real_home / ".codex")},
@@ -5419,7 +5658,14 @@ class TestReviewWorktreeBootstrap:
         with patch.object(
             orch,
             "SPEC_RUNTIME_CONFIG",
-            self._config_with_install("echo 'boom: build hook failed' >&2; exit 1"),
+            self._config_with_install(
+                "echo 'boom: build hook failed' >&2; exit 1",
+                windows_argv=(
+                    sys.executable,
+                    "-c",
+                    "import sys; print('boom: build hook failed', file=sys.stderr); raise SystemExit(1)",
+                ),
+            ),
         ):
             warning = orch._bootstrap_review_worktree(
                 tmp_path / "repo", worktree, warning_path=warning_path
@@ -5428,8 +5674,46 @@ class TestReviewWorktreeBootstrap:
         assert warning
         assert warning_path.is_file()
         payload = json.loads(warning_path.read_text())
-        assert payload["command"] == "echo 'boom: build hook failed' >&2; exit 1"
+        assert "boom: build hook failed" in payload["command"]
         assert "boom: build hook failed" in payload["detail"]
+
+    def test_unavailable_security_boundary_skips_command_and_records_diff_only_warning(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        worktree = tmp_path / "review-worktree"
+        worktree.mkdir()
+        warning_path = tmp_path / "warning.json"
+
+        @contextmanager
+        def unavailable(review_worktree: Path, command_argv: list[str]):  # noqa: ARG001
+            raise orch.ReviewBootstrapSandboxUnavailable("native sandbox setup is unavailable")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(orch, "isolated_review_bootstrap_sandbox", unavailable)
+        with (
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    "echo must-not-run",
+                    windows_argv=(sys.executable, "-c", "raise AssertionError('must not run')"),
+                ),
+            ),
+            patch.object(orch.ProcessSupervisor, "spawn") as spawn,
+        ):
+            warning = orch._bootstrap_review_worktree(
+                tmp_path / "repo",
+                worktree,
+                warning_path=warning_path,
+            )
+
+        assert "enforceable sandbox is unavailable" in warning
+        spawn.assert_not_called()
+        payload = json.loads(warning_path.read_text())
+        assert payload["summary"] == warning
+        assert payload["detail"] == "native sandbox setup is unavailable"
 
     def test_records_warning_on_timeout(self, tmp_path: Path):
         worktree = tmp_path / "review-worktree"
@@ -5437,7 +5721,18 @@ class TestReviewWorktreeBootstrap:
         warning_path = tmp_path / "warning.json"
 
         with (
-            patch.object(orch, "SPEC_RUNTIME_CONFIG", self._config_with_install("sleep 30")),
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    "sleep 30",
+                    windows_argv=(
+                        sys.executable,
+                        "-c",
+                        "import time; time.sleep(30)",
+                    ),
+                ),
+            ),
             patch.object(orch, "REVIEW_BOOTSTRAP_TIMEOUT_SECONDS", 0.2),
         ):
             started = time.monotonic()
@@ -5453,13 +5748,13 @@ class TestReviewWorktreeBootstrap:
         assert elapsed < 15
 
     def test_timeout_kills_whole_process_group_not_just_the_shell(self, tmp_path: Path):
-        """A regression test for a hang: the untrusted install command can fork
-        a background child that outlives the shell and keeps stdout/stderr
-        open. Killing only the ``sh`` process (as a plain
+        """A regression test for a hang: the untrusted install command can spawn
+        a descendant that outlives its parent and keeps stdout/stderr open.
+        Killing only the parent process (as a plain
         ``subprocess.run(..., timeout=...)`` would) leaves that child running
         and can block the caller waiting for the pipes to close. The bootstrap
-        must run the command in its own process group and kill the whole
-        group on timeout so it reliably falls back to diff-only review.
+        must kill the whole process tree on timeout so it reliably falls back
+        to diff-only review.
         """
         worktree = tmp_path / "review-worktree"
         worktree.mkdir()
@@ -5468,9 +5763,33 @@ class TestReviewWorktreeBootstrap:
         # The backgrounded child inherits stdout/stderr (kept open) and, absent
         # a group kill, would keep running/writing long past the timeout.
         install_cmd = f"(sleep 5; touch {marker}) & sleep 30"
+        windows_child = (
+            "import sys, time; "
+            "from pathlib import Path; "
+            "time.sleep(5); "
+            "Path(sys.argv[1]).write_text('alive', encoding='utf-8')"
+        )
+        windows_parent = (
+            "import subprocess, sys, time; "
+            f"child = {windows_child!r}; "
+            "subprocess.Popen([sys.executable, '-c', child, sys.argv[1]]); "
+            "time.sleep(30)"
+        )
 
         with (
-            patch.object(orch, "SPEC_RUNTIME_CONFIG", self._config_with_install(install_cmd)),
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                self._config_with_install(
+                    install_cmd,
+                    windows_argv=(
+                        sys.executable,
+                        "-c",
+                        windows_parent,
+                        str(marker),
+                    ),
+                ),
+            ),
             patch.object(orch, "REVIEW_BOOTSTRAP_TIMEOUT_SECONDS", 0.2),
         ):
             started = time.monotonic()
@@ -6300,6 +6619,17 @@ class TestDistributedLeaseIntegration:
         )
         monkeypatch.setattr(orch, "LEASE_HEARTBEAT_INTERVAL_SECONDS", 0.05)
         heartbeat_calls = 0
+        termination_grace: list[float] = []
+        original_terminate = process_supervisor.ManagedProcess.terminate
+
+        def track_terminate(
+            managed: process_supervisor.ManagedProcess,
+            grace_seconds: float = 5.0,
+        ) -> None:
+            termination_grace.append(grace_seconds)
+            original_terminate(managed, grace_seconds=grace_seconds)
+
+        monkeypatch.setattr(process_supervisor.ManagedProcess, "terminate", track_terminate)
 
         class FakeClient:
             def heartbeat_lease(self, lease_id, payload):
@@ -6331,6 +6661,7 @@ class TestDistributedLeaseIntegration:
         assert result == "failed"
         assert time.monotonic() - started_at < 5
         assert heartbeat_calls >= 2
+        assert termination_grace == [0]
         assert "owner=machine-b" in run.last_error
 
     def test_autopilot_acquires_candidate_lease_before_launch(self, repo: Path):
@@ -7391,8 +7722,11 @@ class TestSpecAutopilot:
             default=True,
         ) == ["macos", "slack", "ntfy:team"]
 
+    @pytest.mark.skipif(os.name == "nt", reason="exercises Unix sysconf and macOS vm_stat fallbacks")
     def test_available_memory_bytes_falls_back_to_vm_stat(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.setattr(autopilot, "_meminfo_available_bytes", lambda: None)
+        from spec_runtime import process_supervisor
+
+        monkeypatch.setattr(process_supervisor, "_meminfo_available_bytes", lambda: None)
         vm_stat_output = textwrap.dedent("""\
             Mach Virtual Memory Statistics: (page size of 16384 bytes)
             Pages free:                               100.
@@ -7408,17 +7742,19 @@ class TestSpecAutopilot:
                 return 4096
             raise AssertionError(f"unexpected sysconf lookup: {name}")
 
-        def fake_run(cmd, capture_output, text, check):  # noqa: ANN001
+        def fake_run(cmd, capture_output, text, errors, check):  # noqa: ANN001
             assert cmd == ["vm_stat"]
             assert capture_output is True
             assert text is True
+            assert errors == "replace"
             assert check is False
             return subprocess.CompletedProcess(cmd, 0, stdout=vm_stat_output, stderr="")
 
-        monkeypatch.setattr(autopilot.os, "sysconf", fake_sysconf)
-        monkeypatch.setattr(autopilot.subprocess, "run", fake_run)
+        monkeypatch.setattr(process_supervisor.os, "sysconf", fake_sysconf)
+        monkeypatch.setattr(process_supervisor.subprocess, "run", fake_run)
 
         assert autopilot.available_memory_bytes() == (100 + 200 + 25) * 16384
+        assert autopilot.available_memory_bytes is process_supervisor.available_memory_bytes
 
     def test_run_loop_dry_run_refreshes_remote_refs_before_building_queue(
         self,
@@ -7816,36 +8152,32 @@ class TestSpecAutopilot:
         captured_out = capsys.readouterr()
         assert "reconciled stale shutdown" in captured_out.out
 
-    def test_start_candidate_launches_spec_implement_in_new_session(
+    def test_start_candidate_launches_spec_implement_as_adoptable_process(
         self,
         repo: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        popen_kwargs: dict[str, object] = {}
+        spawn_kwargs: dict[str, object] = {}
+        supervisor_init: dict[str, object] = {}
 
-        class DummyProcess:
-            pid = 4321
+        class FakeSupervisor:
+            def __init__(self, lifetime_mode, *, supervision_id=None):  # noqa: ANN001
+                supervisor_init["lifetime_mode"] = lifetime_mode
+                supervisor_init["supervision_id"] = supervision_id
 
-        def fake_popen(command, **kwargs):  # noqa: ANN001
-            popen_kwargs["command"] = command
-            popen_kwargs.update(kwargs)
-            return DummyProcess()
+            def spawn(self, command, **kwargs):  # noqa: ANN001
+                spawn_kwargs["command"] = command
+                spawn_kwargs.update(kwargs)
+                return _managed_process_double(
+                    command="spec implement --spec my-feature",
+                )
 
         monkeypatch.setattr(
             autopilot,
             "autopilot_runs_root",
             lambda _repo_root: repo / ".spec-state" / "autopilot" / "runs",
         )
-        monkeypatch.setattr(autopilot.subprocess, "Popen", fake_popen)
-        monkeypatch.setattr(
-            autopilot,
-            "read_process_identity",
-            lambda pid: autopilot.ProcessIdentity(
-                pid=pid,
-                started_at="Mon Mar 17 12:00:00 2026",
-                command="spec implement --spec my-feature",
-            ),
-        )
+        monkeypatch.setattr(autopilot, "ProcessSupervisor", FakeSupervisor)
 
         candidate = autopilot.DispatchCandidate(
             spec_id="my-feature",
@@ -7860,7 +8192,11 @@ class TestSpecAutopilot:
 
         active = autopilot.start_candidate(repo, candidate)
 
-        assert popen_kwargs["command"] == [
+        assert supervisor_init == {
+            "lifetime_mode": LifetimeMode.ADOPTABLE,
+            "supervision_id": None,
+        }
+        assert spawn_kwargs["command"] == [
             "spec",
             "implement",
             "--spec",
@@ -7870,12 +8206,64 @@ class TestSpecAutopilot:
             "--run",
             "my-feature-20260317T000000",
         ]
-        assert popen_kwargs["cwd"] == repo
-        assert popen_kwargs["start_new_session"] is True
+        assert spawn_kwargs["cwd"] == repo
         assert active.pid == 4321
         assert active.process_started_at == "Mon Mar 17 12:00:00 2026"
-        assert popen_kwargs["stdin"] == autopilot.subprocess.DEVNULL
-        assert popen_kwargs["stderr"] == autopilot.subprocess.STDOUT
+        assert spawn_kwargs["stdin"] == autopilot.subprocess.DEVNULL
+        assert spawn_kwargs["stderr"] == autopilot.subprocess.STDOUT
+
+    def test_start_candidate_publishes_cross_platform_launch_reservation(
+        self,
+        repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        control_root = tmp_path / "controls"
+        monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(control_root))
+        supervisor_init: dict[str, object] = {}
+
+        class FakeSupervisor:
+            def __init__(self, lifetime_mode, **kwargs):  # noqa: ANN001
+                supervisor_init["lifetime_mode"] = lifetime_mode
+                supervisor_init.update(kwargs)
+
+            def spawn(self, command, **kwargs):  # noqa: ANN001
+                return _managed_process_double(
+                    command="spec implement --spec launch-reservation",
+                )
+
+        monkeypatch.setattr(
+            autopilot,
+            "autopilot_runs_root",
+            lambda _repo_root: repo / ".spec-state" / "autopilot" / "runs",
+        )
+        monkeypatch.setattr(autopilot, "ProcessSupervisor", FakeSupervisor)
+        supervision_id = "cross-platform-launch-reservation"
+        ready_path = process_supervisor.durable_metadata_path(supervision_id)
+        candidate = autopilot.DispatchCandidate(
+            spec_id="launch-reservation",
+            agent="codex",
+            area="backend",
+            priority=50,
+            unlock_count=0,
+            status="not-started",
+            run_id="",
+            reason="new-run",
+        )
+
+        active = autopilot.start_candidate(
+            repo,
+            candidate,
+            supervision_id=supervision_id,
+            ready_path=str(ready_path),
+        )
+
+        assert supervisor_init == {
+            "lifetime_mode": LifetimeMode.ADOPTABLE,
+            "supervision_id": supervision_id,
+            "publish_durable_token": True,
+        }
+        assert active.ready_path == str(ready_path)
 
     def test_start_candidate_injects_spec_actor_autopilot(
         self,
@@ -7884,29 +8272,17 @@ class TestSpecAutopilot:
     ):
         popen_kwargs: dict[str, object] = {}
 
-        class DummyProcess:
-            pid = 4321
-
-        def fake_popen(command, **kwargs):  # noqa: ANN001
+        def fake_spawn(_supervisor, command, **kwargs):  # noqa: ANN001
             popen_kwargs["command"] = command
             popen_kwargs.update(kwargs)
-            return DummyProcess()
+            return _managed_process_double(command="spec implement --spec s")
 
         monkeypatch.setattr(
             autopilot,
             "autopilot_runs_root",
             lambda _repo_root: repo / ".spec-state" / "autopilot" / "runs",
         )
-        monkeypatch.setattr(autopilot.subprocess, "Popen", fake_popen)
-        monkeypatch.setattr(
-            autopilot,
-            "read_process_identity",
-            lambda pid: autopilot.ProcessIdentity(
-                pid=pid,
-                started_at="Mon Mar 17 12:00:00 2026",
-                command="make code SPEC=s",
-            ),
-        )
+        monkeypatch.setattr(autopilot.ProcessSupervisor, "spawn", fake_spawn)
 
         candidate = autopilot.DispatchCandidate(
             spec_id="s",
@@ -7928,22 +8304,19 @@ class TestSpecAutopilot:
         repo: Path,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        class DummyProcess:
-            pid = 4321
-
         monkeypatch.setattr(
             autopilot,
             "autopilot_runs_root",
             lambda _repo_root: repo / ".spec-state" / "autopilot" / "runs",
         )
-        monkeypatch.setattr(autopilot.subprocess, "Popen", lambda *_args, **_kwargs: DummyProcess())
         monkeypatch.setattr(
-            autopilot,
-            "read_process_identity",
-            lambda pid: autopilot.ProcessIdentity(
-                pid=pid,
-                started_at="Mon Mar 17 12:00:00 2026",
-                command="spec implement --spec my-feature --run my-feature-20260317T000000",
+            autopilot.ProcessSupervisor,
+            "spawn",
+            lambda *_args, **_kwargs: _managed_process_double(
+                command=(
+                    "spec implement --spec my-feature "
+                    "--run my-feature-20260317T000000"
+                ),
             ),
         )
 
@@ -8493,6 +8866,159 @@ class TestSpecAutopilot:
             "started_at": current.started_at,
         }
 
+    def test_windows_v2_pid_record_uses_targeted_generation_without_argv(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        record = autopilot.PidFileRecord(
+            pid=4242,
+            started_at="2026-09-01T03:00:00+00:00",
+            command=r"C:\old-venv\Scripts\spec.exe auto run",
+            instance_id="dispatcher-generation",
+            nonce="secret-nonce",
+        )
+        tracker = autopilot.ShutdownTracker(
+            autopilot.autopilot_state_root(repo),
+            instance_id=record.instance_id,
+            pid=record.pid,
+            process_started_at=record.started_at,
+            nonce=record.nonce,
+        )
+        tracker.initialize()
+        executable_only = autopilot.ProcessIdentity(
+            pid=record.pid,
+            started_at=record.started_at,
+            command=r"C:\Python\python.exe",
+        )
+        assert autopilot._pid_record_has_live_dispatcher_generation(repo, record)
+        tracker.mark_complete()
+        assert not autopilot._pid_record_has_live_dispatcher_generation(repo, record)
+        tracker.initialize()
+
+        monkeypatch.setattr(
+            autopilot,
+            "_pid_record_has_live_dispatcher_generation",
+            lambda _repo, _record: True,
+        )
+        monkeypatch.setattr(autopilot.os, "name", "nt")
+
+        assert autopilot._pid_record_matches_process(
+            record,
+            executable_only,
+            repo_root=repo,
+        )
+
+    def test_stop_command_uses_targeted_generation_on_every_platform(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        identity = autopilot.ProcessIdentity(
+            pid=4242,
+            started_at="2026-09-01T03:00:00+00:00",
+            command="spec auto run",
+        )
+        record = autopilot.PidFileRecord(
+            pid=identity.pid,
+            started_at=identity.started_at,
+            command=identity.command,
+            instance_id="dispatcher-generation",
+            nonce="secret-nonce",
+        )
+        autopilot._write_pid_file(
+            autopilot.autopilot_pid_path(repo),
+            identity,
+            instance_id=record.instance_id,
+            nonce=record.nonce,
+        )
+        tracker = autopilot.ShutdownTracker(
+            autopilot.autopilot_state_root(repo),
+            instance_id=record.instance_id,
+            pid=record.pid,
+            process_started_at=record.started_at,
+            nonce=record.nonce,
+        )
+        tracker.initialize()
+        legacy_shutdown = MagicMock(
+            side_effect=AssertionError("targeted generations must not use legacy signals")
+        )
+        monkeypatch.setattr(
+            autopilot,
+            "read_process_identity",
+            lambda pid: identity if pid == identity.pid else None,
+        )
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", legacy_shutdown)
+        monkeypatch.setattr(autopilot.ShutdownTracker, "is_complete", lambda self: True)
+
+        assert autopilot.stop_command(argparse.Namespace(repo_root=str(repo))) == 0
+
+        state = tracker.state()
+        assert state.phase is autopilot.ShutdownPhase.GRACEFUL
+        assert state.instance_id == record.instance_id
+        assert state.pid == record.pid
+        assert state.nonce == record.nonce
+        legacy_shutdown.assert_not_called()
+
+    def test_stop_command_round_trips_targeted_shutdown_across_processes(
+        self,
+        repo: Path,
+    ):
+        child_code = textwrap.dedent(
+            """
+            import sys
+            import time
+            from pathlib import Path
+            from spec_runtime import autopilot
+            from spec_runtime.control_plane import ShutdownPhase, ShutdownTracker
+
+            repo = Path(sys.argv[1])
+            identity = autopilot.current_process_identity()
+            instance_id = "real-dispatcher-generation"
+            nonce = "real-dispatcher-nonce"
+            autopilot._write_pid_file(
+                autopilot.autopilot_pid_path(repo),
+                identity,
+                instance_id=instance_id,
+                nonce=nonce,
+            )
+            tracker = ShutdownTracker(
+                autopilot.autopilot_state_root(repo),
+                instance_id=instance_id,
+                pid=identity.pid,
+                process_started_at=identity.started_at,
+                nonce=nonce,
+            )
+            tracker.initialize()
+            print("ready", flush=True)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if tracker.state().phase in {ShutdownPhase.GRACEFUL, ShutdownPhase.FORCED}:
+                    tracker.mark_complete()
+                    raise SystemExit(0)
+                time.sleep(0.02)
+            raise SystemExit(3)
+            """
+        )
+        child = process_supervisor.ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+            [sys.executable, "-c", child_code, str(repo)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert child.stdout is not None
+            ready = child.stdout.readline().strip()
+            if ready != "ready":
+                assert child.stderr is not None
+                pytest.fail(f"dispatcher helper did not start: {child.stderr.read()}")
+            assert autopilot.stop_command(argparse.Namespace(repo_root=str(repo))) == 0
+            assert child.wait(timeout=5) == 0
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=5)
+
     def test_stop_command_refuses_to_signal_stale_recycled_pid(
         self,
         repo: Path,
@@ -8511,7 +9037,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock(side_effect=AssertionError("should not signal stale pid"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("should not signal stale pid"))
 
         monkeypatch.setattr(
             autopilot,
@@ -8526,7 +9052,7 @@ class TestSpecAutopilot:
                 else None
             ),
         )
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
@@ -8536,7 +9062,7 @@ class TestSpecAutopilot:
         # say which fields disagree rather than printing the bare word "stale".
         assert "not an autopilot process" in captured.err
         assert "some_other_script.py" in captured.err
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
         # The pid file must survive. Deleting it on a
         # rejected record is what left a repo with a live, unstoppable daemon and
         # no handle to it. A leftover record blocks nothing — ensure_pid_file
@@ -8568,7 +9094,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock()
+        shutdown_mock = MagicMock(return_value=True)
         monkeypatch.setattr(
             autopilot,
             "read_process_identity",
@@ -8585,13 +9111,14 @@ class TestSpecAutopilot:
         # Drift is only forgiven once the process is confirmed to be running in
         # this repo.
         monkeypatch.setattr(autopilot, "read_process_cwd", lambda pid: repo.resolve())
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         captured = capsys.readouterr()
         assert code == 0
-        kill_mock.assert_called_once_with(4242, signal.SIGTERM)
+        shutdown_mock.assert_called_once()
+        assert shutdown_mock.call_args.args[0].pid == 4242
         assert pid_path.exists()
         # The drift is reported, not silently swallowed.
         assert "started_at" in captured.err
@@ -8625,7 +9152,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock(side_effect=AssertionError("must not signal another repo's autopilot"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("must not signal another repo's autopilot"))
         monkeypatch.setattr(
             autopilot,
             "read_process_identity",
@@ -8641,13 +9168,13 @@ class TestSpecAutopilot:
         )
         monkeypatch.setattr(autopilot, "read_process_cwd", lambda pid: other_repo.resolve())
         monkeypatch.setattr(autopilot, "find_autopilot_processes_for_repo", lambda root: [])
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         captured = capsys.readouterr()
         assert code == 1
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
         assert "different repository" in captured.err
         assert str(other_repo.resolve()) in captured.err
         # Never hand the operator a command that kills someone else's dispatcher.
@@ -8672,7 +9199,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock(side_effect=AssertionError("must not signal an unconfirmed process"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("must not signal an unconfirmed process"))
         monkeypatch.setattr(
             autopilot,
             "read_process_identity",
@@ -8687,13 +9214,13 @@ class TestSpecAutopilot:
             ),
         )
         monkeypatch.setattr(autopilot, "read_process_cwd", lambda pid: None)
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         captured = capsys.readouterr()
         assert code == 1
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
         assert "could not be read" in captured.err
         assert "kill -TERM 4242" in captured.err
         assert pid_path.exists()
@@ -8726,7 +9253,7 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock()
+        shutdown_mock = MagicMock(return_value=True)
         monkeypatch.setattr(
             autopilot,
             "read_process_identity",
@@ -8737,12 +9264,12 @@ class TestSpecAutopilot:
             "read_process_cwd",
             MagicMock(side_effect=AssertionError("cwd must not be consulted on an exact match")),
         )
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         assert code == 0
-        kill_mock.assert_called_once_with(4242, signal.SIGTERM)
+        shutdown_mock.assert_called_once_with(identity)
 
     def test_cwd_belongs_to_repo_accepts_linked_worktree_of_same_repo(
         self,
@@ -8814,10 +9341,10 @@ class TestSpecAutopilot:
             )
             + "\n"
         )
-        kill_mock = MagicMock(side_effect=AssertionError("should not signal a dead pid"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("should not signal a dead pid"))
         monkeypatch.setattr(autopilot, "read_process_identity", lambda pid: None)
         monkeypatch.setattr(autopilot, "find_autopilot_processes_for_repo", lambda root: [])
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
@@ -8827,7 +9354,7 @@ class TestSpecAutopilot:
         # `spec web`'s dispatch/stop endpoint classifies a no-op by this phrase.
         assert "not running" in captured.err
         assert not pid_path.exists()
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
 
     def test_stop_command_scans_for_repo_autopilot_when_pid_file_missing(
         self,
@@ -8836,7 +9363,7 @@ class TestSpecAutopilot:
         capsys: pytest.CaptureFixture[str],
     ):
         """Recovery path for a repo already bitten by the destructive unlink."""
-        kill_mock = MagicMock()
+        shutdown_mock = MagicMock(return_value=True)
         monkeypatch.setattr(
             autopilot,
             "find_autopilot_processes_for_repo",
@@ -8848,13 +9375,14 @@ class TestSpecAutopilot:
                 )
             ],
         )
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
         captured = capsys.readouterr()
         assert code == 0
-        kill_mock.assert_called_once_with(9001, signal.SIGTERM)
+        shutdown_mock.assert_called_once()
+        assert shutdown_mock.call_args.args[0].pid == 9001
         assert "9001" in captured.out + captured.err
 
     def test_stop_command_refuses_to_guess_between_multiple_scan_matches(
@@ -8863,7 +9391,7 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
-        kill_mock = MagicMock(side_effect=AssertionError("must not guess"))
+        shutdown_mock = MagicMock(side_effect=AssertionError("must not guess"))
         monkeypatch.setattr(
             autopilot,
             "find_autopilot_processes_for_repo",
@@ -8872,7 +9400,7 @@ class TestSpecAutopilot:
                 autopilot.ProcessIdentity(pid=9002, started_at="b", command="spec auto run"),
             ],
         )
-        monkeypatch.setattr(autopilot.os, "kill", kill_mock)
+        monkeypatch.setattr(autopilot, "request_legacy_process_shutdown", shutdown_mock)
 
         code = autopilot.stop_command(argparse.Namespace(repo_root=str(repo)))
 
@@ -8880,7 +9408,7 @@ class TestSpecAutopilot:
         assert code == 1
         assert "9001" in captured.err and "9002" in captured.err
         assert "kill -TERM" in captured.err
-        kill_mock.assert_not_called()
+        shutdown_mock.assert_not_called()
 
     def test_find_autopilot_processes_for_repo_excludes_other_repos(
         self,
@@ -8891,16 +9419,15 @@ class TestSpecAutopilot:
         """This host runs one autopilot per repo; a scan must never cross repos."""
         other_repo = tmp_path / "other-repo"
         other_repo.mkdir()
-        ps_output = (
-            "  111 Fri Aug  7 09:00:00 2026 /venv/bin/python /bin/spec auto run --concurrency 4\n"
-            "  222 Fri Aug  7 09:00:00 2026 /venv/bin/python /bin/spec auto run --concurrency 2\n"
-            "  333 Fri Aug  7 09:00:00 2026 /venv/bin/python /bin/spec auto run\n"
-            "  444 Fri Aug  7 09:00:00 2026 /venv/bin/python /bin/spec implement --spec foo\n"
-        )
         monkeypatch.setattr(
-            autopilot.subprocess,
-            "run",
-            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, ps_output, ""),
+            autopilot,
+            "iter_processes",
+            lambda: [
+                autopilot.ProcessIdentity(111, "a", command="/venv/bin/python /bin/spec auto run --concurrency 4"),
+                autopilot.ProcessIdentity(222, "b", command="/venv/bin/python /bin/spec auto run --concurrency 2"),
+                autopilot.ProcessIdentity(333, "c", command="/venv/bin/python /bin/spec auto run"),
+                autopilot.ProcessIdentity(444, "d", command="/venv/bin/python /bin/spec implement --spec foo"),
+            ],
         )
         cwds = {
             111: repo.resolve() / "subdir",
@@ -8920,6 +9447,9 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
+        monkeypatch.setattr(
+            autopilot, "_requires_authenticated_process_adoption", lambda: False
+        )
         active_path = autopilot.autopilot_active_path(repo)
         active_path.parent.mkdir(parents=True, exist_ok=True)
         active_path.write_text(
@@ -8973,6 +9503,205 @@ class TestSpecAutopilot:
         assert "adopt" in captured.out
         assert "my-spec" in captured.out
 
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX session-leader adoption")
+    @pytest.mark.parametrize("run_id", ["", "live-spec-run-1"])
+    def test_adopt_active_processes_recovers_real_posix_adoptable_child(
+        self,
+        repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        run_id: str,
+    ):
+        monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+        managed = process_supervisor.ProcessSupervisor(
+            LifetimeMode.ADOPTABLE,
+            supervision_id=f"real-posix-{run_id or 'prelease'}",
+        ).spawn(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            identity = managed.token.payload
+            active = autopilot.ActiveRunProcess(
+                spec_id="live-spec",
+                agent="codex",
+                pid=identity.pid,
+                started_at="2026-09-01T00:00:00+00:00",
+                started_monotonic=0.0,
+                log_path=str(tmp_path / "live.log"),
+                run_id=run_id,
+                phase="implement",
+                process_started_at=identity.started_at,
+                supervision_token=managed.token.to_dict(),
+                supervision_id=managed.token.token,
+            )
+            autopilot.write_active_state(repo, {"live-spec": active})
+            if run_id:
+                save_run_lease(
+                    autopilot.runs_dir(repo),
+                    build_lease(
+                        run_id=run_id,
+                        spec_id="live-spec",
+                        phase="implement",
+                        process_pid=identity.pid,
+                        process_started_at=identity.started_at,
+                    ),
+                )
+
+            adopted = autopilot.adopt_active_processes(repo)
+
+            assert adopted["live-spec"].pid == identity.pid
+            assert adopted["live-spec"].adoption_generation == 1
+            assert autopilot.is_pid_alive(identity.pid, identity.started_at)
+            assert not (tmp_path / "controls" / managed.token.control_relpath).exists()
+        finally:
+            managed.terminate(grace_seconds=0.1)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX launch reservation recovery")
+    def test_adopt_active_processes_recovers_posix_launch_reservation(
+        self,
+        repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+        supervision_id = "posix-launch-window"
+        metadata_path = process_supervisor.durable_metadata_path(supervision_id)
+        managed = process_supervisor.ProcessSupervisor(
+            LifetimeMode.ADOPTABLE,
+            supervision_id=supervision_id,
+            publish_durable_token=True,
+        ).spawn(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            reservation = autopilot.ActiveRunProcess(
+                spec_id="live-spec",
+                agent="codex",
+                pid=0,
+                started_at="2026-09-01T00:00:00+00:00",
+                started_monotonic=0.0,
+                log_path="",
+                run_id="",
+                launch_state="launching",
+                supervision_id=supervision_id,
+                ready_path=str(metadata_path),
+            )
+            autopilot.write_active_state(repo, {"live-spec": reservation})
+
+            adopted = autopilot.adopt_active_processes(repo)
+
+            assert adopted["live-spec"].pid == managed.token.payload.pid
+            assert adopted["live-spec"].process_started_at == managed.token.payload.started_at
+            assert adopted["live-spec"].supervision_token == managed.token.to_dict()
+            assert adopted["live-spec"].launch_state == "ready"
+            assert adopted["live-spec"].adoption_generation == 1
+        finally:
+            managed.terminate(grace_seconds=0.1)
+            managed.wait(timeout=5)
+            metadata_path.unlink(missing_ok=True)
+
+    def test_adopt_active_processes_windows_requires_authenticated_token(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        active_path = autopilot.autopilot_active_path(repo)
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps(
+                {
+                    "unsafe-windows": {
+                        "pid": 9191,
+                        "agent": "codex",
+                        "started_at": "2026-09-01T00:00:00+00:00",
+                        "phase": "implement",
+                        "run_id": "",
+                        "log_path": "/tmp/unsafe.log",
+                        "process_started_at": "created",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            autopilot,
+            "_requires_authenticated_process_adoption",
+            lambda: True,
+        )
+        monkeypatch.setattr(autopilot, "is_pid_alive", lambda *_args: True)
+        monkeypatch.setattr(
+            autopilot,
+            "read_process_identity",
+            lambda pid: orch.ProcessIdentity(pid=pid, started_at="created", command="spec"),
+        )
+
+        assert autopilot.adopt_active_processes(repo) == {}
+        assert "no authenticated supervision token" in capsys.readouterr().out
+
+    def test_adopt_active_processes_validates_lease_before_windows_job_claim(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        payload_identity = ProcessIdentity(9292, "payload-created", command="spec")
+        token = SupervisionToken(
+            LifetimeMode.ADOPTABLE,
+            ProcessIdentity(8181, "keeper-created", command="helper"),
+            7,
+            "owner-created",
+            "deferred-windows-claim",
+            payload_identity=payload_identity,
+        )
+        active_path = autopilot.autopilot_active_path(repo)
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        active_path.write_text(
+            json.dumps(
+                {
+                    "missing-lease": {
+                        "pid": payload_identity.pid,
+                        "agent": "codex",
+                        "started_at": "2026-09-01T00:00:00+00:00",
+                        "phase": "implement",
+                        "run_id": "missing-lease-run",
+                        "log_path": "/tmp/missing-lease.log",
+                        "process_started_at": payload_identity.started_at,
+                        "supervision_token": token.to_dict(),
+                        "supervision_id": token.token,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        claim = MagicMock(side_effect=AssertionError("stale lease must not claim Job"))
+        monkeypatch.setattr(
+            autopilot,
+            "_requires_authenticated_process_adoption",
+            lambda: True,
+        )
+        monkeypatch.setattr(autopilot, "adopt", claim)
+        monkeypatch.setattr(autopilot, "is_pid_alive", lambda *_args: True)
+        monkeypatch.setattr(
+            autopilot,
+            "read_process_identity",
+            lambda pid: orch.ProcessIdentity(
+                pid=pid,
+                started_at=payload_identity.started_at,
+                command="spec",
+            ),
+        )
+
+        assert autopilot.adopt_active_processes(repo) == {}
+        claim.assert_not_called()
+
     def test_adopt_active_processes_drops_dead_entries(
         self,
         repo: Path,
@@ -9021,6 +9750,9 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
+        monkeypatch.setattr(
+            autopilot, "_requires_authenticated_process_adoption", lambda: False
+        )
         active_path = autopilot.autopilot_active_path(repo)
         active_path.parent.mkdir(parents=True, exist_ok=True)
         active_path.write_text(
@@ -9058,6 +9790,9 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
+        monkeypatch.setattr(
+            autopilot, "_requires_authenticated_process_adoption", lambda: False
+        )
         active_path = autopilot.autopilot_active_path(repo)
         active_path.parent.mkdir(parents=True, exist_ok=True)
         active_path.write_text(
@@ -9109,6 +9844,9 @@ class TestSpecAutopilot:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ):
+        monkeypatch.setattr(
+            autopilot, "_requires_authenticated_process_adoption", lambda: False
+        )
         # A freshly dispatched spec has no run_id (and therefore no lease)
         # until the child `spec implement` creates the run record. The live
         # child should still be adopted via PID identity so autopilot
@@ -11660,6 +12398,530 @@ class TestImplementSetupTeardownHelpers:
             branch="spec/my-feature",
         )
 
+    def test_setup_service_handoff_fails_closed_when_registry_write_fails(
+        self,
+        repo: Path,
+    ) -> None:
+        owner = ProcessIdentity(1200, "owner-created", command="setup")
+        service = ProcessIdentity(1201, "service-created", command="server")
+        ownership_token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            owner,
+            os.getpid(),
+            "orchestrator-created",
+            "setup-boundary",
+            pgid=owner.pid,
+            payload_identity=owner,
+        )
+        bound_token = replace(
+            ownership_token,
+            payload_identity=service,
+        )
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="dev-server",
+                    kind="server",
+                    pid=service.pid,
+                    started_at=service.started_at,
+                    command=service.command,
+                ),
+            ),
+            ownership_token=ownership_token,
+        )
+
+        with (
+            patch.object(
+                orch,
+                "bind_held_windows_job_payload",
+                return_value=bound_token,
+            ),
+            patch.object(orch, "bind_held_posix_group_payload") as bind_posix,
+            patch.object(orch, "_register_setup_process_batch", return_value=False),
+            patch.object(
+                orch,
+                "terminate_supervision_token",
+                return_value=True,
+            ) as terminate,
+            patch.object(orch, "close_empty_held_posix_groups") as close_posix,
+            patch.object(orch, "close_empty_held_windows_jobs") as close_windows,
+            pytest.raises(
+                RuntimeError,
+                match=(
+                    "Could not atomically persist cleanup ownership for setup "
+                    "services dev-server"
+                ),
+            ),
+        ):
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+
+        bind_posix.assert_not_called()
+        terminate.assert_called_once_with(ownership_token, grace_seconds=0)
+        close_posix.assert_called_once_with()
+        close_windows.assert_called_once_with()
+
+    def test_prune_retires_completed_setup_boundary_before_closing_held_job(
+        self,
+        repo: Path,
+    ) -> None:
+        keeper = ProcessIdentity(1200, "owner-created", command="setup")
+        service = ProcessIdentity(1201, "service-created", command="server")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            keeper,
+            os.getpid(),
+            "orchestrator-created",
+            "completed-setup-boundary",
+            pgid=keeper.pid,
+            payload_identity=service,
+        )
+        state_root = orch._worktree_registry_state_root(repo, repo)
+        orch.worktree_process_registry.register_process(
+            state_root,
+            repo,
+            name="dev-server",
+            kind="server",
+            pid=service.pid,
+            started_at=service.started_at,
+            supervision_token=token,
+        )
+
+        with (
+            patch.object(
+                orch.worktree_process_registry,
+                "is_process_alive",
+                return_value=False,
+            ),
+            patch.object(
+                orch.worktree_process_registry,
+                "supervision_boundary_is_inactive",
+                return_value=True,
+            ) as boundary_inactive,
+            patch.object(orch, "close_empty_held_posix_groups") as close_posix,
+            patch.object(orch, "close_empty_held_windows_jobs") as close_windows,
+        ):
+            removed = orch._prune_registered_worktree_processes(repo, repo)
+
+        assert removed == (
+            f"dev-server pid={service.pid} owned boundary already inactive",
+        )
+        boundary_inactive.assert_called_once_with(token)
+        close_posix.assert_called_once_with()
+        close_windows.assert_called_once_with()
+        assert orch.worktree_process_registry.load_registered_processes(
+            state_root,
+            repo,
+        ) == []
+        assert orch.worktree_process_registry.reap_registered_processes(
+            state_root,
+            repo,
+        ).surviving == ()
+
+    def test_setup_descendants_without_authenticated_handoff_are_stopped(
+        self,
+        repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        owner = ProcessIdentity(1200, "owner-created", command="setup")
+        ownership_token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            owner,
+            os.getpid(),
+            "orchestrator-created",
+            "setup-boundary",
+            pgid=owner.pid,
+            payload_identity=owner,
+        )
+        manifest = orch.ImplementSetupManifest(ownership_token=ownership_token)
+
+        with (
+            patch.object(
+                orch,
+                "terminate_supervision_token",
+                return_value=True,
+            ) as terminate,
+            patch.object(orch, "close_empty_held_posix_groups") as close_posix,
+            patch.object(orch, "close_empty_held_windows_jobs") as close_windows,
+            caplog.at_level(logging.WARNING),
+        ):
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+
+        terminate.assert_called_once_with(ownership_token, grace_seconds=0)
+        close_posix.assert_called_once_with()
+        close_windows.assert_called_once_with()
+        assert "terminated before agent launch" in caplog.text
+
+    def test_setup_descendant_cleanup_failure_blocks_agent_launch(
+        self,
+        repo: Path,
+    ) -> None:
+        owner = ProcessIdentity(1200, "owner-created", command="setup")
+        ownership_token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            owner,
+            os.getpid(),
+            "orchestrator-created",
+            "setup-boundary",
+            pgid=owner.pid,
+            payload_identity=owner,
+        )
+        manifest = orch.ImplementSetupManifest(ownership_token=ownership_token)
+
+        with (
+            patch.object(
+                orch,
+                "terminate_supervision_token",
+                return_value=False,
+            ) as terminate,
+            patch.object(orch, "close_empty_held_posix_groups"),
+            patch.object(orch, "close_empty_held_windows_jobs"),
+            pytest.raises(
+                RuntimeError,
+                match="Could not terminate setup descendants",
+            ),
+        ):
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+
+        terminate.assert_called_once_with(ownership_token, grace_seconds=0)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX setup handoff integration")
+    def test_posix_setup_service_handoff_persists_and_reaps_complete_group(
+        self,
+        repo: Path,
+    ) -> None:
+        code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(p.pid, flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", code],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is not None
+        child_pid = int(result.stdout.strip())
+        child_identity = process_supervisor.inspect_process(child_pid)
+        assert child_identity is not None
+        group_id = result.ownership_token.pgid
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="dev-server",
+                    kind="server",
+                    pid=child_pid,
+                    started_at=child_identity.started_at,
+                    command=child_identity.command,
+                    termination_scope="pgid",
+                    pgid=group_id,
+                ),
+            ),
+            ownership_token=result.ownership_token,
+        )
+        state_root = orch._worktree_registry_state_root(repo, repo)
+
+        try:
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+            entries = process_registry.load_registered_processes(state_root, repo)
+            assert len(entries) == 1
+            assert entries[0].supervision_token is not None
+            report = orch._reap_registered_worktree_processes(
+                repo,
+                repo,
+                reason="test",
+            )
+            assert report.terminated == (f"dev-server pid={child_pid} terminated",)
+            assert not process_supervisor.is_process_group_alive(group_id)
+        finally:
+            if process_supervisor.is_process_group_alive(group_id):
+                process_supervisor.terminate(
+                    result.ownership_token,
+                    grace_seconds=0,
+                )
+            process_supervisor.close_empty_held_posix_groups()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX setup failure integration")
+    def test_posix_setup_child_without_manifest_is_stopped_before_agent_launch(
+        self,
+        repo: Path,
+    ) -> None:
+        code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(p.pid, flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", code],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is not None
+        child_pid = int(result.stdout.strip())
+        group_id = result.ownership_token.pgid
+
+        try:
+            orch._register_setup_manifest_processes(
+                repo,
+                repo,
+                orch.ImplementSetupManifest(
+                    ownership_token=result.ownership_token,
+                ),
+            )
+            assert process_supervisor.inspect_process(child_pid) is None
+            assert not process_supervisor.is_process_group_alive(group_id)
+        finally:
+            if process_supervisor.is_process_group_alive(group_id):
+                process_supervisor.terminate(
+                    result.ownership_token,
+                    grace_seconds=0,
+                )
+            process_supervisor.close_empty_held_posix_groups()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX keeper handoff integration")
+    def test_posix_keeper_reaps_worker_after_declared_service_exits(
+        self,
+        repo: Path,
+    ) -> None:
+        worker_pid_path = repo / "worker.pid"
+        service_code = (
+            "import subprocess,sys,time; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "open(sys.argv[1],'w').write(str(p.pid)); time.sleep(1)"
+        )
+        setup_code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(p.pid, flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[
+                    sys.executable,
+                    "-c",
+                    setup_code,
+                    service_code,
+                    str(worker_pid_path),
+                ],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is not None
+        service_pid = int(result.stdout.strip())
+        service_identity = process_supervisor.inspect_process(service_pid)
+        assert service_identity is not None
+        group_id = result.ownership_token.pgid
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="short-lived-server",
+                    kind="server",
+                    pid=service_pid,
+                    started_at=service_identity.started_at,
+                    command=service_identity.command,
+                    termination_scope="pgid",
+                    pgid=group_id,
+                ),
+            ),
+            ownership_token=result.ownership_token,
+        )
+
+        try:
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+            deadline = time.monotonic() + 5
+            while (
+                process_supervisor.inspect_process(service_pid) is not None
+                or not worker_pid_path.exists()
+            ):
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            worker_pid = int(worker_pid_path.read_text(encoding="utf-8"))
+            assert process_supervisor.inspect_process(worker_pid) is not None
+            assert os.getpgid(worker_pid) == group_id
+
+            report = orch._reap_registered_worktree_processes(
+                repo,
+                repo,
+                reason="test",
+            )
+
+            assert report.terminated == (
+                f"short-lived-server pid={service_pid} terminated",
+            )
+            assert report.stale == ()
+            assert report.surviving == ()
+            assert process_supervisor.inspect_process(worker_pid) is None
+            assert not process_supervisor.is_process_group_alive(group_id)
+        finally:
+            if process_supervisor.is_process_group_alive(group_id):
+                process_supervisor.terminate(
+                    result.ownership_token,
+                    grace_seconds=0,
+                )
+            process_supervisor.close_empty_held_posix_groups()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX escaped setup cleanup")
+    def test_escaped_setup_service_is_stopped_when_registry_write_fails(
+        self,
+        repo: Path,
+    ) -> None:
+        code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+            "start_new_session=True); print(p.pid, flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", code],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is None
+        service_pid = int(result.stdout.strip())
+        service_identity = process_supervisor.inspect_process(service_pid)
+        assert service_identity is not None
+        service_pgid = os.getpgid(service_pid)
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="escaped-server",
+                    kind="server",
+                    pid=service_pid,
+                    started_at=service_identity.started_at,
+                    command=service_identity.command,
+                    termination_scope="pgid",
+                    pgid=service_pgid,
+                ),
+            ),
+        )
+
+        try:
+            with (
+                patch.object(orch, "_register_setup_process_batch", return_value=False),
+                pytest.raises(
+                    RuntimeError,
+                    match=(
+                        "Could not atomically persist cleanup ownership for setup services "
+                        "escaped-server$"
+                    ),
+                ),
+            ):
+                orch._register_setup_manifest_processes(repo, repo, manifest)
+            assert process_supervisor.inspect_process(service_pid) is None
+            assert not process_supervisor.is_process_group_alive(service_pgid)
+        finally:
+            if process_supervisor.is_process_group_alive(service_pgid):
+                fallback = SupervisionToken(
+                    LifetimeMode.RUN_OWNED,
+                    service_identity,
+                    os.getpid(),
+                    "test",
+                    "escaped-service-test",
+                    pgid=service_pgid,
+                    version=1,
+                )
+                process_supervisor.terminate(fallback, grace_seconds=0)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX atomic escaped cleanup")
+    def test_atomic_handoff_failure_stops_every_escaped_setup_service(
+        self,
+        repo: Path,
+    ) -> None:
+        code = (
+            "import json,subprocess,sys; "
+            "ps=[subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+            "start_new_session=True) for _ in range(2)]; "
+            "print(json.dumps([p.pid for p in ps]), flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", code],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is None
+        service_pids = [int(pid) for pid in json.loads(result.stdout)]
+        identities = [
+            process_supervisor.inspect_process(pid) for pid in service_pids
+        ]
+        assert all(identity is not None for identity in identities)
+        processes = tuple(
+            orch.ImplementManagedProcess(
+                name=f"escaped-{index}",
+                kind="server",
+                pid=pid,
+                started_at=identity.started_at,
+                command=identity.command,
+                termination_scope="pgid",
+                pgid=os.getpgid(pid),
+            )
+            for index, (pid, identity) in enumerate(
+                zip(service_pids, identities, strict=True),
+                start=1,
+            )
+            if identity is not None
+        )
+        manifest = orch.ImplementSetupManifest(managed_processes=processes)
+
+        try:
+            with (
+                patch.object(
+                    orch,
+                    "_register_setup_process_batch",
+                    return_value=False,
+                ),
+                pytest.raises(
+                    RuntimeError,
+                    match=(
+                        "Could not atomically persist cleanup ownership for setup "
+                        "services escaped-1, escaped-2$"
+                    ),
+                ),
+            ):
+                orch._register_setup_manifest_processes(repo, repo, manifest)
+            assert all(
+                process_supervisor.inspect_process(pid) is None
+                for pid in service_pids
+            )
+        finally:
+            for process, identity in zip(processes, identities, strict=True):
+                if identity is None or not process_supervisor.is_process_group_alive(
+                    process.pgid
+                ):
+                    continue
+                fallback = SupervisionToken(
+                    LifetimeMode.RUN_OWNED,
+                    identity,
+                    os.getpid(),
+                    "test",
+                    f"escaped-service-{process.pid}",
+                    pgid=process.pgid,
+                    version=1,
+                )
+                process_supervisor.terminate(fallback, grace_seconds=0)
+
     def test_parse_setup_manifest_ignores_prefixed_logs(self):
         manifest = orch._parse_implement_setup_manifest(
             "starting services\n"
@@ -11698,8 +12960,18 @@ class TestImplementSetupTeardownHelpers:
         )
         seen: dict[str, object] = {}
 
-        def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None, *, inherit_env=True, input_text=None):
+        def fake_run_subprocess(
+            cmd,
+            cwd=None,
+            env=None,
+            timeout=None,
+            *,
+            inherit_env=True,
+            input_text=None,
+            preserve_descendants=False,
+        ):
             del timeout, inherit_env, input_text
+            assert preserve_descendants is True
             seen["cmd"] = cmd
             seen["cwd"] = cwd
             seen["env"] = env
@@ -11754,7 +13026,7 @@ class TestImplementSetupTeardownHelpers:
         assert seen["env"]["SPEC_WORKTREE"] == str(repo)
         assert seen["env"]["SPEC_ATTEMPT"] == "1"
 
-    def test_windows_setup_override_does_not_change_posix_argv(self, repo: Path):
+    def test_setup_selects_the_matching_platform_variant(self, repo: Path):
         run = self._run()
         variants = CommandVariants(
             command="scripts/setup.sh 'literal && value'",
@@ -11780,10 +13052,16 @@ class TestImplementSetupTeardownHelpers:
         ):
             orch._run_implement_setup_command(run, repo)
 
-        assert run_command.call_args.args[0][:2] == [
-            "scripts/setup.sh",
-            "literal && value",
-        ]
+        launched = run_command.call_args.args[0]
+        if os.name == "nt":
+            assert Path(launched[0]).name.lower() in {"powershell", "powershell.exe"}
+            assert "Write-Output setup" in launched[-1]
+            assert "scripts/setup.sh" not in launched
+        else:
+            assert launched[:2] == [
+                "scripts/setup.sh",
+                "literal && value",
+            ]
 
     def test_run_setup_command_returns_failure_on_nonzero_exit(self, repo: Path):
         run = self._run()
@@ -13947,7 +15225,7 @@ class TestImplementSetupTeardownHelpers:
         assert seen["env"]["SPEC_WORKTREE"] == str(repo)
         assert seen["env"]["SPEC_ATTEMPT"] == "1"
 
-    def test_windows_teardown_override_does_not_change_posix_argv(self, repo: Path):
+    def test_teardown_selects_the_matching_platform_variant(self, repo: Path):
         run = self._run()
         variants = CommandVariants(
             command="scripts/teardown.sh 'literal && value'",
@@ -13973,12 +15251,18 @@ class TestImplementSetupTeardownHelpers:
         ):
             orch._run_implement_teardown_command(run, repo)
 
-        assert run_command.call_args.args[0][:2] == [
-            "scripts/teardown.sh",
-            "literal && value",
-        ]
+        launched = run_command.call_args.args[0]
+        if os.name == "nt":
+            assert Path(launched[0]).name.lower() in {"powershell", "powershell.exe"}
+            assert "Write-Output teardown" in launched[-1]
+            assert "scripts/teardown.sh" not in launched
+        else:
+            assert launched[:2] == [
+                "scripts/teardown.sh",
+                "literal && value",
+            ]
 
-    def test_windows_verify_override_does_not_change_posix_argv(self):
+    def test_verify_selects_the_matching_platform_variant(self):
         variants = CommandVariants(
             command="pytest 'literal && value'",
             windows_command="Write-Output verify",
@@ -13991,7 +15275,12 @@ class TestImplementSetupTeardownHelpers:
             patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
             patch.dict(orch.VERIFY_GATE_COMMANDS, {"test": variants.command}),
         ):
-            assert orch._verify_gate_command_args("test") == [
+            launched = orch._verify_gate_command_args("test")
+        if os.name == "nt":
+            assert Path(launched[0]).name.lower() in {"powershell", "powershell.exe"}
+            assert launched[-1] == "Write-Output verify"
+        else:
+            assert launched == [
                 "pytest",
                 "literal && value",
             ]
@@ -14134,6 +15423,9 @@ class TestImplementSetupTeardownHelpers:
         assert plan.agent_env["ANTHROPIC_API_KEY"] == "anthropic-secret"
         assert plan.agent_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
         assert plan.agent_env_redactions == ("anthropic-secret", "oauth-secret")
+        assert "start_new_session" not in plan.popen_kwargs
+        assert plan.popen_kwargs["encoding"] == "utf-8"
+        assert plan.popen_kwargs["errors"] == "replace"
         assert (worktree / ".spec-claude-home" / ".claude.json").read_text() == (
             '{"oauthAccount":{"uuid":"u"}}'
         )
@@ -14144,6 +15436,65 @@ class TestImplementSetupTeardownHelpers:
                 (".spec-claude-home", ".claude/mcp-servers.json"),
             )
         ]
+
+    def test_prepare_registers_setup_services_before_sandbox_failure(
+        self,
+        repo: Path,
+    ):
+        run = self._run()
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="dev-server",
+                    kind="server",
+                    pid=4321,
+                    started_at="created",
+                ),
+            ),
+        )
+        backend = SimpleNamespace(
+            identity=eb.BackendIdentity(
+                backend="worktree",
+                safety_mode="provider-sandbox",
+                workspace_root=".worktrees",
+            )
+        )
+        events: list[str] = []
+        ctx = orch.ImplementContext(
+            implement_reason="initial",
+            run_id=run.run_id,
+            attempt_number=1,
+            spec_path="specs/my-feature.md",
+            spec_revision="sha256:deadbeef",
+        )
+
+        def register(*_args: object, **_kwargs: object) -> None:
+            events.append("register")
+
+        def fail_sandbox(*_args: object, **_kwargs: object) -> None:
+            events.append("sandbox")
+            raise RuntimeError("sandbox preparation failed")
+
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+            patch.object(orch, "_require_agent_available_for_backend"),
+            patch.object(orch, "_run_implement_setup_command", return_value=manifest),
+            patch.object(orch, "_register_setup_manifest_processes", side_effect=register),
+            patch.object(orch, "_write_sandbox_config", side_effect=fail_sandbox),
+            pytest.raises(RuntimeError, match="sandbox preparation failed"),
+        ):
+            orch._prepare_implement_launch_plan(
+                run,
+                repo,
+                worktree,
+                ctx,
+                reason="initial",
+                use_stream_json=False,
+            )
+
+        assert events == ["register", "sandbox"]
 
 
 # ---------------------------------------------------------------------------
@@ -14737,10 +16088,32 @@ class TestSharedMemoryPreflight:
             stdout=self._ipcs_output_linux(4),
             stderr="",
         )
-        with patch.object(orch, "run_subprocess", return_value=mac_result):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", return_value=mac_result),
+        ):
             assert orch._count_sysv_shm_segments() == 3
-        with patch.object(orch, "run_subprocess", return_value=linux_result):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", return_value=linux_result),
+        ):
             assert orch._count_sysv_shm_segments() == 4
+
+    def test_count_sysv_shm_segments_skips_native_windows(self):
+        with (
+            patch.object(orch.os, "name", "nt"),
+            patch.object(orch, "run_subprocess") as mock_run,
+        ):
+            assert orch._count_sysv_shm_segments() is None
+
+        mock_run.assert_not_called()
+
+    def test_count_sysv_shm_segments_handles_missing_ipcs(self):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", side_effect=FileNotFoundError),
+        ):
+            assert orch._count_sysv_shm_segments() is None
 
     def test_verify_preflight_skips_when_usage_is_low(self, repo: Path):
         run = self._make_run()
@@ -14752,7 +16125,10 @@ class TestSharedMemoryPreflight:
             stderr="",
         )
 
-        with patch.object(orch, "run_subprocess", return_value=ipcs_result) as mock_run:
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", return_value=ipcs_result) as mock_run,
+        ):
             assert orch._verify_preflight_shared_memory(run, repo) is True
 
         assert run.last_error == ""
@@ -14787,7 +16163,10 @@ class TestSharedMemoryPreflight:
             ),
         ]
 
-        with patch.object(orch, "run_subprocess", side_effect=run_results) as mock_run:
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", side_effect=run_results) as mock_run,
+        ):
             assert orch._verify_preflight_shared_memory(run, repo) is True
 
         cleanup_call = mock_run.call_args_list[1]
@@ -14816,7 +16195,10 @@ class TestSharedMemoryPreflight:
             ),
         ]
 
-        with patch.object(orch, "run_subprocess", side_effect=run_results):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", side_effect=run_results),
+        ):
             assert orch._verify_preflight_shared_memory(run, repo) is True
 
         assert run.last_error == ""
@@ -14848,7 +16230,10 @@ class TestSharedMemoryPreflight:
             ),
         ]
 
-        with patch.object(orch, "run_subprocess", side_effect=run_results):
+        with (
+            patch.object(orch.os, "name", "posix"),
+            patch.object(orch, "run_subprocess", side_effect=run_results),
+        ):
             assert orch._verify_preflight_shared_memory(run, repo) is True
 
         assert run.last_error == ""
@@ -14960,9 +16345,16 @@ class TestVerifyPreflightMerge:
     def test_test_gate_diagnostic_command_uses_worktree_venv_python(self, repo: Path):
         worktree = repo / ".worktrees" / "my-feature"
         assert orch._test_gate_diagnostic_command(worktree) == [
-            str(worktree / ".venv" / "bin" / "python"),
+            str(orch._worktree_venv_python(worktree)),
             *orch.TEST_GATE_DIAGNOSTIC_ARGS,
         ]
+
+    def test_windows_test_gate_diagnostic_uses_scripts_python(self, repo: Path):
+        worktree = repo / ".worktrees" / "my-feature"
+
+        assert orch._worktree_venv_python(worktree, windows=True) == (
+            worktree / ".venv" / "Scripts" / "python.exe"
+        )
 
     def test_verify_allows_preflight_noop(self, repo: Path):
         run = self._make_run()
@@ -16116,7 +17508,9 @@ class TestVerifyTestEnvironment:
                 assert env["SIM_DATABASE_URL"] == database_url
                 assert env["SIM_TEST_DATABASE_URL"] == database_url
                 assert env["VIRTUAL_ENV"] == str(worktree / ".venv")
-                assert env["PATH"].split(os.pathsep)[0] == str(worktree / ".venv" / "bin")
+                assert env["PATH"].split(os.pathsep)[0] == str(
+                    orch._worktree_venv_python(worktree).parent
+                )
 
         assert commands == [
             [str(postgres_script), "status"],
@@ -16784,9 +18178,33 @@ class TestLocalReviewHelpers:
         assert first_pass == (f"{orch.LOCAL_REVIEW_FIRST_PASS_EXHAUSTIVE_INSTRUCTION}\n\nreview-template")
         assert rereview == "review-template"
 
+    def test_render_local_review_prompt_tolerates_legacy_windows_ansi_template(
+        self,
+        tmp_path: Path,
+    ):
+        prompt_dir = tmp_path / ".github" / "prompts"
+        prompt_dir.mkdir(parents=True)
+        # Native Windows releases before repository writes declared UTF-8
+        # encoded the bundled em dash as cp1252 byte 0x97.
+        (prompt_dir / "review.md").write_bytes(b"review \x97 ${REPO}")
+
+        rendered = orch._render_local_review_prompt(
+            tmp_path,
+            repo_name="acme/repo",
+            pr_number=42,
+            base_sha="b" * 40,
+            head_sha="a" * 40,
+            head_ref="code/my-feature--run123",
+            pr_body="",
+            review_changes=1,
+        )
+
+        assert rendered == "review \ufffd acme/repo"
+
     def test_build_local_review_env_strips_push_credentials(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
     ):
         monkeypatch.setenv("GITHUB_TOKEN", "secret")
         monkeypatch.setenv("GH_TOKEN", "secret-two")
@@ -16796,7 +18214,8 @@ class TestLocalReviewHelpers:
         monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.name")
         monkeypatch.setenv("GIT_CONFIG_VALUE_0", "Test")
 
-        env = orch._build_local_review_env()
+        scratch_dir = tmp_path / "review-scratch"
+        env = orch._build_local_review_env(temp_dir=scratch_dir)
 
         assert "GITHUB_TOKEN" not in env
         assert "GH_TOKEN" not in env
@@ -16808,6 +18227,10 @@ class TestLocalReviewHelpers:
         assert env["GIT_CONFIG_VALUE_1"] == ""
         assert env["GIT_CONFIG_KEY_2"] == "remote.origin.pushurl"
         assert env["GIT_CONFIG_VALUE_2"] == "codex-review-disabled://origin"
+        assert env["TMPDIR"] == str(scratch_dir.resolve())
+        assert env["TMP"] == str(scratch_dir.resolve())
+        assert env["TEMP"] == str(scratch_dir.resolve())
+        assert env["PYTHONDONTWRITEBYTECODE"] == "1"
 
     def test_build_local_review_command_delegates_to_agent_adapter(
         self,
@@ -16815,6 +18238,7 @@ class TestLocalReviewHelpers:
     ):
         schema_path = tmp_path / "schema.json"
         output_path = tmp_path / "out.json"
+        scratch_dir = tmp_path / "review-scratch"
 
         cmd = orch._build_local_review_command(
             prompt="review this change",
@@ -16822,10 +18246,14 @@ class TestLocalReviewHelpers:
             output_path=output_path,
             agent_name="codex",
             reasoning_effort=orch.LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT,
+            writable_temp_dir=scratch_dir,
         )
 
-        assert cmd[0] == "codex"
+        assert cmd[0:5] == ["codex", "exec", "--ephemeral", "-s", "workspace-write"]
         assert "--output-schema" in cmd
+        assert cmd[cmd.index("-C") + 1] == str(scratch_dir)
+        assert "--skip-git-repo-check" in cmd
+        assert "--add-dir" not in cmd
         assert "review this change" in cmd
 
     def test_build_local_review_command_works_with_claude(
@@ -16882,6 +18310,7 @@ class TestLocalReviewHelpers:
         class FakeProcess:
             pid = 4321
             returncode = -15
+            token = SimpleNamespace(pgid=4321)
 
             def communicate(self, timeout: int):  # noqa: ARG002
                 return ("partial stdout\n", "partial stderr\n")
@@ -16890,7 +18319,7 @@ class TestLocalReviewHelpers:
 
         with caplog.at_level(logging.INFO, logger=orch.logger.name):
             with (
-                patch.object(orch.subprocess, "Popen", return_value=fake_proc),
+                patch.object(orch.ProcessSupervisor, "spawn", return_value=fake_proc) as spawn_process,
                 patch.object(
                     orch,
                     "read_process_identity",
@@ -16900,7 +18329,6 @@ class TestLocalReviewHelpers:
                         command="codex exec ...",
                     ),
                 ),
-                patch.object(orch.os, "getpgid", return_value=4321),
                 patch.object(orch, "_register_worktree_process_from_popen") as register_process,
                 patch.object(orch, "_prune_registered_worktree_processes") as prune_processes,
             ):
@@ -16914,6 +18342,9 @@ class TestLocalReviewHelpers:
                 )
 
         assert result.returncode == -15
+        assert "start_new_session" not in spawn_process.call_args.kwargs
+        assert spawn_process.call_args.kwargs["encoding"] == "utf-8"
+        assert spawn_process.call_args.kwargs["errors"] == "replace"
         register_process.assert_called_once()
         prune_processes.assert_called_once_with(repo, worktree)
         payload = json.loads(artifact_paths["process_debug"].read_text())
@@ -16942,6 +18373,7 @@ class TestLocalReviewHelpers:
         class FakeProcess:
             pid = 9876
             returncode = None
+            token = SimpleNamespace(pgid=9876)
 
             def communicate(self, timeout: int):
                 raise subprocess.TimeoutExpired(
@@ -16958,7 +18390,7 @@ class TestLocalReviewHelpers:
 
         with caplog.at_level(logging.WARNING, logger=orch.logger.name):
             with (
-                patch.object(orch.subprocess, "Popen", return_value=fake_proc),
+                patch.object(orch.ProcessSupervisor, "spawn", return_value=fake_proc) as spawn_process,
                 patch.object(
                     orch,
                     "read_process_identity",
@@ -16968,7 +18400,6 @@ class TestLocalReviewHelpers:
                         command="codex exec ...",
                     ),
                 ),
-                patch.object(orch.os, "getpgid", return_value=9876),
                 patch.object(orch, "_register_worktree_process_from_popen"),
                 patch.object(orch, "_prune_registered_worktree_processes"),
                 patch.object(orch, "_terminate_agent_process", side_effect=mark_terminated) as terminate_process,
@@ -16984,6 +18415,7 @@ class TestLocalReviewHelpers:
                     )
 
         terminate_process.assert_called_once_with(fake_proc)
+        assert "start_new_session" not in spawn_process.call_args.kwargs
         payload = json.loads(artifact_paths["process_debug"].read_text())
         assert payload["pid"] == 9876
         assert payload["pgid"] == 9876
@@ -16995,6 +18427,63 @@ class TestLocalReviewHelpers:
         assert payload["stderr_tail"] == "partial stderr"
         assert "timed out after 45s; terminating process group" in caplog.text
 
+    def test_run_local_review_subprocess_removes_checkout_codex_auth_on_launch_failure(
+        self,
+        repo: Path,
+        tmp_path: Path,
+    ):
+        worktree = tmp_path / "review"
+        codex_home = worktree / ".spec-codex-home"
+        codex_home.mkdir(parents=True)
+        auth_path = codex_home / "auth.json"
+        auth_path.write_text('{"token":"secret"}', encoding="utf-8")
+
+        with (
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=OSError("launch failed")),
+            patch.object(orch, "_prune_registered_worktree_processes"),
+            pytest.raises(OSError, match="launch failed"),
+        ):
+            orch._run_local_review_subprocess(
+                repo,
+                ["codex", "exec", "review prompt"],
+                cwd=worktree,
+                env={"CODEX_HOME": str(codex_home)},
+                timeout=45,
+            )
+
+        assert not auth_path.exists()
+
+    def test_run_local_review_subprocess_never_removes_inherited_operator_codex_auth(
+        self,
+        repo: Path,
+        tmp_path: Path,
+    ):
+        worktree = tmp_path / "review"
+        worktree.mkdir()
+        operator_home = tmp_path / "operator-codex-home"
+        operator_home.mkdir()
+        auth_path = operator_home / "auth.json"
+        auth_path.write_text('{"token":"operator-secret"}', encoding="utf-8")
+
+        with (
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=OSError("launch failed")),
+            patch.object(orch, "_prune_registered_worktree_processes"),
+            pytest.raises(OSError, match="launch failed"),
+        ):
+            orch._run_local_review_subprocess(
+                repo,
+                ["custom-reviewer"],
+                cwd=worktree,
+                env={"CODEX_HOME": str(operator_home)},
+                timeout=45,
+            )
+
+        assert auth_path.read_text(encoding="utf-8") == '{"token":"operator-secret"}'
+
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="uses POSIX chmod as a hermetic stand-in for the Codex read-only sandbox",
+    )
     def test_local_review_isolation_blocks_push_and_impl_worktree_writes(
         self,
         repo: Path,
@@ -17291,7 +18780,12 @@ class TestLocalReviewHelpers:
         ):
             orch._cleanup_stale_review_worktrees(repo)
 
-        cleanup.assert_called_once_with(repo, stale, delete_branch=False)
+        cleanup.assert_called_once_with(
+            repo,
+            stale,
+            delete_branch=False,
+            temporary_prefix=orch.LOCAL_REVIEW_WORKTREE_PREFIX,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -17776,16 +19270,20 @@ class TestLocalReviewPhase:
 
         assert review_result.status == "approved"
         env = captured["env"]
-        venv_bin = str(review_worktree / ".venv" / "bin")
+        venv_bin = str(orch._worktree_venv_executable_dir(review_worktree))
         assert env["PATH"].split(os.pathsep)[0] == venv_bin
         assert env["VIRTUAL_ENV"] == str(review_worktree / ".venv")
 
-    @pytest.mark.parametrize("venv_present", [True, False])
+    @pytest.mark.parametrize(
+        ("venv_present", "bootstrap_warning"),
+        [(True, ""), (False, ""), (True, "bootstrap failed")],
+    )
     def test_run_local_review_tells_reviewer_how_to_run_bootstrapped_venv(
         self,
         repo: Path,
         tmp_path: Path,
         venv_present: bool,
+        bootstrap_warning: str,
     ):
         """When bootstrap produced a venv, the reviewer prompt must point at it by
         absolute path — PATH injection alone is not enough because the agent's
@@ -17799,7 +19297,7 @@ class TestLocalReviewPhase:
         review_worktree = tmp_path / "review"
         review_worktree.mkdir()
         if venv_present:
-            (review_worktree / ".venv" / "bin").mkdir(parents=True)
+            orch._worktree_venv_executable_dir(review_worktree).mkdir(parents=True)
 
         raw_review_json = json.dumps(
             {
@@ -17811,7 +19309,7 @@ class TestLocalReviewPhase:
             }
         )
 
-        captured: dict[str, list[str]] = {}
+        captured: dict[str, object] = {}
 
         @contextmanager
         def fake_review_worktree(repo_root: Path, *, head_sha: str, branch=None):  # noqa: ARG001
@@ -17822,17 +19320,22 @@ class TestLocalReviewPhase:
             cmd: list[str],
             *,
             cwd: Path,  # noqa: ARG001
-            env: dict[str, str],  # noqa: ARG001
+            env: dict[str, str],
             timeout: int,  # noqa: ARG001
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             captured["cmd"] = cmd
+            captured["env"] = env
             return subprocess.CompletedProcess(cmd, 0, raw_review_json, "")
 
         with (
             patch.object(orch, "_run_local_review_subprocess", side_effect=mock_review_exec),
             patch.object(orch, "_render_local_review_prompt", return_value="prompt"),
-            patch.object(orch, "_bootstrap_review_worktree", return_value=""),
+            patch.object(
+                orch,
+                "_bootstrap_review_worktree",
+                return_value=bootstrap_warning,
+            ),
             patch.object(orch, "_temporary_review_worktree", side_effect=fake_review_worktree),
         ):
             review_result, _ = orch._run_local_review(
@@ -17846,11 +19349,35 @@ class TestLocalReviewPhase:
             )
 
         assert review_result.status == "approved"
-        prompt_arg = captured["cmd"][-1]
-        if venv_present:
-            assert ".venv/bin/pytest" in prompt_arg
+        captured_cmd = captured["cmd"]
+        assert isinstance(captured_cmd, list)
+        prompt_arg = captured_cmd[-1]
+        expected_pytest_command = (
+            r".venv\Scripts\python.exe -m pytest"
+            if os.name == "nt"
+            else ".venv/bin/pytest"
+        )
+        if venv_present and not bootstrap_warning:
+            assert expected_pytest_command in prompt_arg
         else:
-            assert ".venv/bin/pytest" not in prompt_arg
+            assert expected_pytest_command not in prompt_arg
+        captured_env = captured["env"]
+        assert isinstance(captured_env, dict)
+        venv_bin = str(orch._worktree_venv_executable_dir(review_worktree))
+        if bootstrap_warning:
+            assert captured_env["PATH"].split(os.pathsep)[0] != venv_bin
+            assert "VIRTUAL_ENV" not in captured_env
+        else:
+            assert captured_env["PATH"].split(os.pathsep)[0] == venv_bin
+
+    def test_windows_review_prompt_uses_scripts_python(self, tmp_path: Path):
+        review_worktree = tmp_path / "review"
+        (review_worktree / ".venv" / "Scripts").mkdir(parents=True)
+
+        note = orch._review_env_prompt_note(review_worktree, windows=True)
+
+        assert r".venv\Scripts\python.exe -m pytest" in note
+        assert ".venv/bin/pytest" not in note
 
     def test_run_local_review_uses_distinct_review_agent_when_configured(
         self,
@@ -17867,6 +19394,7 @@ class TestLocalReviewPhase:
         (schema_dir / "codex-review.schema.json").write_text("{}\n")
         review_worktree = tmp_path / "review"
         review_worktree.mkdir()
+        observed_scratch: list[Path] = []
 
         @contextmanager
         def fake_review_worktree(repo_root: Path, *, head_sha: str, branch=None):  # noqa: ARG001
@@ -17885,6 +19413,20 @@ class TestLocalReviewPhase:
             assert repo_root == repo
             assert cmd[0] == "codex"
             assert cwd == review_worktree
+            scratch_dir = Path(cmd[cmd.index("-C") + 1])
+            observed_scratch.append(scratch_dir)
+            assert scratch_dir.is_dir()
+            assert scratch_dir != review_worktree
+            assert cmd[cmd.index("-s") + 1] == "workspace-write"
+            assert "--skip-git-repo-check" in cmd
+            assert "--add-dir" not in cmd
+            assert env["TMPDIR"] == str(scratch_dir)
+            assert env["TMP"] == str(scratch_dir)
+            assert env["TEMP"] == str(scratch_dir)
+            assert env["PYTHONDONTWRITEBYTECODE"] == "1"
+            assert str(review_worktree) in cmd[-1]
+            assert str(scratch_dir) in cmd[-1]
+            (scratch_dir / "pytest-probe").write_text("writable\n")
             output_idx = cmd.index("-o")
             Path(cmd[output_idx + 1]).write_text(
                 json.dumps(
@@ -17915,6 +19457,11 @@ class TestLocalReviewPhase:
             )
 
         assert review_result.status == "approved"
+        assert len(observed_scratch) == 1
+        assert not orch.LOCAL_REVIEW_SCRATCH_PREFIX.startswith(
+            orch.LOCAL_REVIEW_WORKTREE_PREFIX
+        )
+        assert not observed_scratch[0].exists()
         assert "[spec] my-feature: review running with codex for PR #42" in capsys.readouterr().err
 
     def test_run_local_review_timeout_preserves_partial_output(
@@ -19649,7 +21196,7 @@ class TestValidateCodexExec:
 
 class TestWriteSandboxConfig:
     @pytest.mark.parametrize(("agent", "config_name"), [("claude", ".claude"), ("codex", ".codex")])
-    def test_refuses_agent_config_symlink(
+    def test_refuses_agent_config_link(
         self,
         tmp_path: Path,
         agent: str,
@@ -19659,12 +21206,46 @@ class TestWriteSandboxConfig:
         external = tmp_path / "external"
         worktree.mkdir()
         external.mkdir()
-        (worktree / config_name).symlink_to(external, target_is_directory=True)
+        config_path = worktree / config_name
+        if os.name == "nt":
+            subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(config_path), str(external)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            config_path.symlink_to(external, target_is_directory=True)
 
         with pytest.raises(ValueError, match="non-directory path"):
             orch._write_sandbox_config(agent, worktree)
 
         assert list(external.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        ("agent", "relative_path"),
+        [
+            ("claude", Path(".claude/settings.local.json")),
+            ("claude", Path(".claude/mcp-servers.json")),
+            ("codex", Path(".codex/config.toml")),
+        ],
+    )
+    def test_replaces_agent_config_hardlink(
+        self,
+        tmp_path: Path,
+        agent: str,
+        relative_path: Path,
+    ) -> None:
+        worktree = tmp_path / "worktree"
+        target = worktree / relative_path
+        target.parent.mkdir(parents=True)
+        external = tmp_path / "external-config"
+        external.write_text("do-not-overwrite", encoding="utf-8")
+        os.link(external, target)
+
+        orch._write_sandbox_config(agent, worktree)
+
+        assert external.read_text(encoding="utf-8") == "do-not-overwrite"
+        assert not os.path.samefile(external, target)
 
     def test_claude_writes_default_playwright_mcp_config(self, tmp_path: Path):
         # Create the Playwright cli.js so _default_claude_mcp_servers includes it
@@ -22521,6 +24102,10 @@ class TestMergeRequiredChecks:
         wait_mock.assert_called_once_with(repo, run.branch, 12)
         assert sleep_mock.call_count == 1
 
+    @pytest.mark.skipif(
+        os.name != "posix",
+        reason="requires POSIX Popen timeout busy-wait and executable shebang shim",
+    )
     def test_merge_poll_sleeps_exclude_subprocess_busy_wait(
         self,
         repo: Path,
@@ -25100,6 +26685,22 @@ class TestStructuredAuditMetadata:
         assert f"[spec] my-feature: phase merge started (attempt {attempt_label})" in captured.err
         assert f"[spec] my-feature: phase merge passed (attempt {attempt_label})" in captured.err
 
+    def test_run_single_phase_success_clears_resolved_last_error(self, repo: Path):
+        run = orch.RunState(
+            run_id="my-feature-20260101T000019b",
+            spec_id="my-feature",
+            branch="spec/my-feature",
+            last_error="resolved Windows cleanup failure",
+        )
+        run.save(repo)
+
+        with patch.dict(orch.PHASE_HANDLERS, {"cleanup": lambda _run, _root: "passed"}):
+            result = orch.run_single_phase(run, "cleanup", repo)
+
+        assert result == "passed"
+        assert run.last_error == ""
+        assert orch.RunState.load(repo, run.run_id).last_error == ""
+
     def test_run_single_phase_refreshes_lease_heartbeat_during_long_phase(
         self,
         repo: Path,
@@ -25353,6 +26954,22 @@ class TestCleanupPhase:
         assert result == "failed"
         assert "Cleanup left stale worktree metadata" in run.last_error
 
+    def test_phase_cleanup_rejects_mismatched_identity_before_reaping(self, repo: Path):
+        run = self._make_run()
+        mismatched = repo / ".worktrees" / "unrelated-worktree"
+        mismatched.mkdir(parents=True)
+
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=mismatched),
+            patch.object(orch, "_reap_registered_worktree_processes") as reap,
+        ):
+            result = orch.phase_cleanup(run, repo)
+
+        assert result == "failed"
+        assert "does not match expected identity" in run.last_error
+        reap.assert_not_called()
+        assert mismatched.is_dir()
+
     def test_worktree_registration_requires_exact_path_match(self, repo: Path):
         worktree = repo / ".worktrees" / "feature"
         sibling = repo / ".worktrees" / "feature-old"
@@ -25455,6 +27072,62 @@ class TestCleanupPhase:
         assert error == ""
         assert process_registry.list_registered_worktrees(state_root) == []
 
+    def test_cleanup_preserves_worktree_when_registered_helper_survives(self, repo: Path):
+        worktree = repo / ".worktrees" / "feature"
+        worktree.mkdir(parents=True)
+        report = process_registry.ReapReport(
+            surviving=("dev-server pid=4242 survived reap",),
+        )
+
+        with (
+            patch.object(orch, "_stop_worktree_postgres_if_present") as stop_postgres,
+            patch.object(orch, "_reap_registered_worktree_processes", return_value=report),
+            patch.object(
+                orch,
+                "run_subprocess",
+                side_effect=AssertionError("worktree removal must not start"),
+            ),
+        ):
+            error = orch._cleanup_worktree_checkout(
+                repo,
+                worktree,
+                branch=None,
+                delete_branch=False,
+            )
+
+        assert "registered processes survived cleanup" in error
+        assert "dev-server pid=4242" in error
+        assert worktree.is_dir()
+        stop_postgres.assert_called_once_with(worktree)
+
+    def test_cleanup_falls_back_when_git_cannot_delete_registered_worktree(self, repo: Path):
+        worktree = repo / ".worktrees" / "feature"
+        worktree.mkdir(parents=True)
+        listing = f"worktree {worktree}\nHEAD {'a' * 40}\nbranch refs/heads/code/feature\n\n"
+        commands: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):  # noqa: ARG001
+            commands.append(cmd)
+            if cmd[:3] == ["git", "worktree", "list"]:
+                output = listing if len([c for c in commands if c[:3] == ["git", "worktree", "list"]]) == 1 else ""
+                return subprocess.CompletedProcess(cmd, 0, output, "")
+            if cmd[:3] == ["git", "worktree", "remove"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "Filename too long")
+            if cmd[:3] == ["git", "worktree", "prune"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            raise AssertionError(f"unexpected command: {cmd}")
+
+        with patch.object(orch, "run_subprocess", side_effect=fake_run):
+            error = orch._cleanup_worktree_checkout(
+                repo,
+                worktree,
+                branch=None,
+                delete_branch=False,
+            )
+
+        assert error == ""
+        assert not worktree.exists()
+
     def test_orchestrator_sigterm_guard_reaps_registered_helpers(self, repo: Path):
         run = orch.RunState(
             run_id="my-feature-20260101T000000",
@@ -25508,6 +27181,29 @@ class TestCleanupPhase:
         assert "Reaped registered helper for" in caplog.text
         assert "reason=orchestrator SIGTERM" in caplog.text
         assert "Registered helper survived cleanup" in caplog.text
+
+    def test_reap_registered_worktree_processes_exception_fails_closed(
+        self,
+        repo: Path,
+    ):
+        worktree = repo / ".worktrees" / "my-feature"
+        worktree.mkdir(parents=True)
+
+        with patch.object(
+            orch.worktree_process_registry,
+            "reap_registered_processes",
+            side_effect=PermissionError("registry denied"),
+        ):
+            report = orch._reap_registered_worktree_processes(
+                repo,
+                worktree,
+                reason="worktree cleanup",
+            )
+
+        assert report.terminated == ()
+        assert report.surviving == (
+            f"process reaper failed for {worktree}; refusing cleanup: registry denied",
+        )
 
 
 class TestRetryCap:
@@ -27390,7 +29086,7 @@ class TestNoStatusesJsonDependency:
 
     def test_orchestrator_no_json_imports(self):
         """The runtime driver must not import JSON status writers."""
-        src = Path(orch.__file__).read_text()
+        src = Path(orch.__file__).read_text(encoding="utf-8")
         assert "write_spec_status" not in src
         assert "status_file_path" not in src
         assert "set_spec_status" not in src
@@ -28813,6 +30509,142 @@ class TestBaseOverride:
 
 
 class TestSpecAuthoring:
+    def test_windows_codex_authoring_passes_host_gh_token_without_profile_access(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        forge = MagicMock()
+        forge.get_auth_token.return_value = "native-authoring-token"
+
+        with (
+            patch.object(orch.sys, "platform", "win32"),
+            patch.object(orch, "_forge", return_value=forge),
+        ):
+            env = orch._windows_codex_authoring_env("codex")
+
+        assert env is not None
+        assert env["GH_TOKEN"] == "native-authoring-token"
+        assert "GH_TOKEN" not in os.environ
+        forge.get_auth_token.assert_called_once_with()
+
+    def test_windows_codex_authoring_preserves_explicit_token(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("GH_TOKEN", "explicit-token")
+        forge = MagicMock()
+
+        with (
+            patch.object(orch.sys, "platform", "win32"),
+            patch.object(orch, "_forge", return_value=forge),
+        ):
+            env = orch._windows_codex_authoring_env("codex")
+
+        assert env is not None
+        assert env["GH_TOKEN"] == "explicit-token"
+        forge.get_auth_token.assert_not_called()
+
+    def test_windows_codex_authoring_uses_disposable_gh_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        env = {
+            "GH_TOKEN": "native-authoring-token",
+            "GH_CONFIG_DIR": r"C:\\Users\\operator\\AppData\\Roaming\\GitHub CLI",
+        }
+
+        config_dir = orch._isolate_windows_codex_authoring_gh_config(env, tmp_path)
+
+        assert config_dir is not None
+        assert config_dir.is_dir()
+        assert config_dir.parent == tmp_path
+        assert env["GH_CONFIG_DIR"] == str(config_dir)
+        assert env["GH_HOST"] == "github.com"
+        assert list(config_dir.iterdir()) == []
+
+        shutil.rmtree(config_dir)
+
+    def test_windows_codex_authoring_disposable_gh_config_is_cleaned_after_launch(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        worktree_path = repo / ".worktrees" / "spec-windows-authoring"
+        args = argparse.Namespace(
+            agent="codex",
+            base="origin/master",
+            spec="windows-authoring",
+            label="",
+        )
+        monkeypatch.setenv("GH_TOKEN", "native-authoring-token")
+        observed: dict[str, Path] = {}
+
+        def launch(_command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            config_dir = Path(str(env["GH_CONFIG_DIR"]))
+            assert config_dir.is_dir()
+            assert env["GH_HOST"] == "github.com"
+            observed["config_dir"] = config_dir
+            return subprocess.CompletedProcess(["codex"], 130)
+
+        with (
+            patch.object(orch.sys, "platform", "win32"),
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch, "_common_state_root", return_value=repo / ".spec-state"),
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.object(
+                orch,
+                "_prepare_spec_authoring_worktree",
+                return_value=(worktree_path, "spec/windows-authoring", False),
+            ),
+            patch.object(orch, "_write_sandbox_config"),
+            patch.object(
+                orch,
+                "_build_spec_authoring_command",
+                return_value=["codex", "Author spec"],
+            ),
+            patch.object(orch.subprocess, "run", side_effect=launch),
+        ):
+            status = orch.cmd_spec(args)
+
+        assert status == 130
+        assert not observed["config_dir"].exists()
+
+    def test_windows_codex_authoring_missing_token_fails_before_worktree(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        args = argparse.Namespace(
+            agent="codex",
+            base="origin/master",
+            spec="windows-authoring",
+            label="",
+        )
+        forge = MagicMock()
+        forge.get_auth_token.return_value = ""
+
+        with (
+            patch.object(orch.sys, "platform", "win32"),
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.object(orch, "_forge", return_value=forge),
+            patch.object(orch, "_prepare_spec_authoring_worktree") as prepare,
+            patch.object(orch.subprocess, "run") as launch,
+        ):
+            status = orch.cmd_spec(args)
+
+        assert status == 1
+        assert "gh auth token" in capsys.readouterr().err
+        prepare.assert_not_called()
+        launch.assert_not_called()
+
     def test_prepare_spec_authoring_worktree_ignores_prefix_matches(self, repo: Path):
         worktree = repo / ".worktrees" / "spec-foo"
         unrelated_worktree = repo / ".worktrees" / "spec-foo-bar"
@@ -29169,6 +31001,7 @@ class TestSpecAuthoring:
                 "_build_spec_authoring_command",
                 return_value=["codex", "Author spec `new-spec`"],
             ) as build_cmd,
+            patch.object(orch, "_windows_codex_authoring_env", return_value=None),
             patch.object(
                 orch.subprocess,
                 "run",
@@ -29233,6 +31066,7 @@ class TestSpecAuthoring:
                 "_build_spec_authoring_command",
                 return_value=["codex", "Author a new spec"],
             ) as build_cmd,
+            patch.object(orch, "_windows_codex_authoring_env", return_value=None),
             patch.object(
                 orch.subprocess,
                 "run",
@@ -29337,6 +31171,7 @@ class TestSpecAuthoring:
                 "_build_spec_authoring_command",
                 return_value=["codex", "Author spec `new-spec`"],
             ),
+            patch.object(orch, "_windows_codex_authoring_env", return_value=None),
             patch.object(
                 orch.subprocess,
                 "run",
@@ -29589,6 +31424,18 @@ class TestMultiSpecAuthoring:
 
         template = (resource_files("spec_runtime") / "templates" / "TEMPLATE.md").read_text()
         assert "draft" not in template.lower()
+
+    def test_bundled_template_uses_runtime_checklist_syntax(self):
+        """Template-following specs must populate implementation PR criteria."""
+        from importlib.resources import files as resource_files
+
+        template_path = resource_files("spec_runtime") / "templates" / "TEMPLATE.md"
+        criteria = orch._extract_acceptance_checklist_items(Path(str(template_path)))
+        assert criteria == [
+            "- [ ] First concrete, testable requirement",
+            "- [ ] Second requirement",
+            "- [ ] Third requirement",
+        ]
 
     def test_build_spec_authoring_command_multi_spec_initial_prompt(self, repo: Path):
         """Anonymous session initial prompt mentions multiple specs."""
@@ -31932,7 +33779,7 @@ class TestEnsureOrchestratorProcessGroupSigttou:
             patch("os.setpgrp"),
             patch("sys.stdin", mock_stdin),
             patch("os.tcsetpgrp", side_effect=spy_tcsetpgrp),
-            patch.object(orch, "signal", proxy_signal),
+            patch.object(process_supervisor, "signal", proxy_signal),
         ):
             orch._ensure_orchestrator_process_group(run, Path("/tmp/fake"))
 
@@ -31980,6 +33827,32 @@ class TestEnsureOrchestratorProcessGroupSigttou:
             orch._ensure_orchestrator_process_group(run, Path("/tmp/fake"))
 
         assert signal.getsignal(signal.SIGTTOU) == original_handler
+
+
+def test_ensure_orchestrator_process_group_persists_portable_token(repo: Path) -> None:
+    identity = ProcessIdentity(4321, "created", "/usr/bin/python", "python orchestrator.py")
+    token_version = 2 if os.name == "nt" else 1
+    expected_pgid = None if os.name == "nt" else identity.pid
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        identity,
+        identity.pid,
+        identity.started_at,
+        "orchestrator-test-run",
+        pgid=expected_pgid or 0,
+        version=token_version,
+    )
+    run = orch.RunState(run_id="test-run", spec_id="test-spec", branch="test-branch")
+
+    with patch.object(orch, "claim_current_process", return_value=token) as claim:
+        orch._ensure_orchestrator_process_group(run, repo)
+
+    claim.assert_called_once_with("orchestrator-test-run")
+    assert run.pgid == expected_pgid
+    assert run.process_started_at == "created"
+    assert run.supervision_token == token.to_dict()
+    persisted = orch.RunState.load(repo, run.run_id)
+    assert SupervisionToken.from_dict(persisted.supervision_token) == token
 
 
 # ---------------------------------------------------------------------------
@@ -32206,7 +34079,7 @@ class TestDefaultClaudeMcpServers:
 class TestCodexIsolatedHome:
     """Per-worktree CODEX_HOME setup for non-interactive Codex sessions."""
 
-    def test_write_codex_isolated_home_creates_config_and_symlinks_auth(
+    def test_write_codex_isolated_home_uses_platform_safe_auth_materialization(
         self, tmp_path: Path
     ):
         worktree = tmp_path / "worktree"
@@ -32231,9 +34104,134 @@ class TestCodexIsolatedHome:
         config_text = (home / "config.toml").read_text()
         assert "[mcp_servers.kubectl]" in config_text
         assert 'command = "/usr/local/bin/kubectl"' in config_text
-        auth_link = home / "auth.json"
-        assert auth_link.is_symlink()
-        assert auth_link.resolve() == (source_home / "auth.json").resolve()
+        auth_path = home / "auth.json"
+        if sys.platform == "win32":
+            assert auth_path.is_file()
+            assert not auth_path.is_symlink()
+            assert auth_path.read_text() == '{"token":"x"}'
+        else:
+            assert auth_path.is_symlink()
+            assert auth_path.resolve() == (source_home / "auth.json").resolve()
+
+    def test_write_codex_isolated_home_honors_operator_codex_home(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_home = tmp_path / "custom-codex"
+        source_home.mkdir()
+        (source_home / "auth.json").write_text('{"token":"custom"}')
+
+        with patch.dict(os.environ, {"CODEX_HOME": str(source_home)}):
+            home = orch._write_codex_isolated_home(
+                worktree,
+                mcp_servers={},
+                copy_auth=True,
+            )
+
+        assert (home / "auth.json").read_text() == '{"token":"custom"}'
+
+    def test_windows_default_copies_auth_without_symlink_privilege(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_home = tmp_path / "user-codex"
+        source_home.mkdir()
+        (source_home / "auth.json").write_text('{"token":"x"}')
+
+        with patch.object(orch.sys, "platform", "win32"):
+            home = orch._write_codex_isolated_home(
+                worktree,
+                mcp_servers={},
+                source_home=source_home,
+            )
+
+        auth_path = home / "auth.json"
+        assert auth_path.is_file()
+        assert not auth_path.is_symlink()
+        assert auth_path.read_text() == '{"token":"x"}'
+        assert (home / "config.toml").read_text().startswith(
+            '[windows]\nsandbox = "unelevated"\n'
+        )
+
+    def test_non_windows_isolated_home_does_not_override_windows_sandbox(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+
+        with patch.object(orch.sys, "platform", "linux"):
+            home = orch._write_codex_isolated_home(
+                worktree,
+                mcp_servers={},
+                source_home=tmp_path / "missing-source",
+            )
+
+        assert "[windows]" not in (home / "config.toml").read_text()
+
+    def test_write_codex_isolated_home_replaces_hardlinked_config(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        home = worktree / ".spec-codex-home"
+        home.mkdir(parents=True)
+        outside = tmp_path / "outside.toml"
+        outside.write_text("do-not-overwrite")
+        os.link(outside, home / "config.toml")
+
+        orch._write_codex_isolated_home(
+            worktree,
+            mcp_servers={"safe": {"command": "safe-mcp"}},
+            source_home=tmp_path / "missing-source",
+        )
+
+        assert outside.read_text() == "do-not-overwrite"
+        assert "safe-mcp" in (home / "config.toml").read_text()
+        assert not os.path.samefile(outside, home / "config.toml")
+
+    @pytest.mark.skipif(os.name == "nt", reason="Windows junction variant covers native")
+    def test_write_codex_isolated_home_replaces_planted_home_symlink(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (worktree / ".spec-codex-home").symlink_to(outside, target_is_directory=True)
+
+        home = orch._write_codex_isolated_home(
+            worktree,
+            mcp_servers={},
+            source_home=tmp_path / "missing-source",
+        )
+
+        assert not home.is_symlink()
+        assert list(outside.iterdir()) == []
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+    def test_write_codex_isolated_home_replaces_planted_windows_junction(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        home = worktree / ".spec-codex-home"
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(home), str(outside)],
+            check=True,
+            capture_output=True,
+        )
+
+        staged = orch._write_codex_isolated_home(
+            worktree,
+            mcp_servers={},
+            source_home=tmp_path / "missing-source",
+        )
+
+        assert not orch._is_windows_reparse_point(staged)
+        assert list(outside.iterdir()) == []
 
     def test_write_codex_isolated_home_warns_on_missing_auth(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -32359,6 +34357,55 @@ class TestCodexIsolatedHome:
         )
         assert ".gitignore" in check.stdout
 
+    def test_remove_codex_isolated_auth_leaves_config_only(self, tmp_path: Path):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_home = tmp_path / "user-codex"
+        source_home.mkdir()
+        (source_home / "auth.json").write_text('{"token":"x"}')
+        home = orch._write_codex_isolated_home(
+            worktree,
+            mcp_servers={},
+            source_home=source_home,
+            copy_auth=True,
+        )
+
+        orch._remove_codex_isolated_auth(worktree)
+        orch._remove_codex_isolated_auth(worktree)
+
+        assert not (home / "auth.json").exists()
+        assert (home / "config.toml").is_file()
+
+    def test_agent_launch_removes_transient_auth_even_when_backend_fails(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        home = worktree / ".spec-codex-home"
+        home.mkdir(parents=True)
+        (home / "auth.json").write_text('{"token":"secret"}')
+        run = SimpleNamespace(agent="codex", implement_launches=1, attempts=1, run_id="run-1")
+        plan = orch.ImplementLaunchPlan(
+            use_stream_json=False,
+            agent_env={},
+            agent_cmd=["codex"],
+            popen_kwargs={"cwd": worktree, "env": {}},
+        )
+
+        class FailingBackend:
+            def launch_agent(self, _request, *, monitor):
+                raise RuntimeError("launch failed")
+
+        backend = FailingBackend()
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+            patch.object(orch, "_sync_orchestrator_paths_into_workspace") as sync,
+            pytest.raises(RuntimeError, match="launch failed"),
+        ):
+            orch._launch_implement_attempt(run, tmp_path, worktree, plan)
+
+        assert not (home / "auth.json").exists()
+        sync.assert_called_once_with(backend, worktree, (".spec-codex-home",))
+
 
 class TestClaudeIsolatedHome:
     """Per-worktree HOME setup for containerized Claude sessions."""
@@ -32405,9 +34452,13 @@ class TestClaudeIsolatedHome:
         copied = json.loads((home / ".claude" / ".credentials.json").read_text())
         assert copied["claudeAiOauth"]["accessToken"] == "sk-ant-oat01-access"
         assert "refreshToken" not in copied["claudeAiOauth"]
-        mode = (home / ".claude" / ".credentials.json").stat().st_mode & 0o777
-        assert mode == 0o600
+        credentials_path = home / ".claude" / ".credentials.json"
+        assert credentials_path.is_file()
+        assert not credentials_path.is_symlink()
+        if os.name == "posix":
+            assert credentials_path.stat().st_mode & 0o777 == 0o600
 
+    @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows uses hardlink coverage")
     def test_write_claude_isolated_home_replaces_planted_credentials_symlink(
         self, tmp_path: Path
     ):
@@ -32439,6 +34490,35 @@ class TestClaudeIsolatedHome:
         assert exfil_target.read_text() == "untouched"
         assert "sk-ant-oat01-access" in dst.read_text()
 
+    def test_write_claude_isolated_home_replaces_planted_credentials_hardlink(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_config = tmp_path / ".claude.json"
+        source_config.write_text("{}")
+        source_credentials = tmp_path / ".credentials.json"
+        source_credentials.write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-ant-oat01-access"}
+        }))
+        exfil_target = tmp_path / "exfil.json"
+        exfil_target.write_text("untouched")
+        planted = worktree / ".spec-claude-home" / ".claude" / ".credentials.json"
+        planted.parent.mkdir(parents=True)
+        os.link(exfil_target, planted)
+
+        home = orch._write_claude_isolated_home(
+            worktree,
+            source_config=source_config,
+            source_credentials=source_credentials,
+        )
+
+        dst = home / ".claude" / ".credentials.json"
+        assert exfil_target.read_text() == "untouched"
+        assert not os.path.samefile(exfil_target, dst)
+        assert "sk-ant-oat01-access" in dst.read_text()
+
+    @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows uses junction coverage")
     def test_write_claude_isolated_home_replaces_symlinked_claude_dir(
         self, tmp_path: Path
     ):
@@ -32465,6 +34545,40 @@ class TestClaudeIsolatedHome:
         )
 
         assert not (home / ".claude").is_symlink()
+        assert list(exfil_dir.iterdir()) == []
+        assert "sk-ant-oat01-access" in (
+            home / ".claude" / ".credentials.json"
+        ).read_text()
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+    def test_write_claude_isolated_home_replaces_junctioned_claude_dir(
+        self, tmp_path: Path
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_config = tmp_path / ".claude.json"
+        source_config.write_text("{}")
+        source_credentials = tmp_path / ".credentials.json"
+        source_credentials.write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-ant-oat01-access"}
+        }))
+        exfil_dir = tmp_path / "exfil"
+        exfil_dir.mkdir()
+        home_root = worktree / ".spec-claude-home"
+        home_root.mkdir()
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(home_root / ".claude"), str(exfil_dir)],
+            check=True,
+            capture_output=True,
+        )
+
+        home = orch._write_claude_isolated_home(
+            worktree,
+            source_config=source_config,
+            source_credentials=source_credentials,
+        )
+
+        assert not orch._is_windows_reparse_point(home / ".claude")
         assert list(exfil_dir.iterdir()) == []
         assert "sk-ant-oat01-access" in (
             home / ".claude" / ".credentials.json"
@@ -32609,6 +34723,318 @@ class TestContainerOutboxCompletionResult:
         assert result is not None
 
 
+@pytest.mark.host_agent_preflight
+class TestHostClaudeLaunchPreflight:
+    @staticmethod
+    def _windows_error() -> HostAgentUnavailableError:
+        return HostAgentUnavailableError(
+            host_agent_unavailability_reason("claude", platform="win32")
+        )
+
+    @staticmethod
+    def _backend(name: str):
+        return SimpleNamespace(
+            identity=eb.BackendIdentity(
+                backend=name,
+                safety_mode="strict",
+                workspace_root="",
+            )
+        )
+
+    def test_native_worktree_implement_fails_before_launch_reservation(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="windows-claude-20260901T000000",
+            spec_id="windows-claude",
+            branch="code/windows-claude--token",
+            agent="claude",
+        )
+        worktree = repo / ".worktrees" / "windows-claude"
+        worktree.mkdir(parents=True)
+        workspace = eb.WorkspaceHandle(
+            path=worktree,
+            outbox_path=worktree / ".spec-outbox",
+            branch=run.branch,
+        )
+        bundle = orch.ImplementAttemptContextBundle(
+            reason="initial",
+            context=orch.ImplementContext(run_id=run.run_id),
+        )
+
+        with (
+            patch.object(orch, "_resolve_workspace_handle", return_value=workspace),
+            patch.object(orch, "_ensure_required_intake_before_implement", return_value="passed"),
+            patch.object(orch, "_sync_reused_branch_before_implement", return_value="passed"),
+            patch.object(orch, "_build_implement_attempt_context", return_value=bundle),
+            patch.object(orch, "_resolve_execution_backend", return_value=self._backend("worktree")),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_reserve_implement_launch") as reserve,
+            patch.object(orch, "_launch_implement_attempt") as launch,
+        ):
+            status = orch.phase_implement(run, repo)
+
+        assert status == "failed"
+        assert "WSL2" in run.last_error
+        assert run.implement_launches == 0
+        reserve.assert_not_called()
+        launch.assert_not_called()
+
+    def test_spec_authoring_fails_before_worktree_or_agent_launch(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        args = argparse.Namespace(
+            agent="claude",
+            base="origin/master",
+            spec="windows-authoring",
+            label="",
+        )
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_prepare_spec_authoring_worktree") as prepare,
+            patch.object(orch.subprocess, "run") as launch,
+        ):
+            status = orch.cmd_spec(args)
+
+        assert status == 1
+        assert "WSL2" in capsys.readouterr().err
+        prepare.assert_not_called()
+        launch.assert_not_called()
+
+    def test_task_fails_before_run_creation_or_agent_launch(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        args = argparse.Namespace(
+            agent="claude",
+            review_agent="codex",
+            base="origin/master",
+            retry_cap=None,
+        )
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_create_task_run") as create_run,
+            patch.object(orch, "run_full_workflow") as workflow,
+        ):
+            status = orch.cmd_task(args)
+
+        assert status == 1
+        assert "Codex for native execution" in capsys.readouterr().err
+        create_run.assert_not_called()
+        workflow.assert_not_called()
+
+    def test_task_scoping_phase_fails_before_agent_launch(
+        self,
+        repo: Path,
+    ) -> None:
+        worktree = repo / ".worktrees" / "windows-scoping"
+        worktree.mkdir(parents=True)
+        run = orch.RunState(
+            run_id="windows-scoping-20260901T000000",
+            spec_id="windows-scoping",
+            branch="task/windows-scoping--token",
+            worktree_path=str(worktree),
+            run_mode="task",
+            agent="claude",
+        )
+
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_write_sandbox_config") as write_config,
+            patch.object(orch.subprocess, "run") as launch,
+        ):
+            status = orch.phase_scoping(run, repo)
+
+        assert status == "failed"
+        assert "WSL2" in run.last_error
+        write_config.assert_not_called()
+        launch.assert_not_called()
+
+    def test_input_fails_before_interactive_agent_launch(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        worktree = repo / ".worktrees" / "windows-input"
+        worktree.mkdir(parents=True)
+        run = orch.RunState(
+            run_id="windows-input-20260901T000000",
+            spec_id="windows-input",
+            branch="code/windows-input--token",
+            worktree_path=str(worktree),
+            phase="implement",
+            status="waiting-for-input",
+            agent="claude",
+        )
+        run.save(repo)
+        orch.OperatorRequest(
+            kind="agent_question",
+            prompt="Choose a format",
+            status="pending",
+        ).save(repo, run.run_id)
+        args = argparse.Namespace(spec=run.spec_id, agent=None)
+
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch.subprocess, "run") as launch,
+        ):
+            status = orch.cmd_input(args)
+
+        assert status == 1
+        assert "Linux container" in capsys.readouterr().err
+        assert not any(
+            call.args and call.args[0] and call.args[0][0] == "claude"
+            for call in launch.call_args_list
+        )
+
+    def test_container_implementation_does_not_apply_host_claude_policy(self) -> None:
+        with patch.object(orch, "require_host_agent_available") as require:
+            orch._require_agent_available_for_backend(
+                "claude",
+                self._backend("container"),
+            )
+
+        require.assert_not_called()
+
+    def test_recovery_fails_before_reserving_another_launch(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="windows-recovery-20260901T000000",
+            spec_id="windows-recovery",
+            branch="code/windows-recovery--token",
+            agent="claude",
+        )
+        worktree = repo / ".worktrees" / "windows-recovery"
+        worktree.mkdir(parents=True)
+        context = orch.ImplementContext(run_id=run.run_id)
+
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=self._backend("worktree")),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_reserve_implement_launch") as reserve,
+            patch.object(orch, "_launch_implement_attempt") as launch,
+        ):
+            status = orch._attempt_no_handshake_recovery(
+                run,
+                repo_root=repo,
+                worktree_path=worktree,
+                ctx=context,
+                use_stream_json=False,
+            )
+
+        assert status == "failed"
+        assert "WSL2" in run.last_error
+        reserve.assert_not_called()
+        launch.assert_not_called()
+
+    def test_local_review_fails_before_cli_discovery_or_subprocess(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="windows-review-20260901T000000",
+            spec_id="windows-review",
+            branch="code/windows-review--token",
+            agent="codex",
+            review_agent="claude",
+        )
+        with (
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch.shutil, "which") as which,
+            patch.object(orch, "_run_local_review") as review,
+        ):
+            status = orch._phase_review_local(
+                run,
+                repo,
+                pr_data={"number": 7},
+                expected_head_sha="head",
+                expected_base_sha="base",
+            )
+
+        assert status == "failed"
+        assert "Linux container" in run.last_error
+        which.assert_not_called()
+        review.assert_not_called()
+
+    def test_block_debugger_fails_before_context_or_agent_process(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="windows-debugger-20260901T000000",
+            spec_id="windows-debugger",
+            branch="code/windows-debugger--token",
+            phase="verify",
+            status="blocked",
+            agent="codex",
+            review_agent="claude",
+            last_error="verify failed",
+        )
+        run.save(repo)
+        with (
+            patch.object(orch, "_compute_blocker_signature", return_value="new-signature"),
+            patch.object(
+                orch,
+                "require_host_agent_available",
+                side_effect=self._windows_error(),
+            ),
+            patch.object(orch, "_write_block_debugger_context") as write_context,
+            patch.object(orch, "_run_local_review_subprocess") as launch,
+        ):
+            diagnosis = orch._maybe_run_block_debugger(
+                run,
+                repo,
+                source_phase="verify",
+            )
+
+        assert diagnosis is None
+        write_context.assert_not_called()
+        launch.assert_not_called()
+        assert any(
+            "WSL2" in warning.get("detail", "")
+            for warning in run.nonfatal_warnings
+        )
+
+
 class TestCodexIsolatedHomeRequiresAuthCopy:
     """Backend-aware auth.json copy/symlink selection."""
 
@@ -32623,9 +35049,8 @@ class TestCodexIsolatedHomeRequiresAuthCopy:
             backend_explicit=False,
         )
 
-    def test_returns_false_for_worktree_backend(self):
-        """WorktreeExecutionBackend launches the agent as a host subprocess —
-        an absolute auth.json symlink resolves correctly, no copy needed."""
+    def test_worktree_backend_copies_auth_only_on_native_windows(self):
+        """Host worktrees avoid privileged Windows symlinks."""
 
         class _Fake:
             pass
@@ -32633,17 +35058,21 @@ class TestCodexIsolatedHomeRequiresAuthCopy:
         _Fake.__name__ = "WorktreeExecutionBackend"
         fake = _Fake()
         fake.identity = self._identity("container")
-        assert orch._codex_isolated_home_requires_auth_copy(fake) is False
+        assert orch._codex_isolated_home_requires_auth_copy(fake) is (
+            sys.platform == "win32"
+        )
 
-    def test_returns_false_for_local_backend(self):
-        """Non-container identities never bind-mount; the symlink works."""
+    def test_local_backend_copies_auth_only_on_native_windows(self):
+        """Local host launches avoid privileged Windows symlinks."""
 
         class _Fake:
             pass
 
         fake = _Fake()
         fake.identity = self._identity("local")
-        assert orch._codex_isolated_home_requires_auth_copy(fake) is False
+        assert orch._codex_isolated_home_requires_auth_copy(fake) is (
+            sys.platform == "win32"
+        )
 
     def test_returns_true_for_container_backend(self):
         """ContainerExecutionBackend bind-mounts the worktree but not the user
@@ -32656,6 +35085,16 @@ class TestCodexIsolatedHomeRequiresAuthCopy:
         fake = _Fake()
         fake.identity = self._identity("container")
         assert orch._codex_isolated_home_requires_auth_copy(fake) is True
+
+    def test_returns_true_for_native_windows_worktree_backend(self):
+        class _Fake:
+            pass
+
+        _Fake.__name__ = "WorktreeExecutionBackend"
+        fake = _Fake()
+        fake.identity = self._identity("container")
+        with patch.object(orch.sys, "platform", "win32"):
+            assert orch._codex_isolated_home_requires_auth_copy(fake) is True
 
 
 class TestSyncOrchestratorPathsIntoWorkspace:
@@ -32831,7 +35270,7 @@ class TestMakeTreeReadonlyExclude:
         finally:
             orch._restore_tree_writable(root)
 
-    def test_readonly_and_restore_never_chmod_external_symlink_targets(self, tmp_path: Path):
+    def test_readonly_and_restore_never_chmod_external_link_targets(self, tmp_path: Path):
         root = tmp_path / "root"
         root.mkdir()
         locked = root / "locked.txt"
@@ -32842,8 +35281,15 @@ class TestMakeTreeReadonlyExclude:
         external_dir.mkdir()
         external_nested = external_dir / "nested.txt"
         external_nested.write_text("nested")
-        (root / "file-link").symlink_to(external_file)
-        (root / "dir-link").symlink_to(external_dir, target_is_directory=True)
+        if os.name == "nt":
+            subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(root / "dir-link"), str(external_dir)],
+                check=True,
+                capture_output=True,
+            )
+        else:
+            (root / "file-link").symlink_to(external_file)
+            (root / "dir-link").symlink_to(external_dir, target_is_directory=True)
 
         external_modes = {
             path: stat.S_IMODE(os.stat(path).st_mode)
@@ -33128,6 +35574,7 @@ class TestLocalReviewCommandAcceptsMcpConfig:
 class TestStopRunDeadProcess:
     """stop_run() should transition to failed when the process is already dead."""
 
+    @pytest.mark.skipif(os.name != "posix", reason="legacy POSIX process-group record")
     def test_dead_process_transitions_to_failed(self, repo: Path, monkeypatch: pytest.MonkeyPatch):
         run = orch.RunState(
             run_id="my-feature-20260101T000000",
@@ -33140,15 +35587,134 @@ class TestStopRunDeadProcess:
         )
         run.save(repo)
 
-        # is_pid_alive returns False → process is dead
-        monkeypatch.setattr(orch, "is_pid_alive", lambda pid, started_at: False)
-        monkeypatch.setattr(orch, "_is_process_group_alive", lambda *_args: False)
+        monkeypatch.setattr(orch, "terminate_legacy_process_group", lambda *_args, **_kwargs: False)
 
         result = orch.stop_run("my-feature", repo_root=repo)
 
         assert result.status == "failed"
         assert result.last_error == "stopped by user"
 
+    def test_windows_supervision_uses_portable_identity_boundary(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        identity = ProcessIdentity(99999, "created", "python.exe")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "orchestrator-my-feature",
+        )
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--token",
+            status="running",
+            phase="implement",
+            supervision_token=token.to_dict(),
+        )
+        run.save(repo)
+        monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
+        monkeypatch.setattr(orch, "os", SimpleNamespace(name="nt"))
+        stop_supervised = MagicMock(return_value=True)
+        monkeypatch.setattr(orch, "stop_supervised_process", stop_supervised)
+
+        result = orch.stop_run("my-feature", repo_root=repo)
+
+        assert result.status == "failed"
+        stopped_token = stop_supervised.call_args.args[0]
+        assert stopped_token.identity == identity
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX V1 supervision token")
+    def test_posix_v1_supervision_token_uses_portable_stop_boundary(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        identity = ProcessIdentity(99999, "created", "/usr/bin/python")
+        token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "orchestrator-my-feature",
+            pgid=identity.pid,
+            version=1,
+        )
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--token",
+            status="running",
+            phase="implement",
+            pgid=identity.pid,
+            process_started_at=identity.started_at,
+            supervision_token=token.to_dict(),
+        )
+        run.save(repo)
+        monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
+        stop_supervised = MagicMock(return_value=True)
+        monkeypatch.setattr(orch, "stop_supervised_process", stop_supervised)
+
+        result = orch.stop_run("my-feature", repo_root=repo)
+
+        assert result.status == "failed"
+        stopped_token = stop_supervised.call_args.args[0]
+        assert stopped_token == token
+
+    def test_windows_missing_supervision_token_fails_closed(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--token",
+            status="running",
+            phase="implement",
+            pgid=99999,
+            process_started_at="created",
+        )
+        run.save(repo)
+        monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
+        monkeypatch.setattr(orch, "os", SimpleNamespace(name="nt"))
+
+        with pytest.raises(RuntimeError, match="usable supervision token"):
+            orch.stop_run("my-feature", repo_root=repo)
+
+        assert orch.RunState.load(repo, run.run_id).status == "running"
+
+    def test_windows_legacy_supervision_token_fails_closed(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        identity = ProcessIdentity(99999, "created", "python.exe")
+        legacy_token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            identity,
+            identity.pid,
+            identity.started_at,
+            "legacy-token",
+            version=1,
+        )
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--token",
+            status="running",
+            phase="implement",
+            supervision_token=legacy_token.to_dict(),
+        )
+        run.save(repo)
+        monkeypatch.setattr(orch, "_latest_non_superseded_run", lambda *_args, **_kwargs: run)
+        monkeypatch.setattr(orch, "os", SimpleNamespace(name="nt"))
+        # Patch the platform decision seam, not the process supervisor's
+        # entire os module. Durable monitor threads may still be using
+        # os.path concurrently while this test runs.
+        monkeypatch.setattr(process_supervisor, "_platform_is_windows", lambda: True)
+
+        with pytest.raises(RuntimeError, match="unusable supervision token"):
+            orch.stop_run("my-feature", repo_root=repo)
+
+        assert orch.RunState.load(repo, run.run_id).status == "running"
+
+    @pytest.mark.skipif(os.name != "posix", reason="legacy POSIX process-group record")
     def test_dead_process_non_running_state_raises(self, repo: Path, monkeypatch: pytest.MonkeyPatch):
         run = orch.RunState(
             run_id="my-feature-20260101T000000",
@@ -33161,12 +35727,12 @@ class TestStopRunDeadProcess:
         )
         run.save(repo)
 
-        monkeypatch.setattr(orch, "is_pid_alive", lambda pid, started_at: False)
-        monkeypatch.setattr(orch, "_is_process_group_alive", lambda *_args: False)
+        monkeypatch.setattr(orch, "terminate_legacy_process_group", lambda *_args, **_kwargs: False)
 
         with pytest.raises(RuntimeError, match="No live process"):
             orch.stop_run("my-feature", repo_root=repo)
 
+    @pytest.mark.skipif(os.name != "posix", reason="legacy POSIX process-group record")
     def test_dead_process_does_not_clobber_completed_run(self, repo: Path, monkeypatch: pytest.MonkeyPatch):
         """If the run completes between the snapshot and the lock, don't overwrite."""
         run = orch.RunState(
@@ -33180,8 +35746,7 @@ class TestStopRunDeadProcess:
         )
         run.save(repo)
 
-        monkeypatch.setattr(orch, "is_pid_alive", lambda pid, started_at: False)
-        monkeypatch.setattr(orch, "_is_process_group_alive", lambda *_args: False)
+        monkeypatch.setattr(orch, "terminate_legacy_process_group", lambda *_args, **_kwargs: False)
 
         # Simulate the run completing to "passed" on disk after the snapshot
         # but before the lock is acquired.
@@ -33202,6 +35767,7 @@ class TestStopRunDeadProcess:
         assert result.status == "passed"
 
     @pytest.mark.parametrize("reason", ["orphaned leader", "reused leader pid"])
+    @pytest.mark.skipif(os.name != "posix", reason="legacy POSIX process-group record")
     def test_live_group_without_matching_leader_fails_closed(
         self,
         repo: Path,
@@ -33219,15 +35785,17 @@ class TestStopRunDeadProcess:
             process_started_at="Mon Mar 17 12:00:00 2026",
         )
         run.save(repo)
-        monkeypatch.setattr(orch, "is_pid_alive", lambda pid, started_at: False)
-        monkeypatch.setattr(orch, "_is_process_group_alive", lambda *_args: True)
-        killpg = MagicMock()
-        monkeypatch.setattr(orch.os, "killpg", killpg)
+        terminate_group = MagicMock(
+            side_effect=orch.ProcessGroupOwnershipError(
+                "Recorded leader has exited; refusing to signal an orphaned or reused process group."
+            )
+        )
+        monkeypatch.setattr(orch, "terminate_legacy_process_group", terminate_group)
 
         with pytest.raises(RuntimeError, match="orphaned or reused process group"):
             orch.stop_run("my-feature", repo_root=repo)
 
-        killpg.assert_not_called()
+        terminate_group.assert_called_once()
         persisted = orch.RunState.load(repo, run.run_id)
         assert persisted.status == "running"
 
@@ -35192,6 +37760,146 @@ class TestStaleHandshakeGuards:
         assert compatible is not None
 
 
+def _write_sigterm_tree_script(tmp_path: Path) -> tuple[Path, list[Path], list[Path]]:
+    script = tmp_path / "sigterm-tree.py"
+    ready_paths = [tmp_path / f"ready-{level}" for level in range(2)]
+    term_paths = [tmp_path / f"term-{level}" for level in range(2)]
+    script.write_text(
+        "import signal,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "level=int(sys.argv[1]); root=Path(sys.argv[2])\n"
+        "def stop(*_args):\n"
+        "    (root / f'term-{level}').write_text('SIGTERM')\n"
+        "    raise SystemExit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        "if level == 0:\n"
+        "    subprocess.Popen([sys.executable, __file__, '1', str(root)])\n"
+        "(root / f'ready-{level}').write_text('ready')\n"
+        "while True: time.sleep(.05)\n",
+        encoding="utf-8",
+    )
+    return script, ready_paths, term_paths
+
+
+def _wait_for_test_paths(paths: list[Path], timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not all(path.exists() for path in paths) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert all(path.exists() for path in paths)
+
+
+def test_read_process_identity_delegates_to_portable_boundary() -> None:
+    portable = ProcessIdentity(
+        pid=4321,
+        started_at="2026-08-31T12:34:56Z",
+        executable="python.exe",
+        command="python agent.py",
+    )
+
+    with patch.object(orch, "inspect_process", return_value=portable) as inspect:
+        legacy = orch.read_process_identity(4321)
+
+    inspect.assert_called_once_with(4321)
+    assert legacy == orch.ProcessIdentity(
+        pid=4321,
+        started_at="2026-08-31T12:34:56Z",
+        command="python agent.py",
+    )
+    assert type(legacy) is orch.ProcessIdentity
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX process-group integration")
+def test_terminate_agent_process_managed_posix_group_receives_sigterm(tmp_path: Path) -> None:
+    script, ready_paths, term_paths = _write_sigterm_tree_script(tmp_path)
+    managed = orch.ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, str(script), "0", str(tmp_path)]
+    )
+    try:
+        _wait_for_test_paths(ready_paths)
+        with patch.object(orch, "AGENT_TERMINATE_TIMEOUT_SECONDS", 2):
+            orch._terminate_agent_process(managed)
+        _wait_for_test_paths(term_paths)
+        assert [path.read_text(encoding="utf-8") for path in term_paths] == ["SIGTERM", "SIGTERM"]
+    finally:
+        if managed.poll() is None:
+            managed.kill()
+            managed.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX legacy process-group integration")
+def test_terminate_agent_process_raw_popen_preserves_owned_group_semantics(tmp_path: Path) -> None:
+    script, ready_paths, term_paths = _write_sigterm_tree_script(tmp_path)
+    process = subprocess.Popen(  # noqa: S603
+        [sys.executable, str(script), "0", str(tmp_path)],
+        start_new_session=True,
+    )
+    try:
+        _wait_for_test_paths(ready_paths)
+        with patch.object(orch, "AGENT_TERMINATE_TIMEOUT_SECONDS", 2):
+            orch._terminate_agent_process(process)
+        _wait_for_test_paths(term_paths)
+        assert [path.read_text(encoding="utf-8") for path in term_paths] == ["SIGTERM", "SIGTERM"]
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows Job Object integration")
+def test_terminate_agent_process_managed_windows_job_kills_tree(tmp_path: Path) -> None:
+    pid_root = tmp_path / "windows-agent"
+    script = tmp_path / "windows-agent-tree.py"
+    script.write_text(
+        "import os,subprocess,sys,time\n"
+        "level=int(sys.argv[1]); root=sys.argv[2]\n"
+        "open(root+'-'+str(level),'w').write(str(os.getpid()))\n"
+        "if level == 0: subprocess.Popen([sys.executable,__file__,'1',root])\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    managed = orch.ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, str(script), "0", str(pid_root)]
+    )
+    pid_paths = [Path(f"{pid_root}-{level}") for level in range(2)]
+    try:
+        _wait_for_test_paths(pid_paths)
+        identities = [int(path.read_text(encoding="utf-8")) for path in pid_paths]
+        with patch.object(orch, "AGENT_TERMINATE_TIMEOUT_SECONDS", 0.1):
+            orch._terminate_agent_process(managed)
+        deadline = time.monotonic() + 10
+        while any(orch.inspect_process(pid) is not None for pid in identities) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert all(orch.inspect_process(pid) is None for pid in identities)
+    finally:
+        if managed.poll() is None:
+            managed.kill()
+            managed.wait(timeout=5)
+
+
+def test_terminate_agent_process_supports_bounded_no_arg_legacy_double() -> None:
+    events: list[object] = []
+
+    class LegacyProcess:
+        pid = 4321
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def wait(self, timeout: float) -> int:
+            events.append(("wait", timeout))
+            if events.count("kill") == 0:
+                raise subprocess.TimeoutExpired("legacy-agent", timeout)
+            return -9
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    with patch.object(orch, "AGENT_TERMINATE_TIMEOUT_SECONDS", 0.25):
+        orch._terminate_agent_process(LegacyProcess())  # type: ignore[arg-type]
+
+    assert events == ["terminate", ("wait", 0.25), "kill", ("wait", 0.25)]
+
+
 class TestStaleDebuggerRequestAutoConsume:
     """Pre-merge debugger guidance is consumed at readiness promotion."""
 
@@ -35456,7 +38164,7 @@ class TestEnforcePlaywrightBrowserPin:
 
 
 class TestReviewGateEvidence:
-    """The reviewer runs read-only and cannot execute the suite."""
+    """The reviewer gets authoritative gates plus read-only re-execution."""
 
     def _run(self, tmp_path: Path):
         run = orch.RunState(run_id="r1", spec_id="s", branch="code/s--1")
@@ -35483,7 +38191,8 @@ class TestReviewGateEvidence:
 
         assert "make test" in out and "passed" in out
         assert "authoritative" in out
-        assert "do not report an inability to run tests as a finding" in out
+        assert "dedicated writable scratch directory" in out
+        assert "Do not report an inability to run tests as a product finding" in out
 
     def test_empty_when_no_gate_status(self, tmp_path: Path):
         run = self._run(tmp_path)

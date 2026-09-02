@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,13 +13,16 @@ from spec_runtime.config import (
     SpecConfigError,
     SpecConfigNotFoundError,
     _discover_repo_root,
-    _repo_root_from_here,
     load_spec_runtime_config,
 )
+from spec_runtime.git_common import run_git
 from spec_runtime.init import (
+    BaseBranchDetectionError,
+    _agent_detection_failure_message,
     _ask_agent_for_config,
     _build_agent_merge_command,
     _build_yolo_prompt,
+    _copy_template,
     _detect_agents,
     _detect_base_branch,
     _detect_implement_commands,
@@ -27,6 +30,7 @@ from spec_runtime.init import (
     _detect_verify_gates,
     _gather_repo_context,
     _generate_spec_toml,
+    _git_repo_root,
     _merge_file_with_agent,
     _read_bundled_template,
     _toml_escape,
@@ -159,63 +163,82 @@ name = "test"
             assert _discover_repo_root() == repo_root
         run.assert_not_called()
 
-    def test_discover_repo_root_falls_back_to_package_relative_search(self, tmp_path, monkeypatch):
-        monkeypatch.chdir(tmp_path)
-        outer_root = tmp_path / "outer"
-        project_root = outer_root / "project"
-        module_dir = project_root / "src" / "spec_runtime"
-        module_dir.mkdir(parents=True)
-        (module_dir / "config.py").write_text("# synthetic config module\n")
-        (outer_root / "pyproject.toml").write_text("[tool.outer]\nvalue = true\n")
-
-        # The host running the test may itself have a repository marker above
-        # pytest's temporary directory (for example /tmp/.git).  Hide only
-        # markers outside this fixture so the test controls its repository
-        # boundary without changing production's ancestor-search semantics.
+    @pytest.mark.parametrize(
+        "installed_module",
+        (
+            "venv/lib/python3.11/site-packages/spec_runtime/config.py",
+            "venv/Lib/site-packages/spec_runtime/config.py",
+        ),
+        ids=("posix-wheel", "windows-wheel"),
+    )
+    def test_discover_repo_root_never_uses_installed_package_location(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        installed_module: str,
+    ) -> None:
+        working_directory = tmp_path / "unconfigured-project"
+        working_directory.mkdir()
+        module_path = tmp_path / installed_module
+        module_path.parent.mkdir(parents=True)
+        module_path.write_text("# synthetic installed module\n")
+        monkeypatch.chdir(working_directory)
         path_exists = Path.exists
         path_is_file = Path.is_file
 
-        def fixture_scoped_exists(path: Path) -> bool:
-            if path.name == ".git" and tmp_path not in path.parents:
-                return False
-            return path_exists(path)
+        def without_git_markers(path: Path) -> bool:
+            return False if path.name == ".git" else path_exists(path)
 
-        def fixture_scoped_is_file(path: Path) -> bool:
-            if path.name == ".spec.toml" and tmp_path not in path.parents:
-                return False
-            return path_is_file(path)
+        def without_spec_config(path: Path) -> bool:
+            return False if path.name == ".spec.toml" else path_is_file(path)
 
-        with patch(
-            "spec_runtime.config.__file__",
-            str(module_dir / "config.py"),
-        ), patch(
+        with patch("spec_runtime.config.__file__", str(module_path)), patch(
             "spec_runtime.config.Path.exists",
-            fixture_scoped_exists,
+            without_git_markers,
         ), patch(
             "spec_runtime.config.Path.is_file",
-            fixture_scoped_is_file,
+            without_spec_config,
         ), patch(
             "spec_runtime.config.subprocess.run",
-            side_effect=subprocess.CalledProcessError(returncode=128, cmd=["git", "rev-parse", "--show-toplevel"]),
+            side_effect=subprocess.CalledProcessError(
+                returncode=128,
+                cmd=["git", "rev-parse", "--show-toplevel"],
+            ),
         ):
             repo_root = _discover_repo_root()
 
-        assert repo_root == project_root
-        assert repo_root != outer_root
+        assert repo_root == working_directory.resolve()
+        assert "site-packages" not in str(repo_root)
 
-    def test_repo_root_from_here_stops_at_package_boundary_without_in_package_markers(self, tmp_path):
-        outer_root = tmp_path / "outer"
-        project_root = outer_root / "project"
-        module_dir = project_root / "src" / "spec_runtime"
-        module_dir.mkdir(parents=True)
-        (module_dir / "config.py").write_text("# synthetic config module\n")
-        (outer_root / ".git").mkdir()
+    def test_git_repo_root_decodes_git_for_windows_output_as_utf8(self, tmp_path: Path) -> None:
+        expected = tmp_path / "Spec Butler snow-雪"
+        stdout = f"{expected}\n".encode("utf-8")
 
-        with patch("spec_runtime.config.__file__", str(module_dir / "config.py")):
-            repo_root = _repo_root_from_here()
+        def windows_locale_runner(command, **kwargs):  # noqa: ANN001
+            # Reproduce Python on an English Windows host: without an explicit
+            # encoding, subprocess would use cp1252 for Git's UTF-8 bytes.
+            encoding = kwargs.get("encoding") or "cp1252"
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=stdout.decode(encoding),
+                stderr="",
+            )
 
-        assert repo_root == project_root
-        assert repo_root != outer_root
+        with patch("spec_runtime.git_common.subprocess.run", side_effect=windows_locale_runner):
+            assert _git_repo_root() == expected
+
+    def test_git_repo_root_preserves_real_unicode_checkout(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo_root = tmp_path / "Spec Butler snow-雪"
+        repo_root.mkdir()
+        _init_git_repo(repo_root)
+        monkeypatch.chdir(repo_root)
+
+        assert _git_repo_root() == repo_root
 
     def test_cli_main_rejects_commands_without_config(self):
         from spec_runtime.cli import main
@@ -248,16 +271,18 @@ name = "test"
 class TestDetectAgents:
     def test_both_available(self, monkeypatch):
         monkeypatch.setattr("spec_runtime.init.shutil.which", lambda name: f"/usr/bin/{name}")
-        default, allowed = _detect_agents()
+        default, allowed = _detect_agents(platform="linux")
         assert default == "claude"
         assert allowed == ["claude", "codex"]
 
     def test_only_claude(self, monkeypatch):
         monkeypatch.setattr(
             "spec_runtime.init.shutil.which",
-            lambda name: "/usr/bin/claude" if name == "claude" else None,
+            lambda name: f"/usr/bin/{name}"
+            if name in {"claude", "bwrap", "socat"}
+            else None,
         )
-        default, allowed = _detect_agents()
+        default, allowed = _detect_agents(platform="linux")
         assert default == "claude"
         assert allowed == ["claude"]
 
@@ -276,6 +301,40 @@ class TestDetectAgents:
         assert default == ""
         assert allowed == []
 
+    def test_native_windows_filters_unusable_claude(self):
+        resolve = lambda name: f"C:\\tools\\{name}.exe"  # noqa: E731
+
+        default, allowed = _detect_agents(platform="win32", which=resolve)
+
+        assert default == "codex"
+        assert allowed == ["codex"]
+
+    def test_native_windows_claude_only_has_no_usable_agent(self):
+        resolve = lambda name: (  # noqa: E731
+            r"C:\tools\claude.exe" if name == "claude" else None
+        )
+
+        default, allowed = _detect_agents(platform="win32", which=resolve)
+
+        assert default == ""
+        assert allowed == []
+
+    def test_darwin_allows_installed_claude(self):
+        resolve = lambda name: "/usr/local/bin/claude" if name == "claude" else None  # noqa: E731
+
+        default, allowed = _detect_agents(platform="darwin", which=resolve)
+
+        assert default == "claude"
+        assert allowed == ["claude"]
+
+    def test_linux_filters_claude_without_sandbox_prerequisites(self):
+        resolve = lambda name: "/usr/bin/claude" if name == "claude" else None  # noqa: E731
+
+        default, allowed = _detect_agents(platform="linux", which=resolve)
+
+        assert default == ""
+        assert allowed == []
+
 
 # ---------------------------------------------------------------------------
 # Verify gate detection
@@ -290,6 +349,12 @@ class TestDetectVerifyGates:
             g["name"] == "test" and g["command"] == ".venv/bin/python -m pytest"
             for g in gates
         )
+        test_gate = next(g for g in gates if g["name"] == "test")
+        assert test_gate["argv_windows"] == [
+            ".venv/Scripts/python.exe",
+            "-m",
+            "pytest",
+        ]
 
     def test_detects_ruff_from_pyproject(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text('[tool.ruff]\ntarget-version = "py311"\n')
@@ -298,6 +363,14 @@ class TestDetectVerifyGates:
             g["name"] == "lint" and g["command"] == ".venv/bin/python -m ruff check ."
             for g in gates
         )
+        lint_gate = next(g for g in gates if g["name"] == "lint")
+        assert lint_gate["argv_windows"] == [
+            ".venv/Scripts/python.exe",
+            "-m",
+            "ruff",
+            "check",
+            ".",
+        ]
 
     def test_detects_makefile_targets(self, tmp_path):
         (tmp_path / "Makefile").write_text("test:\n\tpytest\n\nlint:\n\truff check .\n")
@@ -342,6 +415,27 @@ class TestDetectVerifyGates:
 
 
 class TestDetectInstallCommand:
+    def test_make_project_preserves_make_install(self, tmp_path):
+        (tmp_path / "Makefile").write_text("install:\n\ttrue\n")
+
+        assert _detect_install_command(tmp_path) == "make install"
+
+    @pytest.mark.parametrize(
+        ("lockfile", "expected"),
+        [("package-lock.json", "npm ci"), (None, "npm install")],
+    )
+    def test_node_project_preserves_native_package_command(
+        self,
+        tmp_path,
+        lockfile,
+        expected,
+    ):
+        (tmp_path / "package.json").write_text("{}\n")
+        if lockfile:
+            (tmp_path / lockfile).write_text("{}\n")
+
+        assert _detect_install_command(tmp_path) == expected
+
     @pytest.mark.parametrize("marker", ["pyproject.toml", "setup.py"])
     def test_python_project_uses_per_worktree_virtualenv(self, tmp_path, marker):
         (tmp_path / marker).write_text("\n")
@@ -439,9 +533,244 @@ class TestDetectImplementCommands:
 class TestDetectBaseBranch:
     def test_falls_back_to_local_branch_without_remote(self, tmp_path):
         _init_git_repo(tmp_path)
+        current_branch = subprocess.check_output(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=tmp_path,
+            text=True,
+            encoding="utf-8",
+        ).strip()
         result = _detect_base_branch(tmp_path)
         # No remote — uses local branch name without origin/ prefix
-        assert result == "main"
+        assert result == current_branch
+
+    def test_reads_remote_head_without_contacting_remote(self, tmp_path):
+        _init_git_repo(tmp_path)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        real_run_git = run_git
+
+        def local_git_only(args, **kwargs):  # noqa: ANN001
+            assert list(args[:2]) != ["remote", "show"]
+            return real_run_git(args, **kwargs)
+
+        with patch("spec_runtime.init.run_git", side_effect=local_git_only):
+            assert _detect_base_branch(tmp_path) == "origin/trunk"
+
+    def test_uses_local_remote_tracking_ref_when_remote_head_is_unset(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/main", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        assert _detect_base_branch(tmp_path) == "origin/main"
+
+    def test_uses_custom_remote_tracking_ref_when_remote_head_is_unset(self, tmp_path):
+        subprocess.run(
+            ["git", "init", "-b", "trunk"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=tmp_path,
+            check=True,
+        )
+        (tmp_path / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/trunk", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        assert _detect_base_branch(tmp_path) == "origin/trunk"
+
+    def test_falls_back_to_custom_current_branch_without_remote(self, tmp_path):
+        subprocess.run(
+            ["git", "init", "-b", "trunk"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+
+        assert _detect_base_branch(tmp_path) == "trunk"
+
+    def test_custom_remote_default_and_feature_require_explicit_base(self, tmp_path):
+        subprocess.run(
+            ["git", "init", "-b", "trunk"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+        (tmp_path / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"], cwd=tmp_path, check=True, capture_output=True
+        )
+        trunk_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "switch", "-c", "feature"], cwd=tmp_path, check=True)
+        (tmp_path / "feature.txt").write_text("feature\n", encoding="utf-8")
+        subprocess.run(["git", "add", "feature.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "feature"], cwd=tmp_path, check=True, capture_output=True
+        )
+        feature_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/trunk", trunk_sha],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/feature", feature_sha],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        with pytest.raises(BaseBranchDetectionError, match="spec init --base"):
+            _detect_base_branch(tmp_path)
+
+    def test_does_not_mistake_stale_ancestor_for_custom_default(self, tmp_path):
+        subprocess.run(
+            ["git", "init", "-b", "legacy"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+        (tmp_path / "legacy.txt").write_text("legacy\n", encoding="utf-8")
+        subprocess.run(["git", "add", "legacy.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "legacy"], cwd=tmp_path, check=True, capture_output=True
+        )
+        legacy_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "switch", "-c", "trunk"], cwd=tmp_path, check=True)
+        (tmp_path / "trunk.txt").write_text("trunk\n", encoding="utf-8")
+        subprocess.run(["git", "add", "trunk.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "trunk"], cwd=tmp_path, check=True, capture_output=True
+        )
+        trunk_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/legacy", legacy_sha],
+            cwd=tmp_path,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "update-ref", "refs/remotes/origin/trunk", trunk_sha],
+            cwd=tmp_path,
+            check=True,
+        )
+
+        with pytest.raises(BaseBranchDetectionError, match="spec init --base"):
+            _detect_base_branch(tmp_path)
+
+    def test_ambiguous_custom_remote_branches_require_explicit_base(self, tmp_path):
+        _init_git_repo(tmp_path)
+        (tmp_path / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "base.txt"], cwd=tmp_path, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "base"], cwd=tmp_path, check=True, capture_output=True
+        )
+        base_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.invalid/private.git"],
+            cwd=tmp_path,
+            check=True,
+        )
+        for branch, filename in (("alpha", "alpha.txt"), ("beta", "beta.txt")):
+            subprocess.run(["git", "switch", "--detach", base_sha], cwd=tmp_path, check=True)
+            (tmp_path / filename).write_text(f"{branch}\n", encoding="utf-8")
+            subprocess.run(["git", "add", filename], cwd=tmp_path, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", branch], cwd=tmp_path, check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "update-ref", f"refs/remotes/origin/{branch}", "HEAD"],
+                cwd=tmp_path,
+                check=True,
+            )
+
+        with pytest.raises(BaseBranchDetectionError, match="spec init --base"):
+            _detect_base_branch(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +835,14 @@ class TestGenerateSpecToml:
         assert parsed["bootstrap"]["install_command"] == 'bash -lc "pip install -e ."'
         assert parsed["verify"]["gates"][0]["command"] == 'bash -lc "pytest -q"'
 
-    def test_generated_windows_bootstrap_roundtrips_through_config_loader(self, tmp_path: Path):
+    @pytest.mark.parametrize("install_command", ["make install", "npm ci", "npm install"])
+    def test_generic_bootstrap_is_not_replaced_by_python_on_windows(
+        self,
+        tmp_path: Path,
+        install_command: str,
+    ):
+        import tomllib
+
         from spec_runtime.config import load_repo_spec_runtime_config
 
         content = _generate_spec_toml(
@@ -515,15 +851,59 @@ class TestGenerateSpecToml:
             review_default="claude",
             allowed_agents=["claude"],
             gates=[],
-            install_command="python -m pip install -e .",
+            install_command=install_command,
+        )
+        (tmp_path / ".spec.toml").write_text(content)
+
+        parsed = tomllib.loads(content)
+        assert parsed["bootstrap"] == {"install_command": install_command}
+        config = load_repo_spec_runtime_config(tmp_path, require=True)
+        selected = config.bootstrap_install.select(windows=True)
+        assert selected is not None
+        assert selected.argv(windows=True) == install_command.split()
+
+    def test_generated_python_commands_preserve_windows_dev_install_and_gates(
+        self,
+        tmp_path: Path,
+    ):
+        from spec_runtime.config import load_repo_spec_runtime_config
+
+        content = _generate_spec_toml(
+            base_ref="origin/main",
+            default_agent="codex",
+            review_default="codex",
+            allowed_agents=["codex"],
+            gates=[
+                {
+                    "name": "test",
+                    "command": ".venv/bin/python -m pytest",
+                    "argv_windows": [
+                        ".venv/Scripts/python.exe",
+                        "-m",
+                        "pytest",
+                    ],
+                    "parallel": True,
+                }
+            ],
+            install_command=(
+                "python -m venv .venv && "
+                ".venv/bin/python -m pip install -e '.[dev]'"
+            ),
         )
         (tmp_path / ".spec.toml").write_text(content)
 
         config = load_repo_spec_runtime_config(tmp_path, require=True)
-        selected = config.bootstrap_install.select(windows=True)
-        assert selected is not None
-        assert selected.shell == "powershell"
-        assert r".\.venv\Scripts\python.exe" in str(selected.value)
+        install = config.bootstrap_install.select(windows=True)
+        gate = config.verify_gates[0].command_variants.select(windows=True)
+
+        assert install is not None
+        assert "'.[dev]'" in str(install.value)
+        assert gate is not None
+        assert gate.argv(windows=True) == [
+            ".venv/Scripts/python.exe",
+            "-m",
+            "pytest",
+        ]
 
     def test_escapes_backslashes_in_commands(self):
         """Backslashes must be escaped for valid TOML (F2)."""
@@ -636,6 +1016,18 @@ class TestCmdInit:
         assert (tmp_path / "AGENTS.md").is_file()
         assert "spec doctor" in capsys.readouterr().out
 
+    def test_template_copy_declares_utf8_encoding(self, tmp_path):
+        """Do not fall back to the native Windows ANSI code page."""
+        with patch.object(Path, "write_text", autospec=True) as write_text:
+            assert _copy_template(
+                tmp_path,
+                "review.md",
+                ".github/prompts/review.md",
+                force=False,
+            )
+
+        assert write_text.call_args.kwargs["encoding"] == "utf-8"
+
     def test_refuses_without_git(self):
         args = MagicMock(force=False, yolo=False)
         with patch(self._patch_root, return_value=None):
@@ -657,12 +1049,49 @@ class TestCmdInit:
         with (
             patch(self._patch_root, return_value=tmp_path),
             patch(self._patch_agents, return_value=("", [])),
+            patch(
+                "spec_runtime.init._agent_detection_failure_message",
+                return_value=(
+                    "No coding agents found on PATH (looked for: claude, codex). "
+                    "Install at least one before running spec init."
+                ),
+            ),
         ):
             rc = cmd_init(args)
         assert rc == 1
         out = capsys.readouterr().out
         assert "No coding agents found on PATH" in out
         assert "claude, codex" in out
+
+    def test_native_windows_claude_only_fails_before_writing(self, tmp_path, capsys):
+        _init_git_repo(tmp_path)
+        args = MagicMock(force=False, yolo=False)
+        resolve = lambda name: (  # noqa: E731
+            r"C:\tools\claude.exe" if name == "claude" else None
+        )
+        with (
+            patch(self._patch_root, return_value=tmp_path),
+            patch(
+                self._patch_agents,
+                side_effect=lambda: _detect_agents(platform="win32", which=resolve),
+            ),
+            patch(
+                "spec_runtime.init._agent_detection_failure_message",
+                side_effect=lambda: _agent_detection_failure_message(
+                    platform="win32",
+                    which=resolve,
+                ),
+            ),
+        ):
+            rc = cmd_init(args)
+
+        assert rc == 1
+        output = capsys.readouterr().out
+        assert "not supported on platform 'win32'" in output
+        assert "Use Codex" in output
+        assert "WSL2" in output
+        assert not (tmp_path / ".spec.toml").exists()
+        assert not (tmp_path / "AGENTS.md").exists()
 
     def test_force_preserves_config_but_refreshes_templates(
         self,
@@ -1072,6 +1501,28 @@ class TestYoloDetection:
         ctx = _gather_repo_context(tmp_path)
         assert "name: Deploy" in ctx
         assert ".github/workflows/deploy.yaml" in ctx
+
+    def test_gather_repo_context_normalizes_windows_ci_heading(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        wf = tmp_path / ".github" / "workflows"
+        wf.mkdir(parents=True)
+        (wf / "ci.yml").write_text("name: CI\n")
+        concrete_path = type(tmp_path)
+        real_relative_to = concrete_path.relative_to
+
+        def windows_relative_to(path, other, *args, **kwargs):
+            relative = real_relative_to(path, other, *args, **kwargs)
+            return PureWindowsPath(*relative.parts)
+
+        monkeypatch.setattr(concrete_path, "relative_to", windows_relative_to)
+
+        ctx = _gather_repo_context(tmp_path)
+
+        assert "--- .github/workflows/ci.yml ---" in ctx
+        assert r".github\workflows\ci.yml" not in ctx
 
     def test_gather_repo_context_includes_build_manifests(self, tmp_path):
         (tmp_path / "pyproject.toml").write_text('[tool.ruff]\ntarget-version = "py311"\n')

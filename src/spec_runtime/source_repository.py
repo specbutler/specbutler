@@ -11,6 +11,8 @@ from importlib import metadata
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from .git_common import run_git
+
 PACKAGE_NAME = "specbutler"
 
 
@@ -72,7 +74,7 @@ def _source_checkout_repository_url() -> str:
     try:
         if source_module.resolve() != Path(__file__).resolve():
             return ""
-        raw = tomllib.loads(pyproject.read_text())
+        raw = tomllib.loads(pyproject.read_text(encoding="utf-8"))
         project = raw.get("project", {})
         if not isinstance(project, dict) or project.get("name") != PACKAGE_NAME:
             return ""
@@ -80,11 +82,9 @@ def _source_checkout_repository_url() -> str:
         return ""
 
     try:
-        result = subprocess.run(
-            ["git", "config", "--get", "remote.origin.url"],
+        result = run_git(
+            ["config", "--get", "remote.origin.url"],
             cwd=source_root,
-            capture_output=True,
-            text=True,
             timeout=5,
             check=False,
         )

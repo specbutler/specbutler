@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from spec_runtime.config import load_repo_spec_runtime_config, resolve_specs_root
+from spec_runtime.git_common import subprocess_text_kwargs
 from spec_runtime.spec_merge_tags import (
     TAG_PREFIX,
     MergeTagProvenance,
@@ -37,7 +38,7 @@ def _run_command(
         command,
         cwd=cwd,
         capture_output=True,
-        text=True,
+        **subprocess_text_kwargs(command),
     )
 
 
@@ -64,7 +65,13 @@ def _git_stdout(*args: str, cwd: Path) -> str:
 
 
 def _current_actor() -> str:
-    return os.getenv("SPEC_ACTOR") or os.getenv("USER") or os.getenv("LOGNAME") or "unknown"
+    return (
+        os.getenv("SPEC_ACTOR")
+        or os.getenv("USER")
+        or os.getenv("LOGNAME")
+        or os.getenv("USERNAME")
+        or "unknown"
+    )
 
 
 def _short_sha(value: str) -> str:
@@ -72,7 +79,7 @@ def _short_sha(value: str) -> str:
 
 
 def _parse_frontmatter(spec_path: Path) -> dict[str, str]:
-    text = spec_path.read_text()
+    text = spec_path.read_text(encoding="utf-8")
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         return {}

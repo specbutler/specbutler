@@ -66,7 +66,33 @@ The orchestrator applies the manifest like this:
 - `managed_processes`: registered for identity-checked teardown. Each entry
   requires a positive `pid` and the process start identity reported by the
   operating system. `termination_scope` may be `pid` or `pgid`; a `pgid` scope
-  may also supply the process-group ID.
+  may also supply the process-group ID. Tokenless `pid` teardown requires a
+  stable kernel process handle (currently Linux pidfd); other platforms fail
+  closed and preserve the worktree. Use a teardown command or a dedicated
+  `pgid` on those platforms rather than relying on a raw PID.
+
+Setup hooks may start background services and then exit. The orchestrator waits
+only for the setup leader, so a child that inherits its output handles does not
+block setup completion. On native Windows, the setup command and its descendants
+are placed in one run-owned Job Object before execution begins. On POSIX, they
+run beneath a small retained session/process-group leader. A parent-death pipe
+makes that leader terminate its group if the orchestrator disappears. In either
+case, a declared `managed_processes` entry is accepted as the boundary teardown
+handoff only when its exact process identity is still a live member and the
+cleanup registration is persisted successfully. At least one authenticated,
+persisted entry retains the complete boundary, including workers that outlive
+the declared service, for whole-tree cleanup. If live in-boundary descendants
+remain but no entry completes that handoff, Spec Butler terminates the retained
+boundary before launching the agent.
+
+For that transactional protection, a service must not daemonize, create a new
+session/process group, request Windows Job breakaway, or otherwise escape the
+setup boundary. An explicitly declared escaped POSIX process may still use the
+older identity-checked `pid`/`pgid` registration where the platform supports
+it, but it is not contained by the keeper and cannot be recovered if setup exits
+before printing the declaration. Registry persistence failure blocks agent
+launch and triggers best-effort exact cleanup; do not rely on this compatibility
+path for new setup hooks.
 
 ## Examples
 
@@ -124,6 +150,10 @@ Because partial manifests are still consumed, setup scripts should:
 - **Emit a partial JSON manifest before crashing when possible.** If a
   `managed_processes` entry is printed before the script errors out, the
   orchestrator registers the process so teardown can clean it up.
+- **Keep Windows services inside the setup Job.** Do not request Job breakaway
+  when launching a service. Print the operating-system start identity for the
+  service itself; Spec Butler verifies that identity against kernel Job
+  membership before persisting teardown ownership.
 - **Not rely on prepare to be a gate.** Repo-specific failures surface as
   diagnostics for the agent to investigate as part of the spec work. Verify
   gates remain strict.

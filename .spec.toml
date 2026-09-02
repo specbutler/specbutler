@@ -16,16 +16,22 @@ review_default = "codex"
 allowed = ["claude", "codex"]
 
 [bootstrap]
-install_command = "python -m venv .venv && .venv/bin/pip install -e ."
+# This repository's full test gate imports the optional TUI and web modules,
+# so isolated development workspaces install all three test/runtime extras.
+install_command = "python -m venv .venv && .venv/bin/python -m pip install -e '.[dev,tui,web]'"
+install_command_windows = "python -m venv .venv; .\\.venv\\Scripts\\python.exe -m pip install -e '.[dev,tui,web]'"
+install_shell_windows = "powershell"
 
 [verify]
 
 [[verify.gates]]
 name = "test"
-command = "pytest"
+command = ".venv/bin/python -m pytest"
+argv_windows = [".venv/Scripts/python.exe", "-m", "pytest"]
 parallel = true
 
 [[verify.gates]]
 name = "lint"
-command = "ruff check ."
+command = ".venv/bin/python -m ruff check ."
+argv_windows = [".venv/Scripts/python.exe", "-m", "ruff", "check", "."]
 parallel = true

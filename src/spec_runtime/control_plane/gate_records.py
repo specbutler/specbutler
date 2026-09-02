@@ -10,12 +10,13 @@ distinguishes a timeout from a generic failure and survives across resumes so
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
+
+from ..platform_fs import atomic_write_text
 
 
 class GateStatus(str, Enum):
@@ -112,7 +113,7 @@ class GateRecordStore:
         if not self._path.exists():
             return []
         try:
-            payload = json.loads(self._path.read_text())
+            payload = json.loads(self._path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return []
         items = payload.get("records") if isinstance(payload, dict) else None
@@ -166,13 +167,10 @@ class GateRecordStore:
             "updated_at": _now_iso(),
             "records": [record.to_dict() for record in records],
         }
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_name(f".{self._path.name}.tmp-{os.getpid()}")
-        try:
-            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-            os.replace(tmp, self._path)
-        finally:
-            tmp.unlink(missing_ok=True)
+        atomic_write_text(
+            self._path,
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        )
 
 
 def record_gate_started(

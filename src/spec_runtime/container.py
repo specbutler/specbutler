@@ -29,6 +29,8 @@ from .execution_backend import (
     host_spec_runtime_source_id,
     host_spec_runtime_version,
 )
+from .git_common import run_git
+from .process_supervisor import run as run_supervised
 from .source_repository import runtime_repository_https_url
 
 WORKER_DOCKERFILE_TEMPLATE = """\
@@ -118,12 +120,13 @@ class _SubprocessContainerRunner:
         input_text: str | None = None,
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return run_supervised(
             argv,
             cwd=cwd,
             env=env,
             input=input_text,
             text=True,
+            errors="replace",
             capture_output=True,
             timeout=timeout,
             check=False,
@@ -260,7 +263,7 @@ def _active_run_ids(repo_root: Path, *, state_dir: str = ".spec-state") -> set[s
     runs_dir = state_root / "runs"
     for path in runs_dir.glob("*.json") if runs_dir.is_dir() else ():
         try:
-            run = json.loads(path.read_text())
+            run = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, TypeError):
             continue
         projection = project_run_record_status(runs_dir, run)
@@ -274,7 +277,7 @@ def _active_run_ids(repo_root: Path, *, state_dir: str = ".spec-state") -> set[s
             active.add(str(run["run_id"]))
     active_path = state_root / "autopilot" / "active.json"
     try:
-        payload = json.loads(active_path.read_text())
+        payload = json.loads(active_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, TypeError):
         payload = {}
     if isinstance(payload, dict):
@@ -415,7 +418,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             build_ssh=bool(config.execution.container.build_ssh),
             agent_versions=agent_versions,
             source_repository_url=source_repository_url,
-        )
+        ),
+        encoding="utf-8",
     )
     _append_config_snippet(repo_root / ".spec.toml")
     print("Container bootstrap files are ready.")
@@ -431,6 +435,7 @@ def _detect_agent_cli_version(agent: str) -> str:
             [agent, "--version"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=10,
             check=False,
         )
@@ -784,7 +789,7 @@ def _build_ssh_agent_check(build_ssh: str, env: Mapping[str, str]) -> CheckResul
 
 
 def _append_config_snippet(path: Path) -> None:
-    text = path.read_text() if path.exists() else ""
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
     if "[execution.container]" in text or "spec container init snippet" in text:
         return
     snippet = """
@@ -807,7 +812,7 @@ def _append_config_snippet(path: Path) -> None:
 #command = "make install"
 #inputs = ["Makefile", "requirements.txt", "frontend/package.json", "frontend/package-lock.json"]
 """
-    path.write_text(text.rstrip() + snippet + "\n")
+    path.write_text(text.rstrip() + snippet + "\n", encoding="utf-8")
 
 
 def _docker_socket_check() -> CheckResult:
@@ -867,11 +872,9 @@ def _one_line(text: str) -> str:
 
 def _current_branch(repo_root: Path) -> str:
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        result = run_git(
+            ["rev-parse", "--abbrev-ref", "HEAD"],
             cwd=repo_root,
-            capture_output=True,
-            text=True,
             check=False,
         )
     except OSError:

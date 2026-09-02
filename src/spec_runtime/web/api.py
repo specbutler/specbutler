@@ -5,10 +5,8 @@ from __future__ import annotations
 import asyncio
 import html as html_mod
 import json
-import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 from dataclasses import asdict
@@ -17,6 +15,8 @@ from pathlib import Path
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+
+from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
 
 
 def _repo_root(request: Request) -> Path:
@@ -263,7 +263,7 @@ async def get_run_log(request: Request) -> Response:
         return _json({"run_id": run_id, "lines": []})
 
     try:
-        all_lines = log_path.read_text(errors="replace").splitlines()
+        all_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return _json({"run_id": run_id, "lines": []})
 
@@ -360,7 +360,7 @@ async def implement_spec(request: Request) -> Response:
     pre_run = pre_index.latest_by_spec.get(spec_id)
     pre_run_id = pre_run.get("run_id", "") if pre_run else ""
 
-    proc = subprocess.Popen(
+    proc = ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
         [
             _spec_executable(),
             "implement",
@@ -370,7 +370,6 @@ async def implement_spec(request: Request) -> Response:
             *(["--review-agent", review_agent] if review_agent else []),
         ],
         cwd=str(repo_root),
-        start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -431,30 +430,36 @@ async def stop_spec(request: Request) -> Response:
     started_processes = _started_processes(request)
 
     leader_pid: int | None = None
+    proc = started_processes.get(spec_id)
 
-    if pg is not None:
-        leader_pid = pg[0]
-    elif spec_id in started_processes:
-        # Fallback: use the Popen object we stored when the web API started
-        # the run.  poll() returns None only when the *original* child is
-        # still alive; once it exits, poll() returns an exit code and we
-        # know the PID may have been recycled by the OS.
-        proc = started_processes[spec_id]
+    if proc is not None:
+        # Prefer the managed process retained by the launch endpoint even
+        # after the orchestrator has persisted its process metadata.  Its
+        # termination boundary validates identity and owns the Windows Job;
+        # reducing it back to a PID/process group loses both guarantees.
         if proc.poll() is not None:
             # Child already exited — PID may have been reused; clean up.
             started_processes.pop(spec_id, None)
+            proc = None
         else:
             leader_pid = proc.pid
+    elif pg is not None:
+        leader_pid = pg[0]
 
     if leader_pid is None:
         return _json({"spec_id": spec_id, "status": "no_active_run"}, 404)
 
-    try:
-        os.killpg(os.getpgid(leader_pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError):
+    if proc is not None:
         try:
-            os.kill(leader_pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+            proc.terminate(grace_seconds=3)
+        except (ProcessLookupError, PermissionError, OSError):
+            return _json({"spec_id": spec_id, "status": "not_found"}, 404)
+    else:
+        try:
+            from spec_runtime.orchestrator import stop_run
+
+            stop_run(spec_id, repo_root=repo_root)
+        except (RuntimeError, ProcessLookupError, PermissionError, OSError):
             return _json({"spec_id": spec_id, "status": "not_found"}, 404)
 
     # Wait briefly for the process to exit so the persisted run record
@@ -514,6 +519,8 @@ async def dispatch_start(request: Request) -> Response:
             cwd=str(repo_root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=120,
         )
         return _json({
@@ -523,10 +530,9 @@ async def dispatch_start(request: Request) -> Response:
             "stderr": completed.stderr,
         })
 
-    proc = subprocess.Popen(
+    proc = ProcessSupervisor(LifetimeMode.DETACHED).spawn(
         cmd,
         cwd=str(repo_root),
-        start_new_session=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -552,6 +558,8 @@ async def dispatch_stop(request: Request) -> Response:
         cwd=str(repo_root),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
     combined = f"{proc.stdout}\n{proc.stderr}".lower()

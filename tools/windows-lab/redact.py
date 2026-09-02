@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+PATTERNS = (
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"gh[opsu]_[A-Za-z0-9]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s\"']+"),
+    re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)[^\s\"']+"),
+    re.compile(r"(?i)(\btoken\s*[:=]\s*[\"']?)[A-Za-z0-9._~-]{16,}"),
+    # JSON and PowerShell commonly quote credential field names.  Match the
+    # complete key (including prefixes such as OPENAI_) so the closing quote
+    # cannot sit between the older key pattern and its colon.
+    re.compile(
+        r"(?i)((?:[\"']?[A-Za-z0-9_-]*(?:api[_-]?key|token|secret)"
+        r"[A-Za-z0-9_-]*[\"']?)\s*[:=]\s*[\"']?)[A-Za-z0-9._~+/=-]{16,}"
+    ),
+)
+TEXT_SUFFIXES = {
+    ".cs",
+    ".csv",
+    ".json",
+    ".log",
+    ".md",
+    ".ps1",
+    ".py",
+    ".toml",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+
+
+def redact_text(payload: str) -> str:
+    for pattern in PATTERNS:
+        payload = pattern.sub(
+            lambda match: match.group(1) + "[REDACTED]"
+            if match.lastindex
+            else "[REDACTED]",
+            payload,
+        )
+    return payload
+
+
+def redact(payload: bytes) -> bytes:
+    if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return redact_text(payload.decode("utf-16")).encode("utf-16")
+    if payload.startswith(b"\xef\xbb\xbf"):
+        return b"\xef\xbb\xbf" + redact_text(payload.decode("utf-8-sig")).encode("utf-8")
+    try:
+        return redact_text(payload.decode("utf-8")).encode("utf-8")
+    except UnicodeDecodeError:
+        # The evidence archive is expanded before redaction. Preserve remaining
+        # binary artifacts byte-for-byte instead of corrupting them.
+        return payload
+
+
+def main() -> int:
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit("usage: redact.py SOURCE DESTINATION [SOURCE_REVISION]")
+    source = Path(sys.argv[1]).resolve()
+    destination = Path(sys.argv[2]).resolve()
+    source_revision = sys.argv[3].strip().lower() if len(sys.argv) == 4 else None
+    if source_revision is not None and (
+        len(source_revision) != 40
+        or any(character not in "0123456789abcdef" for character in source_revision)
+    ):
+        raise SystemExit("source revision must be an exact 40-character Git SHA")
+    if source == destination or source in destination.parents:
+        raise SystemExit("destination must be outside the raw source tree")
+    destination.mkdir(parents=True, exist_ok=True)
+    files_processed = 0
+    text_files = 0
+    changed_files = 0
+    residual_matches: list[str] = []
+    undecodable_text_files: list[str] = []
+    for path in source.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(source)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = path.read_bytes()
+        sanitized = redact(payload)
+        if path.suffix.casefold() in TEXT_SUFFIXES:
+            try:
+                if sanitized.startswith((b"\xff\xfe", b"\xfe\xff")):
+                    sanitized.decode("utf-16")
+                else:
+                    sanitized.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                undecodable_text_files.append(relative.as_posix())
+                sanitized = b"[REDACTION FAILED: undecodable text artifact]\n"
+        target.write_bytes(sanitized)
+        files_processed += 1
+        changed_files += int(payload != sanitized)
+        try:
+            encoding = "utf-16" if sanitized.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+            rendered = sanitized.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+        text_files += 1
+        if any(
+            "[REDACTED]" not in match.group(0)
+            for pattern in PATTERNS
+            for match in pattern.finditer(rendered)
+        ):
+            residual_matches.append(relative.as_posix())
+    report = {
+        "status": "passed"
+        if not residual_matches and not undecodable_text_files
+        else "failed",
+        "files_processed": files_processed,
+        "text_files_scanned": text_files,
+        "files_with_replacements": changed_files,
+        "recognized_secret_shapes_remaining": residual_matches,
+        "undecodable_text_files": undecodable_text_files,
+    }
+    if source_revision is not None:
+        report["source_revision"] = source_revision
+    (destination / "_redaction-report.json").write_text(
+        json.dumps(report, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if residual_matches or undecodable_text_files:
+        raise SystemExit(
+            "redaction failed: recognized secret shape remained or a text artifact was undecodable"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

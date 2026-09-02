@@ -5,7 +5,6 @@ import os
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -30,6 +29,11 @@ from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, St
 
 from spec_runtime import autopilot
 from spec_runtime import orchestrator as orch
+from spec_runtime.agent_adapter import (
+    HostAgentUnavailableError,
+    host_agent_unavailability_reason,
+    require_host_agent_available,
+)
 from spec_runtime.autopilot_tui.dashboard import (  # noqa: F401 — re-exported for backwards compat
     SPEC_RUNTIME_CONFIG,
     VISIBLE_DASHBOARD_RUN_STATUSES,
@@ -48,6 +52,7 @@ from spec_runtime.autopilot_tui.dashboard import (  # noqa: F401 — re-exported
 from spec_runtime.config import load_repo_spec_runtime_config
 from spec_runtime.container import container_image_source
 from spec_runtime.platform_fs import remove_tree
+from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
 from spec_runtime.spec_identity import SPEC_ID_RE
 from spec_runtime.spec_metadata import iter_spec_metadata
 
@@ -74,14 +79,13 @@ def _launch_make_code(
 
     log_handle = open(log_path, "w", encoding="utf-8")  # noqa: SIM115
     try:
-        subprocess.Popen(
+        ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
             command,
             cwd=repo_root,
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             env=env,
-            start_new_session=True,
         )
     finally:
         log_handle.close()
@@ -132,12 +136,15 @@ def _clear_spec_runtime_artifacts(repo_root: Path, spec_id: str) -> None:
         active_path = state_root / "autopilot" / "active.json"
         if active_path.exists():
             try:
-                payload = json.loads(active_path.read_text())
+                payload = json.loads(active_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
             if isinstance(payload, dict) and spec_id in payload:
                 payload.pop(spec_id, None)
-                active_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+                active_path.write_text(
+                    json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
 
 
 def _clear_run_implement_results(repo_root: Path, run: orch.RunState) -> None:
@@ -157,7 +164,7 @@ def _remove_spec_run_state(repo_root: Path, spec_id: str) -> None:
         if runs_root.exists():
             for run_json in runs_root.glob("*.json"):
                 try:
-                    payload = json.loads(run_json.read_text())
+                    payload = json.loads(run_json.read_text(encoding="utf-8"))
                 except (json.JSONDecodeError, OSError, TypeError):
                     continue
                 if str(payload.get("spec_id", "")).strip() != spec_id:
@@ -199,6 +206,8 @@ def _run_code_clean(repo_root: Path, spec_id: str) -> None:
         cwd=repo_root,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if result.returncode != 0:
@@ -207,7 +216,7 @@ def _run_code_clean(repo_root: Path, spec_id: str) -> None:
 
 
 def _mark_spec_obsolete(spec_path: Path) -> None:
-    text = spec_path.read_text()
+    text = spec_path.read_text(encoding="utf-8")
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
         raise RuntimeError(f"Spec file does not have YAML frontmatter: {spec_path}")
@@ -236,7 +245,7 @@ def _mark_spec_obsolete(spec_path: Path) -> None:
                 insert_at = idx + 1
                 break
         lines.insert(insert_at, "obsolete: true")
-    spec_path.write_text("\n".join(lines) + "\n")
+    spec_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _clear_spec_status_override(repo_root: Path, spec_id: str) -> None:
@@ -247,7 +256,9 @@ def _clear_spec_status_override(repo_root: Path, spec_id: str) -> None:
     overrides.pop(spec_id, None)
     if overrides:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(overrides, indent=2, sort_keys=True) + "\n")
+        path.write_text(
+            json.dumps(overrides, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         return
     path.unlink(missing_ok=True)
 
@@ -277,7 +288,7 @@ def _has_task_run_records(repo_root: Path, spec_id: str) -> bool:
             continue
         for run_json in runs_root.glob("*.json"):
             try:
-                payload = json.loads(run_json.read_text())
+                payload = json.loads(run_json.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
             if (
@@ -379,7 +390,7 @@ def _default_agent(repo_root: Path, spec_id: str, *, fallback_agent: str = "") -
 
 
 def _available_chat_agents(repo_root: Path) -> tuple[str, ...]:
-    """Return configured chat agents whose CLI is available on this host."""
+    """Return configured chat agents whose CLI and host isolation are available."""
     config = load_repo_spec_runtime_config(repo_root)
     configured = tuple(
         agent for agent in config.agents.allowed if agent in {"claude", "codex"}
@@ -388,7 +399,11 @@ def _available_chat_agents(repo_root: Path) -> tuple[str, ...]:
     return tuple(
         agent
         for agent in ordered
-        if agent in configured and shutil.which(agent) is not None
+        if (
+            agent in configured
+            and shutil.which(agent) is not None
+            and not host_agent_unavailability_reason(agent)
+        )
     )
 
 
@@ -648,28 +663,6 @@ def _wait_chat_provider_process(
         return proc.wait()
 
 
-def _signal_chat_provider_process_group(
-    proc: subprocess.Popen[str],
-    sig: signal.Signals,
-) -> bool:
-    """Signal the isolated provider process group, falling back to its leader."""
-    pid = getattr(proc, "pid", 0)
-    if os.name == "posix" and isinstance(pid, int) and pid > 0:
-        try:
-            os.killpg(pid, sig)
-            return True
-        except (OSError, ProcessLookupError, PermissionError):
-            pass
-    try:
-        if sig == signal.SIGKILL:
-            proc.kill()
-        else:
-            proc.terminate()
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
 def _terminate_chat_provider_process(proc: subprocess.Popen[str]) -> None:
     """Terminate a provider group, escalate to kill, and reap its leader."""
     try:
@@ -678,7 +671,10 @@ def _terminate_chat_provider_process(proc: subprocess.Popen[str]) -> None:
         running = False
 
     if running:
-        _signal_chat_provider_process_group(proc, signal.SIGTERM)
+        try:
+            proc.terminate(grace_seconds=CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS)
+        except TypeError:  # minimal Popen test doubles
+            proc.terminate()
         try:
             _wait_chat_provider_process(
                 proc,
@@ -686,7 +682,7 @@ def _terminate_chat_provider_process(proc: subprocess.Popen[str]) -> None:
             )
             return
         except subprocess.TimeoutExpired:
-            _signal_chat_provider_process_group(proc, signal.SIGKILL)
+            proc.kill()
 
     # Even an already-exited process needs wait() to release its process table
     # entry. After SIGKILL this second bounded wait normally returns at once.
@@ -716,7 +712,7 @@ def _stream_chat_provider_process(
     process group and waits for the leader.
     """
     with tempfile.TemporaryFile(mode="w+b") as stderr_file:
-        proc = subprocess.Popen(
+        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
             command,
             cwd=cwd,
             env=env,
@@ -724,7 +720,8 @@ def _stream_chat_provider_process(
             stdout=subprocess.PIPE,
             stderr=stderr_file,
             text=True,
-            start_new_session=True,
+            encoding="utf-8",
+            errors="replace",
         )
         assert proc.stdout is not None
         stdout = proc.stdout
@@ -1025,6 +1022,10 @@ class CliChatProvider:
                 raise RuntimeError(f"Codex CLI is not installed: {exc}") from exc
 
     def _stream_claude_output(self, prompt: str):
+        try:
+            require_host_agent_available("claude")
+        except HostAgentUnavailableError as exc:
+            raise RuntimeError(str(exc)) from exc
         command = [
             "claude",
             "-p",
