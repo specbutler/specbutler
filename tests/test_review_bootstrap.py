@@ -262,6 +262,10 @@ print(json.dumps(outcome))
 def test_native_sandbox_bootstrap_does_not_pollute_flat_layout(tmp_path: Path):
     """Run the build shape that failed under native Windows review."""
 
+    setuptools = pytest.importorskip(
+        "setuptools",
+        reason="the native flat-layout probe requires its configured build backend",
+    )
     review_worktree = tmp_path / "flat-layout-review"
     package = review_worktree / "samplepkg"
     package.mkdir(parents=True)
@@ -298,19 +302,13 @@ version = "0.0.0"
         if os.name == "nt"
         else venv_dir / "bin" / "python"
     )
-    parent_site = subprocess.run(
-        [sys.executable, "-c", "import site; print(site.getsitepackages()[0])"],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ).stdout.strip()
+    parent_site = str(Path(setuptools.__file__).parent.parent)
     child_site = Path(
         subprocess.run(
             [
                 str(venv_python),
                 "-c",
-                "import site; print(site.getsitepackages()[0])",
+                "import sysconfig; print(sysconfig.get_path('purelib'))",
             ],
             check=True,
             stdout=subprocess.PIPE,
