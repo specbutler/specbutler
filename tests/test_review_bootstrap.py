@@ -298,6 +298,33 @@ version = "0.0.0"
         if os.name == "nt"
         else venv_dir / "bin" / "python"
     )
+    parent_site = subprocess.run(
+        [sys.executable, "-c", "import site; print(site.getsitepackages()[0])"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    child_site = Path(
+        subprocess.run(
+            [
+                str(venv_python),
+                "-c",
+                "import site; print(site.getsitepackages()[0])",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+    )
+    # The acceptance lifecycle deliberately borrows its preinstalled build
+    # tooling from the release-candidate wheel environment without copying
+    # credentials or permitting network access during the hostile build.
+    (child_site / "spec-review-parent.pth").write_text(
+        f"{parent_site}\n",
+        encoding="utf-8",
+    )
     command = [
         str(venv_python),
         "-m",
