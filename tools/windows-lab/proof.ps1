@@ -312,7 +312,9 @@ function Invoke-NativeOutput {
 function Write-Utf8NoBom {
     param(
         [Parameter(Mandatory = $true)] [string] $LiteralPath,
-        [Parameter(Mandatory = $true)] [string] $Value
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string] $Value
     )
     $encoding = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($LiteralPath, $Value, $encoding)

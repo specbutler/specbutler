@@ -194,6 +194,10 @@ def test_windows_lab_has_complete_controller_surface() -> None:
         < emergency.index("ClosePseudoConsole(pseudoConsole);")
     )
     assert "Set-EvidenceClaim" in proof
+    utf8_writer = proof[
+        proof.index("function Write-Utf8NoBom") : proof.index("function Wait-Condition")
+    ]
+    assert "[AllowEmptyString()]" in utf8_writer
     assert "Proof must run with a non-elevated user token" in proof
     assert "Get-CimInstance -ClassName Win32_OperatingSystem" in proof
     assert "$windowsBuildNumber -lt 22000" in proof
