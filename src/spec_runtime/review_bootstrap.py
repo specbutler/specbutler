@@ -23,7 +23,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from .platform_fs import remove_tree
 
@@ -96,17 +96,27 @@ def _resolve_executable(
     *,
     path: str,
     cwd: Path,
+    windows: bool,
 ) -> Path | None:
+    if windows:
+        windows_candidate = PureWindowsPath(executable)
+        if windows_candidate.drive and not windows_candidate.is_absolute():
+            # ``C:tool.cmd`` is relative to Windows' ambient per-drive current
+            # directory, which can differ from the review checkout even after
+            # the sandbox launcher applies ``--cd``. Refuse that ambiguous
+            # spelling rather than granting an unrelated executable root.
+            return None
     candidate = Path(executable)
     if candidate.is_absolute():
         return candidate.resolve() if candidate.exists() else None
-    if candidate.parent != Path("."):
+    if "/" in executable or "\\" in executable:
         # A path-bearing command is interpreted relative to the command's
         # working directory, not the coordinator's ambient cwd. Review
         # bootstrap normally runs from an isolated checkout, so resolving
         # ``./scripts/bootstrap`` anywhere else produces a false unavailable
         # result (or could select an unrelated executable).
-        relative = cwd / candidate
+        relative_value = executable.replace("\\", os.sep) if windows else executable
+        relative = cwd / relative_value
         return relative.resolve() if relative.exists() else None
     resolved = shutil.which(executable, path=path)
     return Path(resolved).resolve() if resolved else None
@@ -410,6 +420,7 @@ def isolated_review_bootstrap_sandbox(
             str(command_argv[0]),
             path=path,
             cwd=review_worktree,
+            windows=use_windows,
         )
         if command_argv
         else None

@@ -21,6 +21,7 @@ import pytest
 
 from spec_runtime import execution_backend as eb
 from spec_runtime import orchestrator as orch
+from spec_runtime import process_supervisor
 from spec_runtime.config import (
     BootstrapCacheConfig,
     ContainerExecutionConfig,
@@ -29,6 +30,8 @@ from spec_runtime.config import (
     SpecRuntimeConfig,
     load_spec_runtime_config,
 )
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 # ---------------------------------------------------------------------------
 # Config defaults & validation
@@ -665,11 +668,281 @@ class TestWorktreeBackend:
         child_pgid = os.getpgid(child_pid)
         try:
             assert result.returncode == 0
-            assert result.ownership_token is None
+            assert result.ownership_token is not None
+            assert result.ownership_token.pgid == child_pgid
             assert child_pgid != os.getpgrp()
             os.kill(child_pid, 0)
+            child_identity = process_supervisor.inspect_process(child_pid)
+            assert child_identity is not None
+            bound_token = process_supervisor.bind_held_posix_group_payload(
+                result.ownership_token,
+                child_identity,
+            )
+            assert bound_token is not None
+            assert bound_token.payload == child_identity
+            assert process_supervisor.terminate(
+                bound_token,
+                grace_seconds=0.1,
+            )
+            assert not process_supervisor.is_process_group_alive(child_pgid)
         finally:
-            os.killpg(child_pgid, signal.SIGKILL)
+            process_supervisor.close_empty_held_posix_groups()
+            if process_supervisor.is_process_group_alive(child_pgid):
+                os.killpg(child_pgid, signal.SIGKILL)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX setup keeper release")
+    def test_descendant_preserving_command_releases_empty_keeper(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", "print('ready')"],
+                cwd=tmp_path,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == "ready"
+        assert result.ownership_token is None
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX setup keeper timeout")
+    def test_descendant_preserving_timeout_reaps_keeper_and_child(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        code = (
+            "import subprocess,sys,time; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(p.pid, flush=True); time.sleep(60)"
+        )
+
+        with pytest.raises(subprocess.TimeoutExpired) as raised:
+            eb.run_local_command_preserving_descendants(
+                eb.CommandRequest(
+                    argv=[sys.executable, "-c", code],
+                    cwd=tmp_path,
+                    timeout=0.25,
+                    preserve_descendants=True,
+                ),
+                env=os.environ.copy(),
+            )
+
+        child_pid = int(str(raised.value.stdout).strip())
+        assert process_supervisor.inspect_process(child_pid) is None
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX setup keeper launch error")
+    def test_descendant_preserving_command_preserves_launch_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        missing = tmp_path / "missing-setup-command"
+
+        with pytest.raises(FileNotFoundError) as raised:
+            eb.run_local_command_preserving_descendants(
+                eb.CommandRequest(
+                    argv=[str(missing)],
+                    cwd=tmp_path,
+                    timeout=5.0,
+                    preserve_descendants=True,
+                ),
+                env=os.environ.copy(),
+            )
+
+        assert Path(str(raised.value.filename)) == missing
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX parent-death pipe")
+    def test_retained_setup_group_dies_when_orchestrator_exits_without_atexit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        evidence_path = tmp_path / "keeper-evidence.json"
+        parent_script = tmp_path / "crash-parent.py"
+        parent_script.write_text(
+            "import json,os,subprocess,sys\n"
+            "from pathlib import Path\n"
+            "from spec_runtime import execution_backend as eb\n"
+            "code=(\"import subprocess,sys; \"\n"
+            "      \"p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],\"\n"
+            "      \"stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); \"\n"
+            "      \"print(p.pid, flush=True)\")\n"
+            "result=eb.run_local_command_preserving_descendants(\n"
+            "    eb.CommandRequest(argv=[sys.executable,'-c',code],cwd=Path.cwd(),timeout=5,"
+            "preserve_descendants=True),env=os.environ.copy())\n"
+            "Path(sys.argv[1]).write_text(json.dumps({\n"
+            "    'child_pid':int(result.stdout.strip()),\n"
+            "    'token':result.ownership_token.to_dict(),\n"
+            "}),encoding='utf-8')\n"
+            "os._exit(0)\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        prior_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(PROJECT_ROOT / "src") + (
+            os.pathsep + prior_pythonpath if prior_pythonpath else ""
+        )
+
+        parent = subprocess.run(
+            [sys.executable, str(parent_script), str(evidence_path)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert parent.returncode == 0, parent.stderr or parent.stdout
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        token = process_supervisor.SupervisionToken.from_dict(evidence["token"])
+        child_pid = int(evidence["child_pid"])
+
+        try:
+            deadline = time.monotonic() + 5
+            while process_supervisor.is_process_group_alive(token.pgid):
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            assert process_supervisor.inspect_process(child_pid) is None
+        finally:
+            if process_supervisor.identity_matches(token.identity):
+                process_supervisor.terminate(token, grace_seconds=0)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX live parent-death pipe")
+    def test_running_setup_group_dies_when_orchestrator_crashes_before_status(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        evidence_path = tmp_path / "running-keeper-evidence.json"
+        parent_script = tmp_path / "running-crash-parent.py"
+        parent_script.write_text(
+            "import os,sys\n"
+            "from pathlib import Path\n"
+            "from spec_runtime import execution_backend as eb\n"
+            "code=(\"import json,os,subprocess,sys,time; \"\n"
+            "      \"p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],\"\n"
+            "      \"stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); \"\n"
+            "      \"open(sys.argv[1],'w').write(json.dumps({\"\n"
+            "      \"'setup_pid':os.getpid(),'child_pid':p.pid,'pgid':os.getpgrp()})); \"\n"
+            "      \"time.sleep(60)\")\n"
+            "eb.run_local_command_preserving_descendants(\n"
+            "    eb.CommandRequest(argv=[sys.executable,'-c',code,sys.argv[1]],"
+            "cwd=Path.cwd(),timeout=None,preserve_descendants=True),env=os.environ.copy())\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        prior_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(PROJECT_ROOT / "src") + (
+            os.pathsep + prior_pythonpath if prior_pythonpath else ""
+        )
+        parent = subprocess.Popen(
+            [sys.executable, str(parent_script), str(evidence_path)],
+            cwd=tmp_path,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        group_id = 0
+        try:
+            deadline = time.monotonic() + 10
+            while not evidence_path.exists():
+                assert parent.poll() is None
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            group_id = int(evidence["pgid"])
+            assert process_supervisor.is_process_group_alive(group_id)
+
+            parent.kill()
+            parent.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while process_supervisor.is_process_group_alive(group_id):
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            assert process_supervisor.inspect_process(int(evidence["setup_pid"])) is None
+            assert process_supervisor.inspect_process(int(evidence["child_pid"])) is None
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.wait(timeout=5)
+            if group_id > 0 and process_supervisor.is_process_group_alive(group_id):
+                keeper = process_supervisor.inspect_process(group_id)
+                if keeper is not None:
+                    token = process_supervisor.SupervisionToken(
+                        process_supervisor.LifetimeMode.RUN_OWNED,
+                        keeper,
+                        os.getpid(),
+                        "test",
+                        "running-parent-death-test",
+                        pgid=group_id,
+                        version=1,
+                    )
+                    process_supervisor.terminate(token, grace_seconds=0)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX keeper status failure")
+    def test_keeper_status_publication_failure_reaps_complete_group(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        child_pid_path = tmp_path / "status-failure-child.pid"
+        invalid_status_path = tmp_path / "status-is-a-directory"
+        invalid_status_path.mkdir()
+        keeper_path = PROJECT_ROOT / "src" / "spec_runtime" / "setup_process_keeper.py"
+        code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "open(sys.argv[1],'w').write(str(p.pid))"
+        )
+        control_read_fd, control_write_fd = os.pipe()
+        keeper = subprocess.Popen(
+            [
+                sys.executable,
+                str(keeper_path),
+                str(invalid_status_path),
+                str(control_read_fd),
+                "--",
+                sys.executable,
+                "-c",
+                code,
+                str(child_pid_path),
+            ],
+            cwd=tmp_path,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            pass_fds=(control_read_fd,),
+            start_new_session=True,
+        )
+        os.close(control_read_fd)
+        group_id = keeper.pid
+        try:
+            returncode = keeper.wait(timeout=10)
+            assert returncode != 0
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 5
+            while process_supervisor.is_process_group_alive(group_id):
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            assert process_supervisor.inspect_process(child_pid) is None
+        finally:
+            os.close(control_write_fd)
+            if process_supervisor.is_process_group_alive(group_id):
+                identity = process_supervisor.inspect_process(group_id)
+                if identity is not None:
+                    token = process_supervisor.SupervisionToken(
+                        process_supervisor.LifetimeMode.RUN_OWNED,
+                        identity,
+                        os.getpid(),
+                        "test",
+                        "status-publication-test",
+                        pgid=group_id,
+                        version=1,
+                    )
+                    process_supervisor.terminate(token, grace_seconds=0)
 
     def test_cleanup_is_noop(self, tmp_path: Path):
         backend = self._make()

@@ -431,7 +431,12 @@ def _darwin_framework_python_exec_transition_matches(
         return False
     expected = _darwin_framework_python_role(expected_executable)
     live = _darwin_framework_python_role(live_executable)
-    if expected is None or live is None or {expected[1], live[1]} != {"stub", "app"}:
+    if (
+        expected is None
+        or live is None
+        or expected[1] != "stub"
+        or live[1] != "app"
+    ):
         return False
     try:
         return os.path.samefile(expected[0], live[0])
@@ -908,6 +913,31 @@ _LIVE_WINDOWS_JOBS: dict[tuple[int, str], _WindowsJob] = {}
 _CURRENT_WINDOWS_JOBS: dict[str, _WindowsJob] = {}
 
 
+class _HeldPosixSetupGroup:
+    """Live setup-group leader plus the parent side of its death pipe."""
+
+    def __init__(self, token: SupervisionToken, control_fd: int) -> None:
+        self.token = token
+        self.control_fd: int | None = control_fd
+        self._close_lock = threading.Lock()
+
+    def close_control(self) -> None:
+        # Closing without the keeper's explicit release byte is intentional:
+        # the keeper treats EOF as parent death and terminates its whole group.
+        with self._close_lock:
+            if self.control_fd is None:
+                return
+            control_fd = self.control_fd
+            self.control_fd = None
+            try:
+                os.close(control_fd)
+            except OSError:
+                pass
+
+
+_HELD_POSIX_SETUP_GROUPS: dict[str, _HeldPosixSetupGroup] = {}
+
+
 def _windows_job_name(token: str) -> str:
     # A Local\\ object is scoped to one Windows logon session. Web and
     # autopilot processes commonly start in an interactive session but are
@@ -916,6 +946,98 @@ def _windows_job_name(token: str) -> str:
     # other than file mappings and symbolic links do not require
     # SeCreateGlobalPrivilege for this use.
     return f"Global\\SpecButler-{token}"
+
+
+def _posix_identity_is_group_member(identity: ProcessIdentity, pgid: int) -> bool:
+    if os.name != "posix" or pgid <= 0 or not identity_matches(identity):
+        return False
+    try:
+        return os.getpgid(identity.pid) == pgid
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _posix_group_token(
+    token: SupervisionToken,
+    member: ProcessIdentity,
+) -> SupervisionToken:
+    return SupervisionToken(
+        token.mode,
+        token.identity,
+        token.owner_pid,
+        token.owner_started_at,
+        token.token,
+        token.pgid,
+        member,
+        version=token.version,
+        job_name=token.job_name,
+        control_relpath=token.control_relpath,
+        control_nonce=token.control_nonce,
+    )
+
+
+def hold_posix_setup_group(
+    token: SupervisionToken,
+    control_fd: int,
+) -> SupervisionToken | None:
+    """Retain a setup group through its still-live exact leader identity.
+
+    A dedicated keeper remains the session/process-group leader after the
+    repository setup command exits. Its exact identity prevents numeric PGID
+    reuse from authorizing a signal. The parent-side control descriptor also
+    gives the keeper an OS-backed death signal: unexpected parent exit closes
+    the descriptor and makes the keeper terminate its complete group.
+    """
+    if (
+        os.name != "posix"
+        or token.mode is not LifetimeMode.RUN_OWNED
+        or token.pgid <= 0
+        or token.identity.pid != token.pgid
+        or control_fd < 0
+        or not _posix_identity_is_group_member(token.identity, token.pgid)
+    ):
+        return None
+    existing = _HELD_POSIX_SETUP_GROUPS.get(token.token)
+    if existing is not None:
+        if existing.token == token:
+            if existing.control_fd != control_fd:
+                try:
+                    os.close(control_fd)
+                except OSError:
+                    pass
+            return token
+        return None
+    _HELD_POSIX_SETUP_GROUPS[token.token] = _HeldPosixSetupGroup(token, control_fd)
+    return token
+
+
+def bind_held_posix_group_payload(
+    token: SupervisionToken,
+    candidate: ProcessIdentity,
+) -> SupervisionToken | None:
+    """Bind a declared service to the retained setup process group."""
+    holder = _HELD_POSIX_SETUP_GROUPS.get(token.token)
+    if (
+        os.name != "posix"
+        or token.mode is not LifetimeMode.RUN_OWNED
+        or holder is None
+        or holder.token != token
+        or not _posix_identity_is_group_member(candidate, token.pgid)
+    ):
+        return None
+    return _posix_group_token(token, candidate)
+
+
+def close_empty_held_posix_groups() -> None:
+    """Forget setup-group backstops after the group is proven empty."""
+    if os.name != "posix":
+        return
+    for supervision_id, holder in tuple(_HELD_POSIX_SETUP_GROUPS.items()):
+        if is_process_group_alive(holder.token.pgid):
+            continue
+        if _HELD_POSIX_SETUP_GROUPS.get(supervision_id) is holder:
+            _HELD_POSIX_SETUP_GROUPS.pop(supervision_id, None)
+            holder.close_control()
 
 
 def bind_held_windows_job_payload(
@@ -1856,6 +1978,12 @@ class ManagedProcess:
             query = getattr(self._job, "active_process_ids", None)
             if callable(query):
                 return bool(query())
+        if (
+            os.name == "posix"
+            and isinstance(self.process, _REAL_POPEN_TYPE)
+            and self.token.pgid > 0
+        ):
+            return is_process_group_alive(self.token.pgid)
         return self.process.poll() is None
 
     def _owned_tree_identities(self) -> list[ProcessIdentity]:
@@ -2522,6 +2650,20 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
     # Once the exact leader and group are proven, group liveness—not leader
     # liveness—controls escalation. The leader may exit before descendants.
     return _terminate_verified_posix_group(pgid, grace_seconds=grace_seconds)
+
+
+def _terminate_held_posix_setup_groups_at_exit() -> None:
+    """Best-effort backstop for setup groups not yet reaped by workflow code."""
+    for holder in tuple(_HELD_POSIX_SETUP_GROUPS.values()):
+        try:
+            terminate(holder.token, grace_seconds=0)
+        except BaseException:
+            pass
+        finally:
+            holder.close_control()
+
+
+atexit.register(_terminate_held_posix_setup_groups_at_exit)
 
 
 def terminate_legacy_process_group(

@@ -23,7 +23,9 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -47,8 +49,13 @@ from .process_supervisor import (
     ManagedProcess,
     ProcessSupervisor,
     SupervisionToken,
+    hold_posix_setup_group,
+    list_live_process_group_members,
 )
 from .process_supervisor import run as run_supervised
+from .process_supervisor import (
+    terminate as terminate_supervision_token,
+)
 
 CONTAINER_WORKER_ENV_DENYLIST = frozenset(
     {
@@ -708,6 +715,210 @@ def _read_outbox_metadata(outbox_path: Path) -> OutboxMetadata | None:
     )
 
 
+def _close_fd(control_fd: int) -> None:
+    try:
+        os.close(control_fd)
+    except OSError:
+        pass
+
+
+def _wait_for_posix_setup_status(
+    managed: ManagedProcess,
+    status_path: Path,
+    *,
+    argv: Sequence[str],
+    timeout: float | None,
+) -> dict[str, object]:
+    deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            payload = None
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("POSIX setup keeper published invalid status") from exc
+        if isinstance(payload, dict):
+            if payload.get("schema") != 1:
+                raise RuntimeError("POSIX setup keeper published an unknown status schema")
+            return payload
+        if managed.process.poll() is not None:
+            raise RuntimeError("POSIX setup keeper exited before publishing command status")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(list(argv), timeout)
+        time.sleep(0.02)
+
+
+def _stop_posix_setup_keeper(managed: ManagedProcess, control_fd: int) -> bool:
+    """Stop one live keeper boundary and close its parent-death descriptor."""
+    try:
+        stopped = terminate_supervision_token(managed.token, grace_seconds=0)
+    finally:
+        _close_fd(control_fd)
+    try:
+        managed.process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        stopped = False
+    finally:
+        managed.close()
+    return stopped
+
+
+def _release_empty_posix_setup_keeper(
+    managed: ManagedProcess,
+    control_fd: int,
+) -> None:
+    """Tell an empty retained boundary to exit without a group signal."""
+    try:
+        os.write(control_fd, b"R")
+    except OSError as exc:
+        _stop_posix_setup_keeper(managed, control_fd)
+        raise RuntimeError("Could not release empty POSIX setup keeper") from exc
+    _close_fd(control_fd)
+    try:
+        returncode = managed.process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired as exc:
+        terminate_supervision_token(managed.token, grace_seconds=0)
+        managed.process.wait(timeout=5.0)
+        raise RuntimeError("POSIX setup keeper did not acknowledge release") from exc
+    finally:
+        managed.close()
+    if returncode != 0:
+        raise RuntimeError(
+            f"POSIX setup keeper failed while releasing an empty boundary: {returncode}"
+        )
+
+
+def _read_command_output(
+    stdout_file: Any,
+    stderr_file: Any,
+    *,
+    encoding: str,
+) -> tuple[str, str]:
+    stdout_file.seek(0)
+    stderr_file.seek(0)
+    return (
+        stdout_file.read().decode(encoding, errors="replace"),
+        stderr_file.read().decode(encoding, errors="replace"),
+    )
+
+
+def _run_posix_command_preserving_descendants(
+    request: CommandRequest,
+    *,
+    env: dict[str, str] | None,
+) -> CommandResult:
+    """Run setup beneath a live group keeper and retain its complete boundary."""
+    encoding = str(
+        subprocess_text_kwargs(request.argv).get("encoding")
+        or locale.getpreferredencoding(False)
+    )
+    keeper_path = Path(__file__).with_name("setup_process_keeper.py")
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_file,
+        tempfile.TemporaryFile(mode="w+b") as stderr_file,
+        tempfile.TemporaryDirectory(prefix="spec-setup-keeper-") as keeper_dir,
+    ):
+        status_path = Path(keeper_dir) / "status.json"
+        control_read_fd, control_write_fd = os.pipe()
+        managed: ManagedProcess | None = None
+        try:
+            managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+                [
+                    sys.executable,
+                    str(keeper_path),
+                    str(status_path),
+                    str(control_read_fd),
+                    "--",
+                    *request.argv,
+                ],
+                cwd=request.cwd,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                pass_fds=(control_read_fd,),
+            )
+        except BaseException:
+            _close_fd(control_write_fd)
+            raise
+        finally:
+            _close_fd(control_read_fd)
+
+        control_fd: int | None = control_write_fd
+        try:
+            status = _wait_for_posix_setup_status(
+                managed,
+                status_path,
+                argv=request.argv,
+                timeout=request.timeout,
+            )
+            stdout, stderr = _read_command_output(
+                stdout_file,
+                stderr_file,
+                encoding=encoding,
+            )
+            launch_error = status.get("launch_error")
+            if isinstance(launch_error, dict):
+                release_fd = control_fd
+                control_fd = None
+                _release_empty_posix_setup_keeper(managed, release_fd)
+                raw_errno = launch_error.get("errno")
+                error_number = int(raw_errno) if isinstance(raw_errno, int) else None
+                filename = launch_error.get("filename")
+                raise OSError(
+                    error_number,
+                    str(launch_error.get("message") or "setup command launch failed"),
+                    str(filename) if filename else None,
+                )
+            returncode = status.get("returncode")
+            if not isinstance(returncode, int):
+                raise RuntimeError("POSIX setup keeper omitted the command return code")
+
+            members = list_live_process_group_members(managed.token.pgid)
+            if members is None:
+                raise RuntimeError("Could not inventory the retained POSIX setup group")
+            descendants = tuple(
+                pid for pid in members if pid != managed.token.identity.pid
+            )
+            ownership_token: SupervisionToken | None = None
+            if descendants:
+                ownership_token = hold_posix_setup_group(managed.token, control_fd)
+                if ownership_token is None:
+                    raise RuntimeError("Could not retain the POSIX setup-group keeper")
+                # Ownership of this descriptor moved into process_supervisor's
+                # held-group registry and its atexit parent-death backstop.
+                control_fd = None
+            else:
+                release_fd = control_fd
+                control_fd = None
+                _release_empty_posix_setup_keeper(managed, release_fd)
+            return CommandResult(
+                returncode=returncode,
+                stdout=stdout,
+                stderr=stderr,
+                argv=list(request.argv),
+                ownership_token=ownership_token,
+            )
+        except subprocess.TimeoutExpired as exc:
+            if control_fd is not None:
+                _stop_posix_setup_keeper(managed, control_fd)
+                control_fd = None
+            stdout, stderr = _read_command_output(
+                stdout_file,
+                stderr_file,
+                encoding=encoding,
+            )
+            exc.output = stdout
+            exc.stdout = stdout
+            exc.stderr = stderr
+            raise
+        except BaseException:
+            if control_fd is not None:
+                _stop_posix_setup_keeper(managed, control_fd)
+                control_fd = None
+            raise
+
+
 def run_local_command_preserving_descendants(
     request: CommandRequest,
     *,
@@ -718,11 +929,14 @@ def run_local_command_preserving_descendants(
     Pipes are deliberately not used: a background service can inherit them and
     keep ``communicate()`` waiting forever. Temporary files let us wait for only
     the setup leader. On Windows the retained Job handle remains the cleanup
-    capability for descendants; on POSIX their dedicated session/process group
-    is later registered from the setup manifest.
+    capability for descendants; on POSIX a dedicated live group leader plus a
+    parent-death pipe retain the setup boundary until the manifest handoff is
+    accepted or rejected.
     """
     if request.input_text is not None:
         raise ValueError("descendant-preserving commands do not accept input_text")
+    if os.name == "posix":
+        return _run_posix_command_preserving_descendants(request, env=env)
 
     encoding = str(
         subprocess_text_kwargs(request.argv).get("encoding")
@@ -773,11 +987,14 @@ def run_local_command_preserving_descendants(
             stdout = stdout_file.read().decode(encoding, errors="replace")
             stderr = stderr_file.read().decode(encoding, errors="replace")
             ownership_token: SupervisionToken | None = None
-            if os.name == "nt" and managed.owned_tree_active():
-                # The Job is already retained in process_supervisor's live Job
-                # registry. Do not close it until manifest registration gives
-                # the orchestrator an identity-checked teardown path.
-                ownership_token = managed.token
+            if managed.owned_tree_active():
+                if os.name == "nt":
+                    # The Job is already retained in process_supervisor's live
+                    # Job registry. Do not close it until manifest registration
+                    # gives the orchestrator an identity-checked teardown path.
+                    ownership_token = managed.token
+                else:
+                    managed.close()
             else:
                 managed.close()
         except BaseException:

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -216,6 +217,60 @@ def test_relative_bootstrap_executable_resolves_from_review_worktree(
         assert sandbox.launcher_argv[
             sandbox.launcher_argv.index("--cd") + 1
         ] == str(review_worktree)
+
+
+@pytest.mark.parametrize(
+    ("command", "windows"),
+    [
+        ("./bootstrap", False),
+        (r".\bootstrap.cmd", True),
+    ],
+)
+def test_single_component_explicit_relative_bootstrap_uses_review_worktree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    windows: bool,
+) -> None:
+    review_worktree = tmp_path / "review"
+    review_worktree.mkdir()
+    script_name = "bootstrap.cmd" if windows else "bootstrap"
+    script = review_worktree / script_name
+    script.write_text("exit /b 0\n" if windows else "#!/bin/sh\nexit 0\n", encoding="utf-8")
+    ambient_cwd = tmp_path / "unrelated"
+    ambient_cwd.mkdir()
+    monkeypatch.chdir(ambient_cwd)
+
+    resolved = review_bootstrap._resolve_executable(
+        command,
+        path=os.defpath,
+        cwd=review_worktree,
+        windows=windows,
+    )
+
+    assert resolved == script.resolve()
+
+
+@pytest.mark.parametrize("command", ["C:bootstrap.cmd", "D:bootstrap.cmd"])
+def test_windows_drive_relative_bootstrap_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    review_worktree = tmp_path / "review"
+    review_worktree.mkdir()
+    which = MagicMock(side_effect=AssertionError("drive-relative path reached PATH lookup"))
+    monkeypatch.setattr(review_bootstrap.shutil, "which", which)
+
+    resolved = review_bootstrap._resolve_executable(
+        command,
+        path=os.defpath,
+        cwd=review_worktree,
+        windows=True,
+    )
+
+    assert resolved is None
+    which.assert_not_called()
 
 
 @pytest.mark.parametrize("unsafe_tool", ["codex", "bootstrap"])

@@ -119,11 +119,14 @@ from .process_supervisor import (
     ProcessGroupTerminationError,
     ProcessSupervisor,
     SupervisionToken,
+    bind_held_posix_group_payload,
     bind_held_windows_job_payload,
     claim_current_process,
+    close_empty_held_posix_groups,
     close_empty_held_windows_jobs,
     inspect_process,
     stop_supervised_process,
+    terminate_exact_process,
     terminate_legacy_popen_tree,
     terminate_legacy_process_group,
 )
@@ -132,6 +135,9 @@ from .process_supervisor import (
     is_process_group_alive as _supervised_process_group_is_alive,
 )
 from .process_supervisor import run as run_supervised
+from .process_supervisor import (
+    terminate as terminate_supervision_token,
+)
 from .review_bootstrap import (
     ReviewBootstrapSandboxUnavailable,
     isolated_review_bootstrap_sandbox,
@@ -6396,7 +6402,7 @@ def _register_worktree_process(
     termination_scope: str = "pid",
     pgid: int = 0,
     supervision_token: SupervisionToken | None = None,
-) -> None:
+) -> bool:
     try:
         worktree_process_registry.register_process(
             _worktree_registry_state_root(repo_root, worktree_path),
@@ -6410,6 +6416,7 @@ def _register_worktree_process(
             pgid=pgid,
             supervision_token=supervision_token,
         )
+        return True
     except Exception as exc:  # pragma: no cover - defensive best effort
         logger.warning(
             "Could not persist %s cleanup registration for %s: %s",
@@ -6417,6 +6424,46 @@ def _register_worktree_process(
             worktree_path,
             exc,
         )
+        return False
+
+
+def _register_setup_process_batch(
+    repo_root: Path,
+    worktree_path: Path,
+    registrations: Sequence[
+        tuple[ImplementManagedProcess, SupervisionToken | None]
+    ],
+) -> bool:
+    try:
+        worktree_process_registry.register_processes(
+            _worktree_registry_state_root(repo_root, worktree_path),
+            worktree_path,
+            tuple(
+                worktree_process_registry.RegisteredProcess(
+                    name=process.name,
+                    kind=process.kind,
+                    pid=process.pid,
+                    started_at=process.started_at,
+                    command=process.command,
+                    termination_scope=process.termination_scope,
+                    pgid=process.pgid,
+                    supervision_token=(
+                        token.to_dict() if token is not None else None
+                    ),
+                )
+                for process, token in registrations
+            ),
+        )
+        return True
+    except Exception as exc:  # pragma: no cover - defensive fail-closed path
+        names = ", ".join(process.name for process, _token in registrations)
+        logger.warning(
+            "Could not persist setup cleanup registrations (%s) for %s: %s",
+            names,
+            worktree_path,
+            exc,
+        )
+        return False
 
 
 def _register_worktree_process_from_popen(
@@ -6510,12 +6557,40 @@ def _register_worktree_postgres_process(
     )
 
 
+def _terminate_unregistered_setup_process(
+    process: ImplementManagedProcess,
+) -> bool:
+    identity = SupervisedProcessIdentity(
+        process.pid,
+        process.started_at,
+        command=process.command,
+    )
+    if os.name == "posix" and process.termination_scope == "pgid":
+        return terminate_supervision_token(
+            SupervisionToken(
+                LifetimeMode.RUN_OWNED,
+                identity,
+                os.getpid(),
+                "setup-handoff",
+                "unregistered-setup-process",
+                pgid=process.pgid,
+                version=1,
+            ),
+            grace_seconds=0,
+        )
+    if os.name == "posix" and process.termination_scope == "pid":
+        return terminate_exact_process(identity, grace_seconds=0)
+    return False
+
+
 def _register_setup_manifest_processes(
     repo_root: Path,
     worktree_path: Path,
     manifest: ImplementSetupManifest,
 ) -> None:
-    bound_services = 0
+    registrations: list[
+        tuple[ImplementManagedProcess, SupervisionToken | None]
+    ] = []
     for process in manifest.managed_processes:
         supervision_token = None
         if manifest.ownership_token is not None:
@@ -6527,25 +6602,68 @@ def _register_setup_manifest_processes(
                     command=process.command,
                 ),
             )
-            if supervision_token is not None:
-                bound_services += 1
-        _register_worktree_process(
-            repo_root,
-            worktree_path,
-            name=process.name,
-            kind=process.kind,
-            pid=process.pid,
-            started_at=process.started_at,
-            command=process.command,
-            termination_scope=process.termination_scope,
-            pgid=process.pgid,
-            supervision_token=supervision_token,
+            if supervision_token is None:
+                supervision_token = bind_held_posix_group_payload(
+                    manifest.ownership_token,
+                    SupervisedProcessIdentity(
+                        process.pid,
+                        process.started_at,
+                        command=process.command,
+                    ),
+                )
+        registrations.append((process, supervision_token))
+
+    if registrations and not _register_setup_process_batch(
+        repo_root,
+        worktree_path,
+        registrations,
+    ):
+        # Batch persistence is the handoff commit point. Before it succeeds,
+        # every service remains setup-owned: terminate the retained boundary
+        # once, plus each explicitly declared process that escaped it.
+        cleanup_results: list[bool] = []
+        if manifest.ownership_token is not None:
+            cleanup_results.append(
+                terminate_supervision_token(
+                    manifest.ownership_token,
+                    grace_seconds=0,
+                )
+            )
+        cleanup_results.extend(
+            _terminate_unregistered_setup_process(process)
+            for process, token in registrations
+            if token is None
         )
+        close_empty_held_posix_groups()
+        close_empty_held_windows_jobs()
+        cleanup_detail = (
+            ""
+            if cleanup_results and all(cleanup_results)
+            else "; cleanup of one or more live setup processes could not be proven"
+        )
+        names = ", ".join(process.name for process, _token in registrations)
+        raise RuntimeError(
+            f"Could not atomically persist cleanup ownership for setup services "
+            f"{names}{cleanup_detail}"
+        )
+
+    bound_services = sum(token is not None for _process, token in registrations)
     if manifest.ownership_token is not None and not bound_services:
+        stopped = terminate_supervision_token(
+            manifest.ownership_token,
+            grace_seconds=0,
+        )
+        close_empty_held_posix_groups()
+        close_empty_held_windows_jobs()
+        if not stopped:
+            raise RuntimeError(
+                "Could not terminate setup descendants without an authenticated "
+                "managed_processes registration"
+            )
         logger.warning(
-            "Implement setup retained a Windows Job with live descendants, but no "
-            "managed_processes entry authenticated as a Job member; descendants "
-            "will remain run-owned and exit with the orchestrator."
+            "Implement setup left live descendants, but no managed_processes entry "
+            "was both authenticated and persisted; the retained setup boundary was "
+            "terminated before agent launch."
         )
 
 
@@ -6567,6 +6685,7 @@ def _prune_registered_worktree_processes(
         return ()
     for entry in removed:
         logger.info("Pruned stale registered helper for %s: %s", worktree_path, entry)
+    close_empty_held_posix_groups()
     close_empty_held_windows_jobs()
     return removed
 
@@ -6605,6 +6724,7 @@ def _reap_registered_worktree_processes(
             reason,
             entry,
         )
+    close_empty_held_posix_groups()
     close_empty_held_windows_jobs()
     return report
 

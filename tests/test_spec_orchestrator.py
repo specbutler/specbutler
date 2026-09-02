@@ -12398,6 +12398,473 @@ class TestImplementSetupTeardownHelpers:
             branch="spec/my-feature",
         )
 
+    def test_setup_service_handoff_fails_closed_when_registry_write_fails(
+        self,
+        repo: Path,
+    ) -> None:
+        owner = ProcessIdentity(1200, "owner-created", command="setup")
+        service = ProcessIdentity(1201, "service-created", command="server")
+        ownership_token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            owner,
+            os.getpid(),
+            "orchestrator-created",
+            "setup-boundary",
+            pgid=owner.pid,
+            payload_identity=owner,
+        )
+        bound_token = replace(
+            ownership_token,
+            payload_identity=service,
+        )
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="dev-server",
+                    kind="server",
+                    pid=service.pid,
+                    started_at=service.started_at,
+                    command=service.command,
+                ),
+            ),
+            ownership_token=ownership_token,
+        )
+
+        with (
+            patch.object(
+                orch,
+                "bind_held_windows_job_payload",
+                return_value=bound_token,
+            ),
+            patch.object(orch, "bind_held_posix_group_payload") as bind_posix,
+            patch.object(orch, "_register_setup_process_batch", return_value=False),
+            patch.object(
+                orch,
+                "terminate_supervision_token",
+                return_value=True,
+            ) as terminate,
+            patch.object(orch, "close_empty_held_posix_groups") as close_posix,
+            patch.object(orch, "close_empty_held_windows_jobs") as close_windows,
+            pytest.raises(
+                RuntimeError,
+                match=(
+                    "Could not atomically persist cleanup ownership for setup "
+                    "services dev-server"
+                ),
+            ),
+        ):
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+
+        bind_posix.assert_not_called()
+        terminate.assert_called_once_with(ownership_token, grace_seconds=0)
+        close_posix.assert_called_once_with()
+        close_windows.assert_called_once_with()
+
+    def test_setup_descendants_without_authenticated_handoff_are_stopped(
+        self,
+        repo: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        owner = ProcessIdentity(1200, "owner-created", command="setup")
+        ownership_token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            owner,
+            os.getpid(),
+            "orchestrator-created",
+            "setup-boundary",
+            pgid=owner.pid,
+            payload_identity=owner,
+        )
+        manifest = orch.ImplementSetupManifest(ownership_token=ownership_token)
+
+        with (
+            patch.object(
+                orch,
+                "terminate_supervision_token",
+                return_value=True,
+            ) as terminate,
+            patch.object(orch, "close_empty_held_posix_groups") as close_posix,
+            patch.object(orch, "close_empty_held_windows_jobs") as close_windows,
+            caplog.at_level(logging.WARNING),
+        ):
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+
+        terminate.assert_called_once_with(ownership_token, grace_seconds=0)
+        close_posix.assert_called_once_with()
+        close_windows.assert_called_once_with()
+        assert "terminated before agent launch" in caplog.text
+
+    def test_setup_descendant_cleanup_failure_blocks_agent_launch(
+        self,
+        repo: Path,
+    ) -> None:
+        owner = ProcessIdentity(1200, "owner-created", command="setup")
+        ownership_token = SupervisionToken(
+            LifetimeMode.RUN_OWNED,
+            owner,
+            os.getpid(),
+            "orchestrator-created",
+            "setup-boundary",
+            pgid=owner.pid,
+            payload_identity=owner,
+        )
+        manifest = orch.ImplementSetupManifest(ownership_token=ownership_token)
+
+        with (
+            patch.object(
+                orch,
+                "terminate_supervision_token",
+                return_value=False,
+            ) as terminate,
+            patch.object(orch, "close_empty_held_posix_groups"),
+            patch.object(orch, "close_empty_held_windows_jobs"),
+            pytest.raises(
+                RuntimeError,
+                match="Could not terminate setup descendants",
+            ),
+        ):
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+
+        terminate.assert_called_once_with(ownership_token, grace_seconds=0)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX setup handoff integration")
+    def test_posix_setup_service_handoff_persists_and_reaps_complete_group(
+        self,
+        repo: Path,
+    ) -> None:
+        code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(p.pid, flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", code],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is not None
+        child_pid = int(result.stdout.strip())
+        child_identity = process_supervisor.inspect_process(child_pid)
+        assert child_identity is not None
+        group_id = result.ownership_token.pgid
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="dev-server",
+                    kind="server",
+                    pid=child_pid,
+                    started_at=child_identity.started_at,
+                    command=child_identity.command,
+                    termination_scope="pgid",
+                    pgid=group_id,
+                ),
+            ),
+            ownership_token=result.ownership_token,
+        )
+        state_root = orch._worktree_registry_state_root(repo, repo)
+
+        try:
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+            entries = process_registry.load_registered_processes(state_root, repo)
+            assert len(entries) == 1
+            assert entries[0].supervision_token is not None
+            report = orch._reap_registered_worktree_processes(
+                repo,
+                repo,
+                reason="test",
+            )
+            assert report.terminated == (f"dev-server pid={child_pid} terminated",)
+            assert not process_supervisor.is_process_group_alive(group_id)
+        finally:
+            if process_supervisor.is_process_group_alive(group_id):
+                process_supervisor.terminate(
+                    result.ownership_token,
+                    grace_seconds=0,
+                )
+            process_supervisor.close_empty_held_posix_groups()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX setup failure integration")
+    def test_posix_setup_child_without_manifest_is_stopped_before_agent_launch(
+        self,
+        repo: Path,
+    ) -> None:
+        code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(p.pid, flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", code],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is not None
+        child_pid = int(result.stdout.strip())
+        group_id = result.ownership_token.pgid
+
+        try:
+            orch._register_setup_manifest_processes(
+                repo,
+                repo,
+                orch.ImplementSetupManifest(
+                    ownership_token=result.ownership_token,
+                ),
+            )
+            assert process_supervisor.inspect_process(child_pid) is None
+            assert not process_supervisor.is_process_group_alive(group_id)
+        finally:
+            if process_supervisor.is_process_group_alive(group_id):
+                process_supervisor.terminate(
+                    result.ownership_token,
+                    grace_seconds=0,
+                )
+            process_supervisor.close_empty_held_posix_groups()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX keeper handoff integration")
+    def test_posix_keeper_reaps_worker_after_declared_service_exits(
+        self,
+        repo: Path,
+    ) -> None:
+        worker_pid_path = repo / "worker.pid"
+        service_code = (
+            "import subprocess,sys,time; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "open(sys.argv[1],'w').write(str(p.pid)); time.sleep(1)"
+        )
+        setup_code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c',sys.argv[1],sys.argv[2]],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "print(p.pid, flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[
+                    sys.executable,
+                    "-c",
+                    setup_code,
+                    service_code,
+                    str(worker_pid_path),
+                ],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is not None
+        service_pid = int(result.stdout.strip())
+        service_identity = process_supervisor.inspect_process(service_pid)
+        assert service_identity is not None
+        group_id = result.ownership_token.pgid
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="short-lived-server",
+                    kind="server",
+                    pid=service_pid,
+                    started_at=service_identity.started_at,
+                    command=service_identity.command,
+                    termination_scope="pgid",
+                    pgid=group_id,
+                ),
+            ),
+            ownership_token=result.ownership_token,
+        )
+
+        try:
+            orch._register_setup_manifest_processes(repo, repo, manifest)
+            deadline = time.monotonic() + 5
+            while (
+                process_supervisor.inspect_process(service_pid) is not None
+                or not worker_pid_path.exists()
+            ):
+                assert time.monotonic() < deadline
+                time.sleep(0.05)
+            worker_pid = int(worker_pid_path.read_text(encoding="utf-8"))
+            assert process_supervisor.inspect_process(worker_pid) is not None
+            assert os.getpgid(worker_pid) == group_id
+
+            report = orch._reap_registered_worktree_processes(
+                repo,
+                repo,
+                reason="test",
+            )
+
+            assert report.terminated == (
+                f"short-lived-server pid={service_pid} terminated",
+            )
+            assert report.stale == ()
+            assert report.surviving == ()
+            assert process_supervisor.inspect_process(worker_pid) is None
+            assert not process_supervisor.is_process_group_alive(group_id)
+        finally:
+            if process_supervisor.is_process_group_alive(group_id):
+                process_supervisor.terminate(
+                    result.ownership_token,
+                    grace_seconds=0,
+                )
+            process_supervisor.close_empty_held_posix_groups()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX escaped setup cleanup")
+    def test_escaped_setup_service_is_stopped_when_registry_write_fails(
+        self,
+        repo: Path,
+    ) -> None:
+        code = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+            "start_new_session=True); print(p.pid, flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", code],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is None
+        service_pid = int(result.stdout.strip())
+        service_identity = process_supervisor.inspect_process(service_pid)
+        assert service_identity is not None
+        service_pgid = os.getpgid(service_pid)
+        manifest = orch.ImplementSetupManifest(
+            managed_processes=(
+                orch.ImplementManagedProcess(
+                    name="escaped-server",
+                    kind="server",
+                    pid=service_pid,
+                    started_at=service_identity.started_at,
+                    command=service_identity.command,
+                    termination_scope="pgid",
+                    pgid=service_pgid,
+                ),
+            ),
+        )
+
+        try:
+            with (
+                patch.object(orch, "_register_setup_process_batch", return_value=False),
+                pytest.raises(
+                    RuntimeError,
+                    match=(
+                        "Could not atomically persist cleanup ownership for setup services "
+                        "escaped-server$"
+                    ),
+                ),
+            ):
+                orch._register_setup_manifest_processes(repo, repo, manifest)
+            assert process_supervisor.inspect_process(service_pid) is None
+            assert not process_supervisor.is_process_group_alive(service_pgid)
+        finally:
+            if process_supervisor.is_process_group_alive(service_pgid):
+                fallback = SupervisionToken(
+                    LifetimeMode.RUN_OWNED,
+                    service_identity,
+                    os.getpid(),
+                    "test",
+                    "escaped-service-test",
+                    pgid=service_pgid,
+                    version=1,
+                )
+                process_supervisor.terminate(fallback, grace_seconds=0)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX atomic escaped cleanup")
+    def test_atomic_handoff_failure_stops_every_escaped_setup_service(
+        self,
+        repo: Path,
+    ) -> None:
+        code = (
+            "import json,subprocess,sys; "
+            "ps=[subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,"
+            "start_new_session=True) for _ in range(2)]; "
+            "print(json.dumps([p.pid for p in ps]), flush=True)"
+        )
+        result = eb.run_local_command_preserving_descendants(
+            eb.CommandRequest(
+                argv=[sys.executable, "-c", code],
+                cwd=repo,
+                timeout=5.0,
+                preserve_descendants=True,
+            ),
+            env=os.environ.copy(),
+        )
+        assert result.ownership_token is None
+        service_pids = [int(pid) for pid in json.loads(result.stdout)]
+        identities = [
+            process_supervisor.inspect_process(pid) for pid in service_pids
+        ]
+        assert all(identity is not None for identity in identities)
+        processes = tuple(
+            orch.ImplementManagedProcess(
+                name=f"escaped-{index}",
+                kind="server",
+                pid=pid,
+                started_at=identity.started_at,
+                command=identity.command,
+                termination_scope="pgid",
+                pgid=os.getpgid(pid),
+            )
+            for index, (pid, identity) in enumerate(
+                zip(service_pids, identities, strict=True),
+                start=1,
+            )
+            if identity is not None
+        )
+        manifest = orch.ImplementSetupManifest(managed_processes=processes)
+
+        try:
+            with (
+                patch.object(
+                    orch,
+                    "_register_setup_process_batch",
+                    return_value=False,
+                ),
+                pytest.raises(
+                    RuntimeError,
+                    match=(
+                        "Could not atomically persist cleanup ownership for setup "
+                        "services escaped-1, escaped-2$"
+                    ),
+                ),
+            ):
+                orch._register_setup_manifest_processes(repo, repo, manifest)
+            assert all(
+                process_supervisor.inspect_process(pid) is None
+                for pid in service_pids
+            )
+        finally:
+            for process, identity in zip(processes, identities, strict=True):
+                if identity is None or not process_supervisor.is_process_group_alive(
+                    process.pgid
+                ):
+                    continue
+                fallback = SupervisionToken(
+                    LifetimeMode.RUN_OWNED,
+                    identity,
+                    os.getpid(),
+                    "test",
+                    f"escaped-service-{process.pid}",
+                    pgid=process.pgid,
+                    version=1,
+                )
+                process_supervisor.terminate(fallback, grace_seconds=0)
+
     def test_parse_setup_manifest_ignores_prefixed_logs(self):
         manifest = orch._parse_implement_setup_manifest(
             "starting services\n"

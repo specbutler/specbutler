@@ -73,14 +73,26 @@ The orchestrator applies the manifest like this:
 
 Setup hooks may start background services and then exit. The orchestrator waits
 only for the setup leader, so a child that inherits its output handles does not
-block setup completion. On native Windows, the setup command and all of its
-descendants are placed in one run-owned Job Object before execution begins. A
-declared `managed_processes` entry is accepted for teardown only when its exact
-process identity is also a live member of that Job. Undeclared descendants stay
-run-owned and are terminated when the orchestrator exits; they are never
-adopted from a raw PID. On POSIX, give each long-lived service a dedicated
-session/process group and report `termination_scope = "pgid"` when portable
-whole-tree cleanup is required.
+block setup completion. On native Windows, the setup command and its descendants
+are placed in one run-owned Job Object before execution begins. On POSIX, they
+run beneath a small retained session/process-group leader. A parent-death pipe
+makes that leader terminate its group if the orchestrator disappears. In either
+case, a declared `managed_processes` entry is accepted as the boundary teardown
+handoff only when its exact process identity is still a live member and the
+cleanup registration is persisted successfully. At least one authenticated,
+persisted entry retains the complete boundary, including workers that outlive
+the declared service, for whole-tree cleanup. If live in-boundary descendants
+remain but no entry completes that handoff, Spec Butler terminates the retained
+boundary before launching the agent.
+
+For that transactional protection, a service must not daemonize, create a new
+session/process group, request Windows Job breakaway, or otherwise escape the
+setup boundary. An explicitly declared escaped POSIX process may still use the
+older identity-checked `pid`/`pgid` registration where the platform supports
+it, but it is not contained by the keeper and cannot be recovered if setup exits
+before printing the declaration. Registry persistence failure blocks agent
+launch and triggers best-effort exact cleanup; do not rely on this compatibility
+path for new setup hooks.
 
 ## Examples
 

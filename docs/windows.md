@@ -157,8 +157,10 @@ Repository setup hooks may launch a background service and declare it in the
 [implement setup manifest](setup-manifest.md). Spec Butler keeps the setup Job
 alive after the setup command exits, authenticates each declared service by its
 creation identity and kernel Job membership, and reaps the complete Job during
-teardown. A service that deliberately breaks away from the setup Job is not a
-supported handoff and will not receive raw-PID cleanup authority.
+teardown. The handoff succeeds only after its cleanup registration is persisted;
+otherwise the Job is terminated before the agent launches. A service that
+deliberately breaks away from the setup Job is not a supported handoff and will
+not receive raw-PID cleanup authority.
 
 ### Background web service or chat does not start
 

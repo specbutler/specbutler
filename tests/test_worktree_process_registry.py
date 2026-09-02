@@ -142,6 +142,91 @@ def test_supervision_token_must_match_registered_process(
     terminate.assert_not_called()
 
 
+def test_dead_payload_is_reaped_through_its_live_owned_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    keeper = registry.ProcessIdentity(41, "keeper-created")
+    payload = registry.ProcessIdentity(42, "payload-created")
+    token = registry.SupervisionToken(
+        registry.LifetimeMode.RUN_OWNED,
+        keeper,
+        7,
+        "owner-created",
+        "setup-boundary",
+        pgid=keeper.pid,
+        payload_identity=payload,
+    )
+    registry.register_process(
+        tmp_path,
+        worktree,
+        name="short-lived-server",
+        kind="probe",
+        pid=payload.pid,
+        started_at=payload.started_at,
+        supervision_token=token,
+    )
+    monkeypatch.setattr(registry, "is_process_alive", lambda *_args: False)
+    terminate = MagicMock(return_value=True)
+    monkeypatch.setattr(registry, "terminate", terminate)
+
+    assert registry.prune_dead_processes(tmp_path, worktree) == ()
+    report = registry.reap_registered_processes(tmp_path, worktree)
+
+    assert report.terminated == (
+        f"short-lived-server pid={payload.pid} terminated",
+    )
+    assert report.stale == ()
+    assert report.surviving == ()
+    terminate.assert_called_once_with(
+        token,
+        grace_seconds=registry.PROCESS_TERMINATION_TIMEOUT_SECONDS,
+    )
+
+
+def test_setup_registration_batch_is_atomic_on_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    registry.register_process(
+        tmp_path,
+        worktree,
+        name="existing",
+        kind="probe",
+        pid=40,
+        started_at="existing-created",
+    )
+    before = registry.load_registered_processes(tmp_path, worktree)
+    candidates = (
+        registry.RegisteredProcess(
+            name="service-a",
+            kind="server",
+            pid=41,
+            started_at="service-a-created",
+        ),
+        registry.RegisteredProcess(
+            name="service-b",
+            kind="server",
+            pid=42,
+            started_at="service-b-created",
+        ),
+    )
+    monkeypatch.setattr(
+        registry,
+        "_write_json_file_atomically",
+        MagicMock(side_effect=OSError("disk full")),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        registry.register_processes(tmp_path, worktree, candidates)
+
+    assert registry.load_registered_processes(tmp_path, worktree) == before
+
+
 def test_malformed_registry_is_preserved_and_fails_closed(tmp_path: Path) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()

@@ -108,11 +108,9 @@ def test_posix_identity_prefers_darwin_kernel_executable_over_ps_placeholder(
     assert identity.command == "(python3.12)"
 
 
-@pytest.mark.parametrize("reverse", [False, True])
 def test_identity_matches_accepts_darwin_framework_python_exec_transition(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    reverse: bool,
 ) -> None:
     framework = tmp_path / "Library" / "Frameworks" / "Python.framework" / "Versions" / "3.12"
     stub = framework / "bin" / "python"
@@ -135,15 +133,12 @@ def test_identity_matches_accepts_darwin_framework_python_exec_transition(
         return real_resolve(path, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", resolve_framework_alias)
-    expected_executable, live_executable = (
-        (str(app), str(venv_launcher)) if reverse else (str(venv_launcher), str(app))
-    )
-    expected = ProcessIdentity(42, "created", expected_executable)
+    expected = ProcessIdentity(42, "created", str(venv_launcher))
     monkeypatch.setattr(process_supervisor.sys, "platform", "darwin")
     monkeypatch.setattr(
         process_supervisor,
         "inspect_process",
-        lambda _pid: ProcessIdentity(42, "created", live_executable),
+        lambda _pid: ProcessIdentity(42, "created", str(app)),
     )
 
     assert identity_matches(expected)
@@ -221,6 +216,35 @@ def test_posix_token_membership_accepts_darwin_framework_exec_transition(
     monkeypatch.setattr(process_supervisor, "inspect_process", lambda _pid: live)
 
     assert process_supervisor.supervision_token_contains_process(token, live)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX durable token membership")
+def test_posix_token_membership_rejects_reverse_darwin_framework_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    framework = tmp_path / "Python.framework" / "Versions" / "3.12"
+    stub = framework / "bin" / "python3.12"
+    app = framework / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    stub.parent.mkdir(parents=True)
+    app.parent.mkdir(parents=True)
+    stub.write_text("stub", encoding="utf-8")
+    app.write_text("app", encoding="utf-8")
+    recorded = ProcessIdentity(42, "created", str(app), f"{app} worker.py")
+    live = ProcessIdentity(42, "created", str(stub), f"{stub} worker.py")
+    token = SupervisionToken(
+        LifetimeMode.ADOPTABLE,
+        recorded,
+        7,
+        "owner",
+        "darwin-framework-reverse-transition",
+        pgid=42,
+        payload_identity=recorded,
+    )
+    monkeypatch.setattr(process_supervisor.sys, "platform", "darwin")
+    monkeypatch.setattr(process_supervisor, "inspect_process", lambda _pid: live)
+
+    assert not process_supervisor.supervision_token_contains_process(token, live)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX launch invariant")
