@@ -113,6 +113,7 @@ spec init                              # bootstrap repo for spec development
 spec create --spec ID                  # author a new spec
 spec implement --spec ID               # start/resume implementation
 spec status --spec ID                  # show run state
+spec review --pr NUMBER                # inspect full PR review feedback
 spec list                              # list specs with status
 spec show --spec ID                    # display spec content
 spec report --status ok                # report completion (from inside implement)

@@ -12,6 +12,7 @@ Primary commands (happy-path)::
     spec implement   — start or resume an implementation workflow
     spec stop        — stop the active workflow process group for a spec
     spec status      — show run state and gate status
+    spec review      — inspect full machine-readable PR review feedback
     spec list        — list specs with status and dependencies
     spec show        — display a spec's content
     spec report      — report implement-phase completion
@@ -693,6 +694,13 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return orch.cmd_report(args)
 
 
+def _cmd_review(args: argparse.Namespace) -> int:
+    """Inspect the full review-decision payload for a pull request."""
+    from .review_feedback import main as review_main
+
+    return review_main(["--pr", str(args.pr)])
+
+
 def _cmd_task(args: argparse.Namespace) -> int:
     """Describe and execute a quick task."""
     orch = _lazy_orchestrator()
@@ -1158,6 +1166,13 @@ def main(argv: list[str] | None = None) -> int:
     p_status.add_argument("--spec", required=True, help="Spec ID")
     p_status.add_argument("--run", default="", help="Show a specific run id")
 
+    # review
+    p_review = subparsers.add_parser(
+        "review",
+        help="Inspect full machine-readable review feedback for a pull request",
+    )
+    p_review.add_argument("--pr", required=True, type=int, help="Pull request number")
+
     # list
     p_list = subparsers.add_parser("list", help="List specs with status and dependencies")
     p_list.add_argument(
@@ -1480,6 +1495,7 @@ def main(argv: list[str] | None = None) -> int:
         "implement": _cmd_implement,
         "stop": _cmd_stop,
         "status": _cmd_status,
+        "review": _cmd_review,
         "list": _cmd_list,
         "show": _cmd_show,
         "report": _cmd_report,

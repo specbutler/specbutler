@@ -8,6 +8,7 @@ no git repos, no subprocesses.
 
 from __future__ import annotations
 
+import argparse
 import io
 import json
 import subprocess
@@ -826,7 +827,12 @@ class TestCLIMain:
 
     @pytest.mark.parametrize(
         "argv",
-        (["--help"], ["implement", "--help"], ["auto", "run", "--help"]),
+        (
+            ["--help"],
+            ["implement", "--help"],
+            ["review", "--help"],
+            ["auto", "run", "--help"],
+        ),
     )
     def test_help_surfaces_do_not_load_repository_config(self, argv):
         cli = self._import_cli()
@@ -1106,6 +1112,33 @@ class TestCLIMain:
             rc = cli.main(["status", "--spec", "my-spec"])
         assert rc == 0
         mock_orch.cmd_status.assert_called_once()
+
+    def test_review_command_dispatches_with_pull_request_number(self):
+        cli = self._import_cli()
+        mock_config = MagicMock(
+            agents=MagicMock(default="claude"),
+            base_ref="master",
+            retry_cap=5,
+            paths=MagicMock(specs_dir="specs", task_specs_dir="specs/tasks"),
+        )
+        with (
+            patch.object(cli, "_lazy_config", return_value=mock_config),
+            patch.object(cli, "_cmd_review", return_value=0) as mock_review,
+        ):
+            rc = cli.main(["review", "--pr", "42"])
+
+        assert rc == 0
+        forwarded_args = mock_review.call_args.args[0]
+        assert forwarded_args.pr == 42
+
+    def test_review_command_uses_review_feedback_cli(self):
+        cli = self._import_cli()
+        args = argparse.Namespace(pr=42)
+        with patch("spec_runtime.review_feedback.main", return_value=0) as review_main:
+            rc = cli._cmd_review(args)
+
+        assert rc == 0
+        review_main.assert_called_once_with(["--pr", "42"])
 
     def test_report_command_dispatches_to_orchestrator(self):
         cli = self._import_cli()
