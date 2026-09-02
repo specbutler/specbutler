@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -252,6 +253,70 @@ def _remove_runtime_root(runtime_root: Path) -> None:
         raise last_error
 
 
+def _windows_current_principal() -> str:
+    """Return the current Windows token identity in ``DOMAIN\\user`` form."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    name_sam_compatible = 2
+    get_user_name = ctypes.WinDLL("secur32", use_last_error=True).GetUserNameExW
+    get_user_name.argtypes = [
+        wintypes.ULONG,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    get_user_name.restype = wintypes.BOOL
+    size = wintypes.ULONG(0)
+    get_user_name(name_sam_compatible, None, ctypes.byref(size))
+    if size.value == 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_unicode_buffer(size.value)
+    if not get_user_name(name_sam_compatible, buffer, ctypes.byref(size)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return buffer.value
+
+
+def _grant_windows_runtime_cleanup_access(runtime_root: Path, *, path: str) -> None:
+    """Keep the orchestrator able to remove descendants owned by sandbox users."""
+
+    icacls = _resolve_executable("icacls.exe", path=path) or _resolve_executable(
+        "icacls",
+        path=path,
+    )
+    if icacls is None:
+        raise ReviewBootstrapSandboxUnavailable(
+            "Windows ACL tool is unavailable for isolated review bootstrap cleanup"
+        )
+    try:
+        principal = _windows_current_principal()
+    except OSError as exc:
+        raise ReviewBootstrapSandboxUnavailable(
+            "Current Windows identity is unavailable for isolated review bootstrap cleanup"
+        ) from exc
+    result = subprocess.run(
+        [
+            str(icacls),
+            str(runtime_root),
+            "/grant:r",
+            f"{principal}:(OI)(CI)F",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise ReviewBootstrapSandboxUnavailable(
+            "Could not reserve Windows review-bootstrap runtime cleanup access"
+            + (f": {detail[-500:]}" if detail else "")
+        )
+
+
 @contextmanager
 def isolated_review_bootstrap_sandbox(
     review_worktree: Path,
@@ -294,6 +359,8 @@ def isolated_review_bootstrap_sandbox(
     # access below, while its siblings remain outside the sandbox allowlist.
     runtime_root = Path(tempfile.mkdtemp(prefix="spec-review-bootstrap-")).resolve()
     try:
+        if use_windows:
+            _grant_windows_runtime_cleanup_access(runtime_root, path=path)
         configured_home = source_env.get("USERPROFILE" if use_windows else "HOME", "")
         operator_home = (
             Path(configured_home).expanduser().resolve()
