@@ -453,7 +453,8 @@ if (-not $sdist) { throw 'Release-candidate source distribution was not produced
 Invoke-LoggedNative -FilePath $uv -Arguments @('venv', $wheelVenv, '--python', '3.12') -LogName 'wheel-venv.log'
 $wheelPython = Join-Path $wheelVenv 'Scripts\python.exe'
 Invoke-LoggedNative -FilePath $uv -Arguments @(
-    'pip', 'install', '--python', $wheelPython, "$($wheel.FullName)[dev,web,tui]"
+    'pip', 'install', '--python', $wheelPython,
+    "$($wheel.FullName)[dev,web,tui]", 'setuptools>=77'
 ) -LogName 'wheel-install.log'
 $sdistVenvLog = 'sdist-venv.log'
 Invoke-LoggedNative -FilePath $uv -Arguments @('venv', $sdistVenv, '--python', '3.12') -LogName $sdistVenvLog

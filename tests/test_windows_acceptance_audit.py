@@ -567,6 +567,7 @@ def test_proof_records_exact_provenance_and_does_not_claim_release_passed() -> N
     assert "review-bootstrap-warning.json" in proof
     assert "--system-site-packages" in proof
     assert "--no-build-isolation --no-deps" in proof
+    assert '"$($wheel.FullName)[dev,web,tui]", \'setuptools>=77\'' in proof
     assert "install_command_windows = '" in proof
     assert 'install_shell_windows = "powershell"' in proof
     assert 'argv_windows = [".venv/Scripts/python.exe", "-m", "pytest", "-q"]' in proof
