@@ -8212,6 +8212,59 @@ class TestSpecAutopilot:
         assert spawn_kwargs["stdin"] == autopilot.subprocess.DEVNULL
         assert spawn_kwargs["stderr"] == autopilot.subprocess.STDOUT
 
+    def test_start_candidate_publishes_cross_platform_launch_reservation(
+        self,
+        repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        control_root = tmp_path / "controls"
+        monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(control_root))
+        supervisor_init: dict[str, object] = {}
+
+        class FakeSupervisor:
+            def __init__(self, lifetime_mode, **kwargs):  # noqa: ANN001
+                supervisor_init["lifetime_mode"] = lifetime_mode
+                supervisor_init.update(kwargs)
+
+            def spawn(self, command, **kwargs):  # noqa: ANN001
+                return _managed_process_double(
+                    command="spec implement --spec launch-reservation",
+                )
+
+        monkeypatch.setattr(
+            autopilot,
+            "autopilot_runs_root",
+            lambda _repo_root: repo / ".spec-state" / "autopilot" / "runs",
+        )
+        monkeypatch.setattr(autopilot, "ProcessSupervisor", FakeSupervisor)
+        supervision_id = "cross-platform-launch-reservation"
+        ready_path = process_supervisor.durable_metadata_path(supervision_id)
+        candidate = autopilot.DispatchCandidate(
+            spec_id="launch-reservation",
+            agent="codex",
+            area="backend",
+            priority=50,
+            unlock_count=0,
+            status="not-started",
+            run_id="",
+            reason="new-run",
+        )
+
+        active = autopilot.start_candidate(
+            repo,
+            candidate,
+            supervision_id=supervision_id,
+            ready_path=str(ready_path),
+        )
+
+        assert supervisor_init == {
+            "lifetime_mode": LifetimeMode.ADOPTABLE,
+            "supervision_id": supervision_id,
+            "publish_durable_token": True,
+        }
+        assert active.ready_path == str(ready_path)
+
     def test_start_candidate_injects_spec_actor_autopilot(
         self,
         repo: Path,
@@ -9506,6 +9559,54 @@ class TestSpecAutopilot:
             assert not (tmp_path / "controls" / managed.token.control_relpath).exists()
         finally:
             managed.terminate(grace_seconds=0.1)
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX launch reservation recovery")
+    def test_adopt_active_processes_recovers_posix_launch_reservation(
+        self,
+        repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+        supervision_id = "posix-launch-window"
+        metadata_path = process_supervisor.durable_metadata_path(supervision_id)
+        managed = process_supervisor.ProcessSupervisor(
+            LifetimeMode.ADOPTABLE,
+            supervision_id=supervision_id,
+            publish_durable_token=True,
+        ).spawn(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=repo,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            reservation = autopilot.ActiveRunProcess(
+                spec_id="live-spec",
+                agent="codex",
+                pid=0,
+                started_at="2026-09-01T00:00:00+00:00",
+                started_monotonic=0.0,
+                log_path="",
+                run_id="",
+                launch_state="launching",
+                supervision_id=supervision_id,
+                ready_path=str(metadata_path),
+            )
+            autopilot.write_active_state(repo, {"live-spec": reservation})
+
+            adopted = autopilot.adopt_active_processes(repo)
+
+            assert adopted["live-spec"].pid == managed.token.payload.pid
+            assert adopted["live-spec"].process_started_at == managed.token.payload.started_at
+            assert adopted["live-spec"].supervision_token == managed.token.to_dict()
+            assert adopted["live-spec"].launch_state == "ready"
+            assert adopted["live-spec"].adoption_generation == 1
+        finally:
+            managed.terminate(grace_seconds=0.1)
+            managed.wait(timeout=5)
+            metadata_path.unlink(missing_ok=True)
 
     def test_adopt_active_processes_windows_requires_authenticated_token(
         self,

@@ -848,8 +848,34 @@ def test_detached_durable_token_publication_is_opt_in(
         metadata_path.unlink(missing_ok=True)
 
 
-def test_durable_token_publication_rejects_non_detached_lifetime() -> None:
-    with pytest.raises(ValueError, match="requires detached lifetime"):
+@pytest.mark.skipif(os.name != "posix", reason="POSIX adoptable publication")
+def test_adoptable_durable_token_is_published_before_spawn_returns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path / "controls"))
+    supervision_id = f"adoptable-published-{uuid.uuid4().hex}"
+    metadata_path = process_supervisor.durable_metadata_path(supervision_id)
+    managed = ProcessSupervisor(
+        LifetimeMode.ADOPTABLE,
+        supervision_id=supervision_id,
+        publish_durable_token=True,
+    ).spawn([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        published = SupervisionToken.from_dict(
+            json.loads(metadata_path.read_text(encoding="utf-8"))
+        )
+        assert published == managed.token
+        assert published.mode is LifetimeMode.ADOPTABLE
+        assert identity_matches(published.identity)
+    finally:
+        managed.terminate(grace_seconds=0.1)
+        managed.wait(timeout=5)
+        metadata_path.unlink(missing_ok=True)
+
+
+def test_durable_token_publication_rejects_run_owned_lifetime() -> None:
+    with pytest.raises(ValueError, match="requires adoptable or detached lifetime"):
         ProcessSupervisor(
             LifetimeMode.RUN_OWNED,
             publish_durable_token=True,

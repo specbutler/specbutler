@@ -932,13 +932,14 @@ def run_server(
 
     background_payload = _launch_reservation_belongs_to_current_payload(repo_root)
     try:
-        if _native_windows_host() and not background_payload:
-            # A direct foreground Windows server has no durable helper parent.
-            # Claim the current process before publishing it so status, a
-            # second start, and an out-of-process stop all use a reopenable Job
-            # capability instead of an unsafe raw PID. The supervised
-            # background payload carries SPEC_WEB_READY_NONCE and must leave
-            # helper-token publication to its authenticated parent.
+        if not background_payload:
+            # A direct foreground server has no durable helper parent. Claim
+            # the current process before publishing it so status, a second
+            # start, and an out-of-process stop use an owned POSIX process
+            # group or reopenable Windows Job instead of an unsafe raw PID.
+            # The supervised background payload carries SPEC_WEB_READY_NONCE
+            # and must leave helper-token publication to its authenticated
+            # parent.
             from spec_runtime.process_supervisor import claim_current_process
 
             foreground_token = claim_current_process(f"web-foreground-{uuid.uuid4().hex}")

@@ -78,6 +78,7 @@ from spec_runtime.process_supervisor import (
     SupervisionToken,
     adopt,
     available_memory_bytes,
+    durable_metadata_path,
     inspect_process,
     iter_processes,
     process_cwd,
@@ -2102,9 +2103,21 @@ def start_candidate(
     child_env["SPEC_ACTOR"] = "autopilot"
     if preallocated_run_id and not candidate.run_id:
         child_env["SPEC_PREALLOCATED_RUN_ID"] = preallocated_run_id
+    supervisor_kwargs: dict[str, object] = {
+        "supervision_id": supervision_id or None,
+    }
+    if ready_path:
+        if not supervision_id or Path(ready_path) != durable_metadata_path(supervision_id):
+            log_handle.close()
+            raise ValueError("ready_path must be the durable metadata path for supervision_id")
+        # Publish the exact session-leader token before spawn() returns. This
+        # closes the dispatcher crash window between child launch and the
+        # second active-state write on POSIX; Windows already publishes from
+        # its durable helper through the same cross-platform path.
+        supervisor_kwargs["publish_durable_token"] = True
     process = ProcessSupervisor(
         LifetimeMode.ADOPTABLE,
-        supervision_id=supervision_id or None,
+        **supervisor_kwargs,
     ).spawn(
         command,
         cwd=repo_root,
@@ -2900,12 +2913,7 @@ def run_loop(args: argparse.Namespace) -> int:
                         print(format_status_line("warning", f"{candidate.spec_id} coordinator unavailable: {exc}"))
                         continue
                     supervision_id = uuid.uuid4().hex
-                    if os.name == "nt":
-                        from spec_runtime.process_supervisor import durable_metadata_path
-
-                        ready_path = str(durable_metadata_path(supervision_id))
-                    else:
-                        ready_path = str(repo_root / f".spec-supervisor-{supervision_id}.json")
+                    ready_path = str(durable_metadata_path(supervision_id))
                     # Persist the reservation before spawning the durable
                     # helper. A replacement dispatcher can recover from the
                     # helper ready record if this process exits at any point

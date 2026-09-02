@@ -183,6 +183,68 @@ def test_linux_foreground_bind_auth_status_and_legacy_stop(
                 managed.terminate(grace_seconds=0.1)
 
 
+def test_linux_raw_foreground_launch_claims_group_and_stops_out_of_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, token, env = _repo(tmp_path, monkeypatch)
+    port = _free_port()
+    stdout_path = tmp_path / "raw-foreground.stdout.log"
+    stderr_path = tmp_path / "raw-foreground.stderr.log"
+    supervision: SupervisionToken | None = None
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout,
+        stderr_path.open("w", encoding="utf-8") as stderr,
+    ):
+        # Deliberately omit start_new_session: this reproduces a direct caller
+        # whose child initially shares the caller's process group.
+        process = subprocess.Popen(  # noqa: S603
+            _start_command(port),
+            cwd=repo,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        try:
+            _wait_for_authenticated_http(port, token, process=process)
+            supervision = SupervisionToken.from_dict(
+                json.loads(
+                    (repo / ".spec-state" / "web" / "server.supervision.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+            )
+            assert supervision.mode is LifetimeMode.RUN_OWNED
+            assert supervision.identity.pid == process.pid
+            assert supervision.pgid == process.pid
+
+            stopped = subprocess.run(
+                _cli_command("stop"),
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+            process.wait(timeout=10)
+            _assert_port_closed(port)
+            assert not (repo / ".spec-state" / "web" / "server.pid").exists()
+            assert not (
+                repo / ".spec-state" / "web" / "server.supervision.json"
+            ).exists()
+        except Exception as exc:
+            raise AssertionError(f"{exc}\n{_logs(stdout_path, stderr_path)}") from exc
+        finally:
+            if supervision is not None and identity_matches(supervision.identity):
+                terminate(supervision, grace_seconds=0.1)
+            elif process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
+
+
 def test_linux_background_durable_start_auth_status_stop_and_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

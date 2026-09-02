@@ -1942,8 +1942,13 @@ class ProcessSupervisor:
         publish_durable_token: bool = False,
     ):
         self.mode = LifetimeMode(mode)
-        if publish_durable_token and self.mode is not LifetimeMode.DETACHED:
-            raise ValueError("durable token publication requires detached lifetime")
+        if publish_durable_token and self.mode not in {
+            LifetimeMode.ADOPTABLE,
+            LifetimeMode.DETACHED,
+        }:
+            raise ValueError(
+                "durable token publication requires adoptable or detached lifetime"
+            )
         self._supervision_id = supervision_id
         self._publish_durable_token = publish_durable_token
         self._children: list[ManagedProcess | ManagedAsyncProcess] = []
