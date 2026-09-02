@@ -46,8 +46,10 @@ ignored state, builds the QEMU container, and creates the unattended media.
 their pinned hashes on both host and guest, then installs the Windows toolchain.
 `LAB_MEMORY` controls RAM visible to Windows. Keep
 `LAB_CONTAINER_MEMORY_LIMIT` larger so QEMU and the controller services have
-host-side headroom; the supplied 16G/20G defaults are the release-proof
-configuration.
+host-side headroom. When the limit is omitted, `labctl` adds the larger of 4
+GiB or 25 percent of guest RAM and rounds up to a whole GiB (20G for the
+supplied 16G guest). An explicit limit below that threshold fails before
+Docker starts.
 
 Provider and forge authentication are deliberately manual and remain inside
 the VM. Use the loopback-only noVNC console or SSH:

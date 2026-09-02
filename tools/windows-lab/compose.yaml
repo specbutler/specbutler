@@ -27,9 +27,8 @@ services:
       - "127.0.0.1:${LAB_VNC_PORT:-16080}:6080"
     cpus: "${LAB_CPUS:-8}"
     # QEMU needs host-side memory in addition to the RAM assigned to Windows.
-    # Capping the container at LAB_MEMORY lets the memcg OOM-kill QEMU as soon
-    # as the guest touches most of its RAM.
-    mem_limit: "${LAB_CONTAINER_MEMORY_LIMIT:-20G}"
+    # labctl derives and validates this limit from LAB_MEMORY before Compose.
+    mem_limit: "${LAB_CONTAINER_MEMORY_LIMIT}"
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 2m

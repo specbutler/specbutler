@@ -80,6 +80,22 @@ bounded_host_command() {
     python3 "$HARNESS_ROOT/run_with_timeout.py" "$timeout" -- "$@"
 }
 
+resolve_memory_config() {
+    local guest_memory="${LAB_MEMORY:-16G}"
+    local configured_limit="${LAB_CONTAINER_MEMORY_LIMIT:-}"
+    local resolved_limit
+    local args=(--guest-memory "$guest_memory")
+    if [ -n "$configured_limit" ]; then
+        args+=(--container-limit "$configured_limit")
+    fi
+    if ! resolved_limit="$(python3 "$HARNESS_ROOT/memory_config.py" "${args[@]}")"; then
+        die "invalid Windows lab memory configuration"
+    fi
+    LAB_MEMORY="$guest_memory"
+    LAB_CONTAINER_MEMORY_LIMIT="$resolved_limit"
+    export LAB_MEMORY LAB_CONTAINER_MEMORY_LIMIT
+}
+
 load_config() {
     test -f "$CONFIG_FILE" || die "copy lab.env.example to lab.env and fill every placeholder"
     set -a
@@ -93,6 +109,7 @@ load_config() {
     [[ "$WINDOWS_ISO_SHA256" =~ ^[[:xdigit:]]{64}$ ]] || die "WINDOWS_ISO_SHA256 must contain 64 hexadecimal characters"
     [[ "$WINDOWS_IMAGE_INDEX" =~ ^[1-9][0-9]*$ ]] || die "WINDOWS_IMAGE_INDEX must be a positive integer"
     [[ "$WINDOWS_ISO" != *'<'* && "$WINDOWS_ISO_SHA256" != *'<'* ]] || die "lab.env still contains placeholders"
+    resolve_memory_config
 }
 
 load_identity() {

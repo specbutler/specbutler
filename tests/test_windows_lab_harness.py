@@ -43,6 +43,7 @@ REQUIRED_FILES = {
     "labctl",
     "launch_attestation.py",
     "local_acceptance.py",
+    "memory_config.py",
     "proof.ps1",
     "provision.ps1",
     "redact.py",
@@ -400,7 +401,7 @@ def test_windows_lab_has_complete_controller_surface() -> None:
     assert "LAB_INTERACTIVE_SESSION_REPAIR=1" in env_example
     assert "LAB_PROOF_TRASH_KEEP=1" in env_example
     assert "LAB_MEMORY=16G" in env_example
-    assert "LAB_CONTAINER_MEMORY_LIMIT=20G" in env_example
+    assert "# LAB_CONTAINER_MEMORY_LIMIT=20G" in env_example
     proof_run = controller[
         controller.index("run_proof() {") : controller.index('command="${1:-help}"')
     ]
@@ -1267,7 +1268,7 @@ def test_windows_lab_scripts_parse_and_compose_is_loopback_only() -> None:
     assert service["devices"] == ["/dev/kvm:/dev/kvm"]
     assert service["restart"] == "no"
     assert service["environment"]["LAB_MEMORY"] == "${LAB_MEMORY:-16G}"
-    assert service["mem_limit"] == "${LAB_CONTAINER_MEMORY_LIMIT:-20G}"
+    assert service["mem_limit"] == "${LAB_CONTAINER_MEMORY_LIMIT}"
     assert all(str(port).startswith("127.0.0.1:") for port in service["ports"])
     assert "${SPEC_WINDOWS_LAB_STATE_ROOT:-./state}:/state" in service["volumes"]
 
