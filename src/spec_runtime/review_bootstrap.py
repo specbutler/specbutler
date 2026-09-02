@@ -29,6 +29,7 @@ from .platform_fs import remove_tree
 
 REVIEW_BOOTSTRAP_PERMISSION_PROFILE = "spec_review_bootstrap"
 _RUNTIME_CLEANUP_DELAYS = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
+_runtime_cleanup_sleep = time.sleep
 
 # Start the trusted sandbox launcher with only portable process/runtime state.
 # In particular, do not forward provider, forge, registry, cloud, or proxy
@@ -240,7 +241,7 @@ def _remove_runtime_root(runtime_root: Path) -> None:
     last_error: OSError | None = None
     for delay in _RUNTIME_CLEANUP_DELAYS:
         if delay:
-            time.sleep(delay)
+            _runtime_cleanup_sleep(delay)
         if not runtime_root.exists():
             return
         try:
@@ -277,22 +278,40 @@ def _windows_current_principal() -> str:
     return buffer.value
 
 
-def _grant_windows_runtime_cleanup_access(runtime_root: Path, *, path: str) -> None:
+def _windows_system_executable(name: str) -> Path:
+    """Resolve a trusted executable from the actual Windows system directory."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    get_system_directory = ctypes.WinDLL(
+        "kernel32",
+        use_last_error=True,
+    ).GetSystemDirectoryW
+    get_system_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    get_system_directory.restype = wintypes.UINT
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_system_directory(buffer, len(buffer))
+    if length == 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if length >= len(buffer):
+        raise OSError("Windows system directory path exceeded the supported length")
+    executable = Path(buffer.value) / name
+    if not executable.is_file():
+        raise FileNotFoundError(executable)
+    return executable
+
+
+def _grant_windows_runtime_cleanup_access(runtime_root: Path) -> None:
     """Keep the orchestrator able to remove descendants owned by sandbox users."""
 
-    icacls = _resolve_executable("icacls.exe", path=path) or _resolve_executable(
-        "icacls",
-        path=path,
-    )
-    if icacls is None:
-        raise ReviewBootstrapSandboxUnavailable(
-            "Windows ACL tool is unavailable for isolated review bootstrap cleanup"
-        )
     try:
+        icacls = _windows_system_executable("icacls.exe")
         principal = _windows_current_principal()
     except OSError as exc:
         raise ReviewBootstrapSandboxUnavailable(
-            "Current Windows identity is unavailable for isolated review bootstrap cleanup"
+            "Trusted Windows identity or ACL tooling is unavailable for isolated review "
+            "bootstrap cleanup"
         ) from exc
     result = subprocess.run(
         [
@@ -360,7 +379,7 @@ def isolated_review_bootstrap_sandbox(
     runtime_root = Path(tempfile.mkdtemp(prefix="spec-review-bootstrap-")).resolve()
     try:
         if use_windows:
-            _grant_windows_runtime_cleanup_access(runtime_root, path=path)
+            _grant_windows_runtime_cleanup_access(runtime_root)
         configured_home = source_env.get("USERPROFILE" if use_windows else "HOME", "")
         operator_home = (
             Path(configured_home).expanduser().resolve()

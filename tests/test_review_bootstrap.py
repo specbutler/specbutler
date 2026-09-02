@@ -197,7 +197,7 @@ def test_runtime_cleanup_retries_delayed_handle_release(
         real_remove_tree(path)
 
     monkeypatch.setattr(review_bootstrap, "remove_tree", delayed_remove)
-    monkeypatch.setattr(review_bootstrap.time, "sleep", sleeps.append)
+    monkeypatch.setattr(review_bootstrap, "_runtime_cleanup_sleep", sleeps.append)
 
     review_bootstrap._remove_runtime_root(runtime_root)
 
