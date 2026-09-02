@@ -142,6 +142,7 @@ from .review_bootstrap import (
     ReviewBootstrapSandboxUnavailable,
     isolated_review_bootstrap_sandbox,
 )
+from .review_decision import REVIEW_DECISION_VALUES, review_payload_decision
 from .spec_identity import (
     SPEC_ID_RE,
     authoring_branch_identity,
@@ -310,7 +311,6 @@ LOCAL_REVIEW_DISABLED_CREDENTIAL_ENV_VARS = (
 )
 MERGE_CHECKS_POLL_INTERVAL_SECONDS = 10
 MERGE_CHECKS_TIMEOUT_SECONDS = 900
-REVIEW_DECISION_VALUES = ("approved", "request_changes", "blocked", "failed")
 INTAKE_FILE_VERSION = 1
 INTAKE_INPUT_TYPES = ("string", "int", "float", "bool", "choice")
 TASK_SCOPING_PROMPT_FILE = "prompts/task-scoping.md"
@@ -10920,20 +10920,6 @@ def _parse_json_object(text: str) -> dict | None:
     return None
 
 
-def _normalize_review_decision(raw: object) -> str:
-    val = str(raw or "").strip().lower()
-    aliases = {
-        "approve": "approved",
-        "approved": "approved",
-        "changes_requested": "request_changes",
-        "request_changes": "request_changes",
-        "request-changes": "request_changes",
-        "blocked": "blocked",
-        "failed": "failed",
-    }
-    return aliases.get(val, "")
-
-
 def _normalize_review_finding(item: dict, index: int) -> ReviewFinding:
     start_line = _coerce_line_number(
         item.get("start_line", item.get("line", 1)),
@@ -10990,7 +10976,7 @@ def _normalize_review_payload(
     expected_base_sha: str,
     check_run: dict,
 ) -> ReviewResult:
-    decision = _normalize_review_decision(payload.get("status", payload.get("decision")))
+    decision = review_payload_decision(payload)
     if decision not in REVIEW_DECISION_VALUES:
         raise ValueError("review payload has invalid decision/status")
 
@@ -12095,7 +12081,7 @@ def _load_review_result_from_gate_output(result_path: Path) -> ReviewResult:
     if not isinstance(payload, dict):
         raise ValueError(f"Local review gate output must be a JSON object: {result_path}")
 
-    status = str(payload.get("status", payload.get("decision", ""))).strip().lower()
+    status = review_payload_decision(payload)
     if status not in REVIEW_DECISION_VALUES:
         raise ValueError(f"Local review gate output has invalid status/decision: {status or '(missing)'}")
 

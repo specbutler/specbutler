@@ -17,14 +17,13 @@ from pathlib import Path
 
 from .config import load_spec_runtime_config
 from .git_common import subprocess_text_kwargs
+from .review_decision import REVIEW_DECISION_VALUES, review_payload_decision
 from .review_gate_sticky_comment import STICKY_MARKER, extract_embedded_review_result
 from .spec_identity import pr_body_uses_local_review
 
 REVIEW_GATE_CHECK_NAME = "review-decision-gate"
 REVIEW_GATE_ARTIFACT_NAME = "review-decision-gate-result"
 REVIEW_GATE_ARTIFACT_FILE = "review-decision.json"
-REVIEW_DECISION_VALUES = ("approved", "request_changes", "blocked", "failed")
-
 RunSubprocess = Callable[..., subprocess.CompletedProcess[str]]
 ArtifactPayloadLoader = Callable[[Path, dict], dict | None]
 
@@ -226,20 +225,6 @@ def parse_json_object(text: str) -> dict | None:
     return None
 
 
-def _normalize_review_decision(raw: object) -> str:
-    value = str(raw or "").strip().lower()
-    aliases = {
-        "approve": "approved",
-        "approved": "approved",
-        "changes_requested": "request_changes",
-        "request_changes": "request_changes",
-        "request-changes": "request_changes",
-        "blocked": "blocked",
-        "failed": "failed",
-    }
-    return aliases.get(value, "")
-
-
 def _normalize_review_finding(item: dict, index: int) -> ReviewFinding:
     start_line = _coerce_line_number(
         item.get("start_line", item.get("line", 1)),
@@ -286,7 +271,7 @@ def normalize_review_payload(
     expected_base_sha: str,
     check_run: dict,
 ) -> ReviewResult:
-    decision = _normalize_review_decision(payload.get("status", payload.get("decision")))
+    decision = review_payload_decision(payload)
     if decision not in REVIEW_DECISION_VALUES:
         raise ValueError("review payload has invalid decision/status")
 
