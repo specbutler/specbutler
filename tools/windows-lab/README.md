@@ -16,7 +16,8 @@ paths.
 - A Linux x86-64 host with hardware virtualization enabled and `/dev/kvm`
   readable and writable by the operator.
 - Docker Engine with Compose v2, SSH/SCP, Git, Python 3, `sha256sum`, and at
-  least 40 GiB of free disk space (80 GiB is a practical minimum).
+  least 40 GiB of free disk space (80 GiB is a practical minimum). The default
+  VM also needs about 20 GiB of available host memory.
 - A properly licensed or time-limited Windows 11 x64 ISO obtained from
   Microsoft. This repository does not supply an ISO or a license.
 - Current Windows x64 artifacts for Git, GitHub CLI, uv, and Codex. Populate
@@ -43,6 +44,12 @@ fresh local VM identity/password/SSH key, renders the unattended templates into
 ignored state, builds the QEMU container, and creates the unattended media.
 `provision` downloads only the HTTPS artifacts named in `toolchain.json`, checks
 their pinned hashes on both host and guest, then installs the Windows toolchain.
+`LAB_MEMORY` controls RAM visible to Windows. Keep
+`LAB_CONTAINER_MEMORY_LIMIT` larger so QEMU and the controller services have
+host-side headroom. When the limit is omitted, `labctl` adds the larger of 4
+GiB or 25 percent of guest RAM and rounds up to a whole GiB (20G for the
+supplied 16G guest). An explicit limit below that threshold fails before
+Docker starts.
 
 Provider and forge authentication are deliberately manual and remain inside
 the VM. Use the loopback-only noVNC console or SSH:
