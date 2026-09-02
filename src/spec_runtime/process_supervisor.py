@@ -330,6 +330,31 @@ def _windows_identity(pid: int) -> ProcessIdentity | None:
         kernel32.CloseHandle(handle)
 
 
+def _darwin_process_executable(pid: int) -> str:
+    """Return Darwin's kernel-reported executable path when available.
+
+    ``ps -o command`` can transiently report only ``(python3.12)`` for a
+    freshly exec'd child.  Persisting that placeholder makes the same live
+    process fail a later executable identity check once ``ps`` exposes its
+    arguments.  ``proc_pidpath`` is the native stable source for the image
+    path; callers retain the conservative ``ps`` value if it is unavailable.
+    """
+    if sys.platform != "darwin" or pid <= 0:
+        return ""
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidpath = libproc.proc_pidpath
+        proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(4096)
+        length = proc_pidpath(pid, buffer, ctypes.sizeof(buffer))
+    except (AttributeError, OSError):
+        return ""
+    if length <= 0:
+        return ""
+    return os.fsdecode(buffer.value)
+
+
 def _posix_identity(pid: int) -> ProcessIdentity | None:
     try:
         result = subprocess.run(
@@ -350,7 +375,9 @@ def _posix_identity(pid: int) -> ProcessIdentity | None:
     except ValueError:
         return None
     command = parts[6].strip()
-    executable = command.split(None, 1)[0] if command else ""
+    executable = _darwin_process_executable(live_pid)
+    if not executable:
+        executable = command.split(None, 1)[0] if command else ""
     return ProcessIdentity(live_pid, " ".join(parts[1:6]), executable, command)
 
 

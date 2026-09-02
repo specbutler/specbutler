@@ -80,6 +80,34 @@ def test_identity_matches_still_rejects_different_executables(
     assert not identity_matches(expected)
 
 
+def test_posix_identity_prefers_darwin_kernel_executable_over_ps_placeholder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_supervisor.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        process_supervisor.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            "42 Wed Sep 2 08:38:07 2026 (python3.12)\n",
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        process_supervisor,
+        "_darwin_process_executable",
+        lambda _pid: "/Library/Frameworks/Python.framework/Versions/3.12/Resources/"
+        "Python.app/Contents/MacOS/Python",
+    )
+
+    identity = process_supervisor._posix_identity(42)
+
+    assert identity is not None
+    assert identity.executable.endswith("Python.app/Contents/MacOS/Python")
+    assert identity.command == "(python3.12)"
+
+
 @pytest.mark.parametrize("reverse", [False, True])
 def test_identity_matches_accepts_darwin_framework_python_exec_transition(
     monkeypatch: pytest.MonkeyPatch,
