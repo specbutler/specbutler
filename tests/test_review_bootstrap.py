@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tomllib
 from pathlib import Path
@@ -252,3 +253,86 @@ print(json.dumps(outcome))
     assert not runtime_root.exists()
     assert secret.read_text() == "operator-secret"
     assert not escaped.exists()
+
+
+@pytest.mark.skipif(
+    os.environ.get("SPEC_TEST_REVIEW_BOOTSTRAP_SANDBOX") != "1",
+    reason="set SPEC_TEST_REVIEW_BOOTSTRAP_SANDBOX=1 to exercise the installed native sandbox",
+)
+def test_native_sandbox_bootstrap_does_not_pollute_flat_layout(tmp_path: Path):
+    """Run the build shape that failed under native Windows review."""
+
+    review_worktree = tmp_path / "flat-layout-review"
+    package = review_worktree / "samplepkg"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("VALUE = 42\n", encoding="utf-8")
+    (review_worktree / "pyproject.toml").write_text(
+        """\
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spec-review-flat-layout-probe"
+version = "0.0.0"
+""",
+        encoding="utf-8",
+    )
+
+    venv_dir = review_worktree / ".venv"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "venv",
+            "--system-site-packages",
+            str(venv_dir),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    venv_python = (
+        venv_dir / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else venv_dir / "bin" / "python"
+    )
+    command = [
+        str(venv_python),
+        "-m",
+        "pip",
+        "install",
+        "--no-build-isolation",
+        "--no-deps",
+        "-e",
+        ".",
+    ]
+
+    with isolated_review_bootstrap_sandbox(review_worktree, command) as sandbox:
+        runtime_root = sandbox.runtime_root
+        process = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+            sandbox.wrap(command),
+            cwd=review_worktree,
+            env=sandbox.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = process.communicate(timeout=60)
+
+    assert process.returncode == 0, stderr or stdout
+    assert not runtime_root.exists()
+    assert not any(
+        child.name.casefold().startswith("tmp")
+        for child in review_worktree.iterdir()
+    )
+    imported = subprocess.run(
+        [str(venv_python), "-c", "import samplepkg; print(samplepkg.VALUE)"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert imported.returncode == 0, imported.stderr or imported.stdout
+    assert imported.stdout.strip() == "42"
