@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ from pathlib import Path
 from .platform_fs import remove_tree
 
 REVIEW_BOOTSTRAP_PERMISSION_PROFILE = "spec_review_bootstrap"
+_RUNTIME_CLEANUP_DELAYS = (0.0, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
 
 # Start the trusted sandbox launcher with only portable process/runtime state.
 # In particular, do not forward provider, forge, registry, cloud, or proxy
@@ -231,6 +233,25 @@ def _shell_environment_overrides(env: Mapping[str, str]) -> tuple[str, ...]:
     )
 
 
+def _remove_runtime_root(runtime_root: Path) -> None:
+    """Remove sandbox-owned runtime files after delayed Windows handle release."""
+
+    last_error: OSError | None = None
+    for delay in _RUNTIME_CLEANUP_DELAYS:
+        if delay:
+            time.sleep(delay)
+        if not runtime_root.exists():
+            return
+        try:
+            remove_tree(runtime_root)
+        except OSError as exc:
+            last_error = exc
+        else:
+            return
+    if runtime_root.exists() and last_error is not None:
+        raise last_error
+
+
 @contextmanager
 def isolated_review_bootstrap_sandbox(
     review_worktree: Path,
@@ -312,4 +333,4 @@ def isolated_review_bootstrap_sandbox(
         launcher.append("--")
         yield PreparedReviewBootstrapSandbox(tuple(launcher), env, runtime_root)
     finally:
-        remove_tree(runtime_root, ignore_errors=True)
+        _remove_runtime_root(runtime_root)

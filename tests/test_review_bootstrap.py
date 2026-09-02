@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import spec_runtime.review_bootstrap as review_bootstrap
 from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
 from spec_runtime.review_bootstrap import (
     REVIEW_BOOTSTRAP_PERMISSION_PROFILE,
@@ -175,6 +176,34 @@ def test_missing_bootstrap_executable_fails_closed(tmp_path: Path):
             raise AssertionError("unreachable")
 
     assert list(review_worktree.iterdir()) == []
+
+
+def test_runtime_cleanup_retries_delayed_handle_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    (runtime_root / "sandbox-owned.txt").write_text("temporary", encoding="utf-8")
+    real_remove_tree = review_bootstrap.remove_tree
+    attempts = 0
+    sleeps: list[float] = []
+
+    def delayed_remove(path: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("sandbox handle is still closing")
+        real_remove_tree(path)
+
+    monkeypatch.setattr(review_bootstrap, "remove_tree", delayed_remove)
+    monkeypatch.setattr(review_bootstrap.time, "sleep", sleeps.append)
+
+    review_bootstrap._remove_runtime_root(runtime_root)
+
+    assert attempts == 3
+    assert sleeps == [0.1, 0.25]
+    assert not runtime_root.exists()
 
 
 @pytest.mark.skipif(
