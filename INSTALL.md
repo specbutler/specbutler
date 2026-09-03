@@ -1,7 +1,8 @@
 # Installing Spec Butler
 
 `spec` requires Python 3.11+, Git, an authenticated GitHub CLI (`gh`), and at
-least one supported coding-agent CLI. Linux and macOS support Claude and Codex.
+least one supported coding-agent CLI with provider authentication configured.
+Linux and macOS support Claude and Codex.
 The supported native tier is Windows 11 on a local fixed NTFS repository using
 the `worktree` backend, Codex, and PowerShell. Native Claude is unavailable;
 UNC/network workspaces and Docker Desktop container mode are not claimed. See
@@ -70,6 +71,7 @@ spec --version
 git --version
 gh auth status
 claude --version  # or: codex --version; use Codex for native Windows
+claude auth status  # or: codex login status
 ```
 
 The project can also be installed from a wheel built with `python -m build`.
@@ -85,6 +87,26 @@ spec init
 spec doctor                            # verify Git, agents, gh, commands, and paths
 spec container doctor                  # only when using the container backend
 spec create --spec my-feature
+```
+
+`spec create` commits the draft locally and prints its branch and worktree.
+Inspect it, then publish it from your operator shell (using the exact paths the
+command prints):
+
+```bash
+cd .worktrees/spec-my-feature
+git status --short
+git log -1 --stat
+git push --set-upstream origin spec/my-feature
+gh pr create --head spec/my-feature --base main
+```
+
+After reviewing and merging that spec pull request into the orchestration
+branch, update the main checkout and start implementation:
+
+```bash
+cd ../..
+git pull --ff-only
 spec implement --spec my-feature
 ```
 

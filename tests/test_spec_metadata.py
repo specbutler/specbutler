@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import pytest
+
 from spec_runtime import spec_metadata
 
 
@@ -65,3 +67,41 @@ def test_current_frontmatter_has_no_legacy_status_warning(
 
     assert metadata.obsolete is False
     assert not caplog.records
+
+
+@pytest.mark.parametrize(
+    "malicious_id",
+    [
+        'evil\" autofocus onfocus=\"alert(1)',
+        "../outside",
+        "Uppercase",
+        "contains_underscore",
+    ],
+)
+def test_parse_spec_metadata_rejects_noncanonical_id(
+    tmp_path: Path,
+    malicious_id: str,
+) -> None:
+    spec_path = tmp_path / "malicious.md"
+    spec_path.write_text(f"---\nid: {malicious_id!r}\n---\n# Malicious\n")
+
+    with pytest.raises(spec_metadata.InvalidSpecIdError, match="invalid frontmatter id"):
+        spec_metadata.parse_spec_metadata(spec_path)
+
+
+def test_iter_spec_metadata_ignores_invalid_id_and_keeps_valid_specs(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    specs_dir = tmp_path / "specs"
+    specs_dir.mkdir()
+    (specs_dir / "valid.md").write_text("---\nid: valid-spec\n---\n# Valid\n")
+    (specs_dir / "malicious.md").write_text(
+        "---\nid: 'evil\" onmouseover=\"alert(1)'\n---\n# Malicious\n"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="spec_runtime.spec_metadata"):
+        records = spec_metadata.iter_spec_metadata(tmp_path)
+
+    assert [record.spec_id for record in records] == ["valid-spec"]
+    assert "not a canonical slug" in caplog.text

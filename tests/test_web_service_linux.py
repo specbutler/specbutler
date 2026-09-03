@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -29,17 +32,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 def _repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str, dict[str, str]]:
-    token = "linux-web-service-token"
-    (tmp_path / ".spec-state" / "web").mkdir(parents=True)
-    (tmp_path / ".spec-state" / "web" / "auth-token").write_text(
-        token,
-        encoding="utf-8",
-    )
     config_path = tmp_path / ".spec.toml"
     config_path.write_text('base_ref = "HEAD"\n', encoding="utf-8")
     control_root = tmp_path / "process-controls"
+    user_state_root = tmp_path / "user-state"
     monkeypatch.setenv("SPEC_CONFIG", str(config_path))
     monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(control_root))
+    monkeypatch.setenv("XDG_STATE_HOME", str(user_state_root))
+    from spec_runtime.web.auth import load_or_create_token
+
+    token = load_or_create_token(tmp_path)
     env = os.environ.copy()
     env.pop("SPEC_WEB_READY_NONCE", None)
     env["SPEC_NO_UPDATE_CHECK"] = "1"
@@ -176,6 +178,89 @@ def test_linux_foreground_bind_auth_status_and_legacy_stop(
             managed.wait(timeout=10)
             _assert_port_closed(port)
             assert not (repo / ".spec-state" / "web" / "server.pid").exists()
+        except Exception as exc:
+            raise AssertionError(f"{exc}\n{_logs(stdout_path, stderr_path)}") from exc
+        finally:
+            if managed.poll() is None:
+                managed.terminate(grace_seconds=0.1)
+
+
+def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chrome = shutil.which("google-chrome") or shutil.which("chromium")
+    if chrome is None:
+        pytest.skip("Chrome/Chromium is not installed")
+
+    repo, token, env = _repo(tmp_path, monkeypatch)
+    port = _free_port()
+    stdout_path = tmp_path / "chrome-server.stdout.log"
+    stderr_path = tmp_path / "chrome-server.stderr.log"
+    profile = tmp_path / "chrome-profile"
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout,
+        stderr_path.open("w", encoding="utf-8") as stderr,
+    ):
+        managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+            _start_command(port),
+            cwd=repo,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        try:
+            _wait_for_authenticated_http(port, token, process=managed)
+            deadline = time.monotonic() + 5
+            opening_url = ""
+            while time.monotonic() < deadline:
+                match = re.search(
+                    r"One-time browser URL: (\S+)",
+                    stderr_path.read_text(errors="replace"),
+                )
+                if match:
+                    opening_url = match.group(1)
+                    break
+                time.sleep(0.05)
+            assert opening_url
+            assert token not in opening_url
+            assert "bootstrap=" in opening_url
+
+            browser = subprocess.run(
+                [
+                    chrome,
+                    "--headless=new",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-dev-shm-usage",
+                    f"--user-data-dir={profile}",
+                    "--virtual-time-budget=3000",
+                    "--dump-dom",
+                    opening_url,
+                ],
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            assert browser.returncode == 0, browser.stderr[-1000:]
+            assert 'class="summary-row"' in browser.stdout
+
+            history_path = profile / "Default" / "History"
+            assert history_path.is_file()
+            database = sqlite3.connect(f"file:{history_path}?mode=ro", uri=True)
+            try:
+                urls = [row[0] for row in database.execute("select url from urls")]
+            finally:
+                database.close()
+            assert urls
+            assert all(token not in url for url in urls)
+            assert all("spec-csrf" not in url for url in urls)
+
+            with pytest.raises(urllib.error.HTTPError) as replay:
+                urllib.request.urlopen(opening_url, timeout=2)
+            assert replay.value.code == 401
         except Exception as exc:
             raise AssertionError(f"{exc}\n{_logs(stdout_path, stderr_path)}") from exc
         finally:

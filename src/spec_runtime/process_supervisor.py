@@ -15,6 +15,7 @@ import ctypes
 import json
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
@@ -30,11 +31,21 @@ from typing import Any, Sequence
 from spec_runtime.platform_fs import FileLock, atomic_write_text
 
 _REAL_POPEN_TYPE = subprocess.Popen
+_REAL_ASYNC_CREATE_SUBPROCESS_EXEC = asyncio.create_subprocess_exec
 _CONTROL_RECONCILE_LIMIT = 256
 _ORPHAN_LOCK_MIN_AGE_SECONDS = 3600.0
 _CONTROL_STATE_RECONCILE_LOCK = threading.Lock()
 _CONTROL_RECONCILE_CURSOR_FILENAME = "reconcile-cursor.json"
 _CONTROL_RECONCILE_CURSOR_LOCK_FILENAME = "reconcile-cursor.lock"
+_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS = 1.0
+_STRICT_PROCESS_TREE_POLL_SECONDS = 0.05
+_MANAGED_PROCESS_IO_POLL_SECONDS = 0.1
+_LINUX_CGROUP_HANDSHAKE_TIMEOUT_SECONDS = 5.0
+_RETAINED_UNCONFIRMED_MANAGED_PROCESSES: dict[int, Any] = {}
+_RETAINED_UNCONFIRMED_MANAGED_PROCESSES_LOCK = threading.Lock()
+_RETAINED_ABORT_LINUX_CGROUPS: dict[str, Any] = {}
+_RETAINED_ABORT_WINDOWS_JOBS: dict[int, Any] = {}
+_PENDING_MANAGED_ASYNC_CLEANUPS: set[asyncio.Task[bool]] = set()
 _VM_STAT_PAGE_SIZE_RE = re.compile(r"page size of (?P<bytes>\d+) bytes", re.IGNORECASE)
 _VM_STAT_RECLAIMABLE_KEYS = frozenset(
     {
@@ -769,6 +780,510 @@ def _wait_for_identities_exit(identities: Sequence[ProcessIdentity], timeout: fl
     return not any(identity_matches(identity) for identity in pending)
 
 
+class _LinuxRunCgroup:
+    """A delegated cgroup-v2 boundary for one RUN_OWNED launch.
+
+    A POSIX process group is not a descendant boundary: a child can call
+    ``setsid()`` and leave it.  When the current Linux service scope delegates
+    cgroup creation to this user, retain a private cgroup as the stronger
+    ownership capability.  This is deliberately opportunistic because many
+    containers and macOS hosts do not provide a writable cgroup-v2 hierarchy;
+    those hosts continue to use the existing process-group boundary.
+
+    The cgroup namespace remains shared.  Consequently this prevents ordinary
+    daemonisation from escaping cleanup, but it is not a security boundary
+    against a same-uid process that can deliberately migrate itself to a
+    writable ancestor cgroup.  Provider sandboxes must continue to deny writes
+    outside their declared paths.
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        owner_guard: subprocess.Popen[bytes],
+        owner_write_fd: int,
+    ) -> None:
+        self.path = path
+        self.owner_guard = owner_guard
+        self._owner_write_fd = owner_write_fd
+        self._close_lock = threading.Lock()
+
+    @property
+    def procs_path(self) -> Path:
+        return self.path / "cgroup.procs"
+
+    def _kernel_populated(self, *, missing_is_empty: bool = False) -> bool:
+        try:
+            events = (self.path / "cgroup.events").read_text(encoding="ascii")
+        except OSError:
+            return not missing_is_empty
+        for line in events.splitlines():
+            key, _, value = line.partition(" ")
+            if key == "populated":
+                return value.strip() != "0"
+        return True
+
+    def populated(self) -> bool:
+        return self._kernel_populated()
+
+    def wait_empty(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self.populated():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(_STRICT_PROCESS_TREE_POLL_SECONDS, remaining))
+        return True
+
+    async def wait_empty_async(self, timeout: float) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout)
+        while self.populated():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(_STRICT_PROCESS_TREE_POLL_SECONDS, remaining))
+        return True
+
+    def kill(self) -> None:
+        # cgroup.kill recursively covers nested cgroups as well as descendants
+        # that created a new session or process group.
+        (self.path / "cgroup.kill").write_text("1\n", encoding="ascii")
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._kernel_populated(missing_is_empty=True):
+                raise OSError("cannot release a populated RUN_OWNED cgroup")
+            if self._owner_write_fd >= 0:
+                os.close(self._owner_write_fd)
+                self._owner_write_fd = -1
+            try:
+                returncode = self.owner_guard.wait(
+                    timeout=_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise OSError("RUN_OWNED cgroup owner guard did not exit") from exc
+            if returncode != 0:
+                raise OSError(
+                    f"RUN_OWNED cgroup owner guard failed with status {returncode}"
+                )
+            if self.path.exists():
+                raise OSError("RUN_OWNED cgroup owner guard did not retire its cgroup")
+
+
+def _current_linux_cgroup_parent() -> Path | None:
+    """Return the delegated cgroup-v2 directory containing this process."""
+    if sys.platform != "linux" or os.name != "posix":
+        return None
+    root = Path("/sys/fs/cgroup")
+    if not (root / "cgroup.controllers").is_file():
+        return None
+    try:
+        current = next(
+            line.removeprefix("0::").strip()
+            for line in Path("/proc/self/cgroup").read_text(encoding="ascii").splitlines()
+            if line.startswith("0::")
+        )
+    except (OSError, StopIteration):
+        return None
+    relative = Path(current.lstrip("/"))
+    if ".." in relative.parts:
+        return None
+    try:
+        parent = (root / relative).resolve(strict=True)
+        resolved_root = root.resolve(strict=True)
+    except OSError:
+        return None
+    if parent != resolved_root and resolved_root not in parent.parents:
+        return None
+    return parent
+
+
+def _remove_empty_linux_cgroup_tree(path: Path) -> bool:
+    """Remove an empty cgroup tree without ever unlinking virtual files."""
+    if not path.exists():
+        return True
+    try:
+        events = (path / "cgroup.events").read_text(encoding="ascii")
+        if any(line.split() == ["populated", "1"] for line in events.splitlines()):
+            return False
+        for root, directories, _files in os.walk(path, topdown=False):
+            for directory in directories:
+                os.rmdir(Path(root) / directory)
+        path.rmdir()
+    except OSError:
+        return False
+    return not path.exists()
+
+
+def _raise_unretired_linux_cgroup(
+    path: Path,
+    context: str,
+    *,
+    cause: BaseException | None = None,
+) -> None:
+    """Fail closed and retain the path when boundary creation cannot unwind."""
+    _RETAINED_ABORT_LINUX_CGROUPS[str(path)] = path
+    error = OSError(f"{context}; empty cgroup cleanup capability was retained")
+    setattr(error, "linux_cgroup_path", path)
+    if cause is None:
+        raise error
+    raise error from cause
+
+
+def _create_linux_run_cgroup() -> _LinuxRunCgroup | None:
+    """Create a private cgroup when this service scope is delegated to us."""
+    if os.environ.get("SPEC_DISABLE_RUN_CGROUP") == "1":
+        return None
+    parent = _current_linux_cgroup_parent()
+    if parent is None:
+        return None
+    path = parent / f"specbutler-run-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        path.mkdir(mode=0o700)
+        # cgroup.kill is the recursive teardown primitive introduced by
+        # cgroup v2. Without it, a nested subgroup could outlive this handle.
+        if not (path / "cgroup.kill").exists():
+            if not _remove_empty_linux_cgroup_tree(path):
+                _raise_unretired_linux_cgroup(
+                    path,
+                    "RUN_OWNED cgroup lacks recursive kill support",
+                )
+            return None
+    except OSError as exc:
+        if path.exists() and not _remove_empty_linux_cgroup_tree(path):
+            _raise_unretired_linux_cgroup(
+                path,
+                "RUN_OWNED cgroup setup failed",
+                cause=exc,
+            )
+        return None
+    owner_read_fd, owner_write_fd = os.pipe()
+    ready_read_fd, ready_write_fd = os.pipe()
+    guard: subprocess.Popen[bytes] | None = None
+    try:
+        guard = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                _CGROUP_OWNER_GUARD_SCRIPT,
+                str(path),
+                str(owner_read_fd),
+                str(ready_write_fd),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            pass_fds=(owner_read_fd, ready_write_fd),
+            start_new_session=True,
+            env={},
+        )
+    except OSError as exc:
+        os.close(owner_write_fd)
+        if not _remove_empty_linux_cgroup_tree(path):
+            _raise_unretired_linux_cgroup(
+                path,
+                "RUN_OWNED cgroup owner guard failed to start",
+                cause=exc,
+            )
+        return None
+    finally:
+        os.close(owner_read_fd)
+        os.close(ready_write_fd)
+    try:
+        ready, _, _ = select.select(
+            [ready_read_fd],
+            [],
+            [],
+            _LINUX_CGROUP_HANDSHAKE_TIMEOUT_SECONDS,
+        )
+        marker = os.read(ready_read_fd, 1) if ready else b""
+    finally:
+        os.close(ready_read_fd)
+    if marker != b"R" or guard.poll() is not None:
+        failed_cgroup = _LinuxRunCgroup(path, guard, owner_write_fd)
+        if _abort_linux_run_cgroup(failed_cgroup):
+            return None
+        error = OSError(
+            "RUN_OWNED cgroup owner guard handshake failed; cleanup "
+            "capability was retained"
+        )
+        setattr(error, "managed_cgroup", failed_cgroup)
+        raise error
+    return _LinuxRunCgroup(path, guard, owner_write_fd)
+
+
+def _command_is_wrapper_compatible(
+    argv: Sequence[str],
+    kwargs: dict[str, Any],
+) -> bool:
+    """Return whether the exact argv/env can cross the helper pipe safely."""
+    if not argv:
+        return False
+    child_env = kwargs.get("env")
+    if child_env is not None and not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in child_env.items()
+    ):
+        return False
+    if child_env is not None and any(
+        "\0" in key or "=" in key or "\0" in value
+        for key, value in child_env.items()
+    ):
+        # Let Popen itself raise its native argument-validation exception.
+        # Sending malformed values through JSON would defer ValueError until
+        # the helper and turn a launch failure into an ordinary exit status.
+        return False
+    try:
+        decoded = [os.fsdecode(os.fspath(value)) for value in argv]
+    except (TypeError, ValueError):
+        return False
+    return all("\0" not in value for value in decoded)
+
+
+def _target_ignored_signals(*, restore_signals: bool) -> list[int]:
+    """Capture signal dispositions that must remain ignored across exec.
+
+    A Python helper necessarily runs between ``Popen`` and the target.  Python
+    startup changes some signal dispositions (notably SIGPIPE), so the helper
+    cannot simply inherit its own state.  An exec preserves ignored signals and
+    resets caught handlers to default; reproduce that rule from the launcher's
+    state, then apply Popen's documented ``restore_signals`` adjustment.
+    """
+    ignored: set[int] = set()
+    for value in signal.valid_signals():
+        number = int(value)
+        if number in {int(signal.SIGKILL), int(signal.SIGSTOP)}:
+            continue
+        try:
+            if signal.getsignal(number) is signal.SIG_IGN:
+                ignored.add(number)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    if restore_signals:
+        for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+            value = getattr(signal, name, None)
+            if value is not None:
+                ignored.discard(int(value))
+    return sorted(ignored)
+
+
+_CGROUP_OWNER_GUARD_SCRIPT = r"""
+import os, sys, time
+
+path = sys.argv[1]
+owner_fd = int(sys.argv[2])
+ready_fd = int(sys.argv[3])
+os.write(ready_fd, b"R")
+os.close(ready_fd)
+while os.read(owner_fd, 4096):
+    pass
+os.close(owner_fd)
+
+while True:
+    try:
+        events = open(os.path.join(path, "cgroup.events"), encoding="ascii").read()
+    except OSError:
+        raise SystemExit(0)
+    populated = any(
+        line.split() == ["populated", "1"] for line in events.splitlines()
+    )
+    if populated:
+        try:
+            open(os.path.join(path, "cgroup.kill"), "w", encoding="ascii").write("1\n")
+        except OSError:
+            pass
+    else:
+        try:
+            for root, directories, _files in os.walk(path, topdown=False):
+                for directory in directories:
+                    os.rmdir(os.path.join(root, directory))
+            os.rmdir(path)
+            raise SystemExit(0)
+        except OSError:
+            pass
+    time.sleep(0.05)
+""".strip()
+
+
+_CGROUP_EXEC_HELPER_SCRIPT = r"""
+import fcntl, json, os, signal, sys
+
+(
+    _python_c,
+    _sentinel,
+    procs_path,
+    ready_value,
+    release_value,
+    environment_value,
+    error_value,
+    ignored_signals_value,
+    *target,
+) = sys.argv
+ready_fd = int(ready_value)
+release_fd = int(release_value)
+environment_fd = int(environment_value)
+error_fd = int(error_value)
+
+environment_bytes = bytearray()
+while True:
+    chunk = os.read(environment_fd, 65536)
+    if not chunk:
+        break
+    environment_bytes.extend(chunk)
+os.close(environment_fd)
+target_environment = json.loads(environment_bytes.decode("utf-8"))
+
+with open(procs_path, "w", encoding="ascii") as stream:
+    stream.write(str(os.getpid()))
+os.write(ready_fd, b"R")
+if not os.read(release_fd, 1):
+    raise SystemExit(125)
+os.close(ready_fd)
+os.close(release_fd)
+fcntl.fcntl(error_fd, fcntl.F_SETFD, fcntl.FD_CLOEXEC)
+
+ignored_signals = set(json.loads(ignored_signals_value))
+for value in signal.valid_signals():
+    number = int(value)
+    if number in {int(signal.SIGKILL), int(signal.SIGSTOP)}:
+        continue
+    try:
+        signal.signal(
+            number,
+            signal.SIG_IGN if number in ignored_signals else signal.SIG_DFL,
+        )
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+try:
+    os.execvpe(target[0], target, target_environment)
+except OSError as exc:
+    payload = json.dumps(
+        {
+            "errno": exc.errno,
+            "strerror": exc.strerror,
+            "filename": exc.filename,
+        },
+        ensure_ascii=True,
+    ).encode("ascii")
+    os.write(error_fd, payload)
+    os.close(error_fd)
+    raise SystemExit(127)
+""".strip()
+
+
+def _linux_cgroup_launch_argv(
+    cgroup: _LinuxRunCgroup,
+    argv: Sequence[str],
+    ready_fd: int,
+    release_fd: int,
+    environment_fd: int,
+    error_fd: int,
+    ignored_signals: Sequence[int],
+) -> list[str]:
+    """Build a direct-exec helper that joins the cgroup before user code."""
+    return [
+        sys.executable,
+        "-I",
+        "-c",
+        _CGROUP_EXEC_HELPER_SCRIPT,
+        "specbutler-cgroup-launch",
+        str(cgroup.procs_path),
+        str(ready_fd),
+        str(release_fd),
+        str(environment_fd),
+        str(error_fd),
+        json.dumps(list(ignored_signals), separators=(",", ":")),
+        *argv,
+    ]
+
+
+def _await_linux_cgroup_launch(
+    process: subprocess.Popen[Any] | asyncio.subprocess.Process,
+    cgroup: _LinuxRunCgroup,
+    ready_fd: int,
+    release_fd: int,
+    error_fd: int,
+) -> None:
+    """Authenticate containment and reproduce Popen's exec-error handshake."""
+    ready, _, _ = select.select(
+        [ready_fd],
+        [],
+        [],
+        _LINUX_CGROUP_HANDSHAKE_TIMEOUT_SECONDS,
+    )
+    marker = os.read(ready_fd, 1) if ready else b""
+    try:
+        members = {
+            int(value)
+            for value in cgroup.procs_path.read_text(encoding="ascii").split()
+        }
+    except (OSError, ValueError):
+        members = set()
+    if marker != b"R" or process.pid not in members:
+        raise RuntimeError("RUN_OWNED cgroup launcher did not establish containment")
+    os.write(release_fd, b"1")
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + _LINUX_CGROUP_HANDSHAKE_TIMEOUT_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("RUN_OWNED cgroup launcher exec did not complete")
+        readable, _, _ = select.select([error_fd], [], [], remaining)
+        if not readable:
+            continue
+        chunk = os.read(error_fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    if chunks:
+        try:
+            payload = json.loads(b"".join(chunks).decode("ascii"))
+            error_number = int(payload["errno"])
+            message = str(payload.get("strerror") or os.strerror(error_number))
+            filename = payload.get("filename")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("RUN_OWNED cgroup launcher reported invalid exec failure") from exc
+        raise OSError(error_number, message, filename)
+
+
+def _abort_linux_run_cgroup(cgroup: _LinuxRunCgroup | None) -> bool:
+    if cgroup is None:
+        return True
+    try:
+        if cgroup._kernel_populated():
+            cgroup.kill()
+            if not cgroup.wait_empty(_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS):
+                raise OSError("RUN_OWNED cgroup remained populated after abort")
+        cgroup.close()
+        _RETAINED_ABORT_LINUX_CGROUPS.pop(str(cgroup.path), None)
+        return True
+    except OSError:
+        _RETAINED_ABORT_LINUX_CGROUPS[str(cgroup.path)] = cgroup
+        return False
+
+
+def _close_optional_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _write_fd_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write to RUN_OWNED cgroup helper")
+        view = view[written:]
+
+
 class _BasicJobLimit(ctypes.Structure):
     _fields_ = [
         ("per_process", ctypes.c_longlong),
@@ -911,6 +1426,17 @@ class _WindowsJob:
 
 _LIVE_WINDOWS_JOBS: dict[tuple[int, str], _WindowsJob] = {}
 _CURRENT_WINDOWS_JOBS: dict[str, _WindowsJob] = {}
+
+
+def _close_windows_job_retaining_on_failure(job: _WindowsJob) -> bool:
+    """Close a Job without losing the handle when CloseHandle fails."""
+    try:
+        job.close()
+    except BaseException:
+        _RETAINED_ABORT_WINDOWS_JOBS[id(job)] = job
+        return False
+    _RETAINED_ABORT_WINDOWS_JOBS.pop(id(job), None)
+    return True
 
 
 class _HeldPosixSetupGroup:
@@ -1121,28 +1647,33 @@ def _terminate_held_windows_job(token: SupervisionToken, job: _WindowsJob, grace
     except OSError:
         pass
     try:
-        identities = job.active_identities()
-    except OSError:
-        identities = []
-    try:
         job.terminate()
     except OSError:
         return False
-    return _wait_for_identities_exit(identities) if identities else True
+    try:
+        return job.wait_empty(_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS)
+    except OSError:
+        return False
 
 
-def _abort_windows_job(job: _WindowsJob | None) -> None:
-    """Best-effort ownership cleanup that never masks the launching exception."""
+def _abort_windows_job(job: _WindowsJob | None) -> bool:
+    """Abort a partial launch without discarding an unconfirmed Job handle."""
     if job is None:
-        return
+        return True
     try:
         job.terminate()
+        if not job.wait_empty(_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS):
+            raise OSError("partial-launch Windows Job remained populated")
     except BaseException:
-        pass
+        _RETAINED_ABORT_WINDOWS_JOBS[id(job)] = job
+        return False
     try:
         job.close()
     except BaseException:
-        pass
+        _RETAINED_ABORT_WINDOWS_JOBS[id(job)] = job
+        return False
+    _RETAINED_ABORT_WINDOWS_JOBS.pop(id(job), None)
+    return True
 
 
 def _load_durable_publication(
@@ -1298,7 +1829,7 @@ def _windows_job_definitively_absent(job_name: str) -> bool:
     try:
         return False
     finally:
-        job.close()
+        _close_windows_job_retaining_on_failure(job)
 
 
 def supervision_boundary_is_inactive(token: SupervisionToken) -> bool:
@@ -1841,7 +2372,7 @@ def claim_current_process(supervision_id: str) -> SupervisionToken:
         try:
             job.assign(int(_kernel32().GetCurrentProcess()))
         except Exception:
-            job.close()
+            _close_windows_job_retaining_on_failure(job)
             raise
         _CURRENT_WINDOWS_JOBS[supervision_id] = job
     nonce = uuid.uuid4().hex
@@ -1922,18 +2453,74 @@ def claim_current_process(supervision_id: str) -> SupervisionToken:
     return token
 
 
+def _retain_unconfirmed_managed_process(process: Any) -> None:
+    """Keep an ownership capability reachable after bounded cleanup fails."""
+    with _RETAINED_UNCONFIRMED_MANAGED_PROCESSES_LOCK:
+        _RETAINED_UNCONFIRMED_MANAGED_PROCESSES[id(process)] = process
+
+
+def _release_retained_managed_process(process: Any) -> None:
+    with _RETAINED_UNCONFIRMED_MANAGED_PROCESSES_LOCK:
+        current = _RETAINED_UNCONFIRMED_MANAGED_PROCESSES.get(id(process))
+        if current is process:
+            _RETAINED_UNCONFIRMED_MANAGED_PROCESSES.pop(id(process), None)
+
+
+def _attach_unconfirmed_process_to_exception(
+    exc: BaseException,
+    process: Any,
+) -> None:
+    """Preserve the original failure while exposing retained ownership."""
+    _retain_unconfirmed_managed_process(process)
+    try:
+        setattr(exc, "managed_process", process)
+    except (AttributeError, TypeError):
+        pass
+
+
+def _unconfirmed_process_tree_error(process: Any, context: str) -> RuntimeError:
+    _retain_unconfirmed_managed_process(process)
+    error = ProcessGroupTerminationError(
+        f"{context} left a live owned process tree after bounded termination; "
+        "ownership was retained for an explicit cleanup retry"
+    )
+    setattr(error, "managed_process", process)
+    return error
+
+
 class ManagedProcess:
-    def __init__(self, process: subprocess.Popen[Any], token: SupervisionToken, job: _WindowsJob | None = None):
+    def __init__(
+        self,
+        process: subprocess.Popen[Any],
+        token: SupervisionToken,
+        job: _WindowsJob | None = None,
+        cgroup: _LinuxRunCgroup | None = None,
+    ):
         self.process = process
         self.token = token
         self._job = job
+        self._cgroup = cgroup
         self._close_lock = threading.Lock()
         self._pipe_closer_started = False
 
-    def terminate(self, grace_seconds: float = 5.0) -> None:
+    def terminate(self, grace_seconds: float = 5.0) -> bool:
+        """Stop the owned tree and report whether exit was confirmed."""
+        if self._cgroup is not None:
+            try:
+                os.killpg(self.token.pgid or self.process.pid, signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+            if self._cgroup.wait_empty(grace_seconds):
+                return True
+            try:
+                self._cgroup.kill()
+            except OSError:
+                return False
+            return self._cgroup.wait_empty(
+                _STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
+            )
         if os.name == "nt" and self._job is not None:
-            _terminate_held_windows_job(self.token, self._job, grace_seconds)
-            return
+            return _terminate_held_windows_job(self.token, self._job, grace_seconds)
         if os.name == "posix" and isinstance(self.process, _REAL_POPEN_TYPE):
             # The retained Popen plus start_new_session launch is the live
             # ownership capability.  Unlike persisted tokens, it does not
@@ -1941,16 +2528,17 @@ class ManagedProcess:
             # group.  That distinction matters on Darwin, where ps may report
             # a framework executable alias and getpgid rejects an exited
             # (unreaped) leader even while its descendants are still live.
-            _terminate_verified_posix_group(
+            return _terminate_verified_posix_group(
                 self.token.pgid or self.process.pid,
                 grace_seconds=grace_seconds,
             )
-            return
-        terminate(self.token, grace_seconds=grace_seconds)
+        return terminate(self.token, grace_seconds=grace_seconds)
 
     def kill(self) -> None:
         """Kill the complete owned tree, never just the Popen leader."""
-        if self._job is not None:
+        if self._cgroup is not None:
+            self._cgroup.kill()
+        elif self._job is not None:
             self._job.terminate()
         elif os.name == "posix" and isinstance(self.process, _REAL_POPEN_TYPE):
             _terminate_verified_posix_group(
@@ -1961,43 +2549,73 @@ class ManagedProcess:
             terminate(self.token, grace_seconds=0)
 
     def communicate(self, input: Any = None, timeout: float | None = None) -> tuple[Any, Any]:
-        """Mirror Popen.communicate while releasing ownership on completion.
+        """Communicate while enforcing complete owned-tree cleanup.
 
-        A timeout deliberately retains the handle so the caller can kill the
-        tree and call communicate again, matching subprocess.run semantics.
+        Short bounded ``communicate`` polls let us observe a completed leader
+        even when one of its descendants inherited a pipe and prevents EOF.
+        The descendant-preserving setup path deliberately bypasses this method.
         """
-        # On Windows a descendant can inherit stdout/stderr and outlive the
-        # Popen leader. Popen.communicate then waits for EOF forever even
-        # though the leader has exited. Close the run-owned Job as soon as the
-        # leader exits so inherited pipe handles cannot outlive ownership.
-        if os.name == "nt" and isinstance(self.process, _REAL_POPEN_TYPE) and isinstance(self._job, _WindowsJob):
-            self._start_pipe_closer_once()
-        try:
-            result = self.process.communicate(input=input, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise
-        except BaseException:
+        started = time.monotonic()
+        deadline = None if timeout is None else started + max(0.0, timeout)
+        drain_deadline: float | None = None
+        communicate_input = input
+        while True:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            wait_timeout = _MANAGED_PROCESS_IO_POLL_SECONDS
+            if remaining is not None:
+                wait_timeout = min(wait_timeout, remaining)
             try:
-                self.kill()
-            except BaseException:
-                pass
-            try:
-                self.close()
-            except BaseException:
-                pass
-            raise
-        self.close()
-        return result
+                result = self.process.communicate(
+                    input=communicate_input,
+                    timeout=wait_timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                communicate_input = None
+                try:
+                    leader_exited = self.process.poll() is not None
+                except (AttributeError, OSError, ProcessLookupError, RuntimeError):
+                    leader_exited = False
+                if leader_exited:
+                    if not terminate_managed_process_tree(self, grace_seconds=0):
+                        raise _unconfirmed_process_tree_error(
+                            self,
+                            "Process communication",
+                        ) from exc
+                    drain_deadline = drain_deadline or (
+                        time.monotonic() + _STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
+                    )
+                    if time.monotonic() >= drain_deadline:
+                        raise RuntimeError(
+                            "Owned process tree exited but redirected stdio did not close"
+                        ) from exc
+                    continue
+                if deadline is None or time.monotonic() < deadline:
+                    continue
+                # Mirror Popen: a bounded wait timing out does not revoke the
+                # caller's ownership capability or silently stop its command.
+                # The top-level run() convenience API owns final-timeout
+                # teardown; direct callers may poll and retry.
+                raise
+            except BaseException as exc:
+                try:
+                    confirmed = terminate_managed_process_tree(self, grace_seconds=0)
+                except BaseException:
+                    confirmed = False
+                if not confirmed:
+                    _attach_unconfirmed_process_to_exception(exc, self)
+                raise
+
+            if not terminate_managed_process_tree(self, grace_seconds=0):
+                raise _unconfirmed_process_tree_error(
+                    self,
+                    "Completed process communication",
+                )
+            return result
 
     def _start_pipe_closer_once(self) -> None:
-        """Start exactly one Windows inherited-pipe closer for this process.
-
-        ``Popen.communicate(timeout=...)`` is intentionally retryable.  Starting
-        a fresh waiter on every retry leaks one thread per poll while they all
-        wait for the same leader.  Serialize only the one-shot decision here;
-        the waiter must acquire ``_close_lock`` independently after the leader
-        exits.
-        """
+        """Start one strict cleanup worker for legacy Windows callers."""
         with self._close_lock:
             if self._pipe_closer_started:
                 return
@@ -2006,17 +2624,32 @@ class ManagedProcess:
 
     def _close_job_after_leader(self) -> None:
         self.process.wait()
-        self.close()
+        terminate_managed_process_tree(self, grace_seconds=0)
 
     def wait(self, timeout: float | None = None) -> int:
-        tree = self._owned_tree_identities()
-        returncode = int(self.process.wait(timeout=timeout))
-        self.close()
-        _wait_for_identities_exit(tree)
+        """Wait for the leader, then stop and confirm the complete owned tree."""
+        try:
+            returncode = int(self.process.wait(timeout=timeout))
+        except subprocess.TimeoutExpired:
+            # Popen-compatible polling: keep both the tree and the retained
+            # ownership boundary live so wait() can be retried.
+            raise
+        except BaseException as exc:
+            try:
+                confirmed = terminate_managed_process_tree(self, grace_seconds=0)
+            except BaseException:
+                confirmed = False
+            if not confirmed:
+                _attach_unconfirmed_process_to_exception(exc, self)
+            raise
+        if not terminate_managed_process_tree(self, grace_seconds=0):
+            raise _unconfirmed_process_tree_error(self, "Completed process wait")
         return returncode
 
     def owned_tree_active(self) -> bool:
         """Whether the retained ownership boundary still has live members."""
+        if self._cgroup is not None:
+            return self._cgroup.populated()
         if os.name == "nt" and self._job is not None:
             query = getattr(self._job, "active_process_ids", None)
             if callable(query):
@@ -2040,14 +2673,31 @@ class ManagedProcess:
         return _windows_tree_identities(self.token.identity.pid)
 
     def close(self) -> None:
-        with self._close_lock:
-            if self._job is None:
-                return
-            tree = self._owned_tree_identities()
-            self._job.close()
-            _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
-            self._job = None
-        _wait_for_identities_exit(tree)
+        try:
+            if self._cgroup is not None:
+                self._cgroup.close()
+                self._cgroup = None
+            with self._close_lock:
+                if self._job is None:
+                    _release_retained_managed_process(self)
+                    return
+                active_process_ids = getattr(self._job, "active_process_ids", None)
+                if callable(active_process_ids) and active_process_ids():
+                    self._job.terminate()
+                    if not self._job.wait_empty(
+                        _STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
+                    ):
+                        raise OSError("cannot close a populated RUN_OWNED Job")
+                self._job.close()
+                _LIVE_WINDOWS_JOBS.pop(
+                    (self.token.identity.pid, self.token.identity.started_at),
+                    None,
+                )
+                self._job = None
+            _release_retained_managed_process(self)
+        except BaseException:
+            _retain_unconfirmed_managed_process(self)
+            raise
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.process, name)
@@ -2076,14 +2726,16 @@ def run(
     try:
         stdout, stderr = managed.communicate(input=input, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        if not terminate_managed_process_tree(managed, grace_seconds=0):
+            raise _unconfirmed_process_tree_error(
+                managed,
+                "Timed-out managed command",
+            ) from exc
         try:
-            managed.kill()
-            stdout, stderr = managed.communicate(timeout=5.0)
-        except (OSError, subprocess.TimeoutExpired):
-            # A failed Job termination must not turn a bounded command into an
-            # unbounded pipe drain. Closing the retained handle is the final
-            # kill-on-close attempt; preserve the original timeout result.
-            managed.close()
+            stdout, stderr = managed.process.communicate(
+                timeout=_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
             stdout, stderr = exc.output, exc.stderr
         exc.stdout = stdout
         exc.stderr = stderr
@@ -2098,17 +2750,34 @@ def run(
 class ManagedAsyncProcess:
     """Asyncio process facade that retains its run-owned Job handle."""
 
-    def __init__(self, process: asyncio.subprocess.Process, token: SupervisionToken, job: _WindowsJob | None = None):
+    def __init__(
+        self,
+        process: asyncio.subprocess.Process,
+        token: SupervisionToken,
+        job: _WindowsJob | None = None,
+        cgroup: _LinuxRunCgroup | None = None,
+    ):
         self.process = process
         self.token = token
         self._job = job
+        self._cgroup = cgroup
         self._close_lock = threading.Lock()
         self._pipe_closer_started = False
+        self._wait_task: asyncio.Task[int] | None = None
+        self._communicate_task: asyncio.Task[
+            tuple[bytes | None, bytes | None]
+        ] | None = None
 
     def terminate(self) -> None:
         # Match asyncio.subprocess.Process.terminate: initiate graceful
         # cancellation and return immediately so the event loop can enforce
         # its own timeout and escalation policy.
+        if self._cgroup is not None:
+            try:
+                os.killpg(self.token.pgid or self.process.pid, signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+            return
         if self.token.identity.started_at == "test-double":
             terminator = getattr(self.process, "terminate", None)
             if callable(terminator):
@@ -2129,6 +2798,9 @@ class ManagedAsyncProcess:
         terminate(self.token, grace_seconds=0)
 
     def kill(self) -> None:
+        if self._cgroup is not None:
+            self._cgroup.kill()
+            return
         if self.token.identity.started_at == "test-double":
             killer = getattr(self.process, "kill", None)
             if callable(killer):
@@ -2144,35 +2816,146 @@ class ManagedAsyncProcess:
         else:
             terminate(self.token, grace_seconds=0)
 
-    async def wait(self) -> int:
-        tree = self._owned_tree_identities()
-        returncode = int(await self.process.wait())
-        self.close()
-        if tree:
-            await asyncio.to_thread(_wait_for_identities_exit, tree)
+    async def wait(self, timeout: float | None = None) -> int:
+        """Wait for the leader, then stop and confirm the complete owned tree."""
+        if self._wait_task is None:
+            self._wait_task = asyncio.create_task(self.process.wait())
+        wait_task = self._wait_task
+        try:
+            if timeout is None:
+                returncode = int(await wait_task)
+            else:
+                done, _ = await asyncio.wait(
+                    {wait_task},
+                    timeout=max(0.0, timeout),
+                )
+                if wait_task not in done:
+                    raise asyncio.TimeoutError()
+                returncode = int(wait_task.result())
+        except BaseException as exc:
+            if isinstance(exc, ProcessGroupTerminationError):
+                raise
+            if isinstance(exc, asyncio.TimeoutError):
+                raise
+            try:
+                confirmed = await _terminate_managed_async_after_failure(
+                    self,
+                    exc,
+                )
+            except BaseException:
+                confirmed = False
+            if not confirmed:
+                _attach_unconfirmed_process_to_exception(exc, self)
+            raise
+        if not await _shielded_terminate_managed_process_tree_async(
+            self,
+            grace_seconds=0,
+        ):
+            raise _unconfirmed_process_tree_error(
+                self,
+                "Completed asynchronous process wait",
+            )
         return returncode
 
-    async def communicate(self, input: bytes | None = None) -> tuple[bytes | None, bytes | None]:
-        if os.name == "nt" and isinstance(self.process, asyncio.subprocess.Process) and isinstance(self._job, _WindowsJob):
-            self._start_pipe_closer_once()
-        try:
-            result = await self.process.communicate(input)
-        except BaseException:
+    def owned_tree_active(self) -> bool:
+        """Whether the retained async ownership boundary has live members."""
+        if self._cgroup is not None:
+            return self._cgroup.populated()
+        if os.name == "nt" and self._job is not None:
+            query = getattr(self._job, "active_process_ids", None)
+            if callable(query):
+                return bool(query())
+        if (
+            os.name == "posix"
+            and isinstance(self.process, asyncio.subprocess.Process)
+            and self.token.pgid > 0
+        ):
+            return is_process_group_alive(self.token.pgid)
+        return self.process.returncode is None
+
+    async def communicate(
+        self,
+        input: bytes | None = None,
+        timeout: float | None = None,
+    ) -> tuple[bytes | None, bytes | None]:
+        """Communicate without letting inherited descendant pipes wedge EOF."""
+        if self._communicate_task is None:
+            self._communicate_task = asyncio.create_task(
+                self.process.communicate(input)
+            )
+        elif input is not None:
+            raise ValueError("Cannot send input after starting communication")
+        communicate_task = self._communicate_task
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + max(0.0, timeout)
+        drain_deadline: float | None = None
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - loop.time())
+            wait_timeout = _MANAGED_PROCESS_IO_POLL_SECONDS
+            if remaining is not None:
+                wait_timeout = min(wait_timeout, remaining)
             try:
-                self.kill()
-            except BaseException:
-                pass
-            try:
-                await asyncio.wait_for(self.process.wait(), timeout=5.0)
-            except BaseException:
-                pass
-            try:
-                self.close()
-            except BaseException:
-                pass
-            raise
-        self.close()
-        return result
+                done, _ = await asyncio.wait(
+                    {communicate_task},
+                    timeout=wait_timeout,
+                )
+            except BaseException as exc:
+                try:
+                    confirmed = await _terminate_managed_async_after_failure(
+                        self,
+                        exc,
+                    )
+                except BaseException:
+                    confirmed = False
+                if not confirmed:
+                    _attach_unconfirmed_process_to_exception(exc, self)
+                raise
+
+            if communicate_task in done:
+                try:
+                    result = communicate_task.result()
+                except BaseException as exc:
+                    try:
+                        confirmed = await _terminate_managed_async_after_failure(
+                            self,
+                            exc,
+                        )
+                    except BaseException:
+                        confirmed = False
+                    if not confirmed:
+                        _attach_unconfirmed_process_to_exception(exc, self)
+                    raise
+                if not await _shielded_terminate_managed_process_tree_async(
+                    self,
+                    grace_seconds=0,
+                ):
+                    raise _unconfirmed_process_tree_error(
+                        self,
+                        "Completed asynchronous process communication",
+                    )
+                return result
+
+            if self.process.returncode is not None:
+                if not await _shielded_terminate_managed_process_tree_async(
+                    self,
+                    grace_seconds=0,
+                ):
+                    raise _unconfirmed_process_tree_error(
+                        self,
+                        "Asynchronous process communication",
+                    )
+                drain_deadline = drain_deadline or (
+                    loop.time() + _STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
+                )
+                if loop.time() >= drain_deadline:
+                    _retain_unconfirmed_managed_process(self)
+                    raise RuntimeError(
+                        "Owned process tree exited but redirected stdio did not close"
+                    )
+                continue
+
+            if deadline is not None and loop.time() >= deadline:
+                raise asyncio.TimeoutError()
 
     def _start_pipe_closer_once(self) -> None:
         with self._close_lock:
@@ -2183,10 +2966,7 @@ class ManagedAsyncProcess:
 
     async def _close_job_after_leader(self) -> None:
         await self.process.wait()
-        try:
-            self.close()
-        except OSError:
-            pass
+        await terminate_managed_process_tree_async(self, grace_seconds=0)
 
     def _owned_tree_identities(self) -> list[ProcessIdentity]:
         if os.name == "nt" and self._job is not None:
@@ -2199,15 +2979,281 @@ class ManagedAsyncProcess:
         return _windows_tree_identities(self.token.identity.pid)
 
     def close(self) -> None:
-        with self._close_lock:
-            if self._job is None:
-                return
-            _LIVE_WINDOWS_JOBS.pop((self.token.identity.pid, self.token.identity.started_at), None)
-            self._job.close()
-            self._job = None
+        try:
+            if self._cgroup is not None:
+                self._cgroup.close()
+                self._cgroup = None
+            with self._close_lock:
+                if self._job is None:
+                    _release_retained_managed_process(self)
+                    return
+                active_process_ids = getattr(self._job, "active_process_ids", None)
+                if callable(active_process_ids) and active_process_ids():
+                    self._job.terminate()
+                    if not self._job.wait_empty(
+                        _STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
+                    ):
+                        raise OSError("cannot close a populated RUN_OWNED Job")
+                self._job.close()
+                _LIVE_WINDOWS_JOBS.pop(
+                    (self.token.identity.pid, self.token.identity.started_at),
+                    None,
+                )
+                self._job = None
+            _release_retained_managed_process(self)
+        except BaseException:
+            _retain_unconfirmed_managed_process(self)
+            raise
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.process, name)
+
+
+def _managed_process_tree_exit_confirmed(process: ManagedProcess) -> bool:
+    """Confirm both leader reaping and complete retained-boundary exit."""
+    try:
+        leader_exited = process.process.poll() is not None
+    except (AttributeError, OSError, ProcessLookupError, RuntimeError):
+        return False
+    if not leader_exited:
+        return False
+    try:
+        return not process.owned_tree_active()
+    except (AttributeError, OSError, ProcessLookupError, RuntimeError):
+        return False
+
+
+def _wait_for_managed_process_tree_exit(
+    process: ManagedProcess,
+    *,
+    timeout: float,
+) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while not _managed_process_tree_exit_confirmed(process):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_STRICT_PROCESS_TREE_POLL_SECONDS, remaining))
+    return True
+
+
+def terminate_managed_process_tree(
+    process: ManagedProcess,
+    *,
+    grace_seconds: float = 5.0,
+) -> bool:
+    """Strictly stop a retained synchronous process tree.
+
+    A completed leader is not sufficient: the retained Job/process-group
+    boundary must also report no live members. Ownership is closed only after
+    both facts are confirmed. An unconfirmed tree remains attached to the
+    caller's ``ManagedProcess`` so cleanup can be retried safely.
+    """
+    if _managed_process_tree_exit_confirmed(process):
+        try:
+            process.close()
+        except BaseException:
+            _retain_unconfirmed_managed_process(process)
+            return False
+        return True
+
+    try:
+        process.terminate(grace_seconds=max(0.0, grace_seconds))
+    except (OSError, ProcessLookupError, RuntimeError):
+        pass
+    if _managed_process_tree_exit_confirmed(process):
+        try:
+            process.close()
+        except BaseException:
+            _retain_unconfirmed_managed_process(process)
+            return False
+        return True
+
+    try:
+        process.kill()
+    except (OSError, ProcessLookupError, RuntimeError):
+        pass
+    if not _wait_for_managed_process_tree_exit(
+        process,
+        timeout=_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS,
+    ):
+        _retain_unconfirmed_managed_process(process)
+        return False
+    try:
+        process.close()
+    except BaseException:
+        _retain_unconfirmed_managed_process(process)
+        return False
+    return True
+
+
+def _managed_async_process_tree_exit_confirmed(
+    process: ManagedAsyncProcess,
+) -> bool:
+    """Confirm async leader reaping and complete retained-boundary exit."""
+    try:
+        leader_exited = process.process.returncode is not None
+    except (AttributeError, OSError, ProcessLookupError, RuntimeError):
+        return False
+    if not leader_exited:
+        return False
+    try:
+        return not process.owned_tree_active()
+    except (AttributeError, OSError, ProcessLookupError, RuntimeError):
+        return False
+
+
+async def _wait_for_managed_async_process_tree_exit(
+    process: ManagedAsyncProcess,
+    *,
+    timeout: float,
+) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout)
+    while not _managed_async_process_tree_exit_confirmed(process):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(_STRICT_PROCESS_TREE_POLL_SECONDS, remaining))
+    return True
+
+
+async def terminate_managed_process_tree_async(
+    process: ManagedAsyncProcess,
+    *,
+    grace_seconds: float = 5.0,
+) -> bool:
+    """Strictly stop a retained asynchronous process tree.
+
+    The retained ownership boundary is deliberately left open when full-tree
+    exit cannot be confirmed, allowing the caller to keep the handle and retry
+    cleanup instead of silently releasing live descendants.
+    """
+    if _managed_async_process_tree_exit_confirmed(process):
+        try:
+            process.close()
+        except BaseException:
+            _retain_unconfirmed_managed_process(process)
+            return False
+        return True
+
+    try:
+        process.terminate()
+    except (OSError, ProcessLookupError, RuntimeError):
+        pass
+    if await _wait_for_managed_async_process_tree_exit(
+        process,
+        timeout=max(0.0, grace_seconds),
+    ):
+        try:
+            process.close()
+        except BaseException:
+            _retain_unconfirmed_managed_process(process)
+            return False
+        return True
+
+    try:
+        process.kill()
+    except (OSError, ProcessLookupError, RuntimeError):
+        pass
+    if not await _wait_for_managed_async_process_tree_exit(
+        process,
+        timeout=_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS,
+    ):
+        _retain_unconfirmed_managed_process(process)
+        return False
+    try:
+        process.close()
+    except BaseException:
+        _retain_unconfirmed_managed_process(process)
+        return False
+    return True
+
+
+def _retain_pending_managed_async_cleanup(task: asyncio.Task[bool]) -> None:
+    """Keep a shielded cleanup alive if its caller is cancelled."""
+    _PENDING_MANAGED_ASYNC_CLEANUPS.add(task)
+
+    def finished(done: asyncio.Task[bool]) -> None:
+        _PENDING_MANAGED_ASYNC_CLEANUPS.discard(done)
+        if not done.cancelled():
+            done.exception()
+
+    task.add_done_callback(finished)
+
+
+async def _await_task_cancellation_resistant(task: asyncio.Task[Any]) -> Any:
+    """Finish an ownership operation while preserving cancellation counts."""
+    current = asyncio.current_task()
+    removed_cancellations = 0
+    try:
+        while True:
+            if current is not None:
+                while current.cancelling():
+                    current.uncancel()
+                    removed_cancellations += 1
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                # A repeated caller cancellation must not interrupt ownership
+                # teardown. Remove it on the next pass, then restore every
+                # request after the bounded cleanup task completes.
+                continue
+    finally:
+        if current is not None:
+            for _ in range(removed_cancellations):
+                current.cancel()
+
+
+async def _shielded_terminate_managed_process_tree_async(
+    process: ManagedAsyncProcess,
+    *,
+    grace_seconds: float,
+) -> bool:
+    """Run strict cleanup to completion even if the calling task is cancelled."""
+    cleanup = asyncio.create_task(
+        terminate_managed_process_tree_async(
+            process,
+            grace_seconds=grace_seconds,
+        )
+    )
+    _retain_pending_managed_async_cleanup(cleanup)
+    return bool(await _await_task_cancellation_resistant(cleanup))
+
+
+async def _terminate_managed_async_after_failure(
+    process: ManagedAsyncProcess,
+    failure: BaseException,
+) -> bool:
+    """Finish tree cleanup and active I/O tasks before propagating failure."""
+    del failure
+    async def cleanup_and_join() -> bool:
+        confirmed = await terminate_managed_process_tree_async(
+            process,
+            grace_seconds=0,
+        )
+        if not confirmed:
+            return False
+        pending = [
+            task
+            for task in (process._communicate_task, process._wait_task)
+            if task is not None and not task.done()
+        ]
+        if not pending:
+            return True
+        done, _ = await asyncio.wait(
+            pending,
+            timeout=_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS,
+        )
+        return len(done) == len(pending)
+
+    cleanup = asyncio.create_task(cleanup_and_join())
+    _retain_pending_managed_async_cleanup(cleanup)
+    return bool(
+        await _await_task_cancellation_resistant(cleanup)
+    )
 
 
 class ProcessSupervisor:
@@ -2234,6 +3280,15 @@ class ProcessSupervisor:
 
     def spawn(self, argv: Sequence[str], **kwargs: Any) -> ManagedProcess:
         job = None
+        cgroup: _LinuxRunCgroup | None = None
+        cgroup_ready_read: int | None = None
+        cgroup_ready_write: int | None = None
+        cgroup_release_read: int | None = None
+        cgroup_release_write: int | None = None
+        cgroup_environment_read: int | None = None
+        cgroup_environment_write: int | None = None
+        cgroup_error_read: int | None = None
+        cgroup_error_write: int | None = None
         metadata_path: Path | None = None
         publisher_identity: ProcessIdentity | None = None
         supervision_id = self._supervision_id or uuid.uuid4().hex
@@ -2276,12 +3331,97 @@ class ProcessSupervisor:
             kwargs["creationflags"] = flags
         else:
             kwargs["start_new_session"] = True
+            cgroup_eligible = (
+                self.mode is LifetimeMode.RUN_OWNED
+                and sys.platform == "linux"
+                and subprocess.Popen is _REAL_POPEN_TYPE
+                and not kwargs.get("shell")
+                and kwargs.get("executable") is None
+                and kwargs.get("preexec_fn") is None
+                and not kwargs.get("pass_fds")
+                and kwargs.get("close_fds", True) is not False
+                and kwargs.get("user") is None
+                and kwargs.get("group") is None
+                and kwargs.get("extra_groups") is None
+                and _command_is_wrapper_compatible(argv, kwargs)
+            )
+            if cgroup_eligible:
+                cgroup = _create_linux_run_cgroup()
+            if cgroup is not None:
+                target_environment = dict(
+                    os.environ if kwargs.get("env") is None else kwargs["env"]
+                )
+                cgroup_ready_read, cgroup_ready_write = os.pipe()
+                cgroup_release_read, cgroup_release_write = os.pipe()
+                cgroup_environment_read, cgroup_environment_write = os.pipe()
+                cgroup_error_read, cgroup_error_write = os.pipe()
+                existing_pass_fds = tuple(kwargs.get("pass_fds", ()))
+                kwargs["pass_fds"] = (
+                    *existing_pass_fds,
+                    cgroup_ready_write,
+                    cgroup_release_read,
+                    cgroup_environment_read,
+                    cgroup_error_write,
+                )
+                kwargs["env"] = {}
+                argv = _linux_cgroup_launch_argv(
+                    cgroup,
+                    [os.fsdecode(os.fspath(value)) for value in argv],
+                    cgroup_ready_write,
+                    cgroup_release_read,
+                    cgroup_environment_read,
+                    cgroup_error_write,
+                    _target_ignored_signals(
+                        restore_signals=bool(kwargs.get("restore_signals", True))
+                    ),
+                )
         try:
             process = subprocess.Popen(list(argv), **kwargs)
-        except BaseException:
-            _abort_windows_job(job)
+        except BaseException as exc:
+            windows_confirmed = _abort_windows_job(job)
+            linux_confirmed = _abort_linux_run_cgroup(cgroup)
+            for fd in (
+                cgroup_ready_read,
+                cgroup_release_write,
+                cgroup_environment_write,
+                cgroup_error_read,
+            ):
+                _close_optional_fd(fd)
+            if not windows_confirmed or not linux_confirmed:
+                try:
+                    setattr(exc, "unconfirmed_process_ownership", True)
+                except (AttributeError, TypeError):
+                    pass
             raise
+        finally:
+            for fd in (
+                cgroup_ready_write,
+                cgroup_release_read,
+                cgroup_environment_read,
+                cgroup_error_write,
+            ):
+                _close_optional_fd(fd)
         try:
+            if (
+                cgroup is not None
+                and cgroup_ready_read is not None
+                and cgroup_release_write is not None
+                and cgroup_environment_write is not None
+                and cgroup_error_read is not None
+            ):
+                _write_fd_all(
+                    cgroup_environment_write,
+                    json.dumps(target_environment, ensure_ascii=True).encode("ascii"),
+                )
+                os.close(cgroup_environment_write)
+                cgroup_environment_write = None
+                _await_linux_cgroup_launch(
+                    process,
+                    cgroup,
+                    cgroup_ready_read,
+                    cgroup_release_write,
+                    cgroup_error_read,
+                )
             # Minimal Popen doubles used by callers do not represent a live OS
             # process. Keep that compatibility seam out of production paths.
             is_test_double = not isinstance(process, _REAL_POPEN_TYPE)
@@ -2379,24 +3519,58 @@ class ProcessSupervisor:
                     # leave an undiscoverable detached process tree behind.
                     terminate(token, grace_seconds=0)
                     raise
-            managed = ManagedProcess(process, token, job)
+            managed = ManagedProcess(process, token, job, cgroup)
             if job is not None:
                 _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
             self._children.append(managed)
             return managed
-        except BaseException:
-            _abort_windows_job(job)
+        except BaseException as exc:
+            windows_confirmed = _abort_windows_job(job)
+            linux_confirmed = _abort_linux_run_cgroup(cgroup)
             try:
                 killer = getattr(process, "kill", None)
                 if callable(killer):
                     killer()
             except BaseException:
                 pass
+            leader_reaped = False
+            try:
+                waiter = getattr(process, "wait", None)
+                if callable(waiter):
+                    waiter(timeout=_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS)
+                leader_reaped = getattr(process, "poll", lambda: None)() is not None
+            except BaseException:
+                pass
+            if not leader_reaped:
+                _retain_unconfirmed_managed_process(process)
+            if not windows_confirmed or not linux_confirmed or not leader_reaped:
+                try:
+                    setattr(exc, "unconfirmed_process_ownership", True)
+                    setattr(exc, "process", process)
+                except (AttributeError, TypeError):
+                    pass
             raise
+        finally:
+            for fd in (
+                cgroup_ready_read,
+                cgroup_release_write,
+                cgroup_environment_write,
+                cgroup_error_read,
+            ):
+                _close_optional_fd(fd)
 
     async def spawn_async(self, argv: Sequence[str], **kwargs: Any) -> ManagedAsyncProcess:
         """Async counterpart with the same platform-owned launch policy."""
         job = None
+        cgroup: _LinuxRunCgroup | None = None
+        cgroup_ready_read: int | None = None
+        cgroup_ready_write: int | None = None
+        cgroup_release_read: int | None = None
+        cgroup_release_write: int | None = None
+        cgroup_environment_read: int | None = None
+        cgroup_environment_write: int | None = None
+        cgroup_error_read: int | None = None
+        cgroup_error_write: int | None = None
         metadata_path: Path | None = None
         publisher_identity: ProcessIdentity | None = None
         supervision_id = self._supervision_id or uuid.uuid4().hex
@@ -2432,12 +3606,99 @@ class ProcessSupervisor:
             kwargs["creationflags"] = flags
         else:
             kwargs["start_new_session"] = True
+            cgroup_eligible = (
+                self.mode is LifetimeMode.RUN_OWNED
+                and sys.platform == "linux"
+                and asyncio.create_subprocess_exec
+                is _REAL_ASYNC_CREATE_SUBPROCESS_EXEC
+                and kwargs.get("executable") is None
+                and kwargs.get("preexec_fn") is None
+                and not kwargs.get("pass_fds")
+                and kwargs.get("close_fds", True) is not False
+                and kwargs.get("user") is None
+                and kwargs.get("group") is None
+                and kwargs.get("extra_groups") is None
+                and _command_is_wrapper_compatible(argv, kwargs)
+            )
+            if cgroup_eligible:
+                cgroup = _create_linux_run_cgroup()
+            if cgroup is not None:
+                target_environment = dict(
+                    os.environ if kwargs.get("env") is None else kwargs["env"]
+                )
+                cgroup_ready_read, cgroup_ready_write = os.pipe()
+                cgroup_release_read, cgroup_release_write = os.pipe()
+                cgroup_environment_read, cgroup_environment_write = os.pipe()
+                cgroup_error_read, cgroup_error_write = os.pipe()
+                existing_pass_fds = tuple(kwargs.get("pass_fds", ()))
+                kwargs["pass_fds"] = (
+                    *existing_pass_fds,
+                    cgroup_ready_write,
+                    cgroup_release_read,
+                    cgroup_environment_read,
+                    cgroup_error_write,
+                )
+                kwargs["env"] = {}
+                argv = _linux_cgroup_launch_argv(
+                    cgroup,
+                    [os.fsdecode(os.fspath(value)) for value in argv],
+                    cgroup_ready_write,
+                    cgroup_release_read,
+                    cgroup_environment_read,
+                    cgroup_error_write,
+                    _target_ignored_signals(
+                        restore_signals=bool(kwargs.get("restore_signals", True))
+                    ),
+                )
         try:
             process = await asyncio.create_subprocess_exec(*argv, **kwargs)
-        except BaseException:
-            _abort_windows_job(job)
+        except BaseException as exc:
+            windows_confirmed = _abort_windows_job(job)
+            linux_confirmed = _abort_linux_run_cgroup(cgroup)
+            for fd in (
+                cgroup_ready_read,
+                cgroup_release_write,
+                cgroup_environment_write,
+                cgroup_error_read,
+            ):
+                _close_optional_fd(fd)
+            if not windows_confirmed or not linux_confirmed:
+                try:
+                    setattr(exc, "unconfirmed_process_ownership", True)
+                except (AttributeError, TypeError):
+                    pass
             raise
+        finally:
+            for fd in (
+                cgroup_ready_write,
+                cgroup_release_read,
+                cgroup_environment_read,
+                cgroup_error_write,
+            ):
+                _close_optional_fd(fd)
         try:
+            if (
+                cgroup is not None
+                and cgroup_ready_read is not None
+                and cgroup_release_write is not None
+                and cgroup_environment_write is not None
+                and cgroup_error_read is not None
+            ):
+                await asyncio.to_thread(
+                    _write_fd_all,
+                    cgroup_environment_write,
+                    json.dumps(target_environment, ensure_ascii=True).encode("ascii"),
+                )
+                os.close(cgroup_environment_write)
+                cgroup_environment_write = None
+                await asyncio.to_thread(
+                    _await_linux_cgroup_launch,
+                    process,
+                    cgroup,
+                    cgroup_ready_read,
+                    cgroup_release_write,
+                    cgroup_error_read,
+                )
             is_test_double = not isinstance(process, asyncio.subprocess.Process)
             if is_test_double:
                 if job is not None:
@@ -2520,34 +3781,134 @@ class ProcessSupervisor:
                 except BaseException:
                     terminate(token, grace_seconds=0)
                     raise
-            managed = ManagedAsyncProcess(process, token, job)
+            managed = ManagedAsyncProcess(process, token, job, cgroup)
             if job is not None:
                 _LIVE_WINDOWS_JOBS[(identity.pid, identity.started_at)] = job
             self._children.append(managed)
             return managed
-        except BaseException:
-            _abort_windows_job(job)
+        except BaseException as exc:
+            windows_confirmed = _abort_windows_job(job)
+            linux_confirmed = _abort_linux_run_cgroup(cgroup)
             try:
                 killer = getattr(process, "kill", None)
                 if callable(killer):
                     killer()
-                waiter = getattr(process, "wait", None)
-                if callable(waiter):
-                    await asyncio.wait_for(waiter(), timeout=5.0)
             except BaseException:
                 pass
+            leader_reaped = False
+            try:
+                waiter = getattr(process, "wait", None)
+                if callable(waiter):
+                    reap_task = asyncio.create_task(
+                        asyncio.wait_for(
+                            waiter(),
+                            timeout=_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS,
+                        )
+                    )
+                    await _await_task_cancellation_resistant(reap_task)
+                leader_reaped = process.returncode is not None
+            except BaseException:
+                pass
+            if not leader_reaped:
+                _retain_unconfirmed_managed_process(process)
+            if not windows_confirmed or not linux_confirmed or not leader_reaped:
+                try:
+                    setattr(exc, "unconfirmed_process_ownership", True)
+                    setattr(exc, "process", process)
+                except (AttributeError, TypeError):
+                    pass
             raise
+        finally:
+            for fd in (
+                cgroup_ready_read,
+                cgroup_release_write,
+                cgroup_environment_write,
+                cgroup_error_read,
+            ):
+                _close_optional_fd(fd)
 
     def close(self) -> None:
         if self.mode is LifetimeMode.RUN_OWNED:
             for child in self._children:
-                child.close()
+                if isinstance(child, ManagedProcess):
+                    if not terminate_managed_process_tree(child, grace_seconds=0):
+                        raise _unconfirmed_process_tree_error(
+                            child,
+                            "Process supervisor close",
+                        )
+                else:
+                    # A synchronous context cannot await async transport
+                    # reaping. Initiate a complete boundary kill while the
+                    # caller retains the ManagedAsyncProcess for await wait().
+                    child.kill()
 
     def __enter__(self) -> ProcessSupervisor:
         return self
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+async def run_async(
+    argv: Sequence[str],
+    *,
+    input: bytes | None = None,
+    capture_output: bool = False,
+    timeout: float | None = None,
+    check: bool = False,
+    **kwargs: Any,
+) -> subprocess.CompletedProcess[Any]:
+    """Async tree-safe equivalent of :func:`run`."""
+    if input is not None:
+        if kwargs.get("stdin") is not None:
+            raise ValueError("stdin and input arguments may not both be used")
+        kwargs["stdin"] = asyncio.subprocess.PIPE
+    if capture_output:
+        if kwargs.get("stdout") is not None or kwargs.get("stderr") is not None:
+            raise ValueError(
+                "stdout and stderr arguments may not both be used with capture_output"
+            )
+        kwargs["stdout"] = asyncio.subprocess.PIPE
+        kwargs["stderr"] = asyncio.subprocess.PIPE
+    managed = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+        argv,
+        **kwargs,
+    )
+    try:
+        stdout, stderr = await managed.communicate(input=input, timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        if not await _shielded_terminate_managed_process_tree_async(
+            managed,
+            grace_seconds=0,
+        ):
+            raise _unconfirmed_process_tree_error(
+                managed,
+                "Timed-out asynchronous managed command",
+            ) from exc
+        try:
+            stdout, stderr = await managed.communicate(
+                timeout=_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            raise _unconfirmed_process_tree_error(
+                managed,
+                "Timed-out asynchronous managed command output drain",
+            ) from exc
+        raise subprocess.TimeoutExpired(
+            argv,
+            timeout,
+            output=stdout,
+            stderr=stderr,
+        ) from exc
+    completed = subprocess.CompletedProcess(
+        argv,
+        managed.returncode,
+        stdout,
+        stderr,
+    )
+    if check:
+        completed.check_returncode()
+    return completed
 
 
 def _wait_for_process_group_exit(pgid: int, timeout: float) -> bool:
@@ -2671,16 +4032,14 @@ def terminate(token: SupervisionToken, *, grace_seconds: float = 5.0, job: _Wind
             # successful exit into a false failure and strands the durable
             # record. Every remaining member is still confined to this
             # already-authenticated kernel Job.
-            identities = reopened_job.active_identities()
             reopened_job.terminate()
-            return _wait_for_identities_exit(identities) if identities else True
+            return reopened_job.wait_empty(
+                _STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
+            )
         except (OSError, ValueError):
             return False
         finally:
-            try:
-                reopened_job.close()
-            except OSError:
-                pass
+            _close_windows_job_retaining_on_failure(reopened_job)
 
     pgid = token.pgid or token.identity.pid
     if not identity_matches(token.identity):
@@ -3042,10 +4401,7 @@ def supervision_token_contains_process(
     except (OSError, ValueError):
         return False
     finally:
-        try:
-            job.close()
-        except OSError:
-            pass
+        _close_windows_job_retaining_on_failure(job)
 
 
 def promote_payload_identity(token: SupervisionToken, candidate: ProcessIdentity) -> SupervisionToken:
@@ -3154,7 +4510,7 @@ def promote_payload_identity(token: SupervisionToken, candidate: ProcessIdentity
                 raise
             return promoted
     finally:
-        job.close()
+        _close_windows_job_retaining_on_failure(job)
 
 
 def adopt(token: SupervisionToken) -> SupervisionToken:

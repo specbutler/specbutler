@@ -39,7 +39,7 @@ Advanced / debug::
 from __future__ import annotations
 
 import argparse
-import ipaddress
+import re
 import sys
 from pathlib import Path
 
@@ -536,12 +536,38 @@ def _cleanup_run_owned_workspaces(
     failures = 0
     cleaned_roots: set[str] = set()
     for run in runs:
-        expected_source = (workspace_root / run.run_id / "source").resolve(strict=False)
+        run_id = str(getattr(run, "run_id", "") or "").strip()
+        run_spec_id = str(getattr(run, "spec_id", "") or "").strip()
+        # Run records live in agent-adjacent state and must be treated as
+        # untrusted input at this destructive boundary.  A run id is a single
+        # directory component generated as ``<spec-id>-<token>``; accepting
+        # separators or a mismatched prefix would let a forged record redirect
+        # cleanup to an arbitrary ``.../source`` directory.
+        if (
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", run_id)
+            or not run_spec_id
+            or not run_id.startswith(f"{run_spec_id}-")
+        ):
+            print(
+                f"Error: Refusing execution workspace cleanup for invalid run identity {run_id!r}.",
+                file=sys.stderr,
+            )
+            failures += 1
+            continue
+
+        run_root = (workspace_root / run_id).resolve(strict=False)
+        if run_root.parent != workspace_root:
+            print(
+                f"Error: Refusing execution workspace cleanup outside {workspace_root}: {run_root}",
+                file=sys.stderr,
+            )
+            failures += 1
+            continue
+        expected_source = run_root / "source"
         recorded = str(getattr(run, "worktree_path", "") or "").strip()
         recorded_source = Path(recorded).expanduser().resolve(strict=False) if recorded else expected_source
         if recorded_source != expected_source:
             continue
-        run_root = expected_source.parent
         if not run_root.is_dir() or str(run_root) in cleaned_roots:
             continue
 
@@ -574,6 +600,12 @@ def _cleanup_run_owned_workspaces(
                     outbox_path=run_root / "outbox",
                     branch=str(getattr(run, "branch", "") or ""),
                     backend=backend_name,
+                    metadata={
+                        "run_id": run_id,
+                        "spec_id": run_spec_id,
+                        "repo_root": str(common_root.resolve()),
+                        "workspace_root": str(workspace_root),
+                    },
                 ),
                 # `spec clean` is the operator's explicit discard action. The
                 # backend still enforces run-root/resource ownership and owns
@@ -771,14 +803,18 @@ def _cmd_web(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        from .web.server import run_server
+        from .web.server import is_loopback_bind, run_server
 
         host = getattr(args, "host", "127.0.0.1")
-        try:
-            loopback = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
-        except ValueError:
-            loopback = False
-        if not loopback:
+        allow_remote = getattr(args, "allow_remote", False)
+        if not is_loopback_bind(host) and not allow_remote:
+            print(
+                "Error: Refusing to expose the web operator control plane on a "
+                "non-loopback interface without --allow-remote.",
+                file=sys.stderr,
+            )
+            return 2
+        if not is_loopback_bind(host):
             print(
                 "Warning: spec web is an operator control plane and does not terminate TLS. "
                 "Prefer a loopback bind with a TLS-protected SSH or private-network tunnel.",
@@ -791,6 +827,8 @@ def _cmd_web(args: argparse.Namespace) -> int:
             background=getattr(args, "background", False),
             open_browser=getattr(args, "open", False),
             verbose=getattr(args, "verbose", False),
+            allow_remote=allow_remote,
+            trusted_proxies=tuple(getattr(args, "trusted_proxy", ()) or ()),
         )
     if web_cmd == "stop":
         from .web.server import stop_server
@@ -1266,6 +1304,18 @@ def main(argv: list[str] | None = None) -> int:
     p_web_start.add_argument("--port", type=int, default=7700, help="Port (default: 7700)")
     p_web_start.add_argument("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
     p_web_start.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Acknowledge exposure of the operator control plane beyond loopback",
+    )
+    p_web_start.add_argument(
+        "--trusted-proxy",
+        action="append",
+        default=[],
+        metavar="IP",
+        help="Trust forwarded headers from this explicit proxy IP (repeatable)",
+    )
+    p_web_start.add_argument(
         "--open",
         action="store_true",
         help="Open the authenticated URL in the default browser",
@@ -1338,15 +1388,29 @@ def main(argv: list[str] | None = None) -> int:
     p_coord_serve.add_argument("--host", default="127.0.0.1", help="Bind host")
     p_coord_serve.add_argument("--port", type=int, default=8765, help="Bind port")
     p_coord_serve.add_argument("--db", required=True, help="Coordinator SQLite database path")
-    p_coord_serve.add_argument(
+    worker_token_source = p_coord_serve.add_mutually_exclusive_group()
+    worker_token_source.add_argument(
         "--worker-token",
         default="",
-        help="Optional worker token; falls back to SPEC_COORDINATOR_WORKER_TOKEN and is hidden from startup logs",
+        help="Deprecated: worker token in argv; use --worker-token-file or SPEC_COORDINATOR_WORKER_TOKEN",
     )
-    p_coord_serve.add_argument(
+    worker_token_source.add_argument(
+        "--worker-token-file",
+        default="",
+        metavar="PATH",
+        help="Read the optional worker token from a private regular file",
+    )
+    operator_token_source = p_coord_serve.add_mutually_exclusive_group()
+    operator_token_source.add_argument(
         "--operator-token",
         default="",
-        help="Optional operator token; falls back to SPEC_COORDINATOR_OPERATOR_TOKEN and is hidden from startup logs",
+        help="Deprecated: operator token in argv; use --operator-token-file or SPEC_COORDINATOR_OPERATOR_TOKEN",
+    )
+    operator_token_source.add_argument(
+        "--operator-token-file",
+        default="",
+        metavar="PATH",
+        help="Read the optional operator token from a private regular file",
     )
     p_coord_token = coord_sub.add_parser(
         "token",

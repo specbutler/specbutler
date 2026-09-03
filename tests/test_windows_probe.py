@@ -1038,11 +1038,14 @@ def test_foreground_web_bind_and_authenticated_request(tmp_path: Path) -> None:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    token = "windows-probe-token"
-    token_path = tmp_path / ".spec-state" / "web" / "auth-token"
-    token_path.parent.mkdir(parents=True)
-    token_path.write_text(token)
     (tmp_path / ".spec.toml").write_text('[project]\nbase_ref = "main"\n')
+    web_env = _clean_subprocess_env()
+    web_env["LOCALAPPDATA"] = str(tmp_path / "operator-local-state")
+    from spec_runtime.web.auth import load_or_create_token
+
+    with pytest.MonkeyPatch.context() as token_env:
+        token_env.setenv("LOCALAPPDATA", web_env["LOCALAPPDATA"])
+        token = load_or_create_token(tmp_path)
     stdout_path = tmp_path / "web-probe.stdout.log"
     stderr_path = tmp_path / "web-probe.stderr.log"
     with (
@@ -1062,7 +1065,7 @@ def test_foreground_web_bind_and_authenticated_request(tmp_path: Path) -> None:
                 str(port),
             ],
             cwd=tmp_path,
-            env=_clean_subprocess_env(),
+            env=web_env,
             stdout=stdout_log,
             stderr=stderr_log,
             text=True,
@@ -1198,6 +1201,7 @@ def test_installed_artifact_cli_matrix(tmp_path: Path) -> None:
             "SPEC_FIXTURE_PYTHON": sys.executable,
             "SPEC_NO_UPDATE_CHECK": "1",
             "SPEC_PROCESS_CONTROL_ROOT": str(process_control_root),
+            "LOCALAPPDATA": str(tmp_path / "operator local state"),
         }
     )
 
@@ -1418,10 +1422,11 @@ with patch.object(orchestrator, "cmd_run", return_value=0):
     # Foreground and background web modes both bind real sockets and serve an
     # authenticated request. Background status/stop traverse durable Windows
     # supervision rather than terminating a pytest-owned process directly.
-    token = "windows-installed-matrix-token"
-    token_path = repo / ".spec-state" / "web" / "auth-token"
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(token, encoding="utf-8")
+    token_result = _cli(repo, "web", "token", "--reset", env=env)
+    prefix = "Token reset: "
+    assert token_result.stdout.startswith(prefix)
+    token = token_result.stdout.removeprefix(prefix).strip()
+    assert token
     foreground_port = _free_port()
     foreground_log = repo / ".spec-state" / "web" / "foreground-test.log"
     with foreground_log.open("w", encoding="utf-8") as web_log:

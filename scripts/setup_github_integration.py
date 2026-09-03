@@ -6,9 +6,12 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 DEFAULT_REQUIRED_CHECKS = [
@@ -169,6 +172,59 @@ def _prompt_review_api_key(secret_name: str) -> str:
         print(f"{secret_name} is required unless you skip secret setup.")
 
 
+def _read_review_api_key_file(path_value: str) -> str:
+    """Read one private, regular secret file without following a symlink."""
+    path = Path(path_value).expanduser()
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise SetupError("Could not inspect the OpenAI API key file.") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise SetupError("The OpenAI API key file must be a regular file, not a link.")
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise SetupError("Could not open the OpenAI API key file safely.") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise SetupError("The OpenAI API key file changed while it was opened.")
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SetupError("The OpenAI API key file must be a regular file, not a link.")
+        if metadata.st_nlink != 1:
+            raise SetupError("The OpenAI API key file must have exactly one hard link.")
+        if os.name == "posix":
+            if metadata.st_uid != os.getuid():
+                raise SetupError("The OpenAI API key file must be owned by the current user.")
+            if stat.S_IMODE(metadata.st_mode) & 0o077:
+                raise SetupError(
+                    "The OpenAI API key file must not be accessible by group or other users."
+                )
+        try:
+            with os.fdopen(descriptor, encoding="utf-8") as stream:
+                descriptor = -1
+                payload = stream.read()
+        except (OSError, UnicodeError) as exc:
+            raise SetupError("Could not read the OpenAI API key file.") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    lines = payload.splitlines()
+    if len(lines) != 1 or not lines[0].strip() or lines[0] != lines[0].strip():
+        raise SetupError("The OpenAI API key file must contain exactly one non-empty line.")
+    return lines[0]
+
+
+def _provided_review_api_key(args: argparse.Namespace) -> str | None:
+    if args.openai_api_key_file:
+        return _read_review_api_key_file(args.openai_api_key_file)
+    value = os.environ.get("OPENAI_API_KEY", "").strip()
+    return value or None
+
+
 def _list_repo_rulesets(repo: str) -> list[dict[str, Any]]:
     output = _gh_api(f"repos/{repo}/rulesets")
     try:
@@ -318,7 +374,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         description=(
             "Configure GitHub integration for an automated review gate. "
             "By default this runs interactively and prompts for required values."
-        )
+        ),
+        allow_abbrev=False,
     )
     parser.add_argument("--repo", help="GitHub repository in OWNER/REPO form.")
     parser.add_argument("--branch", help="Target protected branch (default: main).")
@@ -335,8 +392,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Required check context (repeatable).",
     )
     parser.add_argument(
-        "--openai-api-key",
-        help="OpenAI API key value for OPENAI_API_KEY secret.",
+        "--openai-api-key-file",
+        help=(
+            "Private one-line file containing OPENAI_API_KEY. "
+            "Alternatively set OPENAI_API_KEY in the environment or use the hidden prompt."
+        ),
     )
     parser.add_argument(
         "--anthropic-api-key",
@@ -443,7 +503,7 @@ def _resolve_config(args: argparse.Namespace) -> SetupConfig:
     reviewer_agent = _validate_reviewer_selection(args)
     detected_repo = _detect_repo()
 
-    provided_review_api_key = args.openai_api_key
+    provided_review_api_key = _provided_review_api_key(args)
     skip_review_secret = args.skip_openai_secret
     review_secret_name = "OPENAI_API_KEY"
     required_check_defaults = DEFAULT_REQUIRED_CHECKS
@@ -458,7 +518,10 @@ def _resolve_config(args: argparse.Namespace) -> SetupConfig:
         set_review_secret = not skip_review_secret
         review_api_key = provided_review_api_key if set_review_secret else None
         if set_review_secret and not review_api_key:
-            raise SetupError("Missing --openai-api-key (or use --skip-openai-secret).")
+            raise SetupError(
+                "Missing OPENAI_API_KEY or --openai-api-key-file "
+                "(or use --skip-openai-secret)."
+            )
         return SetupConfig(
             repo=repo,
             branch=branch,

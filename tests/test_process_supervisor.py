@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -27,8 +27,11 @@ from spec_runtime.process_supervisor import (
     legacy_pid_record_is_live,
     promote_payload_identity,
     run,
+    run_async,
     terminate,
     terminate_legacy_pid_record,
+    terminate_managed_process_tree,
+    terminate_managed_process_tree_async,
 )
 
 
@@ -935,6 +938,713 @@ def test_durable_token_publication_rejects_run_owned_lifetime() -> None:
         )
 
 
+def test_managed_process_terminate_propagates_unconfirmed_result() -> None:
+    from spec_runtime import process_supervisor
+
+    process = MagicMock(pid=1234)
+    token = process_supervisor.SupervisionToken(
+        process_supervisor.LifetimeMode.RUN_OWNED,
+        process_supervisor.ProcessIdentity(1234, "test-double"),
+        4321,
+        "owner-start",
+        "supervision-id",
+    )
+    managed = process_supervisor.ManagedProcess(process, token)
+
+    with patch(
+        "spec_runtime.process_supervisor.terminate",
+        return_value=False,
+    ):
+        assert managed.terminate(grace_seconds=0.1) is False
+
+
+def test_strict_managed_process_cleanup_retains_unconfirmed_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Leader:
+        def poll(self) -> int:
+            return 0
+
+    class UnconfirmedTree:
+        process = Leader()
+        terminate_calls = 0
+        kill_calls = 0
+        close_calls = 0
+
+        def owned_tree_active(self) -> bool:
+            return True
+
+        def terminate(self, *, grace_seconds: float) -> bool:
+            del grace_seconds
+            self.terminate_calls += 1
+            return False
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    process = UnconfirmedTree()
+    monkeypatch.setattr(
+        process_supervisor,
+        "_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS",
+        0.0,
+    )
+
+    try:
+        assert not terminate_managed_process_tree(process, grace_seconds=0.0)
+        assert process.terminate_calls == 1
+        assert process.kill_calls == 1
+        assert process.close_calls == 0
+        assert (
+            process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES[
+                id(process)
+            ]
+            is process
+        )
+    finally:
+        process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES.pop(
+            id(process),
+            None,
+        )
+
+
+def test_strict_managed_async_cleanup_retains_unconfirmed_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Leader:
+        returncode = 0
+
+    class UnconfirmedTree:
+        process = Leader()
+        terminate_calls = 0
+        kill_calls = 0
+        close_calls = 0
+
+        def owned_tree_active(self) -> bool:
+            return True
+
+        def terminate(self) -> None:
+            self.terminate_calls += 1
+
+        def kill(self) -> None:
+            self.kill_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    process = UnconfirmedTree()
+    monkeypatch.setattr(
+        process_supervisor,
+        "_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS",
+        0.0,
+    )
+
+    async def exercise() -> None:
+        assert not await terminate_managed_process_tree_async(
+            process,
+            grace_seconds=0.0,
+        )
+
+    try:
+        asyncio.run(exercise())
+        assert process.terminate_calls == 1
+        assert process.kill_calls == 1
+        assert process.close_calls == 0
+        assert (
+            process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES[
+                id(process)
+            ]
+            is process
+        )
+    finally:
+        process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES.pop(
+            id(process),
+            None,
+        )
+
+
+def test_partial_linux_cgroup_abort_retains_unconfirmed_capability() -> None:
+    class Cgroup:
+        path = Path("/delegated/specbutler-run-test")
+
+        def _kernel_populated(self) -> bool:
+            return True
+
+        def kill(self) -> None:
+            pass
+
+        def wait_empty(self, _timeout: float) -> bool:
+            return False
+
+        def close(self) -> None:
+            raise AssertionError("populated cgroup was closed")
+
+    cgroup = Cgroup()
+    try:
+        assert not process_supervisor._abort_linux_run_cgroup(cgroup)  # type: ignore[arg-type]
+        assert (
+            process_supervisor._RETAINED_ABORT_LINUX_CGROUPS[str(cgroup.path)]
+            is cgroup
+        )
+    finally:
+        process_supervisor._RETAINED_ABORT_LINUX_CGROUPS.pop(
+            str(cgroup.path),
+            None,
+        )
+
+
+def test_partial_windows_job_abort_retains_unconfirmed_handle() -> None:
+    class Job:
+        def terminate(self) -> None:
+            raise OSError("job termination failed")
+
+    job = Job()
+    try:
+        assert not process_supervisor._abort_windows_job(job)  # type: ignore[arg-type]
+        assert process_supervisor._RETAINED_ABORT_WINDOWS_JOBS[id(job)] is job
+    finally:
+        process_supervisor._RETAINED_ABORT_WINDOWS_JOBS.pop(id(job), None)
+
+
+def test_managed_close_failure_retains_facade() -> None:
+    class Process:
+        pid = 42
+
+    class Job:
+        def active_process_ids(self) -> tuple[int, ...]:
+            return ()
+
+        def close(self) -> None:
+            raise OSError("handle close failed")
+
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        ProcessIdentity(42, "created"),
+        7,
+        "owner",
+        "close-failure",
+    )
+    managed = process_supervisor.ManagedProcess(Process(), token, Job())  # type: ignore[arg-type]
+    try:
+        with pytest.raises(OSError, match="handle close failed"):
+            managed.close()
+        assert (
+            process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES[id(managed)]
+            is managed
+        )
+        assert managed._job is not None
+    finally:
+        process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES.pop(
+            id(managed),
+            None,
+        )
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_strict_managed_process_cleanup_reaps_descendant_after_leader_exit(
+    tmp_path: Path,
+) -> None:
+    descendant_pid_path = tmp_path / "descendant.pid"
+    leader = (
+        "import subprocess,sys; from pathlib import Path; "
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import time; time.sleep(30)']); "
+        "Path(sys.argv[1]).write_text(str(child.pid))"
+    )
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", leader, str(descendant_pid_path)]
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while (
+            not descendant_pid_path.exists() or managed.process.poll() is None
+        ) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert descendant_pid_path.exists()
+        assert managed.process.poll() == 0
+        assert managed.owned_tree_active()
+        assert terminate_managed_process_tree(managed, grace_seconds=0.2)
+        assert not managed.owned_tree_active()
+    finally:
+        if managed.owned_tree_active():
+            managed.kill()
+        managed.process.wait(timeout=5.0)
+        managed.close()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_run_reaps_descendant_that_inherits_redirected_stdio(
+    tmp_path: Path,
+) -> None:
+    identities_path = tmp_path / "redirected-stdio-pids.json"
+    leader = (
+        "import json,os,subprocess,sys; from pathlib import Path; "
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import time; print(\"child-ready\",flush=True); time.sleep(30)']); "
+        "Path(sys.argv[1]).write_text(json.dumps([os.getpid(),child.pid])); "
+        "print('leader-ready',flush=True)"
+    )
+
+    completed = run(
+        [sys.executable, "-c", leader, str(identities_path)],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+    )
+
+    leader_pid, _descendant_pid = json.loads(identities_path.read_text())
+    assert completed.returncode == 0
+    assert "leader-ready" in completed.stdout
+    assert "child-ready" in completed.stdout
+    assert not process_supervisor.is_process_group_alive(leader_pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_managed_communicate_timeout_preserves_tree_for_polling_retry() -> None:
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(.3); print('finished', flush=True)",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        managed.communicate(timeout=0.05)
+
+    assert managed.process.poll() is None
+    assert managed.owned_tree_active()
+    stdout, _stderr = managed.communicate(timeout=2.0)
+    assert stdout.strip() == "finished"
+    assert managed.returncode == 0
+    assert not managed.owned_tree_active()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_managed_wait_timeout_preserves_tree_for_polling_retry() -> None:
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "import time; time.sleep(.3)"],
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        managed.wait(timeout=0.05)
+
+    assert managed.process.poll() is None
+    assert managed.owned_tree_active()
+    assert managed.wait(timeout=2.0) == 0
+    assert not managed.owned_tree_active()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_run_owned_supervisor_close_reaps_live_tree() -> None:
+    supervisor = ProcessSupervisor(LifetimeMode.RUN_OWNED)
+    managed = supervisor.spawn(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
+
+    supervisor.close()
+
+    assert managed.process.poll() is not None
+    assert not managed.owned_tree_active()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX launch contract")
+def test_run_owned_cgroup_preserves_missing_executable_error(tmp_path: Path) -> None:
+    missing = tmp_path / "missing-command"
+    with pytest.raises(FileNotFoundError) as caught:
+        ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn([str(missing)])
+    assert Path(str(caught.value.filename)) == missing
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX launch contract")
+def test_run_owned_cgroup_preserves_enoexec_without_shell_fallback(
+    tmp_path: Path,
+) -> None:
+    probe = process_supervisor._create_linux_run_cgroup()
+    if probe is None:
+        pytest.skip("delegated cgroup-v2 boundary is unavailable")
+    probe.close()
+    executable_text = tmp_path / "executable-text-without-shebang"
+    executable_text.write_text("echo must-not-run\n", encoding="utf-8")
+    executable_text.chmod(0o755)
+
+    with pytest.raises(OSError) as expected:
+        subprocess.Popen([str(executable_text)])
+    with pytest.raises(OSError) as actual:
+        ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn([str(executable_text)])
+
+    assert type(actual.value) is type(expected.value)
+    assert actual.value.errno == expected.value.errno
+    assert actual.value.filename == expected.value.filename
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native Linux fd integration")
+def test_run_owned_cgroup_closes_all_handshake_fds_before_exec() -> None:
+    probe = process_supervisor._create_linux_run_cgroup()
+    if probe is None:
+        pytest.skip("delegated cgroup-v2 boundary is unavailable")
+    probe.close()
+    # Use a small explicit script instead of relying on /proc/self/fd, whose
+    # directory enumeration owns a transient descriptor itself.
+    code = (
+        "import json,os; live=[]; "
+        "exec('for fd in range(3,256):\\n try: os.fstat(fd); live.append(fd)"
+        "\\n except OSError: pass'); print(json.dumps(live))"
+    )
+    completed = run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=5.0,
+    )
+    assert json.loads(completed.stdout) == []
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="native Linux cgroup integration")
+def test_run_owned_normal_completion_retires_exact_cgroup_boundary() -> None:
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "print('done')"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if managed._cgroup is None:
+        terminate_managed_process_tree(managed, grace_seconds=0)
+        pytest.skip("delegated cgroup-v2 boundary is unavailable")
+    cgroup_path = managed._cgroup.path
+
+    stdout, _stderr = managed.communicate(timeout=5.0)
+
+    assert stdout.strip() == b"done"
+    assert managed._cgroup is None
+    assert not cgroup_path.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="native Linux cgroup integration")
+def test_run_owned_cgroup_owner_death_kills_tree_and_retires_boundary(
+    tmp_path: Path,
+) -> None:
+    probe = process_supervisor._create_linux_run_cgroup()
+    if probe is None:
+        pytest.skip("delegated cgroup-v2 boundary is unavailable")
+    probe.close()
+    outer = tmp_path / "abrupt-owner.py"
+    descendant_pid_path = tmp_path / "descendant.pid"
+    cgroup_path_file = tmp_path / "cgroup.path"
+    outer.write_text(
+        "import os,subprocess,sys\n"
+        "from pathlib import Path\n"
+        "from spec_runtime.process_supervisor import LifetimeMode,ProcessSupervisor\n"
+        "code=(\"import os,subprocess,sys,time; from pathlib import Path; \"\n"
+        "      \"child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'], \"\n"
+        "      \"start_new_session=True,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); \"\n"
+        "      \"Path(sys.argv[1]).write_text(str(child.pid)); \"\n"
+        "      \"Path(sys.argv[2]).write_text(next(x[3:].strip() for x in Path('/proc/self/cgroup').read_text().splitlines() if x.startswith('0::'))); \"\n"
+        "      \"time.sleep(30)\")\n"
+        "ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn([sys.executable,'-c',code,sys.argv[1],sys.argv[2]])\n"
+        "os._exit(0)\n",
+        encoding="utf-8",
+    )
+    child_env = os.environ.copy()
+    child_env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    owner = subprocess.Popen(
+        [
+            sys.executable,
+            str(outer),
+            str(descendant_pid_path),
+            str(cgroup_path_file),
+        ],
+        env=child_env,
+    )
+    assert owner.wait(timeout=5.0) == 0
+    descendant_pid = int(descendant_pid_path.read_text())
+    cgroup_path = Path("/sys/fs/cgroup") / cgroup_path_file.read_text().lstrip("/")
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if (
+            process_supervisor.inspect_process(descendant_pid) is None
+            and not cgroup_path.exists()
+        ):
+            break
+        time.sleep(0.01)
+    try:
+        assert process_supervisor.inspect_process(descendant_pid) is None
+        assert not cgroup_path.exists()
+    finally:
+        if process_supervisor.inspect_process(descendant_pid) is not None:
+            os.kill(descendant_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_run_owned_cgroup_reaps_descendant_that_escapes_process_group(
+    tmp_path: Path,
+) -> None:
+    probe = process_supervisor._create_linux_run_cgroup()
+    if probe is None:
+        pytest.skip("delegated cgroup-v2 boundary is unavailable")
+    probe.close()
+
+    descendant_pid_path = tmp_path / "escaped-descendant.pid"
+    leader = (
+        "import subprocess,sys; from pathlib import Path; "
+        "relative=next(line[3:].strip() for line in "
+        "Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::')); "
+        "nested=Path('/sys/fs/cgroup')/relative.lstrip('/')/'nested'; "
+        "nested.mkdir(); "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'], "
+        "start_new_session=True, stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+        "(nested/'cgroup.procs').write_text(str(child.pid)); "
+        "Path(sys.argv[1]).write_text(str(child.pid))"
+    )
+
+    completed = run(
+        [sys.executable, "-c", leader, str(descendant_pid_path)],
+        capture_output=True,
+        timeout=5.0,
+    )
+
+    descendant_pid = int(descendant_pid_path.read_text())
+    deadline = time.monotonic() + 2.0
+    while (
+        process_supervisor.inspect_process(descendant_pid) is not None
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.01)
+    try:
+        assert completed.returncode == 0
+        assert process_supervisor.inspect_process(descendant_pid) is None
+    finally:
+        if process_supervisor.inspect_process(descendant_pid) is not None:
+            os.kill(descendant_pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_managed_wait_reaps_descendant_after_normal_leader_exit(
+    tmp_path: Path,
+) -> None:
+    identities_path = tmp_path / "wait-pids.json"
+    leader = (
+        "import json,os,subprocess,sys; from pathlib import Path; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+        "Path(sys.argv[1]).write_text(json.dumps([os.getpid(),child.pid]))"
+    )
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", leader, str(identities_path)]
+    )
+    try:
+        assert managed.wait(timeout=5.0) == 0
+        leader_pid, _descendant_pid = json.loads(identities_path.read_text())
+        assert not process_supervisor.is_process_group_alive(leader_pid)
+    finally:
+        terminate_managed_process_tree(managed, grace_seconds=0)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_run_async_reaps_descendant_that_inherits_redirected_stdio(
+    tmp_path: Path,
+) -> None:
+    identities_path = tmp_path / "async-redirected-stdio-pids.json"
+    leader = (
+        "import json,os,subprocess,sys; from pathlib import Path; "
+        "child=subprocess.Popen([sys.executable,'-c',"
+        "'import time; print(\"async-child-ready\",flush=True); time.sleep(30)']); "
+        "Path(sys.argv[1]).write_text(json.dumps([os.getpid(),child.pid])); "
+        "print('async-leader-ready',flush=True)"
+    )
+
+    async def exercise() -> subprocess.CompletedProcess[bytes]:
+        return await run_async(
+            [sys.executable, "-c", leader, str(identities_path)],
+            capture_output=True,
+            timeout=5.0,
+        )
+
+    completed = asyncio.run(exercise())
+    leader_pid, _descendant_pid = json.loads(identities_path.read_text())
+    assert completed.returncode == 0
+    assert b"async-leader-ready" in completed.stdout
+    assert b"async-child-ready" in completed.stdout
+    assert not process_supervisor.is_process_group_alive(leader_pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_managed_async_communicate_timeout_preserves_tree_for_retry() -> None:
+    async def exercise() -> None:
+        managed = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+            [
+                sys.executable,
+                "-c",
+                "import time; print('started', flush=True); "
+                "time.sleep(.3); print('finished', flush=True)",
+            ],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await managed.communicate(timeout=0.05)
+        assert managed.process.returncode is None
+        assert managed.owned_tree_active()
+        stdout, _stderr = await managed.communicate(timeout=2.0)
+        assert stdout is not None and stdout.splitlines() == [b"started", b"finished"]
+        assert managed.returncode == 0
+        assert not managed.owned_tree_active()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_managed_async_communicate_timeout_sends_input_once() -> None:
+    async def exercise() -> None:
+        managed = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+            [
+                sys.executable,
+                "-c",
+                "import sys,time; value=sys.stdin.buffer.read(); "
+                "time.sleep(.3); sys.stdout.buffer.write(value)",
+            ],
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await managed.communicate(input=b"one-input", timeout=0.05)
+        with pytest.raises(ValueError, match="Cannot send input"):
+            await managed.communicate(input=b"duplicate", timeout=0.05)
+        stdout, _stderr = await managed.communicate(timeout=2.0)
+        assert stdout == b"one-input"
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_managed_async_communicate_cancellation_reaps_complete_tree(
+    tmp_path: Path,
+) -> None:
+    identities_path = tmp_path / "async-cancel-pids.json"
+    leader = (
+        "import json,os,subprocess,sys,time; from pathlib import Path; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+        "Path(sys.argv[1]).write_text(json.dumps([os.getpid(),child.pid])); "
+        "print('ready',flush=True); time.sleep(30)"
+    )
+
+    async def exercise() -> int:
+        managed = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+            [sys.executable, "-c", leader, str(identities_path)],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        communication = asyncio.create_task(managed.communicate())
+        # Let the managed coroutine establish its cancellation cleanup frame.
+        # Cancelling a task before Python executes its first bytecode cannot be
+        # observed by any coroutine; the direct caller still retains `managed`
+        # in that degenerate case.
+        await asyncio.sleep(0)
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not identities_path.exists():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
+        communication.cancel()
+        communication.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await communication
+        assert communication.cancelling() == 2
+        assert not managed.owned_tree_active()
+        return managed.token.pgid
+
+    pgid = asyncio.run(exercise())
+    assert not process_supervisor.is_process_group_alive(pgid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_run_async_timeout_reaps_complete_tree(tmp_path: Path) -> None:
+    identities_path = tmp_path / "async-timeout-pids.json"
+    leader = (
+        "import json,os,subprocess,sys,time; from pathlib import Path; "
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); "
+        "Path(sys.argv[1]).write_text(json.dumps([os.getpid(),child.pid])); "
+        "time.sleep(30)"
+    )
+    pgid = 0
+
+    async def exercise() -> None:
+        with pytest.raises(subprocess.TimeoutExpired):
+            await run_async(
+                [sys.executable, "-c", leader, str(identities_path)],
+                capture_output=True,
+                timeout=0.2,
+            )
+
+    try:
+        asyncio.run(exercise())
+        pgid, _descendant_pid = json.loads(identities_path.read_text())
+        assert not process_supervisor.is_process_group_alive(pgid)
+    finally:
+        if pgid and process_supervisor.is_process_group_alive(pgid):
+            os.killpg(pgid, signal.SIGKILL)
+
+
+def test_managed_communicate_fails_without_closing_unconfirmed_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Leader:
+        pid = 43210
+        returncode = 0
+        args = ["provider"]
+
+        def communicate(self, **_kwargs: object) -> tuple[str, str]:
+            return "output", ""
+
+        def poll(self) -> int:
+            return self.returncode
+
+    leader = Leader()
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        ProcessIdentity(leader.pid, "test-double"),
+        os.getpid(),
+        "test-owner",
+        "unconfirmed-communicate",
+    )
+    managed = process_supervisor.ManagedProcess(leader, token)
+    close = MagicMock()
+    monkeypatch.setattr(managed, "owned_tree_active", lambda: True)
+    monkeypatch.setattr(managed, "terminate", lambda **_kwargs: False)
+    monkeypatch.setattr(managed, "kill", lambda: None)
+    monkeypatch.setattr(managed, "close", close)
+    monkeypatch.setattr(
+        process_supervisor,
+        "_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS",
+        0.0,
+    )
+
+    try:
+        with pytest.raises(
+            process_supervisor.ProcessGroupTerminationError,
+            match="ownership was retained",
+        ) as caught:
+            managed.communicate()
+        assert caught.value.managed_process is managed  # type: ignore[attr-defined]
+        assert (
+            process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES[
+                id(managed)
+            ]
+            is managed
+        )
+        close.assert_not_called()
+    finally:
+        process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES.pop(
+            id(managed),
+            None,
+        )
+
+
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX ownership integration")
 def test_detached_publication_failure_terminates_launched_session(
     monkeypatch: pytest.MonkeyPatch,
@@ -1546,15 +2256,20 @@ def test_posix_run_owned_boundary_rejects_mismatched_keeper_and_group(
     inventory.assert_not_called()
 
 
-def test_managed_process_wait_closes_job_after_leader_exit() -> None:
+def test_managed_process_wait_closes_job_after_full_tree_exit() -> None:
     events: list[str] = []
     identity = ProcessIdentity(42, "created")
     token = SupervisionToken(LifetimeMode.RUN_OWNED, identity, 7, "owner", "normal-wait")
 
     class Process:
+        returncode = 23
+
         def wait(self, timeout: float | None = None) -> int:
             events.append(f"wait:{timeout}")
             return 23
+
+        def poll(self) -> int:
+            return self.returncode
 
     class Job:
         def close(self) -> None:
@@ -1612,7 +2327,9 @@ def test_managed_async_process_starts_only_one_pipe_closer_across_retries(
     started[0].close()  # type: ignore[union-attr]
 
 
-def test_managed_process_communicate_preserves_baseexception_when_cleanup_fails() -> None:
+def test_managed_process_communicate_preserves_baseexception_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Abort(BaseException):
         pass
 
@@ -1631,11 +2348,25 @@ def test_managed_process_communicate_preserves_baseexception_when_cleanup_fails(
             raise ValueError("close cleanup failed")
 
     managed = process_supervisor.ManagedProcess(Process(), token, Job())  # type: ignore[arg-type]
-    with pytest.raises(Abort):
-        managed.communicate()
+    monkeypatch.setattr(
+        process_supervisor,
+        "_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS",
+        0.0,
+    )
+    try:
+        with pytest.raises(Abort) as caught:
+            managed.communicate()
+        assert caught.value.managed_process is managed  # type: ignore[attr-defined]
+    finally:
+        process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES.pop(
+            id(managed),
+            None,
+        )
 
 
-def test_managed_async_communicate_preserves_baseexception_when_cleanup_fails() -> None:
+def test_managed_async_communicate_preserves_baseexception_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class Abort(BaseException):
         pass
 
@@ -1658,13 +2389,25 @@ def test_managed_async_communicate_preserves_baseexception_when_cleanup_fails() 
 
     async def exercise() -> None:
         managed = process_supervisor.ManagedAsyncProcess(Process(), token, Job())  # type: ignore[arg-type]
-        with pytest.raises(Abort):
-            await managed.communicate()
+        try:
+            with pytest.raises(Abort) as caught:
+                await managed.communicate()
+            assert caught.value.managed_process is managed  # type: ignore[attr-defined]
+        finally:
+            process_supervisor._RETAINED_UNCONFIRMED_MANAGED_PROCESSES.pop(
+                id(managed),
+                None,
+            )
 
+    monkeypatch.setattr(
+        process_supervisor,
+        "_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS",
+        0.0,
+    )
     asyncio.run(exercise())
 
 
-def test_held_windows_job_uses_original_group_and_exact_grace_before_hard_kill(
+def test_held_windows_job_requires_authoritative_empty_state_after_hard_kill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[object] = []
@@ -1694,8 +2437,13 @@ def test_held_windows_job_uses_original_group_and_exact_grace_before_hard_kill(
 
     monkeypatch.setattr(process_supervisor, "_send_windows_break", lambda pgid: events.append(("break", pgid)) or True)
 
-    assert process_supervisor._terminate_held_windows_job(token, Job(), 0.375) is True  # type: ignore[arg-type]
-    assert events == [("break", 4242), ("wait", 0.375), "hard-kill"]
+    assert process_supervisor._terminate_held_windows_job(token, Job(), 0.375) is False  # type: ignore[arg-type]
+    assert events == [
+        ("break", 4242),
+        ("wait", 0.375),
+        "hard-kill",
+        ("wait", process_supervisor._STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS),
+    ]
 
 
 def test_durable_metadata_path_is_independent_of_payload_cwd(
@@ -1833,11 +2581,12 @@ def test_persisted_windows_termination_keeps_authenticated_job_when_payload_exit
         def active_process_ids(self) -> tuple[int, ...]:
             return (99,)
 
-        def active_identities(self) -> list[ProcessIdentity]:
-            return [ProcessIdentity(99, "remaining-job-member")]
-
         def terminate(self) -> None:
             events.append("terminate")
+
+        def wait_empty(self, timeout: float) -> bool:
+            events.append(("wait-empty", timeout))
+            return True
 
         def close(self) -> None:
             events.append("close")
@@ -1850,10 +2599,63 @@ def test_persisted_windows_termination_keeps_authenticated_job_when_payload_exit
         "open",
         classmethod(lambda _cls, _name: job),
     )
-    monkeypatch.setattr(process_supervisor, "_wait_for_identities_exit", lambda _items: True)
-
     assert process_supervisor.terminate(token, grace_seconds=0)
-    assert events == [("contains", payload), "terminate", "close"]
+    assert events == [
+        ("contains", payload),
+        "terminate",
+        (
+            "wait-empty",
+            process_supervisor._STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS,
+        ),
+        "close",
+    ]
+
+
+def test_persisted_windows_termination_does_not_infer_empty_job_from_missing_identities(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    keeper = ProcessIdentity(41, "keeper", "python.exe")
+    payload = ProcessIdentity(42, "payload", "python.exe")
+    token = SupervisionToken(
+        LifetimeMode.DETACHED,
+        keeper,
+        7,
+        "owner",
+        "uninspectable-active-member",
+        payload_identity=payload,
+    )
+    monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(tmp_path))
+    _write_promotion_state(tmp_path, token)
+
+    class Job:
+        def contains(self, _identity: ProcessIdentity) -> bool:
+            return True
+
+        def active_process_ids(self) -> tuple[int, ...]:
+            return (99,)
+
+        def active_identities(self) -> list[ProcessIdentity]:
+            return []
+
+        def terminate(self) -> None:
+            pass
+
+        def wait_empty(self, _timeout: float) -> bool:
+            return False
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(process_supervisor, "_platform_is_windows", lambda: True)
+    monkeypatch.setattr(process_supervisor, "identity_matches", lambda _identity: True)
+    monkeypatch.setattr(
+        process_supervisor._WindowsJob,
+        "open",
+        classmethod(lambda _cls, _name: Job()),
+    )
+
+    assert not process_supervisor.terminate(token, grace_seconds=0)
 
 
 def test_persisted_windows_termination_accepts_empty_job_after_keeper_exits(

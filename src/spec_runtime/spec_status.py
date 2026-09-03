@@ -575,6 +575,8 @@ def refresh_merge_completion_state(
     base_ref: str = "",
     config: SpecRuntimeConfig | None = None,
     timeout: float = MERGE_COMPLETION_FENCE_FETCH_TIMEOUT_SECONDS,
+    remote_url: str = "",
+    env: dict[str, str] | None = None,
 ) -> tuple[str, str, str]:
     """Refresh the remote base ref and ``spec/merged/*`` tags from origin.
 
@@ -605,12 +607,14 @@ def refresh_merge_completion_state(
     fenced_ref = f"refs/remotes/{remote_name}/{remote_branch}"
     branch_refspec = f"+refs/heads/{remote_branch}:{fenced_ref}"
     tag_refspec = "+refs/tags/spec/merged/*:refs/tags/spec/merged/*"
-    action = f"git fetch {remote_name} {branch_refspec} {tag_refspec}"
+    remote_source = remote_url or remote_name
+    action = f"git fetch {remote_source} {branch_refspec} {tag_refspec}"
     try:
         result = run_git(
-            ["fetch", remote_name, branch_refspec, tag_refspec],
+            ["fetch", remote_source, branch_refspec, tag_refspec],
             cwd=repo_root,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return action, f"timed out after {timeout:g}s", fenced_ref

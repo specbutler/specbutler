@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import runpy
 from pathlib import Path
 
@@ -31,6 +32,85 @@ def test_non_interactive_defaults_are_least_privilege(monkeypatch: pytest.Monkey
     assert config.workflow_permission == "read"
     assert config.can_approve_pull_request_reviews is False
     assert config.required_checks == ["ci", "review-decision-gate", "spec-pr-policy"]
+
+
+def test_non_interactive_review_key_comes_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolve_config = SCRIPT["_resolve_config"]
+    monkeypatch.setitem(resolve_config.__globals__, "_detect_repo", lambda: None)
+    monkeypatch.setenv("OPENAI_API_KEY", "environment-secret")
+
+    config = resolve_config(
+        _args("--non-interactive", "--repo", "acme/spec")
+    )
+
+    assert config.review_api_key == "environment-secret"
+
+
+def test_review_key_file_must_be_private_and_is_never_a_cli_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_file = tmp_path / "review-key"
+    key_file.write_text("file-secret\n", encoding="utf-8")
+    if os.name == "posix":
+        key_file.chmod(0o600)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    resolve_config = SCRIPT["_resolve_config"]
+    monkeypatch.setitem(resolve_config.__globals__, "_detect_repo", lambda: None)
+
+    config = resolve_config(
+        _args(
+            "--non-interactive",
+            "--repo",
+            "acme/spec",
+            "--openai-api-key-file",
+            str(key_file),
+        )
+    )
+
+    assert config.review_api_key == "file-secret"
+    with pytest.raises(SystemExit):
+        _args("--openai-api-key", "command-line-secret")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission enforcement")
+def test_review_key_file_rejects_group_readable_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_file = tmp_path / "review-key"
+    key_file.write_text("file-secret\n", encoding="utf-8")
+    key_file.chmod(0o640)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(SCRIPT["SetupError"], match="group or other"):
+        SCRIPT["_provided_review_api_key"](
+            _args("--openai-api-key-file", str(key_file))
+        )
+
+
+def test_review_key_file_rejects_symlink_and_multiple_lines(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key_file = tmp_path / "review-key"
+    key_file.write_text("first\nsecond\n", encoding="utf-8")
+    if os.name == "posix":
+        key_file.chmod(0o600)
+    link = tmp_path / "review-key-link"
+    link.symlink_to(key_file)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    with pytest.raises(SCRIPT["SetupError"], match="regular file"):
+        SCRIPT["_provided_review_api_key"](
+            _args("--openai-api-key-file", str(link))
+        )
+    with pytest.raises(SCRIPT["SetupError"], match="exactly one"):
+        SCRIPT["_provided_review_api_key"](
+            _args("--openai-api-key-file", str(key_file))
+        )
 
 
 def test_claude_reviewer_has_actionable_migration_error() -> None:

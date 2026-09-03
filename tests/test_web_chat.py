@@ -191,6 +191,181 @@ class TestClaudeBridge:
             bridge = ClaudeBridge()
             assert bridge._sessions == {}
 
+    def test_session_uses_explicit_fail_closed_host_policy(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import asyncio
+        import os
+        import sys
+        from types import SimpleNamespace
+
+        from spec_runtime.web import bridge_claude
+
+        captured = {}
+
+        class _FakeOptions:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                for key, value in kwargs.items():
+                    setattr(self, key, value)
+
+        class _FakeClient:
+            def __init__(self, *, options):
+                self.options = options
+
+            async def connect(self):
+                return None
+
+            async def interrupt(self):
+                return None
+
+            async def disconnect(self):
+                return None
+
+        monkeypatch.setitem(
+            sys.modules,
+            "claude_agent_sdk",
+            SimpleNamespace(
+                ClaudeAgentOptions=_FakeOptions,
+                ClaudeSDKClient=_FakeClient,
+            ),
+        )
+        monkeypatch.setattr(bridge_claude, "_sdk_available", lambda: True)
+        monkeypatch.setattr(
+            bridge_claude.shutil,
+            "which",
+            lambda _name: "/usr/bin/claude",
+        )
+        protected = (
+            tmp_path / "operator-state" / "specbutler",
+            tmp_path / "operator-home" / ".claude",
+            tmp_path / "operator-home" / ".ssh",
+            Path("/proc"),
+        )
+        monkeypatch.setattr(
+            bridge_claude,
+            "protected_operator_paths",
+            lambda _source: protected,
+        )
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        git_grants = (tmp_path / "gitdir", tmp_path / "objects")
+        git_read_only = (tmp_path / "real-gitdir", tmp_path / "shared-objects")
+        git_isolation = SimpleNamespace(
+            writable_paths=git_grants,
+            read_only_paths=git_read_only,
+            env_overrides={
+                "GIT_DIR": str(git_grants[0]),
+                "GIT_WORK_TREE": str(worktree),
+            },
+        )
+
+        async def _run():
+            bridge = bridge_claude.ClaudeBridge()
+            session_id = await bridge.start_session(
+                "system prompt",
+                agent="claude",
+                cwd=str(worktree),
+                allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+                git_isolation=git_isolation,
+            )
+            await bridge.stop_session(session_id)
+
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": "/bin",
+                "ANTHROPIC_API_KEY": "provider-secret",
+                "CLAUDE_CONFIG_DIR": str(tmp_path / "operator-home" / ".claude"),
+                "GH_TOKEN": "forge-secret",
+                "DATABASE_URL": "database-secret",
+            },
+            clear=True,
+        ):
+            asyncio.run(_run())
+
+        selected = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+        assert captured["cli_path"] == "/usr/bin/claude"
+        assert captured["tools"] == selected
+        assert captured["allowed_tools"] == selected
+        assert captured["setting_sources"] == []
+        assert captured["skills"] == []
+        assert captured["plugins"] == []
+        assert captured["mcp_servers"] == {}
+        assert captured["permission_mode"] == "dontAsk"
+
+        sandbox = captured["sandbox"]
+        assert sandbox["enabled"] is True
+        assert sandbox["failIfUnavailable"] is True
+        assert sandbox["allowUnsandboxedCommands"] is False
+        assert sandbox["excludedCommands"] == []
+        assert sandbox["enableWeakerNestedSandbox"] is False
+        denied = sorted(str(path.resolve()) for path in protected)
+        assert sandbox["filesystem"]["denyRead"] == denied
+        assert sandbox["filesystem"]["denyWrite"] == sorted(
+            {*denied, *(str(path.resolve()) for path in git_read_only)}
+        )
+        assert sandbox["filesystem"]["allowWrite"] == [
+            str(path) for path in git_grants
+        ]
+        credential_names = {
+            entry["name"] for entry in sandbox["credentials"]["envVars"]
+        }
+        assert "HTTPS_PROXY" in credential_names
+        assert "ANTHROPIC_API_KEY" in credential_names
+        assert sandbox["credentials"]["files"] == [
+            {"path": path, "mode": "deny"} for path in denied
+        ]
+        assert sandbox["network"]["strictAllowlist"] is True
+        assert sandbox["network"]["allowLocalBinding"] is True
+        assert sandbox["network"]["allowAllUnixSockets"] is False
+
+        extra_args = captured["extra_args"]
+        assert set(extra_args) == {
+            "restricted",
+            "safe-mode",
+            "strict-mcp-config",
+            "no-session-persistence",
+            "disable-slash-commands",
+            "no-chrome",
+        }
+        assert set(extra_args.values()) == {None}
+        settings = json.loads(captured["settings"])
+        assert settings["permissions"]["disableBypassPermissionsMode"] == "disable"
+        assert "Bash(git reset --hard*)" in settings["permissions"]["deny"]
+
+        child_env = captured["env"]
+        assert child_env["ANTHROPIC_API_KEY"] == "provider-secret"
+        assert child_env["CLAUDE_CONFIG_DIR"] == str(
+            tmp_path / "operator-home" / ".claude"
+        )
+        assert child_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+        assert child_env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] == "1"
+        assert child_env["GIT_DIR"] == str(git_grants[0])
+        assert child_env["GIT_WORK_TREE"] == str(worktree)
+        assert child_env["GH_TOKEN"] == ""
+        assert child_env["DATABASE_URL"] == ""
+
+    def test_session_rejects_tools_outside_web_allowlist(self, tmp_path):
+        import asyncio
+
+        from spec_runtime.web.bridge_claude import ClaudeBridge
+
+        async def _run():
+            bridge = ClaudeBridge()
+            with pytest.raises(ValueError, match="WebFetch"):
+                await bridge.start_session(
+                    "system prompt",
+                    agent="claude",
+                    cwd=str(tmp_path),
+                    allowed_tools=["Read", "WebFetch"],
+                )
+
+        with patch("spec_runtime.web.bridge_claude._sdk_available", return_value=True):
+            asyncio.run(_run())
+
     def test_connect_failure_stops_partially_started_client(self):
         import asyncio
 
@@ -491,6 +666,120 @@ class TestClaudeBridge:
         client.disconnect.assert_awaited_once()
         assert bridge._sessions == {}
 
+    def test_provider_error_reaps_failed_claude_session(self):
+        import asyncio
+
+        from spec_runtime.web.bridge_claude import ClaudeBridge
+
+        class _FailingClient:
+            def __init__(self, *, options):
+                self.connect = AsyncMock()
+                self.disconnect = AsyncMock()
+                self.interrupt = AsyncMock()
+
+            async def query(self, _prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                raise RuntimeError("provider stream failed")
+                yield  # pragma: no cover - keeps this an async generator
+
+        async def _run():
+            clients = []
+
+            def make_client(*, options):
+                client = _FailingClient(options=options)
+                clients.append(client)
+                return client
+
+            with (
+                patch("spec_runtime.web.bridge_claude._sdk_available", return_value=True),
+                patch("claude_agent_sdk.ClaudeSDKClient", side_effect=make_client),
+            ):
+                bridge = ClaudeBridge()
+                session_id = await bridge.start_session(
+                    prompt="system prompt",
+                    agent="claude",
+                    cwd="/tmp/spec-web-chat",
+                )
+                events = [
+                    event
+                    async for event in bridge.send_message(
+                        session_id,
+                        "trigger provider failure",
+                    )
+                ]
+                retry_events = [
+                    event
+                    async for event in bridge.send_message(
+                        session_id,
+                        "must not reuse failed client",
+                    )
+                ]
+            return clients[0], events, retry_events, bridge
+
+        client, events, retry_events, bridge = asyncio.run(_run())
+        assert [event.kind for event in events] == ["error", "done"]
+        assert "provider stream failed" in events[0].text
+        assert [event.kind for event in retry_events] == ["error", "done"]
+        assert "Unknown session" in retry_events[0].text
+        client.interrupt.assert_awaited_once()
+        client.disconnect.assert_awaited_once()
+        assert bridge._sessions == {}
+
+    def test_claude_connect_failure_retains_client_until_disconnect_retry(self):
+        import asyncio
+
+        from spec_runtime.web.bridge_claude import (
+            _PENDING_CLIENT_ACTIONS,
+            ClaudeBridge,
+        )
+
+        async def _run():
+            release = asyncio.Event()
+
+            class _FailedConnectClient:
+                def __init__(self, *, options):
+                    self.interrupt = AsyncMock()
+
+                async def connect(self):
+                    raise RuntimeError("connect handshake failed")
+
+                async def disconnect(self):
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        await release.wait()
+
+            with (
+                patch("spec_runtime.web.bridge_claude._sdk_available", return_value=True),
+                patch(
+                    "claude_agent_sdk.ClaudeSDKClient",
+                    side_effect=_FailedConnectClient,
+                ),
+            ):
+                bridge = ClaudeBridge()
+                bridge._CLIENT_STOP_TIMEOUT_SECONDS = 0.001
+                with pytest.raises(RuntimeError, match="connect handshake failed"):
+                    await bridge.start_session(
+                        prompt="system",
+                        agent="claude",
+                        cwd="/tmp/spec-web-chat",
+                        session_id="provisional-claude",
+                    )
+
+                assert "provisional-claude" in bridge._sessions
+                release.set()
+                await bridge.stop_session("provisional-claude")
+                if _PENDING_CLIENT_ACTIONS:
+                    await asyncio.gather(
+                        *list(_PENDING_CLIENT_ACTIONS),
+                        return_exceptions=True,
+                    )
+                assert "provisional-claude" not in bridge._sessions
+
+        asyncio.run(_run())
+
     def test_stop_session_interrupts_and_disconnects(self):
         import asyncio
 
@@ -529,6 +818,194 @@ class TestClaudeBridge:
 
         asyncio.run(_run())
 
+    @pytest.mark.parametrize(
+        ("subtype", "is_error", "detail"),
+        [
+            ("error_during_execution", True, "provider failed"),
+            ("interrupted", False, "request interrupted"),
+        ],
+    )
+    def test_failed_terminal_result_emits_error_and_reaps_session(
+        self,
+        subtype,
+        is_error,
+        detail,
+    ):
+        import asyncio
+
+        import claude_agent_sdk
+
+        from spec_runtime.web.bridge_claude import ClaudeBridge
+
+        class _FakeClient:
+            def __init__(self, *, options):
+                self.connect = AsyncMock()
+                self.disconnect = AsyncMock()
+                self.interrupt = AsyncMock()
+
+            async def query(self, _prompt, session_id="default"):
+                return None
+
+            async def receive_response(self):
+                yield claude_agent_sdk.ResultMessage(
+                    subtype=subtype,
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=is_error,
+                    num_turns=1,
+                    session_id="sdk-session-1",
+                    result=detail,
+                )
+
+        async def _run():
+            clients = []
+
+            def make_client(*, options):
+                client = _FakeClient(options=options)
+                clients.append(client)
+                return client
+
+            with (
+                patch("spec_runtime.web.bridge_claude._sdk_available", return_value=True),
+                patch("claude_agent_sdk.ClaudeSDKClient", side_effect=make_client),
+            ):
+                bridge = ClaudeBridge()
+                session_id = await bridge.start_session(
+                    prompt="system prompt",
+                    agent="claude",
+                    cwd="/tmp/spec-web-chat",
+                )
+                events = [
+                    event
+                    async for event in bridge.send_message(session_id, "do it")
+                ]
+            return bridge, session_id, clients[0], events
+
+        bridge, session_id, client, events = asyncio.run(_run())
+        assert [event.kind for event in events] == ["error", "done"]
+        assert subtype in events[0].text
+        assert detail in events[0].text
+        client.disconnect.assert_awaited_once()
+        assert session_id not in bridge._sessions
+
+    def test_disconnect_timeout_retains_session_until_successful_retry(self):
+        import asyncio
+
+        from spec_runtime.web.bridge_claude import (
+            _PENDING_CLIENT_ACTIONS,
+            ClaudeBridge,
+        )
+
+        class _ResistantClient:
+            def __init__(self, *, options):
+                self.connect = AsyncMock()
+                self.interrupt = AsyncMock()
+                self.release = asyncio.Event()
+                self.disconnect_calls = 0
+
+            async def disconnect(self):
+                self.disconnect_calls += 1
+                if self.disconnect_calls == 1:
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        await self.release.wait()
+
+        async def _run():
+            clients = []
+
+            def make_client(*, options):
+                client = _ResistantClient(options=options)
+                clients.append(client)
+                return client
+
+            with (
+                patch("spec_runtime.web.bridge_claude._sdk_available", return_value=True),
+                patch("claude_agent_sdk.ClaudeSDKClient", side_effect=make_client),
+            ):
+                bridge = ClaudeBridge()
+                bridge._CLIENT_STOP_TIMEOUT_SECONDS = 0.001
+                session_id = await bridge.start_session(
+                    prompt="system prompt",
+                    agent="claude",
+                    cwd="/tmp/spec-web-chat",
+                )
+                with pytest.raises(RuntimeError, match="disconnect timed out"):
+                    await bridge.stop_session(session_id)
+                assert session_id in bridge._sessions
+
+                # A retry joins the exact in-flight disconnect; it must not
+                # issue a second call and falsely retire ownership.
+                with pytest.raises(RuntimeError, match="disconnect timed out"):
+                    await bridge.stop_session(session_id)
+                assert session_id in bridge._sessions
+                assert clients[0].disconnect_calls == 1
+
+                clients[0].release.set()
+                await bridge.stop_session(session_id)
+                assert session_id not in bridge._sessions
+                if _PENDING_CLIENT_ACTIONS:
+                    await asyncio.gather(
+                        *list(_PENDING_CLIENT_ACTIONS),
+                        return_exceptions=True,
+                    )
+            return clients[0]
+
+        client = asyncio.run(_run())
+        assert client.disconnect_calls == 1
+
+    def test_hung_interrupt_does_not_block_confirmed_disconnect(self):
+        import asyncio
+
+        from spec_runtime.web.bridge_claude import (
+            _PENDING_CLIENT_ACTIONS,
+            ClaudeBridge,
+        )
+
+        class _ResistantClient:
+            def __init__(self, *, options):
+                self.connect = AsyncMock()
+                self.disconnect = AsyncMock()
+                self.release = asyncio.Event()
+
+            async def interrupt(self):
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    await self.release.wait()
+
+        async def _run():
+            clients = []
+
+            def make_client(*, options):
+                client = _ResistantClient(options=options)
+                clients.append(client)
+                return client
+
+            with (
+                patch("spec_runtime.web.bridge_claude._sdk_available", return_value=True),
+                patch("claude_agent_sdk.ClaudeSDKClient", side_effect=make_client),
+            ):
+                bridge = ClaudeBridge()
+                bridge._CLIENT_STOP_TIMEOUT_SECONDS = 0.001
+                session_id = await bridge.start_session(
+                    prompt="system prompt",
+                    agent="claude",
+                    cwd="/tmp/spec-web-chat",
+                )
+                await bridge.stop_session(session_id)
+                assert session_id not in bridge._sessions
+                clients[0].release.set()
+                if _PENDING_CLIENT_ACTIONS:
+                    await asyncio.gather(
+                        *list(_PENDING_CLIENT_ACTIONS),
+                        return_exceptions=True,
+                    )
+            return clients[0]
+
+        client = asyncio.run(_run())
+        client.disconnect.assert_awaited_once()
+
 
 # ---------------------------------------------------------------------------
 # Codex bridge tests
@@ -553,10 +1030,27 @@ class TestCodexBridge:
             assert bridge._sessions == {}
 
     def test_codex_available_true_when_cli_present(self):
-        """The directly launched Codex CLI is the only availability dependency."""
+        """Availability requires every CLI isolation control used by web chat."""
         from spec_runtime.web.bridge_codex import _codex_available
 
-        with patch("spec_runtime.web.bridge_codex.shutil.which", return_value="/bin/codex"):
+        help_result = MagicMock(
+            returncode=0,
+            stdout=(
+                "--add-dir --ephemeral --ignore-rules --ignore-user-config "
+                "--json --output-schema --strict-config --permission-profile"
+            ),
+            stderr="",
+        )
+        with (
+            patch(
+                "spec_runtime.web.bridge_codex.shutil.which",
+                return_value="/bin/codex",
+            ),
+            patch(
+                "spec_runtime.web.bridge_codex.subprocess.run",
+                return_value=help_result,
+            ),
+        ):
             assert _codex_available() is True
 
     def test_codex_available_false_when_cli_missing(self):
@@ -568,14 +1062,47 @@ class TestCodexBridge:
         ):
             assert _codex_available() is False
 
-    def test_codex_available_true_when_sdk_and_cli_present(self):
-        """_codex_available returns True when both SDK and CLI are available."""
+    def test_codex_available_false_when_cli_lacks_isolation_control(self):
+        """An older CLI is rejected before a browser session starts."""
         from spec_runtime.web.bridge_codex import _codex_available
 
+        help_result = MagicMock(returncode=0, stdout="--json", stderr="")
         with (
             patch("spec_runtime.web.bridge_codex.shutil.which", return_value="/usr/bin/codex"),
+            patch(
+                "spec_runtime.web.bridge_codex.subprocess.run",
+                return_value=help_result,
+            ),
         ):
-            assert _codex_available() is True
+            assert _codex_available() is False
+
+    def test_codex_available_false_when_cli_rejects_security_config(self):
+        from spec_runtime.web.bridge_codex import _codex_available
+
+        help_result = MagicMock(
+            returncode=0,
+            stdout=(
+                "--add-dir --ephemeral --ignore-rules --ignore-user-config "
+                "--json --output-schema --strict-config --permission-profile"
+            ),
+            stderr="",
+        )
+        rejected_probe = MagicMock(
+            returncode=1,
+            stdout="",
+            stderr="unknown configuration field features.browser_use",
+        )
+        with (
+            patch(
+                "spec_runtime.web.bridge_codex.shutil.which",
+                return_value="/bin/codex",
+            ),
+            patch(
+                "spec_runtime.web.bridge_codex.subprocess.run",
+                side_effect=[help_result, help_result, help_result, rejected_probe],
+            ),
+        ):
+            assert _codex_available() is False
 
     def test_codex_session_start_passes_prompt_as_thread_instructions(self):
         from spec_runtime.web.bridge_codex import _CodexSession
@@ -632,16 +1159,42 @@ class TestCodexBridge:
                 await session.start("keep task chat context")
                 await session.stop()
 
-            assert exec_args == ["/usr/bin/codex", "app-server"]
+            assert exec_args[0] == "/usr/bin/codex"
+            assert exec_args[-1] == "app-server"
+            assert "--strict-config" in exec_args
+            assert "shell_environment_policy.inherit=all" in exec_args
+            assert "features.shell_snapshot=false" in exec_args
+            assert "features.plugins=false" in exec_args
+            assert "features.code_mode=false" in exec_args
+            assert "features.browser_use=false" in exec_args
+            assert "features.computer_use=false" in exec_args
+            assert "features.view_image=false" in exec_args
+            assert "features.recommended_plugins=false" in exec_args
+            assert "features.skill_mcp_dependency_install=false" in exec_args
+            assert "features.skip_host_skill_discovery=true" in exec_args
+            assert any(
+                value.startswith("permissions.specbutler-web.filesystem=")
+                for value in exec_args
+            )
             assert calls == [
-                ("initialize", {"clientInfo": {"name": "spec-web-chat", "version": "0.1.0"}}),
+                (
+                    "initialize",
+                    {
+                        "clientInfo": {
+                            "name": "spec-web-chat",
+                            "version": "0.1.0",
+                        },
+                        "capabilities": {"experimentalApi": True},
+                    },
+                ),
                 (
                     "thread/start",
                     {
                         "cwd": "/tmp/spec-web-chat",
+                        "runtimeWorkspaceRoots": ["/tmp/spec-web-chat"],
                         "developerInstructions": "keep task chat context",
                         "approvalPolicy": "never",
-                        "sandbox": "workspace-write",
+                        "permissions": "specbutler-web",
                     },
                 ),
             ]
@@ -649,6 +1202,76 @@ class TestCodexBridge:
         import asyncio
 
         asyncio.run(_run())
+
+    def test_codex_web_home_and_operator_state_are_denied_to_model_tools(
+        self,
+        tmp_path,
+    ):
+        from spec_runtime.web import bridge_codex
+
+        operator_home = tmp_path / "operator-codex-home"
+        operator_home.mkdir()
+        source_auth = operator_home / "auth.json"
+        source_auth.write_text('{"token":"canary"}', encoding="utf-8")
+        user_state = tmp_path / "operator-state" / "specbutler"
+
+        context, isolated_home = bridge_codex._CodexSession._isolated_provider_home(
+            {"CODEX_HOME": str(operator_home)},
+        )
+        try:
+            assert isolated_home.parent != tmp_path / "repo"
+            assert (isolated_home / "auth.json").exists()
+            with patch.object(
+                bridge_codex,
+                "protected_operator_paths",
+                return_value=(user_state, Path("/proc")),
+            ):
+                cmd = bridge_codex._CodexSession._safety_config_overrides(
+                    isolated_home,
+                    operator_codex_home=operator_home,
+                )
+
+            filesystem = next(
+                value
+                for value in cmd
+                if value.startswith("permissions.specbutler-web.filesystem=")
+            )
+            assert f'{json.dumps(str(isolated_home.resolve()))}="deny"' in filesystem
+            assert f'{json.dumps(str(operator_home.resolve()))}="deny"' in filesystem
+            assert f'{json.dumps(str(user_state.resolve()))}="deny"' in filesystem
+            assert f'{json.dumps(str(Path("/proc").resolve()))}="deny"' in filesystem
+            assert "shell_environment_policy.inherit=all" in cmd
+        finally:
+            context.cleanup()
+
+        assert not isolated_home.exists()
+
+    def test_codex_web_policy_omits_nested_deny_mounts(self, tmp_path):
+        """Keep Codex/bubblewrap startup viable without weakening state denial."""
+        from spec_runtime.web import bridge_codex
+
+        user_state = tmp_path / "operator-state" / "specbutler"
+        isolated_home = user_state / "provider-homes" / "session"
+        operator_home = tmp_path / "operator-codex-home"
+        with patch.object(
+            bridge_codex,
+            "protected_operator_paths",
+            return_value=(user_state, Path("/proc")),
+        ):
+            cmd = bridge_codex._CodexSession._safety_config_overrides(
+                isolated_home,
+                operator_codex_home=operator_home,
+            )
+
+        filesystem = next(
+            value
+            for value in cmd
+            if value.startswith("permissions.specbutler-web.filesystem=")
+        )
+        assert f'{json.dumps(str(user_state.resolve()))}="deny"' in filesystem
+        assert f'{json.dumps(str(isolated_home.resolve()))}="deny"' not in filesystem
+        assert f'{json.dumps(str(operator_home.resolve()))}="deny"' in filesystem
+        assert f'{json.dumps(str(Path("/proc").resolve()))}="deny"' in filesystem
 
     def test_codex_session_start_raises_when_codex_not_on_path(self):
         from spec_runtime.web.bridge_codex import _CodexSession
@@ -923,6 +1546,50 @@ class TestCodexBridge:
 
         asyncio.run(_run())
 
+    def test_codex_turn_eof_before_completion_is_an_error(self):
+        import asyncio
+
+        from spec_runtime.web.bridge_codex import _CodexSession
+
+        class _EofStdout:
+            async def readline(self):
+                return b""
+
+        async def _run():
+            session = _CodexSession(cwd="/tmp/test")
+            session._proc = MagicMock(stdout=_EofStdout(), returncode=17)
+            session._thread_id = "thread-123"
+
+            async def fake_send_request(method, _params):
+                if method == "thread/resume":
+                    return {"result": {}}, []
+                if method == "turn/start":
+                    return {"result": {"turn": {"id": "turn-1"}}}, []
+                raise AssertionError(f"unexpected method {method}")
+
+            with (
+                patch.object(
+                    _CodexSession,
+                    "_send_request",
+                    side_effect=fake_send_request,
+                ),
+                patch.object(
+                    session,
+                    "_collect_stderr_detail",
+                    new=AsyncMock(return_value=":\n  fatal transport error"),
+                ),
+                patch.object(session, "stop", new_callable=AsyncMock) as stop_mock,
+            ):
+                with pytest.raises(
+                    RuntimeError,
+                    match=r"(?s)before the chat turn completed.*exit code 17.*fatal transport error",
+                ):
+                    _ = [event async for event in session.send_turn("hello")]
+
+            stop_mock.assert_awaited_once()
+
+        asyncio.run(_run())
+
     def test_codex_turn_timeout_reaps_real_app_server_process(self):
         import asyncio
 
@@ -970,6 +1637,140 @@ class TestCodexBridge:
 
         asyncio.run(_run())
 
+    def test_codex_stop_timeout_retains_process_until_successful_retry(self):
+        import asyncio
+
+        from spec_runtime.web.bridge_codex import (
+            _PENDING_PROCESS_WAITS,
+            _CodexSession,
+        )
+
+        class _ResistantProcess:
+            def __init__(self):
+                self.returncode = None
+                self.release = asyncio.Event()
+                self.terminate_calls = 0
+                self.kill_calls = 0
+
+            def terminate(self):
+                self.terminate_calls += 1
+
+            def kill(self):
+                self.kill_calls += 1
+
+            async def wait(self):
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    await self.release.wait()
+                return 0
+
+        async def _run():
+            session = _CodexSession(cwd="/tmp/test")
+            process = _ResistantProcess()
+            session._proc = process
+            credential_home = MagicMock()
+            session._isolated_home_context = credential_home
+
+            with patch(
+                "spec_runtime.web.bridge_codex._PROCESS_STOP_TIMEOUT_SECONDS",
+                0.001,
+            ):
+                with pytest.raises(RuntimeError, match="did not exit after kill"):
+                    await session.stop()
+                assert session._proc is process
+                credential_home.cleanup.assert_not_called()
+
+                process.release.set()
+                if _PENDING_PROCESS_WAITS:
+                    await asyncio.gather(
+                        *list(_PENDING_PROCESS_WAITS),
+                        return_exceptions=True,
+                    )
+                await session.stop()
+
+            assert session._proc is None
+            credential_home.cleanup.assert_called_once()
+            assert process.terminate_calls >= 2
+            assert process.kill_calls == 1
+
+        asyncio.run(_run())
+
+    def test_codex_handshake_failure_retains_process_until_kill_retry(self):
+        import asyncio
+
+        from spec_runtime.web.bridge_codex import (
+            _PENDING_PROCESS_WAITS,
+            CodexBridge,
+            _CodexSession,
+        )
+
+        class _ResistantProcess:
+            def __init__(self, release):
+                self.returncode = None
+                self.release = release
+                self.terminate_calls = 0
+                self.kill_calls = 0
+
+            def terminate(self):
+                self.terminate_calls += 1
+
+            def kill(self):
+                self.kill_calls += 1
+
+            async def wait(self):
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    await self.release.wait()
+                return 1
+
+        async def _run():
+            release = asyncio.Event()
+            process = _ResistantProcess(release)
+
+            async def failed_handshake(session, _prompt):
+                session._proc = process
+                try:
+                    await session.stop()
+                except RuntimeError:
+                    pass
+                raise RuntimeError("app-server handshake failed")
+
+            with (
+                patch("spec_runtime.web.bridge_codex._codex_available", return_value=True),
+                patch.object(_CodexSession, "start", new=failed_handshake),
+                patch(
+                    "spec_runtime.web.bridge_codex._PROCESS_STOP_TIMEOUT_SECONDS",
+                    0.001,
+                ),
+            ):
+                bridge = CodexBridge()
+                with pytest.raises(RuntimeError, match="handshake failed"):
+                    await bridge.start_session(
+                        prompt="system",
+                        agent="codex",
+                        cwd="/tmp/spec-web-chat",
+                        session_id="provisional-codex",
+                    )
+
+                assert "provisional-codex" in bridge._sessions
+                assert bridge._sessions["provisional-codex"]._proc is process
+
+                release.set()
+                if _PENDING_PROCESS_WAITS:
+                    await asyncio.gather(
+                        *list(_PENDING_PROCESS_WAITS),
+                        return_exceptions=True,
+                    )
+                await bridge.stop_session("provisional-codex")
+                assert "provisional-codex" not in bridge._sessions
+
+            assert process.terminate_calls >= 2
+            assert process.kill_calls == 1
+
+        asyncio.run(_run())
+
 
 # ---------------------------------------------------------------------------
 # Chat API endpoint tests
@@ -979,12 +1780,30 @@ class TestCodexBridge:
 class TestChatAPI:
     """Tests for /api/v1/chat route handlers."""
 
+    @pytest.fixture(autouse=True)
+    def _trusted_publication_baseline(self, monkeypatch):
+        monkeypatch.setattr(
+            "spec_runtime.web.chat_api.capture_repository_publication_baseline",
+            lambda _repo: ("https://example.invalid/repo.git", "fingerprint"),
+        )
+        monkeypatch.setattr(
+            "spec_runtime.web.chat_api.assert_repository_publication_baseline",
+            lambda _repo, **_kwargs: None,
+        )
+        # Endpoint unit tests generally stub worktree creation with a plain
+        # directory. Dedicated integration tests below exercise the real
+        # linked-worktree Git isolation boundary.
+        monkeypatch.setattr(
+            "spec_runtime.web.chat_api.prepare_agent_git_isolation_if_linked",
+            lambda _repo: None,
+        )
+
     def _make_client(self, tmp_path, token="test-token"):
         from starlette.testclient import TestClient
 
         from spec_runtime.web.server import create_app
 
-        app = create_app(tmp_path, token)
+        app = create_app(tmp_path, token, reload_token=False)
         client = TestClient(app, raise_server_exceptions=False)
         return client
 
@@ -1179,6 +1998,75 @@ class TestChatAPI:
         # Stop response includes branch info for integration visibility (F1).
         assert "branch" in data
         assert session.status == "completed"
+
+        _sessions.pop(session.session_id, None)
+        _bridges.pop(session.session_id, None)
+
+    @pytest.mark.parametrize(
+        ("stop_error", "expected_status"),
+        [
+            (TimeoutError("provider still stopping"), 504),
+            (RuntimeError("disconnect failed"), 503),
+        ],
+    )
+    def test_stop_failure_retains_ownership_and_retry_clears_it(
+        self,
+        tmp_path,
+        stop_error,
+        expected_status,
+    ):
+        import asyncio
+
+        from spec_runtime.web.bridge import (
+            _bridges,
+            _sessions,
+            create_session,
+            get_bridge,
+            register_bridge,
+        )
+        from spec_runtime.web.chat_api import (
+            _provider_stop_tasks,
+            _turn_completions,
+            _turn_event_lists,
+            _turn_notifiers,
+            _turn_owners,
+        )
+
+        session = create_session(mode="create", agent="claude")
+        mock_bridge = MagicMock()
+        mock_bridge.stop_session = AsyncMock(side_effect=[stop_error, None])
+        register_bridge(session.session_id, mock_bridge)
+        _turn_notifiers[session.session_id] = asyncio.Event()
+        _turn_completions[session.session_id] = asyncio.Event()
+        _turn_event_lists[session.session_id] = []
+        _turn_owners[session.session_id] = session.owner_id
+
+        client = self._make_client(tmp_path)
+        first = client.post(
+            f"/api/v1/chat/sessions/{session.session_id}/stop",
+            headers=self._auth_headers(),
+        )
+
+        assert first.status_code == expected_status
+        assert first.json()["status"] == "stopping"
+        assert session.status == "stopping"
+        assert get_bridge(session.session_id) is mock_bridge
+        assert session.session_id in _turn_notifiers
+        assert session.session_id in _turn_owners
+
+        retry = client.post(
+            f"/api/v1/chat/sessions/{session.session_id}/stop",
+            headers=self._auth_headers(),
+        )
+
+        assert retry.status_code == 200
+        assert retry.json()["status"] == "stopped"
+        assert session.status == "completed"
+        assert session.session_id not in _provider_stop_tasks
+        assert session.session_id not in _turn_notifiers
+        assert session.session_id not in _turn_completions
+        assert session.session_id not in _turn_event_lists
+        assert session.session_id not in _turn_owners
 
         _sessions.pop(session.session_id, None)
         _bridges.pop(session.session_id, None)
@@ -1590,6 +2478,183 @@ class TestChatAPI:
         cleanup_mock.assert_called_once()
         mock_bridge.stop_session.assert_awaited_once()
 
+    def test_startup_cleanup_failure_retains_public_ownership_for_stop_retry(
+        self,
+        tmp_path,
+    ):
+        """Do not remove the only bridge capable of reaping a failed startup."""
+        from spec_runtime.web.bridge import get_bridge, get_session
+
+        wt_path = tmp_path / "worktree"
+        wt_path.mkdir()
+        mock_bridge = MagicMock()
+        mock_bridge.start_session = AsyncMock(
+            side_effect=RuntimeError("provider handshake failed")
+        )
+        mock_bridge.stop_session = AsyncMock(
+            side_effect=[RuntimeError("provider still alive"), None, None]
+        )
+        cleanup_mock = MagicMock(
+            side_effect=[RuntimeError("git worktree remove failed"), None]
+        )
+
+        with (
+            patch(
+                "spec_runtime.web.chat_api._available_backends",
+                return_value={"claude": False, "codex": True},
+            ),
+            patch("spec_runtime.web.chat_api._create_bridge", return_value=mock_bridge),
+            patch(
+                "spec_runtime.web.chat_api._setup_chat_worktree",
+                return_value=(
+                    wt_path,
+                    "task/web-task-startup--token",
+                    "abc123",
+                    "origin/main",
+                ),
+            ),
+            patch(
+                "spec_runtime.web.chat_api._cleanup_chat_worktree",
+                cleanup_mock,
+            ),
+        ):
+            client = self._make_client(tmp_path)
+            response = client.post(
+                "/api/v1/chat/sessions",
+                json={"mode": "task", "agent": "codex", "prompt": "build it"},
+                headers=self._auth_headers(),
+            )
+
+            assert response.status_code == 503
+            payload = response.json()
+            session_id = payload["session_id"]
+            assert payload["status"] == "stopping"
+            assert get_session(session_id).status == "stopping"
+            assert get_bridge(session_id) is mock_bridge
+            assert wt_path.exists()
+            cleanup_mock.assert_not_called()
+
+            retry = client.post(
+                f"/api/v1/chat/sessions/{session_id}/stop",
+                headers=self._auth_headers(),
+            )
+
+            assert retry.status_code == 503
+            assert retry.json()["status"] == "stopping"
+            assert "worktree_removed" not in retry.json()
+            assert get_session(session_id) is not None
+            assert get_bridge(session_id) is mock_bridge
+
+            retry = client.post(
+                f"/api/v1/chat/sessions/{session_id}/stop",
+                headers=self._auth_headers(),
+            )
+
+        assert retry.status_code == 200
+        assert retry.json()["worktree_removed"] is True
+        assert get_session(session_id) is None
+        assert get_bridge(session_id) is None
+        assert cleanup_mock.call_count == 2
+        cleanup_mock.assert_called_with(
+            tmp_path,
+            str(wt_path),
+            "task/web-task-startup--token",
+        )
+        assert mock_bridge.stop_session.await_count == 3
+
+    @pytest.mark.parametrize("agent", ["claude", "codex"])
+    def test_concurrent_stop_joins_provider_start_and_prevents_initial_turn(
+        self,
+        tmp_path,
+        agent,
+    ):
+        import asyncio
+
+        import httpx
+
+        from spec_runtime.web.bridge import _sessions
+        from spec_runtime.web.chat_api import _turn_tasks
+        from spec_runtime.web.server import create_app
+
+        async def run_test():
+            startup_paused = asyncio.Event()
+            release_startup = asyncio.Event()
+            provider_stopped = asyncio.Event()
+            bridge = MagicMock()
+
+            async def start_session(**_kwargs):
+                startup_paused.set()
+                await release_startup.wait()
+
+            async def stop_session(_session_id):
+                provider_stopped.set()
+
+            bridge.start_session = AsyncMock(side_effect=start_session)
+            bridge.stop_session = AsyncMock(side_effect=stop_session)
+            worktree = tmp_path / ".worktrees" / "task-web-task-start--token"
+            worktree.mkdir(parents=True)
+            app = create_app(tmp_path, "token", reload_token=False)
+            transport = httpx.ASGITransport(app=app)
+            headers = {"Authorization": "Bearer token"}
+
+            with (
+                patch(
+                    "spec_runtime.web.chat_api._available_backends",
+                    return_value={"claude": True, "codex": True},
+                ),
+                patch("spec_runtime.web.chat_api._create_bridge", return_value=bridge),
+                patch(
+                    "spec_runtime.web.chat_api._setup_chat_worktree",
+                    return_value=(
+                        worktree,
+                        "task/web-task-start--token",
+                        "abc123",
+                        "origin/main",
+                    ),
+                ),
+                patch("spec_runtime.orchestrator._write_sandbox_config"),
+            ):
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://test",
+                ) as client:
+                    creating = asyncio.create_task(
+                        client.post(
+                            "/api/v1/chat/sessions",
+                            json={"mode": "task", "agent": agent, "prompt": "scope it"},
+                            headers=headers,
+                        )
+                    )
+                    await startup_paused.wait()
+                    session = next(
+                        item
+                        for item in _sessions.values()
+                        if item.owner_id == app.state.chat_owner_id
+                    )
+                    stopping = asyncio.create_task(
+                        client.post(
+                            f"/api/v1/chat/sessions/{session.session_id}/stop",
+                            headers=headers,
+                        )
+                    )
+                    await asyncio.sleep(0)
+                    assert not stopping.done()
+                    release_startup.set()
+                    create_response, stop_response = await asyncio.gather(
+                        creating,
+                        stopping,
+                    )
+
+            assert create_response.status_code == 409
+            assert stop_response.status_code == 200
+            assert provider_stopped.is_set()
+            bridge.stop_session.assert_awaited_once_with(session.session_id)
+            bridge.send_message.assert_not_called()
+            assert session.session_id not in _turn_tasks
+            assert session.status == "completed"
+
+        asyncio.run(run_test())
+
     def test_stopped_session_rejects_messages(self, tmp_path):
         """After /stop, POST /messages must return 409 instead of
         accepting new messages."""
@@ -1756,7 +2821,7 @@ class TestStreamEndpoint:
 
         from spec_runtime.web.server import create_app
 
-        app = create_app(tmp_path, token)
+        app = create_app(tmp_path, token, reload_token=False)
         client = TestClient(app, raise_server_exceptions=False)
         return client
 
@@ -1810,6 +2875,10 @@ class TestPromptLoading:
 
         prompt = _load_system_prompt(tmp_path, "create")
         assert "spec" in prompt.lower()
+        assert "push `spec/<spec-id>`" not in prompt
+        assert "open a single pr" not in prompt.lower()
+        assert "do not run `git push`" in prompt.lower()
+        assert "ready for operator publication" in prompt.lower()
 
     def test_default_task_prompt(self, tmp_path):
         from spec_runtime.web.chat_api import _load_system_prompt
@@ -1846,6 +2915,7 @@ class TestPromptLoading:
         # to the base prompt, so check inclusion rather than exact match.
         assert prompt.startswith("Custom creation prompt for testing")
         assert "spec" in prompt.lower()
+        assert "ready for operator publication" in prompt.lower()
 
     def test_custom_task_prompt(self, tmp_path):
         prompt_file = tmp_path / "prompts" / "task-scoping.md"
@@ -1909,7 +2979,7 @@ class TestBackendAvailability:
         with (
             patch("spec_runtime.web.bridge_claude._sdk_available", return_value=True),
             patch(
-                "spec_runtime.agent_adapter.host_agent_unavailability_reason",
+                "spec_runtime.web.bridge_claude._claude_cli_unavailability_reason",
                 return_value="missing socat",
             ),
             patch("spec_runtime.web.bridge_codex._codex_available", return_value=False),
@@ -2012,6 +3082,91 @@ class TestTurnTracking:
         _turn_tasks.pop("test-done", None)
         loop.close()
 
+    def test_cancellation_resistant_turn_retains_relay_until_retry(self):
+        import asyncio
+
+        from spec_runtime.web.chat_api import (
+            _begin_turn_cancel,
+            _finish_turn_cancel,
+            _turn_completions,
+            _turn_event_lists,
+            _turn_notifiers,
+            _turn_owners,
+            _turn_tasks,
+        )
+
+        async def run_test():
+            session_id = "cancellation-resistant-turn"
+            release = asyncio.Event()
+
+            async def resist_cancellation():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+
+            task = asyncio.create_task(resist_cancellation())
+            await asyncio.sleep(0)
+            _turn_tasks[session_id] = task
+            _turn_notifiers[session_id] = asyncio.Event()
+            _turn_completions[session_id] = asyncio.Event()
+            _turn_event_lists[session_id] = []
+            _turn_owners[session_id] = "owner"
+
+            with patch(
+                "spec_runtime.web.chat_api._TURN_CANCEL_TIMEOUT_SECONDS",
+                0.001,
+            ):
+                claimed = _begin_turn_cancel(session_id)
+                assert claimed is task
+                assert await _finish_turn_cancel(session_id, task) is False
+
+            assert session_id in _turn_tasks
+            assert session_id in _turn_owners
+
+            release.set()
+            await task
+            assert await _finish_turn_cancel(session_id, task) is True
+            assert session_id not in _turn_tasks
+            assert session_id not in _turn_owners
+
+        asyncio.run(run_test())
+
+    def test_provider_stop_timeout_retains_task_until_confirmed(self):
+        import asyncio
+
+        from spec_runtime.web.chat_api import (
+            _confirm_provider_stop,
+            _provider_stop_tasks,
+        )
+
+        async def run_test():
+            session_id = "provider-stop-timeout"
+            release = asyncio.Event()
+
+            async def delayed_stop(_session_id):
+                await release.wait()
+
+            bridge = MagicMock(
+                stop_session=AsyncMock(side_effect=delayed_stop)
+            )
+            with patch(
+                "spec_runtime.web.chat_api._PROVIDER_STOP_TIMEOUT_SECONDS",
+                0.001,
+            ):
+                with pytest.raises(TimeoutError, match="still running"):
+                    await _confirm_provider_stop(session_id, bridge)
+                pending = _provider_stop_tasks[session_id]
+                assert not pending.done()
+
+                release.set()
+                await _confirm_provider_stop(session_id, bridge)
+
+            assert session_id not in _provider_stop_tasks
+            bridge.stop_session.assert_awaited_once_with(session_id)
+
+        asyncio.run(run_test())
+
     def test_app_shutdown_stops_bridges_cancels_turns_and_clears_registry(self):
         import asyncio
 
@@ -2022,6 +3177,7 @@ class TestTurnTracking:
             register_bridge,
         )
         from spec_runtime.web.chat_api import (
+            _provider_stop_tasks,
             _turn_tasks,
             shutdown_chat_sessions,
         )
@@ -2044,6 +3200,7 @@ class TestTurnTracking:
             bridge.stop_session.assert_awaited_once_with(session.session_id)
             assert session.session_id not in _sessions
             assert session.session_id not in _bridges
+            assert session.session_id not in _provider_stop_tasks
             assert session.session_id not in _turn_tasks
 
         asyncio.run(run_test())
@@ -2088,6 +3245,49 @@ class TestTurnTracking:
 
         asyncio.run(run_test())
 
+    @pytest.mark.parametrize("agent", ["claude", "codex"])
+    def test_shutdown_retries_provider_cleanup_until_exit_is_confirmed(self, agent):
+        import asyncio
+
+        from spec_runtime.web.bridge import (
+            _bridges,
+            _sessions,
+            create_session,
+            register_bridge,
+        )
+        from spec_runtime.web.chat_api import _provider_stop_tasks, shutdown_chat_sessions
+
+        async def run_test():
+            retry_started = asyncio.Event()
+            release = asyncio.Event()
+            calls = 0
+            session = create_session("create", agent)
+
+            async def stop_session(_session_id):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise RuntimeError("cleanup not yet confirmed")
+                retry_started.set()
+                await release.wait()
+
+            bridge = MagicMock(stop_session=AsyncMock(side_effect=stop_session))
+            register_bridge(session.session_id, bridge)
+            shutdown = asyncio.create_task(shutdown_chat_sessions())
+            await retry_started.wait()
+            assert not shutdown.done()
+            assert session.session_id in _sessions
+            assert session.session_id in _bridges
+
+            release.set()
+            await shutdown
+            assert calls == 2
+            assert session.session_id not in _sessions
+            assert session.session_id not in _bridges
+            assert session.session_id not in _provider_stop_tasks
+
+        asyncio.run(run_test())
+
     def test_testclient_lifespan_stops_only_sessions_owned_by_that_app(
         self,
         tmp_path,
@@ -2102,8 +3302,8 @@ class TestTurnTracking:
         )
         from spec_runtime.web.server import create_app
 
-        app_one = create_app(tmp_path / "one", "token")
-        app_two = create_app(tmp_path / "two", "token")
+        app_one = create_app(tmp_path / "one", "token", reload_token=False)
+        app_two = create_app(tmp_path / "two", "token", reload_token=False)
         session_one = create_session(
             "create",
             "codex",
@@ -2153,6 +3353,52 @@ class TestTurnTracking:
 
 
 class TestChatWorktreeBase:
+    def test_cleanup_fails_closed_when_worktree_remove_fails(self, tmp_path):
+        import subprocess
+
+        from spec_runtime.web.chat_api import _cleanup_chat_worktree
+
+        worktrees = tmp_path / ".worktrees"
+        target = worktrees / "task-web-task-cleanup--token"
+        target.mkdir(parents=True)
+        listing = subprocess.CompletedProcess(
+            [], 0, f"worktree {target}\n", ""
+        )
+        failed = subprocess.CompletedProcess([], 1, "", "busy")
+        with (
+            patch("spec_runtime.orchestrator._worktrees_root", return_value=worktrees),
+            patch(
+                "spec_runtime.orchestrator.run_subprocess",
+                side_effect=[listing, failed],
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="busy"):
+                _cleanup_chat_worktree(
+                    tmp_path,
+                    str(target),
+                    "task/web-task-cleanup--token",
+                )
+
+        assert target.exists()
+
+    def test_cleanup_fails_closed_when_branch_delete_fails(self, tmp_path):
+        import subprocess
+
+        from spec_runtime.web.chat_api import _cleanup_chat_worktree
+
+        exists = subprocess.CompletedProcess([], 0, "", "")
+        failed = subprocess.CompletedProcess([], 1, "", "branch busy")
+        with patch(
+            "spec_runtime.orchestrator.run_subprocess",
+            side_effect=[exists, failed],
+        ):
+            with pytest.raises(RuntimeError, match="branch busy"):
+                _cleanup_chat_worktree(
+                    tmp_path,
+                    None,
+                    "task/web-task-cleanup--token",
+                )
+
     def test_setup_uses_configured_base_ref(self, tmp_path):
         from spec_runtime.web.chat_api import _setup_chat_worktree
 
@@ -2218,6 +3464,51 @@ class TestCodexParseNotification:
         events = session._parse_notification({"method": "turn/completed"})
         assert len(events) == 1
         assert events[0].kind == "done"
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            {
+                "type": "turn.completed",
+                "turn": {
+                    "status": "failed",
+                    "error": {"message": "plain provider failure"},
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {
+                    "turn": {
+                        "status": "interrupted",
+                        "error": {"message": "rpc interruption"},
+                    }
+                },
+            },
+            {
+                "type": "turn.failed",
+                "error": {"message": "plain failed notification"},
+            },
+            {
+                "method": "turn/interrupted",
+                "params": {"message": "rpc interrupted notification"},
+            },
+        ],
+    )
+    def test_failed_and_interrupted_terminals_emit_error_then_done(self, message):
+        from spec_runtime.web.bridge_codex import _CodexSession
+
+        session = _CodexSession.__new__(_CodexSession)
+        session._saw_delta_text = False
+        session._last_turn_error = ""
+
+        events = session._parse_notification(message)
+
+        assert [event.kind for event in events] == ["error", "done"]
+        assert session._last_turn_error == events[0].text
+        assert any(
+            marker in events[0].text.lower()
+            for marker in ("failed", "interrupted")
+        )
 
     def test_item_completed_agent_message(self):
         from spec_runtime.web.bridge_codex import _CodexSession
@@ -2857,7 +4148,7 @@ class TestImplementEndpoint:
 
         from spec_runtime.web.server import create_app
 
-        app = create_app(tmp_path, token)
+        app = create_app(tmp_path, token, reload_token=False)
         client = TestClient(app, raise_server_exceptions=False)
         return client
 
@@ -2979,6 +4270,88 @@ class TestImplementEndpoint:
         assert data["run_state"]["spec_id"] == "correct-spec"
         assert data["run_state"]["run_id"] == data["run_id"]
 
+    def test_implement_validates_committed_bytes_not_dirty_correction(self, tmp_path):
+        from spec_runtime.web.bridge import create_session
+
+        client = self._make_client(tmp_path)
+        task_dir = tmp_path / "specs" / "tasks"
+        task_dir.mkdir(parents=True)
+        # The mutable file looks corrected, but the reviewed/committed bytes
+        # still carry the mismatched id and must be rejected.
+        (task_dir / "committed-name.md").write_text(
+            "---\nid: committed-name\n---\n",
+            encoding="utf-8",
+        )
+        session = create_session(mode="task", agent="codex")
+        session.worktree_path = str(tmp_path)
+        session.branch = "task/committed-name"
+        detected = {
+            "spec_id": "committed-name",
+            "spec_content": "---\nid: wrong-committed-id\n---\n",
+            "head_sha": "deadbeef",
+        }
+
+        with (
+            patch("spec_runtime.web.chat_api._detect_task_spec", return_value=detected),
+            patch("spec_runtime.web.chat_api.ProcessSupervisor.spawn") as spawn,
+        ):
+            response = client.post(
+                f"/api/v1/chat/sessions/{session.session_id}/implement",
+                json={},
+                headers=self._auth_headers(),
+            )
+
+        assert response.status_code == 422
+        assert "wrong-committed-id" in response.json()["error"]
+        assert session.status == "active"
+        spawn.assert_not_called()
+
+    def test_implement_pins_same_committed_bytes_it_validates(self, tmp_path):
+        import hashlib
+
+        from spec_runtime.orchestrator import RunState, _run_spec_snapshot_path
+        from spec_runtime.web.bridge import create_session
+
+        client = self._make_client(tmp_path)
+        task_dir = tmp_path / "specs" / "tasks"
+        task_dir.mkdir(parents=True)
+        # A dirty mismatch cannot redirect validation away from committed HEAD.
+        (task_dir / "stable-task.md").write_text(
+            "---\nid: dirty-other-id\n---\n",
+            encoding="utf-8",
+        )
+        committed = "---\nid: stable-task\n---\n\n# Committed task\n"
+        session = create_session(mode="task", agent="codex")
+        session.worktree_path = str(tmp_path)
+        session.branch = "task/stable-task"
+        detected = {
+            "spec_id": "stable-task",
+            "spec_content": committed,
+            "head_sha": "deadbeef",
+        }
+        process = MagicMock(pid=1234)
+        process.poll.return_value = None
+
+        with (
+            patch("spec_runtime.web.chat_api._detect_task_spec", return_value=detected),
+            patch(
+                "spec_runtime.web.chat_api.ProcessSupervisor.spawn",
+                return_value=process,
+            ),
+        ):
+            response = client.post(
+                f"/api/v1/chat/sessions/{session.session_id}/implement",
+                json={},
+                headers=self._auth_headers(),
+            )
+
+        assert response.status_code == 200
+        run_id = response.json()["run_id"]
+        assert _run_spec_snapshot_path(tmp_path, run_id).read_text(encoding="utf-8") == committed
+        assert RunState.load(tmp_path, run_id).spec_revision == (
+            "sha256:" + hashlib.sha256(committed.encode("utf-8")).hexdigest()
+        )
+
     def test_implement_idempotent_after_completion(self, tmp_path):
         """A second POST to implement on a completed session returns 409."""
         from spec_runtime.web.bridge import create_session
@@ -3079,6 +4452,316 @@ class TestImplementEndpoint:
         assert response.status_code == 200
         supervisor_cls.assert_called_once_with(LifetimeMode.ADOPTABLE)
 
+    @pytest.mark.parametrize(
+        ("stop_error", "expected_status"),
+        [
+            (TimeoutError("provider cleanup is still running"), 504),
+            (RuntimeError("disconnect failed"), 503),
+        ],
+    )
+    def test_implement_requires_confirmed_provider_stop_before_spawn(
+        self,
+        tmp_path,
+        stop_error,
+        expected_status,
+    ):
+        """A failed provider stop leaves a retryable session and no run."""
+        from spec_runtime.web.bridge import (
+            _bridges,
+            _sessions,
+            create_session,
+            register_bridge,
+        )
+
+        client = self._make_client(tmp_path)
+        task_dir = tmp_path / "specs" / "tasks"
+        task_dir.mkdir(parents=True)
+        spec_content = "---\nid: stop-first\n---\n"
+        (task_dir / "stop-first.md").write_text(spec_content, encoding="utf-8")
+        session = create_session(mode="task", agent="codex")
+        session.worktree_path = str(tmp_path)
+        session.branch = "task/stop-first"
+        session.base_sha = "abc123"
+        bridge = MagicMock(stop_session=AsyncMock())
+        register_bridge(session.session_id, bridge)
+
+        detected = {
+            "spec_id": "stop-first",
+            "spec_content": spec_content,
+            "head_sha": "deadbeef",
+        }
+        try:
+            with (
+                patch(
+                    "spec_runtime.web.chat_api._detect_task_spec",
+                    return_value=detected,
+                ),
+                patch(
+                    "spec_runtime.web.chat_api._confirm_provider_stop",
+                    new=AsyncMock(side_effect=stop_error),
+                ),
+                patch(
+                    "spec_runtime.web.chat_api.ProcessSupervisor.spawn",
+                ) as spawn_mock,
+            ):
+                response = client.post(
+                    f"/api/v1/chat/sessions/{session.session_id}/implement",
+                    json={},
+                    headers=self._auth_headers(),
+                )
+
+            assert response.status_code == expected_status
+            assert response.json()["status"] == "stopping"
+            assert session.status == "stopping"
+            spawn_mock.assert_not_called()
+            runs_root = tmp_path / ".spec-state" / "runs"
+            assert not runs_root.exists()
+
+            # Stop is explicitly retryable after either failure mode.
+            with patch(
+                "spec_runtime.web.chat_api._confirm_provider_stop",
+                new=AsyncMock(),
+            ):
+                retry = client.post(
+                    f"/api/v1/chat/sessions/{session.session_id}/stop",
+                    headers=self._auth_headers(),
+                )
+            assert retry.status_code == 200
+            assert session.status == "completed"
+        finally:
+            _sessions.pop(session.session_id, None)
+            _bridges.pop(session.session_id, None)
+
+    def test_implement_requires_cancellation_resistant_relay_to_exit(self, tmp_path):
+        """A turn that wins the initial status-check race blocks handoff."""
+        import asyncio
+        import json as json_mod
+
+        from starlette.requests import Request
+
+        from spec_runtime.web.bridge import (
+            _bridges,
+            _sessions,
+            create_session,
+            register_bridge,
+        )
+        from spec_runtime.web.chat_api import (
+            _turn_completions,
+            _turn_event_lists,
+            _turn_notifiers,
+            _turn_owners,
+            _turn_tasks,
+            implement_chat_task,
+            stop_chat_session,
+        )
+        from spec_runtime.web.server import create_app
+
+        app = create_app(tmp_path, "test-token", reload_token=False)
+        task_dir = tmp_path / "specs" / "tasks"
+        task_dir.mkdir(parents=True)
+        spec_content = "---\nid: relay-first\n---\n"
+        (task_dir / "relay-first.md").write_text(spec_content, encoding="utf-8")
+        session = create_session(mode="task", agent="codex")
+        session.worktree_path = str(tmp_path)
+        session.branch = "task/relay-first"
+        session.base_sha = "abc123"
+        bridge = MagicMock(stop_session=AsyncMock())
+        register_bridge(session.session_id, bridge)
+        detected = {
+            "spec_id": "relay-first",
+            "spec_content": spec_content,
+            "head_sha": "deadbeef",
+        }
+
+        def make_request(path: str, body: dict | None = None) -> Request:
+            payload = json_mod.dumps(body or {}).encode()
+            delivered = False
+
+            async def receive():
+                nonlocal delivered
+                if delivered:
+                    return {"type": "http.disconnect"}
+                delivered = True
+                return {
+                    "type": "http.request",
+                    "body": payload,
+                    "more_body": False,
+                }
+
+            return Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": path,
+                    "path_params": {"id": session.session_id},
+                    "headers": [],
+                    "app": app,
+                },
+                receive,
+            )
+
+        async def run_test():
+            release = asyncio.Event()
+
+            async def resist_cancellation():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    await release.wait()
+
+            turn = asyncio.create_task(resist_cancellation())
+            await asyncio.sleep(0)
+            sid = session.session_id
+            _turn_tasks[sid] = turn
+            _turn_notifiers[sid] = asyncio.Event()
+            _turn_completions[sid] = asyncio.Event()
+            _turn_event_lists[sid] = []
+            _turn_owners[sid] = "owner"
+
+            try:
+                with (
+                    # Simulate a turn starting immediately after the endpoint's
+                    # optimistic active-turn check.
+                    patch("spec_runtime.web.chat_api._is_turn_active", return_value=False),
+                    patch(
+                        "spec_runtime.web.chat_api._detect_task_spec",
+                        return_value=detected,
+                    ),
+                    patch(
+                        "spec_runtime.web.chat_api._TURN_CANCEL_TIMEOUT_SECONDS",
+                        0.001,
+                    ),
+                    patch(
+                        "spec_runtime.web.chat_api.ProcessSupervisor.spawn",
+                    ) as spawn_mock,
+                ):
+                    response = await implement_chat_task(
+                        make_request(
+                            f"/api/v1/chat/sessions/{sid}/implement",
+                            {},
+                        )
+                    )
+
+                assert response.status_code == 503
+                assert session.status == "stopping"
+                assert sid in _turn_tasks
+                assert sid in _turn_owners
+                spawn_mock.assert_not_called()
+                assert not (tmp_path / ".spec-state" / "runs").exists()
+
+                release.set()
+                await turn
+                retry = await stop_chat_session(
+                    make_request(f"/api/v1/chat/sessions/{sid}/stop")
+                )
+                assert retry.status_code == 200
+                assert session.status == "completed"
+                assert sid not in _turn_tasks
+                assert sid not in _turn_owners
+            finally:
+                if not turn.done():
+                    release.set()
+                    await turn
+                _turn_tasks.pop(sid, None)
+                _turn_notifiers.pop(sid, None)
+                _turn_completions.pop(sid, None)
+                _turn_event_lists.pop(sid, None)
+                _turn_owners.pop(sid, None)
+                _sessions.pop(sid, None)
+                _bridges.pop(sid, None)
+
+        asyncio.run(run_test())
+
+    def test_concurrent_stop_wins_handoff_before_process_spawn(self, tmp_path):
+        import asyncio
+        import json as json_mod
+
+        from starlette.requests import Request
+
+        from spec_runtime.web.bridge import create_session, register_bridge
+        from spec_runtime.web.chat_api import implement_chat_task, stop_chat_session
+        from spec_runtime.web.server import create_app
+
+        app = create_app(tmp_path, "token", reload_token=False)
+        task_dir = tmp_path / "specs" / "tasks"
+        task_dir.mkdir(parents=True)
+        committed = "---\nid: handoff-race\n---\n"
+        (task_dir / "handoff-race.md").write_text(committed, encoding="utf-8")
+        session = create_session(mode="task", agent="codex")
+        session.worktree_path = str(tmp_path)
+        session.branch = "task/handoff-race"
+        bridge = MagicMock(stop_session=AsyncMock())
+        register_bridge(session.session_id, bridge)
+        detected = {
+            "spec_id": "handoff-race",
+            "spec_content": committed,
+            "head_sha": "deadbeef",
+        }
+
+        def request(path: str) -> Request:
+            delivered = False
+
+            async def receive():
+                nonlocal delivered
+                if delivered:
+                    return {"type": "http.disconnect"}
+                delivered = True
+                return {
+                    "type": "http.request",
+                    "body": json_mod.dumps({}).encode(),
+                    "more_body": False,
+                }
+
+            return Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": path,
+                    "path_params": {"id": session.session_id},
+                    "headers": [],
+                    "app": app,
+                },
+                receive,
+            )
+
+        async def run_test():
+            provider_stop_started = asyncio.Event()
+            release_handoff = asyncio.Event()
+            calls = 0
+
+            async def controlled_stop(_session_id, _bridge):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    provider_stop_started.set()
+                    await release_handoff.wait()
+
+            with (
+                patch("spec_runtime.web.chat_api._detect_task_spec", return_value=detected),
+                patch(
+                    "spec_runtime.web.chat_api._confirm_provider_stop",
+                    side_effect=controlled_stop,
+                ),
+                patch("spec_runtime.web.chat_api.ProcessSupervisor.spawn") as spawn,
+            ):
+                handoff = asyncio.create_task(
+                    implement_chat_task(request("/implement"))
+                )
+                await provider_stop_started.wait()
+                stop = asyncio.create_task(stop_chat_session(request("/stop")))
+                await asyncio.sleep(0)
+                assert not stop.done()
+                release_handoff.set()
+                handoff_response, stop_response = await asyncio.gather(handoff, stop)
+
+            assert handoff_response.status_code == 409
+            assert stop_response.status_code == 200
+            spawn.assert_not_called()
+            assert session.status == "completed"
+            assert not (tmp_path / ".spec-state" / "runs").exists()
+
+        asyncio.run(run_test())
+
     def test_implement_supervisor_failure_rolls_back_session_and_run(self, tmp_path):
         import subprocess
 
@@ -3115,7 +4798,9 @@ class TestImplementEndpoint:
 
         assert response.status_code == 422
         assert "identity inspection failed" in response.json()["error"]
-        assert session.status == "active"
+        # Provider ownership was already relinquished before launch, so a
+        # failed orchestrator spawn cannot safely reactivate the chat.
+        assert session.status == "error"
         runs_root = tmp_path / ".spec-state" / "runs"
         assert not list(runs_root.glob("*.json"))
         assert not list(runs_root.glob("**/spec.md"))
@@ -3343,7 +5028,7 @@ class TestClearReviewEndpoint:
 
         from spec_runtime.web.server import create_app
 
-        app = create_app(tmp_path, token)
+        app = create_app(tmp_path, token, reload_token=False)
         client = TestClient(app, raise_server_exceptions=False)
         return client
 
@@ -3568,6 +5253,754 @@ class TestHandoffClearsSpecReview:
         assert session.history[0]["role"] == "assistant"
 
 
+def _linked_web_chat_repo(tmp_path: Path) -> tuple[Path, Path, str]:
+    import subprocess
+
+    remote = tmp_path / "remote.git"
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "task-worktree"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Web Test"], cwd=repo,
+                   check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "web-test@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / ".spec.toml").write_text(
+        'base_ref = "HEAD"\n[agents]\ndefault = "codex"\n'
+        'review_default = "codex"\nallowed = ["codex"]\n',
+        encoding="utf-8",
+    )
+    (repo / ".gitignore").write_text(
+        ".spec-state/\n.worktrees/\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True,
+                   capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo,
+                   check=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, text=True,
+        capture_output=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "task/web-canary", str(worktree)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+    )
+    return repo, worktree, base_sha
+
+
+class TestWebGitMetadataBoundary:
+    def test_private_git_grant_excludes_all_real_metadata(
+        self,
+        tmp_path,
+    ):
+        from spec_runtime.agent_git_isolation import (
+            prepare_agent_git_isolation,
+        )
+
+        repo, worktree, _ = _linked_web_chat_repo(tmp_path)
+        common = repo / ".git"
+        gitdir = Path(
+            (worktree / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+        ).resolve()
+        isolation = prepare_agent_git_isolation(worktree)
+        grants = set(isolation.writable_paths)
+
+        assert grants == {gitdir / "specbutler-private-git"}
+        assert gitdir not in grants
+        assert common.resolve() not in grants
+        assert (common / "objects").resolve() in isolation.read_only_paths
+        assert (common / "refs").resolve() in isolation.read_only_paths
+        assert (common / "config").resolve() in isolation.read_only_paths
+        assert (worktree / ".git").resolve(strict=False) in isolation.read_only_paths
+
+    def test_chat_lifecycle_passes_private_git_to_bridge_and_cleans_it_on_stop(
+        self,
+        tmp_path,
+    ):
+        import subprocess
+
+        from starlette.testclient import TestClient
+
+        from spec_runtime.agent_git_isolation import (
+            prepare_agent_git_isolation_if_linked,
+        )
+        from spec_runtime.web.bridge import AgentEvent, get_session
+        from spec_runtime.web.server import create_app
+
+        repo, worktree, base_sha = _linked_web_chat_repo(tmp_path)
+        initial_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        captured: dict[str, object] = {}
+
+        class _Bridge:
+            async def start_session(self, **kwargs):
+                captured.update(kwargs)
+                return kwargs["session_id"]
+
+            async def send_message(self, _session_id, _text):
+                yield AgentEvent(kind="done")
+
+            async def stop_session(self, _session_id):
+                return None
+
+        app = create_app(repo, "token", reload_token=False)
+        with (
+            patch(
+                "spec_runtime.web.chat_api._available_backends",
+                return_value={"claude": False, "codex": True},
+            ),
+            patch("spec_runtime.web.chat_api._create_bridge", return_value=_Bridge()),
+            patch(
+                "spec_runtime.web.chat_api._setup_chat_worktree",
+                return_value=(worktree, "task/web-canary", base_sha, "HEAD"),
+            ),
+            patch(
+                "spec_runtime.web.chat_api.prepare_agent_git_isolation_if_linked",
+                side_effect=prepare_agent_git_isolation_if_linked,
+            ),
+            patch("spec_runtime.orchestrator._write_sandbox_config"),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            created = client.post(
+                "/api/v1/chat/sessions",
+                json={"mode": "task", "agent": "codex", "prompt": "scope it"},
+                headers={"Authorization": "Bearer token"},
+            )
+            assert created.status_code == 200, created.text
+            session_id = created.json()["session_id"]
+            session = get_session(session_id)
+            assert session is not None
+            isolation = session.agent_git_isolation
+            assert isolation is not None
+            assert captured["git_isolation"] is isolation
+            assert isolation.private_git_dir.is_dir()
+
+            stopped = client.post(
+                f"/api/v1/chat/sessions/{session_id}/stop",
+                headers={"Authorization": "Bearer token"},
+            )
+            assert stopped.status_code == 200, stopped.text
+            assert session.agent_git_isolation is None
+            assert not isolation.private_git_dir.exists()
+
+        assert subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip() == initial_head
+
+    def test_handoff_refuses_private_head_changed_after_spec_selection(
+        self,
+        tmp_path,
+    ):
+        import asyncio
+        import os
+        import subprocess
+
+        from spec_runtime.agent_git_isolation import (
+            UnsafeAgentGitIsolationError,
+            agent_git_head,
+            prepare_agent_git_isolation,
+        )
+        from spec_runtime.web.bridge import ChatSession
+        from spec_runtime.web.chat_api import _finalize_agent_git
+
+        _repo, worktree, _base_sha = _linked_web_chat_repo(tmp_path)
+        isolation = prepare_agent_git_isolation(worktree)
+        env = isolation.apply_to_environment({"PATH": os.environ["PATH"]})
+        task = worktree / "specs" / "tasks" / "selected.md"
+        task.parent.mkdir(parents=True)
+        task.write_text("---\nid: selected\n---\n", encoding="utf-8")
+        subprocess.run(["git", "add", "specs/tasks/selected.md"], cwd=worktree,
+                       env=env, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "selected"], cwd=worktree,
+                       env=env, check=True, capture_output=True)
+        selected_head = agent_git_head(isolation)
+
+        (worktree / "later.txt").write_text("later\n", encoding="utf-8")
+        subprocess.run(["git", "add", "later.txt"], cwd=worktree,
+                       env=env, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "later"], cwd=worktree,
+                       env=env, check=True, capture_output=True)
+        session = ChatSession(
+            session_id="head-race",
+            mode="task",
+            agent="codex",
+            worktree_path=str(worktree),
+            agent_git_isolation=isolation,
+        )
+
+        with pytest.raises(UnsafeAgentGitIsolationError, match="HEAD changed"):
+            asyncio.run(_finalize_agent_git(session, expected_head=selected_head))
+
+        assert subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=worktree, text=True,
+            capture_output=True, check=True,
+        ).stdout.strip() == isolation.initial_head
+        assert session.agent_git_isolation is None
+        assert not isolation.private_git_dir.exists()
+
+    def test_poisoned_private_git_is_discarded_without_losing_working_files(
+        self,
+        tmp_path,
+    ):
+        import asyncio
+
+        from spec_runtime.agent_git_isolation import (
+            UnsafeAgentGitIsolationError,
+            prepare_agent_git_isolation,
+        )
+        from spec_runtime.web.bridge import ChatSession
+        from spec_runtime.web.chat_api import _finalize_agent_git
+
+        _repo, worktree, _base_sha = _linked_web_chat_repo(tmp_path)
+        isolation = prepare_agent_git_isolation(worktree)
+        recovery_file = worktree / "recover-me.txt"
+        recovery_file.write_text("working copy survives\n", encoding="utf-8")
+        (isolation.private_git_dir / "config").write_text(
+            "[core]\n\thooksPath = attacker\n",
+            encoding="utf-8",
+        )
+        session = ChatSession(
+            session_id="poisoned-git",
+            mode="task",
+            agent="codex",
+            worktree_path=str(worktree),
+            agent_git_isolation=isolation,
+        )
+
+        with pytest.raises(UnsafeAgentGitIsolationError, match="config changed"):
+            asyncio.run(_finalize_agent_git(session))
+
+        assert session.agent_git_isolation is None
+        assert not isolation.private_git_dir.exists()
+        assert recovery_file.read_text(encoding="utf-8") == "working copy survives\n"
+
+    def test_failed_startup_discards_private_git_before_worktree_cleanup(
+        self,
+        tmp_path,
+    ):
+        from starlette.testclient import TestClient
+
+        from spec_runtime.agent_git_isolation import (
+            prepare_agent_git_isolation_if_linked,
+        )
+        from spec_runtime.web.server import create_app
+
+        repo, worktree, base_sha = _linked_web_chat_repo(tmp_path)
+        prepared = []
+
+        def prepare(path):
+            isolation = prepare_agent_git_isolation_if_linked(path)
+            prepared.append(isolation)
+            return isolation
+
+        def cleanup(_repo_root, _worktree, _branch):
+            assert prepared and prepared[0] is not None
+            assert not prepared[0].private_git_dir.exists()
+
+        bridge = MagicMock()
+        bridge.start_session = AsyncMock(side_effect=RuntimeError("connect failed"))
+        bridge.stop_session = AsyncMock()
+        app = create_app(repo, "token", reload_token=False)
+        with (
+            patch(
+                "spec_runtime.web.chat_api._available_backends",
+                return_value={"claude": False, "codex": True},
+            ),
+            patch("spec_runtime.web.chat_api._create_bridge", return_value=bridge),
+            patch(
+                "spec_runtime.web.chat_api._setup_chat_worktree",
+                return_value=(worktree, "task/web-canary", base_sha, "HEAD"),
+            ),
+            patch(
+                "spec_runtime.web.chat_api.prepare_agent_git_isolation_if_linked",
+                side_effect=prepare,
+            ),
+            patch("spec_runtime.web.chat_api._cleanup_chat_worktree", side_effect=cleanup),
+            patch("spec_runtime.orchestrator._write_sandbox_config"),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                "/api/v1/chat/sessions",
+                json={"mode": "task", "agent": "codex", "prompt": "scope it"},
+                headers={"Authorization": "Bearer token"},
+            )
+
+        assert response.status_code == 422
+        assert prepared and prepared[0] is not None
+        assert not prepared[0].private_git_dir.exists()
+
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="Codex sandbox canary uses the Linux filesystem boundary",
+    )
+    def test_real_codex_sandbox_can_commit_surface_ready_spec_and_handoff(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import asyncio
+        import os
+        import shlex
+        import shutil
+        import subprocess
+
+        from starlette.testclient import TestClient
+
+        from spec_runtime.agent_git_isolation import (
+            prepare_agent_git_isolation,
+        )
+        from spec_runtime.git_publish_guard import (
+            capture_repository_publication_baseline,
+        )
+        from spec_runtime.web.bridge import AgentEvent, create_session
+        from spec_runtime.web.bridge_codex import _CodexSession
+        from spec_runtime.web.chat_api import (
+            _run_turn_bg,
+            _turn_completions,
+            _turn_event_lists,
+            _turn_notifiers,
+        )
+        from spec_runtime.web.server import create_app
+
+        codex = shutil.which("codex")
+        if codex is None:
+            pytest.skip("Codex CLI is not installed")
+        repo, worktree, base_sha = _linked_web_chat_repo(tmp_path)
+        isolation = prepare_agent_git_isolation(worktree)
+        dot_git = worktree / ".git"
+        real_head = isolation.real_git_dir / "HEAD"
+        main_ref = isolation.common_git_dir / "refs" / "heads" / "main"
+        real_metadata_before = {
+            path: path.read_bytes() for path in (dot_git, real_head, main_ref)
+        }
+        codex_home = tmp_path / "codex-home"
+        codex_home.mkdir()
+        overrides = [
+            item
+            for item in _CodexSession._safety_config_overrides(
+                codex_home,
+                git_write_paths=isolation.writable_paths,
+                git_read_only_paths=isolation.read_only_paths,
+            )
+            if item != "--strict-config"
+        ]
+        command = (
+            f"if printf attack > {shlex.quote(str(dot_git))}; then exit 41; fi; "
+            f"if printf attack > {shlex.quote(str(real_head))}; then exit 42; fi; "
+            f"if printf attack > {shlex.quote(str(main_ref))}; then exit 43; fi; "
+            "mkdir -p specs/tasks && "
+            "printf '%s\\n' '---' 'id: sandbox-canary' '---' '# Canary' "
+            "> specs/tasks/sandbox-canary.md && "
+            "git add specs/tasks/sandbox-canary.md && "
+            "git -c user.name='Web Test' -c user.email='web-test@example.invalid' "
+            "commit -m sandbox-canary"
+        )
+        env = dict(os.environ)
+        env["CODEX_HOME"] = str(codex_home)
+        env.update(isolation.env_overrides)
+        completed = subprocess.run(
+            [
+                codex,
+                *overrides,
+                "sandbox",
+                "-P",
+                "specbutler-web",
+                "-C",
+                str(worktree),
+                "bash",
+                "-c",
+                command,
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert {
+            path: path.read_bytes() for path in real_metadata_before
+        } == real_metadata_before
+
+        session = create_session(mode="task", agent="codex")
+        session.worktree_path = str(worktree)
+        session.branch = "task/web-canary"
+        session.base_sha = base_sha
+        session.base_ref = "HEAD"
+        session.agent_git_isolation = isolation
+        session.publication_baseline = capture_repository_publication_baseline(
+            worktree
+        )
+
+        class _FinishedBridge:
+            async def send_message(self, _session_id, _text):
+                yield AgentEvent(kind="done")
+
+            async def stop_session(self, _session_id):
+                return None
+
+        sid = session.session_id
+        _turn_event_lists[sid] = []
+        _turn_notifiers[sid] = asyncio.Event()
+        _turn_completions[sid] = asyncio.Event()
+        asyncio.run(_run_turn_bg(sid, session, _FinishedBridge(), "scope"))
+        assert any(
+            event.get("kind") == "task_spec_ready"
+            for event in _turn_event_lists[sid]
+        )
+
+        process = MagicMock(pid=31337)
+        process.poll.return_value = None
+        app = create_app(repo, "token", reload_token=False)
+        with (
+            patch(
+                "spec_runtime.web.chat_api.ProcessSupervisor.spawn",
+                return_value=process,
+            ),
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                f"/api/v1/chat/sessions/{sid}/implement",
+                json={},
+                headers={"Authorization": "Bearer token"},
+            )
+        assert response.status_code == 200, response.text
+        assert response.json()["spec_id"] == "sandbox-canary"
+        assert session.handoff_completed is True
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="process-group descendant regression is POSIX-specific",
+)
+def test_codex_stop_reaps_descendant_after_app_server_leader_exits(
+    tmp_path,
+    monkeypatch,
+):
+    import asyncio
+    import os
+    import signal
+    import subprocess
+
+    from spec_runtime.process_supervisor import (
+        LifetimeMode,
+        ProcessSupervisor,
+        inspect_process,
+        is_process_group_alive,
+    )
+    from spec_runtime.web.bridge_codex import _terminate_process
+
+    child_code = (
+        "import signal,time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    )
+    leader_code = (
+        "import subprocess,sys; "
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]); "
+        "print(p.pid, flush=True)"
+    )
+
+    async def run():
+        proc = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+            [sys.executable, "-c", leader_code],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=tmp_path,
+        )
+        assert proc.stdout is not None
+        child_pid = int((await proc.stdout.readline()).decode().strip())
+        await proc.process.wait()
+        assert inspect_process(child_pid) is not None
+        # Keep the facade wait fast: the web boundary itself must notice the
+        # still-live group and escalate after the exited leader was reaped.
+        monkeypatch.setattr(
+            "spec_runtime.process_supervisor._wait_for_identities_exit",
+            lambda _identities, timeout=5.0: False,
+        )
+        try:
+            await _terminate_process(proc)
+            assert not is_process_group_alive(proc.token.pgid)
+            assert inspect_process(child_pid) is None
+        finally:
+            if is_process_group_alive(proc.token.pgid):
+                os.killpg(proc.token.pgid, signal.SIGKILL)
+
+    asyncio.run(run())
+
+
+class TestWebPublicationBaseline:
+    def test_private_git_detection_failure_completes_the_turn_stream(self):
+        import asyncio
+
+        from spec_runtime.agent_git_isolation import UnsafeAgentGitIsolationError
+        from spec_runtime.web.bridge import AgentEvent, ChatSession
+        from spec_runtime.web.chat_api import (
+            _run_turn_bg,
+            _turn_completions,
+            _turn_event_lists,
+            _turn_notifiers,
+        )
+
+        session = ChatSession(
+            session_id="private-git-detection-failure",
+            mode="task",
+            agent="codex",
+            worktree_path="/unused",
+        )
+
+        class _FinishedBridge:
+            async def send_message(self, _session_id, _text):
+                yield AgentEvent(kind="done")
+
+        session_id = session.session_id
+        _turn_event_lists[session_id] = []
+        _turn_notifiers[session_id] = asyncio.Event()
+        _turn_completions[session_id] = asyncio.Event()
+        with patch(
+            "spec_runtime.web.chat_api._detect_task_spec",
+            side_effect=UnsafeAgentGitIsolationError("private metadata changed"),
+        ):
+            asyncio.run(
+                _run_turn_bg(session_id, session, _FinishedBridge(), "scope")
+            )
+
+        assert _turn_completions[session_id].is_set()
+        assert session.status == "error"
+        assert any(
+            event.get("kind") == "error"
+            and "private metadata changed" in event.get("text", "")
+            for event in _turn_event_lists[session_id]
+        )
+
+    @pytest.mark.parametrize("agent", ["claude", "codex"])
+    def test_poisoning_after_turn_is_terminal_and_never_surfaces_ready_spec(
+        self,
+        tmp_path,
+        agent,
+    ):
+        import asyncio
+        import subprocess
+
+        from spec_runtime.git_publish_guard import (
+            capture_repository_publication_baseline,
+        )
+        from spec_runtime.web.bridge import AgentEvent, ChatSession
+        from spec_runtime.web.chat_api import (
+            _run_turn_bg,
+            _turn_completions,
+            _turn_event_lists,
+            _turn_notifiers,
+        )
+
+        _, worktree, base_sha = _linked_web_chat_repo(tmp_path)
+        session = ChatSession(
+            session_id=f"poison-{agent}",
+            mode="task",
+            agent=agent,
+            worktree_path=str(worktree),
+            branch="task/web-canary",
+            base_sha=base_sha,
+            publication_baseline=capture_repository_publication_baseline(worktree),
+        )
+
+        class _PoisoningBridge:
+            stopped = False
+
+            async def send_message(self, _session_id, _text):
+                subprocess.run(
+                    ["git", "config", "--local", "core.hooksPath", "attacker-hooks"],
+                    cwd=worktree,
+                    check=True,
+                )
+                yield AgentEvent(kind="done")
+
+            async def stop_session(self, _session_id):
+                self.stopped = True
+
+        bridge = _PoisoningBridge()
+        sid = session.session_id
+        _turn_event_lists[sid] = []
+        _turn_notifiers[sid] = asyncio.Event()
+        _turn_completions[sid] = asyncio.Event()
+        asyncio.run(_run_turn_bg(sid, session, bridge, "poison"))
+
+        assert session.status == "error"
+        assert bridge.stopped is True
+        assert any(
+            "publication configuration changed" in event.get("text", "")
+            for event in _turn_event_lists[sid]
+        )
+        assert not any(
+            event.get("kind") == "task_spec_ready"
+            for event in _turn_event_lists[sid]
+        )
+
+    @pytest.mark.parametrize("agent", ["claude", "codex"])
+    def test_poisoning_immediately_before_handoff_never_spawns(
+        self,
+        tmp_path,
+        agent,
+    ):
+        import subprocess
+
+        from starlette.testclient import TestClient
+
+        from spec_runtime.git_publish_guard import (
+            capture_repository_publication_baseline,
+        )
+        from spec_runtime.web.bridge import create_session
+        from spec_runtime.web.server import create_app
+
+        repo, worktree, _ = _linked_web_chat_repo(tmp_path)
+        session = create_session(mode="task", agent=agent)
+        session.worktree_path = str(worktree)
+        session.branch = "task/web-canary"
+        session.publication_baseline = capture_repository_publication_baseline(
+            worktree
+        )
+        detected = {
+            "spec_id": "poisoned-task",
+            "spec_content": "---\nid: poisoned-task\n---\n",
+            "head_sha": "deadbeef",
+        }
+        subprocess.run(
+            ["git", "config", "--local", "remote.origin.url", "https://evil.invalid/repo"],
+            cwd=worktree,
+            check=True,
+        )
+        app = create_app(repo, "token", reload_token=False)
+        with (
+            patch("spec_runtime.web.chat_api._detect_task_spec", return_value=detected),
+            patch("spec_runtime.web.chat_api.ProcessSupervisor.spawn") as spawn,
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = client.post(
+                f"/api/v1/chat/sessions/{session.session_id}/implement",
+                json={},
+                headers={"Authorization": "Bearer token"},
+            )
+        assert response.status_code == 409
+        assert session.status == "error"
+        spawn.assert_not_called()
+
+
+class TestClaudeStartupDecoyCleanup:
+    def test_confirmed_stop_removes_only_unchanged_launch_decoys(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import asyncio
+        import sys
+        from types import SimpleNamespace
+
+        from spec_runtime.web import bridge_claude
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        (worktree / ".env.keep").write_bytes(b"")
+        (worktree / "package.json").write_text("{}\n", encoding="utf-8")
+        (worktree / ".yarnrc.keep").symlink_to(worktree / "missing-target")
+        before = {path.name for path in worktree.iterdir()}
+        created = {
+            ".env",
+            ".env.local",
+            ".env.staging",
+            ".gitmodules",
+            ".npmrc",
+            ".yarnrc",
+            ".yarnrc.yml",
+            ".yarnrc.project",
+            "bun.lock",
+            "bun.lockb",
+            "bunfig.toml",
+            "npm-shrinkwrap.json",
+            "package-lock.json",
+            "package.generated.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+        }
+
+        class _Options:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        class _Client:
+            def __init__(self, *, options):
+                self.options = options
+
+            async def connect(self):
+                for name in created:
+                    (worktree / name).write_bytes(b"")
+
+            async def interrupt(self):
+                return None
+
+            async def disconnect(self):
+                return None
+
+        monkeypatch.setitem(
+            sys.modules,
+            "claude_agent_sdk",
+            SimpleNamespace(ClaudeAgentOptions=_Options, ClaudeSDKClient=_Client),
+        )
+        monkeypatch.setattr(bridge_claude, "_sdk_available", lambda: True)
+        monkeypatch.setattr(bridge_claude.shutil, "which", lambda _name: "/bin/true")
+        async def run():
+            bridge = bridge_claude.ClaudeBridge()
+            session_id = await bridge.start_session(
+                "system",
+                agent="claude",
+                cwd=str(worktree),
+            )
+            await bridge.stop_session(session_id)
+
+        asyncio.run(run())
+        assert {path.name for path in worktree.iterdir()} == before
+        assert (worktree / ".env.keep").read_bytes() == b""
+        assert (worktree / "package.json").read_text(encoding="utf-8") == "{}\n"
+        assert (worktree / ".yarnrc.keep").is_symlink()
+
+    def test_launch_decoy_modified_after_start_is_preserved(self, tmp_path):
+        from spec_runtime.web.bridge_claude import (
+            _cleanup_claude_launch_decoys,
+            _record_claude_launch_decoys,
+            _snapshot_claude_decoy_candidates,
+        )
+
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        session = {
+            "cwd": worktree,
+            "decoy_before": _snapshot_claude_decoy_candidates(worktree),
+            "launch_decoys": {},
+        }
+        decoy = worktree / ".env"
+        decoy.write_bytes(b"")
+        _record_claude_launch_decoys(session)
+        decoy.write_text("user-authored-content\n", encoding="utf-8")
+        _cleanup_claude_launch_decoys(session)
+        assert decoy.read_text(encoding="utf-8") == "user-authored-content\n"
+
+
 class TestChatJavaScriptContract:
     @pytest.fixture()
     def source(self) -> str:
@@ -3584,3 +6017,9 @@ class TestChatJavaScriptContract:
         assert "worktree and branch will be preserved" in source
         assert "if (data.worktree)" in source
         assert "if (data.branch)" in source
+
+    def test_spec_review_id_uses_attribute_escaping(self, source: str) -> None:
+        assert "&quot;" in source
+        assert "&#39;" in source
+        assert "escapeAttribute(msg.specId)" in source
+        assert "escapeHtml(msg.specId) + '\">Implement" not in source

@@ -7,10 +7,13 @@ either agent.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import AsyncIterator, Literal, Protocol, runtime_checkable
+
+from spec_runtime.agent_git_isolation import AgentGitIsolation
 
 # ---------------------------------------------------------------------------
 # AgentEvent — union type covering all streamed event kinds
@@ -75,7 +78,7 @@ class ChatSession:
     agent: str  # "claude" or "codex"
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     last_active: str = ""
-    status: str = "active"  # active / completed / error
+    status: str = "active"  # active / stopping / completed / error
     history: list = field(default_factory=list)
     initial_prompt: str = ""
     initial_turn_dispatched: bool = False  # True once the create-time turn starts
@@ -85,6 +88,17 @@ class ChatSession:
     base_sha: str = ""  # commit SHA the worktree branched from
     base_ref: str = ""  # configured ref the worktree branched from
     owner_id: str = ""  # web-app instance that owns provider lifecycle
+    cleanup_worktree_on_stop: bool = False  # deferred failed-start rollback
+    stop_requested: bool = False
+    handoff_completed: bool = False
+    publication_baseline: tuple[str, str] | None = field(
+        default=None,
+        repr=False,
+    )
+    agent_git_isolation: AgentGitIsolation | None = field(default=None, repr=False)
+    agent_git_reconciled_head: str = field(default="", repr=False)
+    startup_done: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    terminal_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def touch(self) -> None:
         self.last_active = datetime.now(timezone.utc).isoformat()
@@ -108,6 +122,7 @@ class AgentBridge(Protocol):
         allowed_tools: list[str] | None = None,
         session_id: str | None = None,
         initial_prompt: str = "",
+        git_isolation: AgentGitIsolation | None = None,
     ) -> str:
         """Start a new interactive session. Returns a session_id."""
         ...

@@ -12,7 +12,7 @@ the full implementation lifecycle.
 - **Python 3.11+**
 - **pipx** -- installs the CLI in an isolated environment
 - **git** (with a remote named `origin`)
-- **At least one agent CLI on PATH** -- `claude` or `codex`
+- **At least one authenticated agent CLI on PATH** -- `claude` or `codex`
 - **`gh` CLI** -- required for forge operations (push, PR creation, merge)
 
 ## 1. Install
@@ -44,6 +44,7 @@ Verify the install:
 spec --version
 gh auth status
 claude --version  # or: codex --version; use Codex for native Windows
+claude auth status  # or: codex login status
 ```
 
 On native Windows, use the PowerShell installation commands in
@@ -93,10 +94,11 @@ Run the read-only onboarding preflight before the first workflow:
 spec doctor
 ```
 
-It validates the configured base ref and origin, agent and GitHub CLI access,
-bootstrap and verify command executables, runtime path safety, and the selected
-execution backend. Blockers exit nonzero and include an exact remediation;
-optional missing agents and unignored paths are reported as warnings.
+It validates the configured base ref and origin, GitHub repository identity,
+agent and GitHub CLI access, provider login state, bootstrap and verify command
+executables, runtime path safety, and the selected execution backend. Blockers
+exit nonzero and include an exact remediation; optional missing agents,
+unverifiable provider login state, and unignored paths are reported as warnings.
 
 ## 3. Configure
 
@@ -180,7 +182,28 @@ spec create --spec my-first-feature
 ```
 
 This launches the configured agent in an authoring worktree to help you write
-the spec. The resulting file is saved to `specs/my-first-feature.md`.
+the spec. The resulting file is committed locally at
+`specs/my-first-feature.md`. Ordinary forge credentials are omitted from the
+agent process and Git publication is guarded. Explicitly trusted user MCP
+servers retain their own service authority and provider approval behavior, so
+review those integrations. Publish from your operator shell:
+
+```bash
+cd .worktrees/spec-my-first-feature
+git status --short
+git log -1 --stat
+git push --set-upstream origin spec/my-first-feature
+gh pr create --head spec/my-first-feature --base main
+```
+
+Review and merge that pull request, then update the orchestration checkout
+before running `spec implement`:
+
+```bash
+cd ../..
+git pull --ff-only
+spec implement --spec my-first-feature
+```
 
 A spec file uses YAML frontmatter followed by markdown:
 
@@ -300,7 +323,8 @@ token. See [Web dashboard and chat](web.md) for startup, authentication, remote
 access, and lifecycle commands.
 
 On native Windows, web chat supports Codex only. Claude fails closed there;
-use WSL2 or a supported Linux/macOS container when Claude is required.
+run the web server and Claude CLI inside WSL2, or use a supported Linux/macOS
+host, when Claude is required.
 
 ## 6. Monitor
 

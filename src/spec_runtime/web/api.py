@@ -5,18 +5,22 @@ from __future__ import annotations
 import asyncio
 import html as html_mod
 import json
-import re
 import shutil
 import subprocess
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+from spec_runtime.process_supervisor import (
+    LifetimeMode,
+    ProcessSupervisor,
+    SupervisionToken,
+)
 
 
 def _repo_root(request: Request) -> Path:
@@ -39,6 +43,124 @@ def _started_processes(request: Request) -> dict[str, subprocess.Popen]:
     return registry
 
 
+def _spec_lifecycle_lock(request: Request, spec_id: str) -> asyncio.Lock:
+    """Return the per-app lock serializing one spec's Start and Stop."""
+    locks = getattr(request.app.state, "web_spec_lifecycle_locks", None)
+    if locks is None:
+        locks = {}
+        request.app.state.web_spec_lifecycle_locks = locks
+    return locks.setdefault(spec_id, asyncio.Lock())
+
+
+def _remove_started_process(
+    started_processes: dict,
+    spec_id: str,
+    process: object,
+) -> None:
+    """Drop a registry entry only when it still names this exact launch."""
+    if started_processes.get(spec_id) is process:
+        started_processes.pop(spec_id, None)
+
+
+def _tracked_process_matches_group(process: object, pg: tuple[int, str]) -> bool:
+    """Compare both PID and creation identity when the handle exposes one."""
+    if getattr(process, "pid", None) != pg[0]:
+        return False
+    token = getattr(process, "token", None)
+    identity = getattr(token, "identity", None)
+    started_at = getattr(identity, "started_at", "")
+    if not isinstance(started_at, str) or started_at in {"", "test-double"}:
+        return True
+    return not pg[1] or started_at == pg[1]
+
+
+def _persisted_run_matches_tracked_process(
+    run_state: dict,
+    process: object,
+) -> bool:
+    """Correlate late-published run state to one exact retained launch."""
+    raw_token = run_state.get("supervision_token")
+    process_token = getattr(process, "token", None)
+    if not isinstance(raw_token, dict) or process_token is None:
+        return False
+
+    def identity_pair(value: object) -> tuple[int, str] | None:
+        if isinstance(value, dict):
+            pid = value.get("pid")
+            started_at = value.get("started_at")
+        else:
+            pid = getattr(value, "pid", None)
+            started_at = getattr(value, "started_at", None)
+        if not isinstance(pid, int) or not isinstance(started_at, str) or not started_at:
+            return None
+        return pid, started_at
+
+    persisted_identity = identity_pair(raw_token.get("identity"))
+    persisted_payload = identity_pair(
+        raw_token.get("payload_identity") or raw_token.get("payload")
+    )
+    tracked_identity = identity_pair(getattr(process_token, "identity", None))
+    tracked_payload = identity_pair(getattr(process_token, "payload", None))
+    if tracked_payload is None:
+        tracked_payload = identity_pair(
+            getattr(process_token, "payload_identity", None)
+        )
+    if not {persisted_identity, persisted_payload} & {
+        tracked_identity,
+        tracked_payload,
+    }:
+        return False
+    persisted_pgid = run_state.get("pgid")
+    tracked_pgid = getattr(process_token, "pgid", 0)
+    return not (
+        isinstance(persisted_pgid, int)
+        and persisted_pgid > 0
+        and isinstance(tracked_pgid, int)
+        and tracked_pgid > 0
+        and persisted_pgid != tracked_pgid
+    )
+
+
+def _terminalize_matching_run(
+    repo_root: Path,
+    spec_id: str,
+    run_id: str,
+    *,
+    expected_process: object | None = None,
+) -> dict | None:
+    """Mark only the exact web-launched running record stopped."""
+    if not run_id:
+        return None
+    from spec_runtime.orchestrator import (
+        _locked_state_path,
+        _now_iso,
+        _read_json_dict,
+        _run_state_path,
+        _write_json_file_atomically,
+    )
+
+    path = _run_state_path(repo_root, run_id)
+    with _locked_state_path(path):
+        payload = _read_json_dict(path)
+        if payload is None or payload.get("spec_id") != spec_id:
+            return None
+        if (
+            expected_process is not None
+            and isinstance(getattr(expected_process, "token", None), SupervisionToken)
+            and not _persisted_run_matches_tracked_process(
+                payload,
+                expected_process,
+            )
+        ):
+            return None
+        if payload.get("status") in {"running", "in_progress"}:
+            payload["status"] = "failed"
+            payload["last_error"] = "stopped by user"
+            payload["updated_at"] = _now_iso()
+            _write_json_file_atomically(path, payload)
+        return payload
+
+
 def _spec_executable() -> str:
     """Resolve the ``spec`` console-script path.
 
@@ -58,26 +180,113 @@ def _json(data: object, status: int = 200) -> JSONResponse:
     return JSONResponse(data, status_code=status)
 
 
-_UNSAFE_LINK_RE = re.compile(
-    r"""((?:href|src)\s*=\s*)(["']?)\s*(javascript|vbscript|data)\s*:""",
-    re.IGNORECASE,
-)
+def _valid_spec_id(spec_id: str) -> bool:
+    """Return whether a URL identifier is safe and canonical."""
+    from spec_runtime.spec_identity import SPEC_ID_RE
+
+    return bool(SPEC_ID_RE.fullmatch(spec_id))
+
+
+_MARKDOWN_TAGS = {
+    "a",
+    "blockquote",
+    "br",
+    "code",
+    "em",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "img",
+    "li",
+    "ol",
+    "p",
+    "pre",
+    "strong",
+    "table",
+    "tbody",
+    "td",
+    "th",
+    "thead",
+    "tr",
+    "ul",
+}
+_MARKDOWN_ATTRIBUTES = {
+    "a": {"href", "title"},
+    "code": {"class"},
+    "img": {"alt", "src", "title"},
+    "ol": {"start"},
+    "td": {"align", "colspan", "rowspan"},
+    "th": {"align", "colspan", "rowspan", "scope"},
+}
+_MARKDOWN_URL_SCHEMES = {"http", "https", "mailto"}
+_URL_ATTRIBUTES = {"href", "src"}
+
+
+def _sanitize_url_attribute(value: str) -> str | None:
+    """Allow relative URLs and an explicit set of absolute URL schemes.
+
+    URL parsers discard or decode more syntax than a string-prefix check. Run
+    entity and percent decoding to a fixed point, remove ASCII whitespace and
+    controls for scheme classification, and fail closed on replacement
+    characters emitted for malformed/NUL input. The original value is returned
+    only after the normalized scheme passes the allowlist.
+    """
+    normalized = value
+    for _ in range(8):
+        decoded = html_mod.unescape(unquote(normalized))
+        if decoded == normalized:
+            break
+        normalized = decoded
+    if "\ufffd" in normalized:
+        return None
+    compact = "".join(
+        character
+        for character in normalized
+        if ord(character) > 0x20 and ord(character) != 0x7F
+    )
+    try:
+        scheme = urlsplit(compact).scheme.lower()
+    except ValueError:
+        return None
+    if scheme and scheme not in _MARKDOWN_URL_SCHEMES:
+        return None
+    return value
+
+
+def _markdown_attribute_filter(tag: str, attribute: str, value: str) -> str | None:
+    del tag
+    if attribute in _URL_ATTRIBUTES:
+        return _sanitize_url_attribute(value)
+    return value
 
 
 def _render_markdown(text: str) -> str:
-    """Render markdown to HTML with raw HTML and dangerous links disabled.
+    """Render Markdown and sanitize its complete parsed HTML output.
 
     Raw HTML in the source is entity-escaped *before* markdown processing so
-    that only markdown-generated tags appear in the output.  After rendering,
-    dangerous URL schemes (``javascript:``, ``vbscript:``, ``data:``) are
-    stripped from ``href`` and ``src`` attributes to prevent XSS via
-    markdown link syntax like ``[click](javascript:...)``.
+    that only Markdown-generated tags should appear. The parsed-output
+    sanitizer is still the authoritative boundary: it allowlists tags,
+    attributes, and URL schemes and adds ``noopener noreferrer`` to links.
     """
     import markdown as md
+    import nh3
 
     safe_text = html_mod.escape(text)
     rendered = md.markdown(safe_text, extensions=["tables", "fenced_code"])
-    return _UNSAFE_LINK_RE.sub(r"\1\2#blocked-", rendered)
+    return nh3.clean(
+        rendered,
+        tags=_MARKDOWN_TAGS,
+        clean_content_tags={"script", "style"},
+        attributes=_MARKDOWN_ATTRIBUTES,
+        attribute_filter=_markdown_attribute_filter,
+        url_schemes=_MARKDOWN_URL_SCHEMES,
+        url_relative="pass_through",
+        link_rel="noopener noreferrer",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +331,8 @@ async def list_specs(request: Request) -> Response:
 
 async def get_spec(request: Request) -> Response:
     spec_id = request.path_params["spec_id"]
+    if not _valid_spec_id(spec_id):
+        return _json({"error": "Invalid spec ID"}, 400)
     repo_root = _repo_root(request)
     from spec_runtime.config import load_repo_spec_runtime_config
     from spec_runtime.spec_metadata import iter_spec_metadata
@@ -333,6 +544,16 @@ def _serialize_snapshot(snapshot: object) -> dict:
 
 async def implement_spec(request: Request) -> Response:
     spec_id = request.path_params["spec_id"]
+    if not _valid_spec_id(spec_id):
+        return _json({"error": "Invalid spec ID"}, 400)
+    async with _spec_lifecycle_lock(request, spec_id):
+        return await _implement_spec_locked(request)
+
+
+async def _implement_spec_locked(request: Request) -> Response:
+    spec_id = request.path_params["spec_id"]
+    if not _valid_spec_id(spec_id):
+        return _json({"error": "Invalid spec ID"}, 400)
     repo_root = _repo_root(request)
 
     # Validate the spec exists before spawning a subprocess.
@@ -360,6 +581,16 @@ async def implement_spec(request: Request) -> Response:
     pre_run = pre_index.latest_by_spec.get(spec_id)
     pre_run_id = pre_run.get("run_id", "") if pre_run else ""
 
+    started_processes = _started_processes(request)
+    existing = started_processes.get(spec_id)
+    if existing is not None:
+        if existing.poll() is None:
+            return _json(
+                {"error": "An implementation launch is already active", "spec_id": spec_id},
+                409,
+            )
+        _remove_started_process(started_processes, spec_id, existing)
+
     proc = ProcessSupervisor(LifetimeMode.ADOPTABLE).spawn(
         [
             _spec_executable(),
@@ -373,6 +604,9 @@ async def implement_spec(request: Request) -> Response:
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    # Publish the exact ownership capability before the first await.
+    setattr(proc, "_spec_web_run_id", "")
+    started_processes[spec_id] = proc
 
     # Give the process a moment to fail on startup (e.g. bad arguments,
     # permission errors).  If it exits immediately with a non-zero code the
@@ -380,6 +614,7 @@ async def implement_spec(request: Request) -> Response:
     await asyncio.sleep(0.5)
     exit_code = proc.poll()
     if exit_code is not None and exit_code != 0:
+        _remove_started_process(started_processes, spec_id, proc)
         return _json(
             {"error": f"spec implement exited immediately (code {exit_code})", "spec_id": spec_id},
             422,
@@ -388,8 +623,6 @@ async def implement_spec(request: Request) -> Response:
     # Track the Popen object so stop_spec can terminate it.  Storing the
     # object (not a bare PID) lets us call proc.poll() to verify the child
     # is still alive before signalling, preventing PID-reuse kills.
-    _started_processes(request)[spec_id] = proc
-
     # Return latest known run state for the spec.  Only return a persisted
     # run record when it belongs to *this* launch (run_id changed from the
     # pre-spawn snapshot).  Otherwise fall back to a synthesized "starting"
@@ -401,6 +634,8 @@ async def implement_spec(request: Request) -> Response:
     if latest_run and new_run_id and new_run_id != pre_run_id:
         run_id = new_run_id
         run_state = latest_run
+        if started_processes.get(spec_id) is proc:
+            setattr(proc, "_spec_web_run_id", run_id)
     else:
         run_id = ""
         run_state = {
@@ -422,6 +657,16 @@ async def implement_spec(request: Request) -> Response:
 
 async def stop_spec(request: Request) -> Response:
     spec_id = request.path_params["spec_id"]
+    if not _valid_spec_id(spec_id):
+        return _json({"error": "Invalid spec ID"}, 400)
+    async with _spec_lifecycle_lock(request, spec_id):
+        return await _stop_spec_locked(request)
+
+
+async def _stop_spec_locked(request: Request) -> Response:
+    spec_id = request.path_params["spec_id"]
+    if not _valid_spec_id(spec_id):
+        return _json({"error": "Invalid spec ID"}, 400)
     repo_root = _repo_root(request)
 
     from spec_runtime.autopilot_tui.dashboard import _resolve_live_process_group
@@ -430,19 +675,56 @@ async def stop_spec(request: Request) -> Response:
     started_processes = _started_processes(request)
 
     leader_pid: int | None = None
+    tracked_exit_confirmed = False
     proc = started_processes.get(spec_id)
+    owned_process = proc
+    tracked_run_id = ""
 
     if proc is not None:
+        value = getattr(proc, "_spec_web_run_id", "")
+        tracked_run_id = value if isinstance(value, str) else ""
+        if not tracked_run_id and pg is not None and _tracked_process_matches_group(proc, pg):
+            from spec_runtime.autopilot import load_run_record_index
+
+            current = load_run_record_index(repo_root).latest_by_spec.get(spec_id)
+            if current:
+                candidate = current.get("run_id", "")
+                tracked_run_id = candidate if isinstance(candidate, str) else ""
         # Prefer the managed process retained by the launch endpoint even
         # after the orchestrator has persisted its process metadata.  Its
         # termination boundary validates identity and owns the Windows Job;
         # reducing it back to a PID/process group loses both guarantees.
-        if proc.poll() is not None:
-            # Child already exited — PID may have been reused; clean up.
-            started_processes.pop(spec_id, None)
+        leader_exited = proc.poll() is not None
+        tree_active = getattr(proc, "owned_tree_active", None)
+        if leader_exited and callable(tree_active):
+            try:
+                leader_exited = not tree_active()
+            except (OSError, RuntimeError):
+                leader_exited = False
+        if leader_exited:
+            # A retained ManagedProcess proves ownership. Its bounded
+            # termination path already covers descendants; a completed
+            # leader on a later retry is enough to reap the registry handle.
+            leader_pid = proc.pid
+            _remove_started_process(started_processes, spec_id, proc)
+            # A live persisted group belongs to a current run, even when an
+            # older web-started handle under the same spec key has exited.
+            tracked_exit_confirmed = pg is None
             proc = None
+            if pg is not None:
+                leader_pid = pg[0]
         else:
             leader_pid = proc.pid
+            if pg is not None and not _tracked_process_matches_group(proc, pg):
+                return _json(
+                    {
+                        "error": "Tracked launch does not match the current persisted run",
+                        "spec_id": spec_id,
+                        "status": "stopping",
+                        "pid": leader_pid,
+                    },
+                    409,
+                )
     elif pg is not None:
         leader_pid = pg[0]
 
@@ -451,25 +733,99 @@ async def stop_spec(request: Request) -> Response:
 
     if proc is not None:
         try:
-            proc.terminate(grace_seconds=3)
-        except (ProcessLookupError, PermissionError, OSError):
-            return _json({"spec_id": spec_id, "status": "not_found"}, 404)
-    else:
+            termination_confirmed = proc.terminate(grace_seconds=3)
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            return _json(
+                {
+                    "error": f"Process stop was not confirmed: {exc}",
+                    "spec_id": spec_id,
+                    "status": "stopping",
+                    "pid": leader_pid,
+                },
+                503,
+            )
+
+        # Reap the leader as a separate positive confirmation. Lightweight
+        # compatibility doubles may not yet return the ManagedProcess boolean,
+        # so an ordinary successful wait remains an accepted boundary for them.
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            return _json(
+                {
+                    "error": "Process stop is still pending",
+                    "spec_id": spec_id,
+                    "status": "stopping",
+                    "pid": leader_pid,
+                },
+                504,
+            )
+        except (OSError, RuntimeError) as exc:
+            return _json(
+                {
+                    "error": f"Process stop was not confirmed: {exc}",
+                    "spec_id": spec_id,
+                    "status": "stopping",
+                    "pid": leader_pid,
+                },
+                503,
+            )
+        if termination_confirmed is False:
+            return _json(
+                {
+                    "error": "Owned process tree exit was not confirmed",
+                    "spec_id": spec_id,
+                    "status": "stopping",
+                    "pid": leader_pid,
+                },
+                503,
+            )
+        _remove_started_process(started_processes, spec_id, proc)
+        tracked_exit_confirmed = True
+    elif not tracked_exit_confirmed:
         try:
             from spec_runtime.orchestrator import stop_run
 
-            stop_run(spec_id, repo_root=repo_root)
-        except (RuntimeError, ProcessLookupError, PermissionError, OSError):
-            return _json({"spec_id": spec_id, "status": "not_found"}, 404)
+            stopped_run = stop_run(spec_id, repo_root=repo_root)
+            tracked_run_id = stopped_run.run_id
+        except (RuntimeError, ProcessLookupError, PermissionError, OSError) as exc:
+            return _json(
+                {
+                    "error": f"Process stop was not confirmed: {exc}",
+                    "spec_id": spec_id,
+                    "status": "stopping",
+                    "pid": leader_pid,
+                },
+                503,
+            )
 
-    # Wait briefly for the process to exit so the persisted run record
-    # has a chance to update before we read it back.
-    proc = started_processes.pop(spec_id, None)
-    if proc is not None:
-        try:
-            proc.wait(timeout=3)
-        except Exception:
-            pass  # Best-effort; we already sent the signal
+    if tracked_exit_confirmed and not tracked_run_id and owned_process is not None:
+        # The child can publish its RunState after Stop's initial process-group
+        # snapshot but before its retained tree exits. Reload only after that
+        # positive exit boundary, and correlate the durable identity to this
+        # exact launch before terminalizing anything.
+        from spec_runtime.autopilot import load_run_record_index
+
+        late_run = load_run_record_index(repo_root).latest_by_spec.get(spec_id)
+        if (
+            late_run
+            and isinstance(late_run.get("run_id"), str)
+            and _persisted_run_matches_tracked_process(late_run, owned_process)
+        ):
+            tracked_run_id = late_run["run_id"]
+
+    if tracked_exit_confirmed:
+        terminalized = _terminalize_matching_run(
+            repo_root,
+            spec_id,
+            tracked_run_id,
+            expected_process=owned_process,
+        )
+        if tracked_run_id and terminalized is None:
+            # The exact run disappeared or changed ownership while Stop was
+            # correlating it. Preserve the current state and take the
+            # non-success path below instead of reporting a false Stop.
+            tracked_run_id = ""
 
     # Return latest run state for the spec
     from spec_runtime.autopilot import load_run_record_index
@@ -477,11 +833,33 @@ async def stop_spec(request: Request) -> Response:
     run_index = load_run_record_index(repo_root)
     latest_run = run_index.latest_by_spec.get(spec_id)
 
-    # Ensure the returned state reflects the stop even if the persisted
-    # record hasn't been flushed yet.
     run_state = dict(latest_run) if latest_run else None
     if run_state and run_state.get("status") in ("running", "in_progress"):
-        run_state["status"] = "stopped"
+        if tracked_run_id and run_state.get("run_id") != tracked_run_id:
+            return _json(
+                {
+                    "error": "A newer implementation run is still active",
+                    "spec_id": spec_id,
+                    "status": "stopping",
+                    "pid": leader_pid,
+                    "run_state": run_state,
+                },
+                409,
+            )
+        if not tracked_run_id:
+            # No persisted identity was correlated to the exited startup
+            # process. Never relabel or hide an arbitrary current run while
+            # returning a false successful Stop response.
+            return _json(
+                {
+                    "error": "A running implementation could not be correlated to the stopped launch",
+                    "spec_id": spec_id,
+                    "status": "stopping",
+                    "pid": leader_pid,
+                    "run_state": run_state,
+                },
+                409,
+            )
 
     return _json({
         "spec_id": spec_id,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specbutler"
-version = "0.3.1"
+version = "0.4.0"
 description = "Local spec-to-merge workflow for coding agents"
 authors = [{name = "Thiago Hirai"}]
 requires-python = ">=3.11"
@@ -42,6 +42,7 @@ web = [
     "uvicorn>=0.30",
     "starlette>=0.40",
     "markdown>=3.5",
+    "nh3>=0.3.0",
     "claude-agent-sdk>=0.1.68",
 ]
 dev = [
@@ -78,6 +79,7 @@ pythonpath = ["src"]
 markers = [
   "host_agent_preflight: exercise the real host provider availability policy",
   "linux_claude_real_provider: opt-in Linux web chat proof using an authenticated real Claude provider",
+  "linux_codex_real_provider: opt-in Linux web chat proof using an authenticated real Codex provider",
   "windows_real_provider: opt-in Windows 11 lab proof using real Codex and a disposable GitHub repository",
 ]
 
