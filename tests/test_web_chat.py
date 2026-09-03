@@ -5792,11 +5792,15 @@ def test_codex_stop_reaps_descendant_after_app_server_leader_exits(
 
     child_code = (
         "import signal,time; "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "signal.signal(signal.SIGHUP, signal.SIG_IGN); "
+        "print('ready', flush=True); time.sleep(60)"
     )
     leader_code = (
         "import subprocess,sys; "
-        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}]); "
+        f"p=subprocess.Popen([sys.executable,'-c',{child_code!r}],"
+        "stdout=subprocess.PIPE,text=True); "
+        "assert p.stdout.readline().strip() == 'ready'; "
         "print(p.pid, flush=True)"
     )
 

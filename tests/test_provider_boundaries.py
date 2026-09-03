@@ -511,6 +511,7 @@ def test_claude_local_review_removes_checkout_controlled_mcp_before_launch(
         patch.object(orch, "_render_local_review_prompt", return_value="review"),
         patch.object(orch, "_bootstrap_review_worktree", return_value=""),
         patch.object(orch, "_claude_review_evidence_prompt_note", return_value=""),
+        patch.object(orch, "require_host_agent_available"),
         patch.object(
             orch,
             "_run_local_review_subprocess",
