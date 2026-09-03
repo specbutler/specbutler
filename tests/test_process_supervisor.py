@@ -2407,6 +2407,73 @@ def test_managed_async_communicate_preserves_baseexception_when_cleanup_fails(
     asyncio.run(exercise())
 
 
+def test_managed_async_wait_caller_cancellation_does_not_poison_cached_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out caller may retry without cancelling process reaping."""
+    identity = ProcessIdentity(42, "created")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        identity,
+        7,
+        "owner",
+        "async-wait-cancellation",
+    )
+
+    class Process:
+        def __init__(self) -> None:
+            self.returncode: int | None = None
+            self.release = asyncio.Event()
+
+        async def wait(self) -> int:
+            await self.release.wait()
+            self.returncode = 0
+            return 0
+
+    async def cleanup_after_cancel(
+        _managed: process_supervisor.ManagedAsyncProcess,
+        _failure: BaseException,
+    ) -> bool:
+        return True
+
+    async def confirm_tree(
+        _managed: process_supervisor.ManagedAsyncProcess,
+        *,
+        grace_seconds: float,
+    ) -> bool:
+        del grace_seconds
+        return True
+
+    async def exercise() -> None:
+        process = Process()
+        managed = process_supervisor.ManagedAsyncProcess(
+            process, token  # type: ignore[arg-type]
+        )
+        first_wait = asyncio.create_task(managed.wait())
+        await asyncio.sleep(0)
+        assert managed._wait_task is not None
+
+        first_wait.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_wait
+
+        assert not managed._wait_task.cancelled()
+        process.release.set()
+        assert await managed.wait() == 0
+
+    monkeypatch.setattr(
+        process_supervisor,
+        "_terminate_managed_async_after_failure",
+        cleanup_after_cancel,
+    )
+    monkeypatch.setattr(
+        process_supervisor,
+        "_shielded_terminate_managed_process_tree_async",
+        confirm_tree,
+    )
+    asyncio.run(exercise())
+
+
 def test_held_windows_job_requires_authoritative_empty_state_after_hard_kill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

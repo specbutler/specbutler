@@ -515,6 +515,88 @@ class TestClaudeBridge:
 
         asyncio.run(_run())
 
+    def test_result_only_first_turn_does_not_replay_initial_prompt(self):
+        """A terminal-only SDK response still advances conversation state."""
+        import asyncio
+
+        import claude_agent_sdk
+
+        from spec_runtime.web.bridge_claude import ClaudeBridge
+
+        class _FakeClient:
+            def __init__(self, *, options):
+                self.options = options
+                self.query_calls = []
+                self._turn = 0
+                self.connect = AsyncMock()
+                self.disconnect = AsyncMock()
+                self.interrupt = AsyncMock()
+
+            async def query(self, prompt, session_id="default"):
+                self.query_calls.append((prompt, session_id))
+
+            async def receive_response(self):
+                self._turn += 1
+                yield claude_agent_sdk.ResultMessage(
+                    subtype="success",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=False,
+                    num_turns=self._turn,
+                    session_id="sdk-session-result-only",
+                    result=f"turn {self._turn}",
+                )
+
+        async def _run():
+            created_clients = []
+
+            def _make_client(*, options):
+                client = _FakeClient(options=options)
+                created_clients.append(client)
+                return client
+
+            with (
+                patch("spec_runtime.web.bridge_claude._sdk_available", return_value=True),
+                patch("claude_agent_sdk.ClaudeSDKClient", side_effect=_make_client),
+            ):
+                bridge = ClaudeBridge()
+                session_id = await bridge.start_session(
+                    prompt="system prompt",
+                    agent="claude",
+                    cwd="/tmp/spec-web-chat",
+                    initial_prompt="first prompt",
+                )
+                first_events = [
+                    event
+                    async for event in bridge.send_message(
+                        session_id,
+                        "ignored transport text",
+                    )
+                ]
+                second_events = [
+                    event
+                    async for event in bridge.send_message(
+                        session_id,
+                        "follow-up question",
+                    )
+                ]
+
+            client = created_clients[0]
+            assert client.query_calls == [
+                ("first prompt", "default"),
+                ("follow-up question", "default"),
+            ]
+            assert [(event.kind, event.text) for event in first_events] == [
+                ("text", "turn 1"),
+                ("done", ""),
+            ]
+            assert [(event.kind, event.text) for event in second_events] == [
+                ("text", "turn 2"),
+                ("done", ""),
+            ]
+
+        asyncio.run(_run())
+
     def test_user_message_tool_results_emit_current_sdk_structured_events(self):
         """Claude SDK 0.1.68 delivers ToolResultBlock in UserMessage."""
         import asyncio
@@ -5742,6 +5824,70 @@ def test_codex_stop_reaps_descendant_after_app_server_leader_exits(
         finally:
             if is_process_group_alive(proc.token.pgid):
                 os.killpg(proc.token.pgid, signal.SIGKILL)
+
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="SIGTERM-resistant real-process regression is POSIX-specific",
+)
+def test_codex_stop_retries_shared_wait_after_grace_timeout(tmp_path, monkeypatch):
+    """Graceful timeout must not poison the cached process-reaping task."""
+    import asyncio
+    import subprocess
+
+    from spec_runtime.process_supervisor import (
+        LifetimeMode,
+        ProcessSupervisor,
+        terminate_managed_process_tree_async,
+    )
+    from spec_runtime.web.bridge_codex import _CodexSession
+
+    async def run():
+        proc = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                (
+                    "import signal,time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "print('ready', flush=True); time.sleep(60)"
+                ),
+            ],
+            stdout=asyncio.subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=tmp_path,
+        )
+        assert proc.stdout is not None
+        assert await proc.stdout.readline() == b"ready\n"
+
+        session = _CodexSession(cwd=str(tmp_path))
+        session._proc = proc
+        credential_home = MagicMock()
+        session._isolated_home_context = credential_home
+        monkeypatch.setattr(
+            "spec_runtime.web.bridge_codex._PROCESS_STOP_TIMEOUT_SECONDS",
+            0.01,
+        )
+
+        try:
+            await session.stop()
+            assert proc.returncode is not None
+            assert proc._wait_task is not None
+            assert proc._wait_task.done()
+            assert not proc._wait_task.cancelled()
+            assert session._proc is None
+            assert session._isolated_home_context is None
+            credential_home.cleanup.assert_called_once()
+            await session.stop()
+        finally:
+            if proc.owned_tree_active():
+                assert await terminate_managed_process_tree_async(
+                    proc,
+                    grace_seconds=0,
+                )
 
     asyncio.run(run())
 

@@ -2823,7 +2823,13 @@ class ManagedAsyncProcess:
         wait_task = self._wait_task
         try:
             if timeout is None:
-                returncode = int(await wait_task)
+                # The process wait is shared across callers.  A caller may
+                # abandon its own wait (for example, a graceful-shutdown
+                # timeout before escalating to kill), but that must not
+                # cancel the one task capable of reaping the child.  Keeping
+                # the cached task alive also lets a later cleanup attempt
+                # observe the same process exit.
+                returncode = int(await asyncio.shield(wait_task))
             else:
                 done, _ = await asyncio.wait(
                     {wait_task},
