@@ -7,10 +7,30 @@
   var sseLabel = document.getElementById("sse-label");
   var currentView = "dashboard";
   var currentSpecId = null;
-  var evtSource = null;
   var latestSnapshot = null;
   var showMerged = false;
   var elapsedTickerId = null;
+  var sseAbortController = null;
+  var sseReconnectTimer = null;
+  var csrfStorageKey = "spec-web-csrf";
+
+  function authenticatedFetch(path, opts) {
+    opts = opts || {};
+    var headers = new Headers(opts.headers || {});
+    if (String(path).indexOf("/api/") === 0) {
+      var proof = window.localStorage.getItem(csrfStorageKey);
+      if (proof) headers.set("X-Spec-CSRF", proof);
+    }
+    var requestOpts = Object.assign({}, opts, { headers: headers });
+    return fetch(path, requestOpts).then(function (response) {
+      if (response.status === 401 || response.status === 403) {
+        window.localStorage.removeItem(csrfStorageKey);
+      }
+      return response;
+    });
+  }
+
+  window.specFetch = authenticatedFetch;
 
   // ---- Helpers ----
 
@@ -18,6 +38,16 @@
     var d = document.createElement("div");
     d.textContent = s;
     return d.innerHTML;
+  }
+
+  // Text-node escaping does not necessarily encode quotes. Encode them when
+  // interpolating untrusted data into a quoted HTML attribute.
+  function escapeAttribute(s) {
+    return escapeHtml(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  function specRoute(specId) {
+    return "#/specs/" + escapeAttribute(encodeURIComponent(specId));
   }
 
   function badgeClass(status) {
@@ -41,7 +71,7 @@
   }
 
   function api(path, opts) {
-    return fetch(path, opts).then(function (response) {
+    return authenticatedFetch(path, opts).then(function (response) {
       return response.json().catch(function () { return {}; }).then(function (data) {
         if (!response.ok) {
           throw new Error(data.error || ("Request failed with status " + response.status));
@@ -100,32 +130,54 @@
   // ---- SSE ----
 
   function connectSSE() {
-    if (evtSource) evtSource.close();
-    evtSource = new EventSource("/api/v1/events");
+    if (sseAbortController) sseAbortController.abort();
+    if (sseReconnectTimer) window.clearTimeout(sseReconnectTimer);
+    sseAbortController = new AbortController();
+    authenticatedFetch("/api/v1/events", { signal: sseAbortController.signal })
+      .then(function (response) {
+        if (!response.ok || !response.body) throw new Error("event stream unavailable");
+        return readDashboardStream(response.body.getReader());
+      })
+      .catch(function (error) {
+        if (error.name === "AbortError") return;
+        sseDot.className = "status-dot disconnected";
+        sseLabel.textContent = "reconnecting";
+        sseReconnectTimer = window.setTimeout(connectSSE, 3000);
+      });
+  }
 
-    evtSource.addEventListener("run_update", function (e) {
-      try {
-        latestSnapshot = JSON.parse(e.data);
-        if (currentView === "dashboard") renderDashboard(latestSnapshot);
-      } catch (err) { /* ignore parse errors */ }
-    });
+  function readDashboardStream(reader) {
+    var decoder = new TextDecoder();
+    var buffer = "";
+    sseDot.className = "status-dot connected";
+    sseLabel.textContent = "live";
 
-    evtSource.addEventListener("dashboard", function (e) {
-      try {
-        latestSnapshot = JSON.parse(e.data);
-        if (currentView === "dashboard") renderDashboard(latestSnapshot);
-      } catch (err) { /* ignore */ }
-    });
+    function pump() {
+      return reader.read().then(function (result) {
+        if (result.done) throw new Error("event stream closed");
+        buffer += decoder.decode(result.value, { stream: true });
+        var boundary;
+        while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+          var block = buffer.substring(0, boundary);
+          buffer = buffer.substring(boundary + 2);
+          var eventName = "message";
+          var dataLines = [];
+          block.split("\n").forEach(function (line) {
+            if (line.indexOf("event:") === 0) eventName = line.substring(6).trim();
+            if (line.indexOf("data:") === 0) dataLines.push(line.substring(5).trimStart());
+          });
+          if (eventName === "run_update" || eventName === "dashboard") {
+            try {
+              latestSnapshot = JSON.parse(dataLines.join("\n"));
+              if (currentView === "dashboard") renderDashboard(latestSnapshot);
+            } catch (err) { /* ignore malformed events */ }
+          }
+        }
+        return pump();
+      });
+    }
 
-    evtSource.onopen = function () {
-      sseDot.className = "status-dot connected";
-      sseLabel.textContent = "live";
-    };
-
-    evtSource.onerror = function () {
-      sseDot.className = "status-dot disconnected";
-      sseLabel.textContent = "reconnecting";
-    };
+    return pump();
   }
 
   // ---- Dashboard view ----
@@ -179,7 +231,7 @@
         var spec = visibleSpecs[sv];
         var activeRun = runBySpec[spec.spec_id];
         html += "<tr>";
-        html += '<td data-label="Spec"><a href="#/specs/' + escapeHtml(spec.spec_id) + '">' + escapeHtml(spec.spec_id) + "</a></td>";
+        html += '<td data-label="Spec"><a href="' + specRoute(spec.spec_id) + '">' + escapeHtml(spec.spec_id) + "</a></td>";
         html += '<td data-label="Status">' + badge(spec.status) + "</td>";
         html += '<td data-label="Area">' + escapeHtml(spec.area || "-") + "</td>";
         html += '<td data-label="Priority">' + spec.priority + "</td>";
@@ -204,7 +256,7 @@
       for (var i = 0; i < data.rows.length; i++) {
         var row = data.rows[i];
         html += "<tr>";
-        html += '<td data-label="Spec"><a href="#/specs/' + escapeHtml(row.spec_id) + '">' + escapeHtml(row.display_spec_id || row.spec_id) + "</a></td>";
+        html += '<td data-label="Spec"><a href="' + specRoute(row.spec_id) + '">' + escapeHtml(row.display_spec_id || row.spec_id) + "</a></td>";
         html += '<td data-label="Status">' + badge(row.status) + "</td>";
         html += '<td data-label="Phase">' + escapeHtml(row.phase) + "</td>";
         html += '<td data-label="Agent">' + escapeHtml(row.agent) + "</td>";
@@ -212,9 +264,9 @@
         html += '<td data-label="Elapsed">' + escapeHtml(row.elapsed) + "</td>";
         html += '<td data-label="Actions">';
         if (row.status === "running") {
-          html += '<button class="btn btn-danger btn-sm" data-action="stop" data-spec="' + escapeHtml(row.spec_id) + '">Stop</button>';
+          html += '<button class="btn btn-danger btn-sm" data-action="stop" data-spec="' + escapeAttribute(row.spec_id) + '">Stop</button>';
         } else {
-          html += '<button class="btn btn-primary btn-sm" data-action="implement" data-spec="' + escapeHtml(row.spec_id) + '">Implement</button>';
+          html += '<button class="btn btn-primary btn-sm" data-action="implement" data-spec="' + escapeAttribute(row.spec_id) + '">Implement</button>';
         }
         html += "</td></tr>";
       }
@@ -230,7 +282,7 @@
       for (var j = 0; j < data.queue.length; j++) {
         var q = data.queue[j];
         html += "<tr>";
-        html += '<td data-label="Spec"><a href="#/specs/' + escapeHtml(q.spec_id) + '">' + escapeHtml(q.spec_id) + "</a></td>";
+        html += '<td data-label="Spec"><a href="' + specRoute(q.spec_id) + '">' + escapeHtml(q.spec_id) + "</a></td>";
         html += '<td data-label="Agent">' + escapeHtml(q.agent) + "</td>";
         html += '<td data-label="Area">' + escapeHtml(q.area) + "</td>";
         html += '<td data-label="Priority">' + q.priority + "</td>";
@@ -282,7 +334,7 @@
       for (var i = 0; i < sessions.length; i++) {
         var s = sessions[i];
         html += "<tr>";
-        html += '<td data-label="Session"><a href="#/chat/' + escapeHtml(s.session_id) + '">' + escapeHtml(s.session_id.substring(0, 8)) + "...</a></td>";
+        html += '<td data-label="Session"><a href="#/chat/' + escapeAttribute(encodeURIComponent(s.session_id)) + '">' + escapeHtml(s.session_id.substring(0, 8)) + "...</a></td>";
         html += '<td data-label="Mode">' + escapeHtml(s.mode) + "</td>";
         html += '<td data-label="Agent">' + escapeHtml(s.agent) + "</td>";
         html += '<td data-label="Status">' + badge(s.status) + "</td>";
@@ -426,8 +478,8 @@
 
       // Actions
       html += '<div class="btn-group" style="margin:1rem 0">';
-      html += '<button class="btn btn-primary btn-sm" data-action="implement" data-spec="' + escapeHtml(specId) + '">Implement</button>';
-      html += '<button class="btn btn-danger btn-sm" data-action="stop" data-spec="' + escapeHtml(specId) + '">Stop</button>';
+      html += '<button class="btn btn-primary btn-sm" data-action="implement" data-spec="' + escapeAttribute(specId) + '">Implement</button>';
+      html += '<button class="btn btn-danger btn-sm" data-action="stop" data-spec="' + escapeAttribute(specId) + '">Stop</button>';
       html += "</div>";
 
       // Body — prefer server-rendered body_html, fall back to client-side

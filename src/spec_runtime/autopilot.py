@@ -53,6 +53,8 @@ from spec_runtime.execution_backend import (
     WorkspaceHandle,
     get_execution_backend,
     inspect_container_capacity,
+    path_is_link_or_junction,
+    validate_workspace_run_identity,
 )
 from spec_runtime.git_common import resolve_common_root, run_git, subprocess_text_kwargs
 from spec_runtime.orchestrator import (
@@ -84,6 +86,7 @@ from spec_runtime.process_supervisor import (
     process_cwd,
     request_legacy_process_shutdown,
 )
+from spec_runtime.spec_identity import SPEC_ID_RE
 from spec_runtime.spec_merge_tags import (
     MergeTagProvenance,
     annotated_tag_command,
@@ -1791,6 +1794,53 @@ def adopt_active_processes(repo_root: Path) -> dict[str, ActiveRunProcess]:
     return adopted
 
 
+def _validated_stale_cleanup_run_root(
+    repo_root: Path,
+    configured_workspace_root: str,
+    run_id: str,
+) -> Path:
+    """Return a contained, link-free active-run cleanup target."""
+    repo = repo_root.resolve()
+    workspace_root = Path(configured_workspace_root).expanduser()
+    if not workspace_root.is_absolute():
+        workspace_root = repo / workspace_root
+    workspace_root = Path(os.path.abspath(os.fspath(workspace_root)))
+    try:
+        relative_root = workspace_root.relative_to(repo)
+    except ValueError as exc:
+        raise ValueError(
+            f"workspace root is outside the orchestration checkout: {workspace_root}"
+        ) from exc
+    if not relative_root.parts:
+        raise ValueError("workspace root resolves to the orchestration checkout")
+
+    current = repo
+    for component in relative_root.parts:
+        current /= component
+        if path_is_link_or_junction(current):
+            raise ValueError(f"workspace root contains symlink or junction: {current}")
+    resolved_workspace_root = workspace_root.resolve()
+    try:
+        resolved_workspace_root.relative_to(repo)
+    except ValueError as exc:
+        raise ValueError(
+            f"workspace root escapes the orchestration checkout: {workspace_root}"
+        ) from exc
+
+    run_root = workspace_root / run_id
+    if run_root.parent != workspace_root:
+        raise ValueError(f"run root is not a direct workspace-root child: {run_root}")
+    for candidate in (run_root, run_root / "source", run_root / "outbox"):
+        if path_is_link_or_junction(candidate):
+            raise ValueError(f"run layout contains symlink or junction: {candidate}")
+    resolved_run_root = run_root.resolve(strict=False)
+    if resolved_run_root.parent != resolved_workspace_root:
+        raise ValueError(
+            f"run root escapes configured workspace root: {resolved_run_root}"
+        )
+    return resolved_run_root
+
+
 def cleanup_unadopted_container_runs(
     repo_root: Path,
     adopted: dict[str, ActiveRunProcess],
@@ -1809,36 +1859,93 @@ def cleanup_unadopted_container_runs(
     repo_config = load_repo_spec_runtime_config(repo_root)
     state_runs_dir = runs_dir(repo_root, config=repo_config)
     handled_run_ids: set[str] = set()
-    for spec_id, item in payload.items():
+    for raw_spec_id, item in payload.items():
+        spec_id = raw_spec_id if isinstance(raw_spec_id, str) else ""
         if spec_id in adopted:
             continue
         if not isinstance(item, dict):
             continue
-        run_id = str(item.get("run_id", "")).strip()
-        if not run_id or run_id in handled_run_ids:
+        raw_run_id = item.get("run_id", "")
+        try:
+            if not SPEC_ID_RE.fullmatch(spec_id):
+                raise ValueError(f"invalid spec_id {spec_id!r}")
+            run_id = validate_workspace_run_identity(raw_run_id, spec_id)
+        except (TypeError, ValueError) as exc:
+            print(
+                format_status_line(
+                    "warning",
+                    f"refusing stale container cleanup for invalid active-run identity: {exc}",
+                )
+            )
             continue
-        handled_run_ids.add(run_id)
+        if run_id in handled_run_ids:
+            continue
         run_path = state_runs_dir / f"{run_id}.json"
+        try:
+            resolved_runs_dir = state_runs_dir.resolve()
+            if path_is_link_or_junction(run_path):
+                raise ValueError(f"run record is a symlink or junction: {run_path}")
+            if run_path.resolve().parent != resolved_runs_dir:
+                raise ValueError(f"run record escapes state directory: {run_path}")
+        except (OSError, ValueError) as exc:
+            print(
+                format_status_line(
+                    "warning",
+                    f"{spec_id} stale container cleanup refused for run={run_id}: {exc}",
+                )
+            )
+            continue
         try:
             run_record = json.loads(run_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
         if not isinstance(run_record, dict):
             continue
+        if (
+            run_record.get("run_id") != run_id
+            or run_record.get("spec_id") != spec_id
+        ):
+            print(
+                format_status_line(
+                    "warning",
+                    f"{spec_id} stale container cleanup refused for run={run_id}: run record identity mismatch",
+                )
+            )
+            continue
         if str(run_record.get("backend", "")).strip() != "container":
             continue
+        handled_run_ids.add(run_id)
 
         execution = replace(
             repo_config.execution,
             backend="container",
             safety_mode=str(run_record.get("safety_mode") or repo_config.execution.safety_mode),
         )
-        run_root = repo_root / execution.workspace_root / run_id
+        try:
+            run_root = _validated_stale_cleanup_run_root(
+                repo_root,
+                execution.workspace_root,
+                run_id,
+            )
+        except (OSError, ValueError) as exc:
+            print(
+                format_status_line(
+                    "warning",
+                    f"{spec_id} stale container cleanup refused for run={run_id}: {exc}",
+                )
+            )
+            continue
         workspace = WorkspaceHandle(
             path=run_root / "source",
             outbox_path=run_root / "outbox",
             branch=str(run_record.get("branch", "")).strip(),
             backend="container",
+            metadata={
+                "run_id": run_id,
+                "spec_id": spec_id,
+                "repo_root": str(repo_root.resolve()),
+                "workspace_root": str(run_root.parent),
+            },
         )
         try:
             get_execution_backend(execution).cleanup(workspace)

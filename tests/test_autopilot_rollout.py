@@ -15,6 +15,9 @@ from spec_runtime.process_supervisor import available_memory_bytes, system_memor
 
 
 def _write_config(path: Path, body: str) -> Path:
+    # Keep resolve_common_root anchored in this fixture even if a parent of the
+    # system temporary directory is itself a Git checkout.
+    (path / ".git").mkdir(exist_ok=True)
     config_path = path / ".spec.toml"
     config_path.write_text(textwrap.dedent(body))
     return config_path

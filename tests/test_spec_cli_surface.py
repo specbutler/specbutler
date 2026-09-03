@@ -210,6 +210,21 @@ class TestGitHubForgeProtocol:
         """GitHubForge must satisfy the ForgeAdapter protocol."""
         assert isinstance(GitHubForge(), ForgeAdapter)
 
+    def test_pinned_repo_slug_is_used_for_every_gh_call(self, tmp_path):
+        captured = {}
+
+        def run_fn(cmd, cwd=None, **kw):
+            captured["cmd"] = cmd
+            captured["env"] = kw.get("env", {})
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        forge = GitHubForge(run_fn=run_fn, repo_slug="specbutler/specbutler")
+
+        assert forge.get_repo_slug(cwd=tmp_path) == "specbutler/specbutler"
+        assert forge.get_required_checks(12, cwd=tmp_path) == []
+        assert captured["cmd"][:3] == ["gh", "pr", "checks"]
+        assert captured["env"]["GH_REPO"] == "specbutler/specbutler"
+
     def test_required_checks_treats_gh_no_required_prose_as_empty(self, tmp_path):
         def run_fn(cmd, cwd=None, **kw):  # noqa: ARG001
             return subprocess.CompletedProcess(
@@ -456,7 +471,6 @@ class TestClaudeAgent:
         assert caps.name == "claude"
         assert caps.supports_stream_json is True
         assert caps.supports_mcp is True
-        assert caps.supports_dangerously_skip_permissions is True
 
     def test_build_implement_command_basic(self, tmp_path):
         agent = ClaudeAgent()
@@ -467,10 +481,33 @@ class TestClaudeAgent:
         )
         assert cmd[0] == "claude"
         assert "-p" in cmd
-        assert "--dangerously-skip-permissions" in cmd
+        assert "--dangerously-skip-permissions" not in cmd
+        assert "--restricted" in cmd
+        assert "--safe-mode" not in cmd
+        assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
+        assert cmd[cmd.index("--settings") + 1] == str(
+            tmp_path / ".claude" / "settings.local.json"
+        )
+        assert cmd[cmd.index("--setting-sources") + 1] == ""
+        assert "--no-session-persistence" in cmd
         assert "--add-dir" in cmd
         assert str(tmp_path / ".state") in cmd
         assert cmd[-1] == "Do the work"
+
+    def test_container_implement_command_uses_restricted_external_boundary(self, tmp_path):
+        cmd = ClaudeAgent().build_implement_command(
+            prompt="Do the work",
+            worktree_path=tmp_path,
+            state_dir=tmp_path / ".state",
+            externally_sandboxed=True,
+        )
+
+        assert "--dangerously-skip-permissions" not in cmd
+        assert "--restricted" in cmd
+        assert "--safe-mode" not in cmd
+        assert cmd[cmd.index("--settings") + 1] == str(
+            tmp_path / ".claude" / "settings.local.json"
+        )
 
     def test_build_implement_command_with_stream_json(self, tmp_path):
         agent = ClaudeAgent()
@@ -503,20 +540,33 @@ class TestClaudeAgent:
             prompt="Author a spec",
             worktree_path=tmp_path,
             initial_prompt="Start here",
+            mcp_config_path=tmp_path / ".claude" / "mcp-servers.json",
         )
         assert cmd[0] == "claude"
-        assert "--dangerously-skip-permissions" in cmd
+        assert "--dangerously-skip-permissions" not in cmd
+        assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
+        assert cmd[cmd.index("--settings") + 1] == str(
+            tmp_path / ".claude" / "settings.local.json"
+        )
+        assert "--mcp-config" in cmd
+        assert "--strict-mcp-config" not in cmd
         assert "--append-system-prompt" in cmd
         assert "Author a spec" in cmd
         assert "Start here" in cmd
 
-    def test_build_review_command_without_mcp_config_is_unchanged(self, tmp_path):
+    def test_build_review_command_is_restricted_read_only(self, tmp_path):
         agent = ClaudeAgent()
         cmd = agent.build_review_command(
             prompt="Review please",
             output_path=tmp_path / "review.json",
         )
-        assert cmd == ["claude", "-p", "--dangerously-skip-permissions", "Review please"]
+        assert cmd[0:2] == ["claude", "-p"]
+        assert "--restricted" in cmd
+        assert "--safe-mode" in cmd
+        assert "--dangerously-skip-permissions" not in cmd
+        assert cmd[cmd.index("--tools") + 1] == "Read,Glob,Grep"
+        assert "Review please" not in cmd
+        assert cmd[-1] == "--no-session-persistence"
 
     def test_build_review_command_with_mcp_config(self, tmp_path):
         agent = ClaudeAgent()
@@ -528,11 +578,13 @@ class TestClaudeAgent:
         )
         assert cmd[0] == "claude"
         assert "-p" in cmd
-        assert "--dangerously-skip-permissions" in cmd
-        assert "--mcp-config" in cmd
-        assert str(mcp_path) in cmd
+        assert "--restricted" in cmd
+        assert "--dangerously-skip-permissions" not in cmd
+        assert "--mcp-config" not in cmd
+        assert str(mcp_path) not in cmd
         assert "--strict-mcp-config" in cmd
-        assert cmd[-1] == "Review please"
+        assert "Review please" not in cmd
+        assert cmd[-1] == "--no-session-persistence"
 
     def test_implements_protocol(self):
         assert isinstance(ClaudeAgent(), AgentAdapter)
@@ -562,40 +614,71 @@ class TestCodexAgent:
         assert "--add-dir" in cmd
         assert "Do the work" in cmd
 
-    def test_build_implement_command_adds_linked_worktree_git_metadata(self, tmp_path):
+    def test_build_implement_command_only_adds_private_linked_worktree_git_metadata(
+        self,
+        tmp_path,
+    ):
         worktree = tmp_path / ".worktrees" / "feature"
         gitdir = tmp_path / ".git" / "worktrees" / "feature"
         common_git = tmp_path / ".git"
+        private_git = gitdir / "specbutler-private-git"
         worktree.mkdir(parents=True)
         gitdir.mkdir(parents=True)
+        private_git.mkdir()
         (worktree / ".git").write_text(f"gitdir: {gitdir}\n")
-        (gitdir / "commondir").write_text("../..\n")
+        (common_git / "objects").mkdir()
+        isolation = MagicMock()
+        isolation.worktree = worktree.resolve()
+        isolation.writable_paths = (private_git.resolve(),)
+        isolation.read_only_paths = (
+            (worktree / ".git").resolve(),
+            gitdir.resolve(),
+            (common_git / "objects").resolve(),
+            (common_git / "refs").resolve(),
+        )
 
         cmd = CodexAgent().build_implement_command(
             prompt="Do the work",
             worktree_path=worktree,
             state_dir=tmp_path / ".spec-state",
+            git_isolation=isolation,
         )
 
         add_dirs = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "--add-dir"]
         assert str(tmp_path / ".spec-state") in add_dirs
-        assert str(gitdir.resolve()) in add_dirs
-        assert str(common_git.resolve()) in add_dirs
+        assert str(private_git.resolve()) in add_dirs
+        assert str(gitdir.resolve()) not in add_dirs
+        assert str((common_git / "objects").resolve()) not in add_dirs
+        assert str(common_git.resolve()) not in add_dirs
 
         config_overrides = [
             cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-c"
         ]
-        writable_roots = next(
+        filesystem_policy = next(
             value
             for value in config_overrides
-            if value.startswith("sandbox_workspace_write.writable_roots=")
+            if value.startswith("permissions.specbutler-implement.filesystem=")
         )
-        roots = json.loads(writable_roots.partition("=")[2])
-        assert str(tmp_path / ".spec-state") in roots
-        assert str(gitdir.resolve()) in roots
-        assert str(common_git.resolve()) in roots
+        assert f'{json.dumps(str(tmp_path / ".spec-state"))}="write"' in filesystem_policy
+        assert f'{json.dumps(str(private_git.resolve()))}="write"' in filesystem_policy
+        assert f'{json.dumps(str((worktree / ".git").resolve()))}="deny"' in filesystem_policy
+        assert f'{json.dumps(str((common_git / "objects").resolve()))}="deny"' in filesystem_policy
+        assert f'{json.dumps(str(gitdir.resolve()))}="write"' not in filesystem_policy
+        assert f'{json.dumps(str(common_git.resolve()))}="write"' not in filesystem_policy
 
-    def test_build_authoring_command_adds_git_metadata(self, tmp_path):
+    def test_build_implement_command_refuses_unisolated_linked_worktree(self, tmp_path):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        (worktree / ".git").write_text("gitdir: /tmp/untrusted\n")
+
+        with pytest.raises(RuntimeError, match="without a prepared private Git"):
+            CodexAgent().build_implement_command(
+                prompt="Do the work",
+                worktree_path=worktree,
+                state_dir=tmp_path / ".spec-state",
+            )
+
+    def test_build_authoring_command_needs_no_external_path_for_full_clone(self, tmp_path):
         worktree = tmp_path / "checkout"
         gitdir = worktree / ".git"
         gitdir.mkdir(parents=True)
@@ -604,38 +687,99 @@ class TestCodexAgent:
             prompt="Author a spec",
             worktree_path=worktree,
             state_dir=tmp_path / ".spec-state",
+            protected_env_keys={"AUTHORING_MCP_TOKEN"},
         )
 
         add_dirs = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "--add-dir"]
         assert str(tmp_path / ".spec-state") in add_dirs
-        assert str(gitdir.resolve()) in add_dirs
+        assert str(gitdir.resolve()) not in add_dirs
 
         config_overrides = [
             cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-c"
         ]
-        writable_roots = next(
+        filesystem_policy = next(
             value
             for value in config_overrides
-            if value.startswith("sandbox_workspace_write.writable_roots=")
+            if value.startswith("permissions.specbutler-authoring.filesystem=")
         )
-        roots = json.loads(writable_roots.partition("=")[2])
-        assert str(tmp_path / ".spec-state") in roots
-        assert str(gitdir.resolve()) in roots
+        assert f'{json.dumps(str(tmp_path / ".spec-state"))}="write"' in filesystem_policy
+        assert f'{json.dumps(str(gitdir.resolve()))}="write"' not in filesystem_policy
+        assert 'permissions.specbutler-authoring.network={enabled=false}' in cmd
+        shell_policy = next(
+            value
+            for value in config_overrides
+            if value.startswith("shell_environment_policy.exclude=")
+        )
+        assert '"AUTHORING_MCP_TOKEN"' in shell_policy
 
     def test_codex_git_metadata_dirs_ignores_non_git_directory(self, tmp_path):
         assert _codex_git_metadata_dirs(tmp_path) == []
 
-    def test_build_implement_command_uses_codex_default_linux_sandbox(self, tmp_path):
+    def test_build_implement_command_uses_scoped_permission_profile(self, tmp_path):
         agent = CodexAgent()
         cmd = agent.build_implement_command(
             prompt="Do the work",
             worktree_path=tmp_path,
             state_dir=tmp_path / ".state",
         )
-        assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "workspace-write"
+        assert "-s" not in cmd
+        assert 'default_permissions="specbutler-implement"' in cmd
+        assert any(
+            value.startswith("permissions.specbutler-implement.filesystem=")
+            for value in cmd
+        )
+        assert (
+            'permissions.specbutler-implement.network='
+            '{enabled=true,mode="full",allow_local_binding=true}'
+        ) in cmd
+        assert "--strict-config" in cmd
+        assert "--ignore-rules" in cmd
+        assert "features.shell_snapshot=false" in cmd
+        for disabled_capability in (
+            "features.browser_use=false",
+            "features.browser_use_external=false",
+            "features.browser_use_full_cdp_access=false",
+            "features.computer_use=false",
+            "features.image_generation=false",
+            "features.in_app_browser=false",
+            "features.plugins=false",
+            "features.recommended_plugins=false",
+            "features.skill_mcp_dependency_install=false",
+            "features.skip_host_skill_discovery=true",
+            "features.view_image=false",
+        ):
+            assert disabled_capability in cmd
         assert "features.use_legacy_landlock=true" not in cmd
 
-    def test_build_review_command_uses_scratch_as_only_writable_root(self, tmp_path):
+    def test_build_implement_command_hides_mcp_bearer_env_from_shell(self, tmp_path):
+        cmd = CodexAgent().build_implement_command(
+            prompt="Do the work",
+            worktree_path=tmp_path,
+            state_dir=tmp_path / ".state",
+            mcp_servers={
+                "remote": {
+                    "url": "https://mcp.example.test",
+                    "bearer_token_env_var": "MCP_BEARER_SECRET",
+                },
+                "stdio": {
+                    "command": "helper",
+                    "args": ["--token", "${MCP_CHILD_SECRET}"],
+                },
+            },
+        )
+
+        policy = next(
+            value
+            for value in cmd
+            if value.startswith("shell_environment_policy.exclude=")
+        )
+        assert '"MCP_BEARER_SECRET"' in policy
+        assert '"MCP_CHILD_SECRET"' in policy
+        assert '"OPENAI_API_KEY"' in policy
+
+    def test_build_review_command_uses_scratch_as_working_directory_not_writable_root(
+        self, tmp_path
+    ):
         agent = CodexAgent()
         scratch_dir = tmp_path / "review-scratch"
         cmd = agent.build_review_command(
@@ -643,10 +787,12 @@ class TestCodexAgent:
             output_path=tmp_path / "review.json",
             writable_temp_dir=scratch_dir,
         )
-        assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "workspace-write"
+        assert "-s" in cmd and cmd[cmd.index("-s") + 1] == "read-only"
         assert cmd[cmd.index("-C") + 1] == str(scratch_dir)
         assert "--skip-git-repo-check" in cmd
         assert "--add-dir" not in cmd
+        assert cmd[-1] == "-"
+        assert "Review the work" not in cmd
         assert "features.use_legacy_landlock=true" not in cmd
 
     def test_build_review_command_without_scratch_remains_read_only(self, tmp_path):
@@ -1349,6 +1495,7 @@ class TestPhasePublishCwdPropagation:
             patch.object(orch, "format_pr_review_owner", return_value="@reviewer"),
             patch.object(orch, "_head_sha", return_value="abc123"),
             patch.object(orch, "_gate_status_path", return_value=tmp_path / "gate.json"),
+            patch.object(orch, "_assert_publication_transition_safe"),
         ):
             orch.phase_publish(run, tmp_path)
 

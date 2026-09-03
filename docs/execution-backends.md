@@ -43,6 +43,15 @@ Worktree mode uses `.worktrees/code-<spec-id>--<token>/` and the corresponding
 `code/<spec-id>--<token>` branch. The main worktree is for orchestration only.
 Do not edit it while an implementation run is active.
 
+Agent-side Git writes do not go directly to the linked worktree's shared
+administrative directory. Spec Butler creates a disposable Git directory for
+each provider launch, backed by a read-only object alternate. Once the provider
+ownership boundary is confirmed stopped, the host validates and imports only a
+fast-forward commit chain for that worktree's exact branch. This keeps sibling
+refs, the shared object database, hooks, config, and real worktree index outside
+the agent's write boundary while preserving normal `git add` and `git commit`
+inside the session.
+
 Before the first run, confirm that a clean worktree can execute the commands in
 `[bootstrap]` and `[verify]`:
 
@@ -162,6 +171,14 @@ to override it.
 Before enabling container mode for unattended autopilot runs, use the
 [container dogfood checklist](autopilot-container-dogfood.md) to capture startup,
 retry, cleanup, and capacity evidence.
+
+Codex OAuth credentials must be copied into an isolated provider home for
+container launches. Because the provider may rotate its refresh token, Spec
+Butler permits only one copy-backed OAuth session per canonical Codex auth file
+at a time; another launch fails promptly with an actionable busy error instead of
+waiting behind a potentially hours-long agent turn. Use `OPENAI_API_KEY` /
+`CODEX_API_KEY` authentication when concurrent Codex container runs are
+required, or run OAuth-backed specs sequentially.
 
 ### Private dependencies
 

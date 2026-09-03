@@ -5,11 +5,12 @@
 
 ## Orchestrated sessions
 
-`spec` currently launches Codex implementation and authoring sessions with
-workspace-write and network access, and local review sessions read-only.
-Approval prompts are unavailable in non-interactive runs. These fixed launch
-settings—and the selected execution backend—are the effective boundary;
-`[execution].safety_mode` does not change them.
+`spec` launches Codex implementation sessions with workspace-write and network
+access, interactive authoring with workspace-write and approval-gated network
+access, and local review sessions read-only. Approval prompts are unavailable
+in non-interactive runs. These fixed launch settings—and the selected execution
+backend—are the effective boundary; `[execution].safety_mode` does not change
+them.
 
 Follow the provided workspace and implement-agent contract. If the requested
 work cannot be completed within the available permissions, report

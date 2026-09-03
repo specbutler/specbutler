@@ -18,43 +18,153 @@ import json
 import logging
 import os
 import shutil
+import subprocess
+import tempfile
 import uuid
+from pathlib import Path
 from typing import AsyncIterator
 
+from spec_runtime.agent_adapter import (
+    CODEX_AMBIENT_CAPABILITY_OVERRIDES,
+    codex_capability_probe_command,
+    codex_capability_probe_unavailability_reason,
+    codex_isolation_unavailability_reason,
+)
+from spec_runtime.agent_git_isolation import AgentGitIsolation
+from spec_runtime.git_publish_guard import apply_host_owned_publication_guard
 from spec_runtime.process_supervisor import LifetimeMode, ManagedAsyncProcess, ProcessSupervisor
+from spec_runtime.provider_env import (
+    CODEX_SECRET_ENV_KEYS,
+    PROXY_ENV_KEYS,
+    create_ephemeral_codex_home,
+    minimal_provider_environment,
+    protected_operator_paths,
+)
 
 from .bridge import AgentEvent
 
 logger = logging.getLogger(__name__)
 
 _PROCESS_STOP_TIMEOUT_SECONDS = 5.0
+_WEB_PERMISSION_PROFILE = "specbutler-web"
+_PENDING_PROCESS_WAITS: set[asyncio.Task] = set()
+
+
+def _retain_pending_process_wait(task: asyncio.Task) -> None:
+    """Own a cancellation-resistant wait task until it eventually exits."""
+    _PENDING_PROCESS_WAITS.add(task)
+
+    def finished(done: asyncio.Task) -> None:
+        _PENDING_PROCESS_WAITS.discard(done)
+        if not done.cancelled():
+            done.exception()
+
+    task.add_done_callback(finished)
 
 
 def _codex_available() -> bool:
-    """Check whether the Codex CLI that provides ``app-server`` is on PATH."""
-    return shutil.which("codex") is not None
+    """Check whether Codex provides every enforced web-chat control."""
+    return not _codex_unavailability_reason()
+
+
+def _codex_unavailability_reason() -> str:
+    path = shutil.which("codex")
+    if path is None:
+        return "Codex CLI was not found on PATH."
+    try:
+        exec_help = subprocess.run(
+            [path, "exec", "--help"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        sandbox_help = subprocess.run(
+            [path, "sandbox", "--help"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        app_server_help = subprocess.run(
+            [path, "app-server", "--help"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        with tempfile.TemporaryDirectory(prefix="spec-codex-capability-probe-") as home:
+            probe_env = minimal_provider_environment("codex")
+            for key in CODEX_SECRET_ENV_KEYS:
+                probe_env.pop(key, None)
+            probe_env["CODEX_HOME"] = home
+            capability_probe = subprocess.run(
+                codex_capability_probe_command(path),
+                text=True,
+                capture_output=True,
+                timeout=5,
+                check=False,
+                env=probe_env,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"Could not validate Codex isolation controls: {exc}"
+    if app_server_help.returncode != 0:
+        return "Codex CLI does not provide a usable app-server command."
+    reason = codex_isolation_unavailability_reason(
+        f"{exec_help.stdout}\n{exec_help.stderr}" if exec_help.returncode == 0 else "",
+        f"{sandbox_help.stdout}\n{sandbox_help.stderr}"
+        if sandbox_help.returncode == 0
+        else "",
+    )
+    if reason:
+        return reason
+    return codex_capability_probe_unavailability_reason(
+        capability_probe.returncode,
+        capability_probe.stdout,
+        capability_probe.stderr,
+    )
 
 
 async def _terminate_process(proc: ManagedAsyncProcess) -> None:
-    """Terminate, escalate when necessary, and always wait for the leader."""
+    """Terminate and raise unless provider exit is positively confirmed."""
     if getattr(proc, "returncode", None) is None:
         proc.terminate()
-    try:
-        await asyncio.wait_for(
-            proc.wait(),
-            timeout=_PROCESS_STOP_TIMEOUT_SECONDS,
-        )
+    if await _wait_for_process_exit(proc):
         return
-    except asyncio.TimeoutError:
-        proc.kill()
 
     try:
-        await asyncio.wait_for(
-            proc.wait(),
-            timeout=_PROCESS_STOP_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        logger.warning("Codex app-server did not exit after kill")
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+    if await _wait_for_process_exit(proc):
+        return
+    raise RuntimeError("Codex app-server did not exit after kill")
+
+
+async def _wait_for_process_exit(proc: ManagedAsyncProcess) -> bool:
+    """Bound a wait and positively confirm the whole owned process tree."""
+    wait_task = asyncio.create_task(proc.wait())
+    done, _ = await asyncio.wait(
+        {wait_task},
+        timeout=_PROCESS_STOP_TIMEOUT_SECONDS,
+    )
+    if wait_task not in done:
+        _retain_pending_process_wait(wait_task)
+        wait_task.cancel()
+        return False
+    try:
+        wait_task.result()
+    except (OSError, RuntimeError):
+        return False
+    owned_tree_active = getattr(proc, "owned_tree_active", None)
+    if callable(owned_tree_active):
+        try:
+            if owned_tree_active():
+                return False
+        except (OSError, RuntimeError):
+            return False
+    return True
 
 
 class CodexBridge:
@@ -62,8 +172,9 @@ class CodexBridge:
 
     def __init__(self) -> None:
         if not _codex_available():
+            reason = _codex_unavailability_reason()
             raise RuntimeError(
-                "Codex backend unavailable — requires the codex CLI on PATH "
+                "Codex backend unavailable — " + reason + " "
                 "(npm install -g @openai/codex)"
             )
         self._sessions: dict[str, _CodexSession] = {}
@@ -77,12 +188,34 @@ class CodexBridge:
         allowed_tools: list[str] | None = None,
         session_id: str | None = None,
         initial_prompt: str = "",
+        git_isolation: AgentGitIsolation | None = None,
     ) -> str:
         session_id = session_id or uuid.uuid4().hex
-        session = _CodexSession(cwd=cwd, allowed_tools=allowed_tools)
+        session = _CodexSession(
+            cwd=cwd,
+            allowed_tools=allowed_tools,
+            git_isolation=git_isolation,
+        )
         session.initial_prompt = initial_prompt
-        await session.start(prompt)
+        # Publish provisional ownership before the handshake. A failed
+        # app-server handshake can leave a live process when bounded cleanup
+        # fails, and Stop must retain a route back to that exact process.
         self._sessions[session_id] = session
+        try:
+            await session.start(prompt)
+        except BaseException:
+            if session._proc is None:
+                # start() either failed before launch or already confirmed
+                # process exit. Finish credential cleanup and retire the entry.
+                try:
+                    await self.stop_session(session_id)
+                except Exception:
+                    logger.warning(
+                        "Codex startup cleanup remains pending for %s",
+                        session_id,
+                        exc_info=True,
+                    )
+            raise
         return session_id
 
     async def send_message(
@@ -99,20 +232,37 @@ class CodexBridge:
         try:
             async for event in session.send_turn(text):
                 yield event
+            if session._last_turn_error:
+                try:
+                    await self.stop_session(session_id)
+                except Exception:
+                    logger.warning(
+                        "Codex provider cleanup remains pending for %s",
+                        session_id,
+                        exc_info=True,
+                    )
         except Exception as exc:
             # A failed turn leaves no usable browser session. Reap the
             # app-server immediately instead of waiting for an explicit stop
             # or web-server shutdown.
-            self._sessions.pop(session_id, None)
-            await session.stop()
+            try:
+                await self.stop_session(session_id)
+            except Exception:
+                logger.warning(
+                    "Codex provider cleanup remains pending for %s",
+                    session_id,
+                    exc_info=True,
+                )
             yield AgentEvent(kind="error", text=str(exc))
 
         yield AgentEvent(kind="done")
 
     async def stop_session(self, session_id: str) -> None:
-        session = self._sessions.pop(session_id, None)
+        session = self._sessions.get(session_id)
         if session:
             await session.stop()
+            if self._sessions.get(session_id) is session:
+                self._sessions.pop(session_id, None)
 
 
 class _CodexSession:
@@ -123,10 +273,14 @@ class _CodexSession:
     _TURN_INACTIVITY_TIMEOUT_SECONDS = 180.0
 
     def __init__(
-        self, cwd: str, allowed_tools: list[str] | None = None,
+        self,
+        cwd: str,
+        allowed_tools: list[str] | None = None,
+        git_isolation: AgentGitIsolation | None = None,
     ) -> None:
         self._cwd = cwd
         self._allowed_tools = allowed_tools
+        self._git_isolation = git_isolation
         self._proc: ManagedAsyncProcess | None = None
         self._stderr_task: asyncio.Task | None = None
         self._stderr_lines: list[str] = []
@@ -136,6 +290,104 @@ class _CodexSession:
         self.initial_prompt: str = ""
         self._started: bool = False
         self._saw_delta_text: bool = False
+        self._last_turn_error: str = ""
+        self._isolated_home_context: object | None = None
+
+    @staticmethod
+    def _isolated_provider_home(env: dict[str, str]) -> tuple[object, Path]:
+        """Create an auth-only Codex home outside the repository checkout."""
+        return create_ephemeral_codex_home(env)
+
+    @staticmethod
+    def _safety_config_overrides(
+        codex_home: Path,
+        *,
+        operator_codex_home: Path | None = None,
+        git_write_paths: tuple[Path, ...] = (),
+        git_read_only_paths: tuple[Path, ...] = (),
+    ) -> list[str]:
+        """Return fail-closed web-chat filesystem and environment controls."""
+        protected_candidates = {
+            codex_home.resolve(strict=False),
+            *(
+                path.resolve(strict=False)
+                for path in protected_operator_paths()
+            ),
+        }
+        if operator_codex_home is not None:
+            protected_candidates.add(operator_codex_home.resolve(strict=False))
+        # Codex 0.151 constructs Linux deny mounts from shallowest to deepest.
+        # Asking it to deny both an operator-state root and the launch-scoped
+        # CODEX_HOME below that root fails before app-server initialization:
+        # bubblewrap cannot create the nested mount point after denying its
+        # ancestor.  A denied ancestor already covers every descendant, so
+        # omit only those redundant entries.  This preserves the stronger
+        # boundary around the complete operator-state tree while leaving the
+        # provider process itself able to use its copied credential.
+        protected_paths: list[Path] = []
+        for candidate in sorted(
+            protected_candidates,
+            key=lambda path: (len(path.parts), str(path)),
+        ):
+            if any(candidate.is_relative_to(parent) for parent in protected_paths):
+                continue
+            protected_paths.append(candidate)
+        filesystem_entries = [
+            '":root"="read"',
+            '":workspace_roots"="write"',
+            *(
+                f"{json.dumps(str(path))}=\"write\""
+                for path in git_write_paths
+            ),
+            *(
+                f"{json.dumps(str(path))}=\"read\""
+                for path in git_read_only_paths
+            ),
+            *(
+                f"{json.dumps(str(path))}=\"deny\""
+                for path in protected_paths
+            ),
+        ]
+        tool_env_exclude = sorted(
+            {
+                *CODEX_SECRET_ENV_KEYS,
+                *PROXY_ENV_KEYS,
+                "CODEX_APP_SERVER",
+                "CODEX_HOME",
+                "OPENAI_API_BASE",
+                "OPENAI_BASE_URL",
+                "OPENAI_ORG_ID",
+                "OPENAI_ORGANIZATION",
+                "OPENAI_PROJECT_ID",
+            }
+        )
+        overrides = [
+            "--strict-config",
+            "-c",
+            f'default_permissions="{_WEB_PERMISSION_PROFILE}"',
+            "-c",
+            (
+                f"permissions.{_WEB_PERMISSION_PROFILE}.filesystem="
+                "{" + ",".join(filesystem_entries) + "}"
+            ),
+            "-c",
+            # Codex's command runner requires core process variables such as
+            # PATH. The provider parent already has an allowlisted minimal
+            # environment; inherit it while withholding every credential,
+            # routing, and session-control value from model-run commands.
+            "shell_environment_policy.inherit=all",
+            "-c",
+            "shell_environment_policy.exclude=" + json.dumps(tool_env_exclude),
+            "-c",
+            "allow_login_shell=false",
+        ]
+        # Do not let user configuration or evolving CLI defaults reintroduce
+        # capabilities outside browser chat's shell/edit surface.
+        for override in CODEX_AMBIENT_CAPABILITY_OVERRIDES:
+            overrides += ["-c", override]
+        if os.name == "nt":
+            overrides += ["-c", 'windows.sandbox="unelevated"']
+        return overrides
 
     async def start(self, system_prompt: str) -> None:
         codex_bin = shutil.which("codex")
@@ -144,16 +396,50 @@ class _CodexSession:
                 "codex CLI not found on PATH. "
                 "Install it with: npm install -g @openai/codex"
             )
-        cmd = [codex_bin, "app-server"]
-        env = {**os.environ, "CODEX_APP_SERVER": "1"}
-        self._proc = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
-            cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self._cwd,
-            env=env,
-        )
+        env = minimal_provider_environment("codex")
+        operator_codex_home = Path(
+            env.get("CODEX_HOME") or Path.home() / ".codex"
+        ).expanduser()
+        isolated_home_context, isolated_home = self._isolated_provider_home(env)
+        self._isolated_home_context = isolated_home_context
+        for key in CODEX_SECRET_ENV_KEYS:
+            env.pop(key, None)
+        env["CODEX_HOME"] = str(isolated_home)
+        env["CODEX_APP_SERVER"] = "1"
+        apply_host_owned_publication_guard(env, Path(self._cwd))
+        if self._git_isolation is not None:
+            env.update(self._git_isolation.env_overrides)
+        cmd = [
+            codex_bin,
+            *self._safety_config_overrides(
+                isolated_home,
+                operator_codex_home=operator_codex_home,
+                git_write_paths=(
+                    self._git_isolation.writable_paths
+                    if self._git_isolation is not None
+                    else ()
+                ),
+                git_read_only_paths=(
+                    self._git_isolation.read_only_paths
+                    if self._git_isolation is not None
+                    else ()
+                ),
+            ),
+            "app-server",
+        ]
+        try:
+            self._proc = await ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn_async(
+                cmd,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self._cwd,
+                env=env,
+            )
+        except BaseException:
+            isolated_home_context.cleanup()
+            self._isolated_home_context = None
+            raise
 
         # Drain stderr in the background so the pipe buffer never fills
         # and blocks the child process.
@@ -164,6 +450,11 @@ class _CodexSession:
             # the web chat prompt as developer instructions.
             init_params: dict = {
                 "clientInfo": {"name": "spec-web-chat", "version": "0.1.0"},
+                # thread/start.permissions is intentionally experimental in
+                # the app-server protocol.  Advertise support explicitly so
+                # current Codex versions accept the named fail-closed profile
+                # instead of rejecting the session before its first turn.
+                "capabilities": {"experimentalApi": True},
             }
             try:
                 init_resp, _ = await asyncio.wait_for(
@@ -187,9 +478,14 @@ class _CodexSession:
                         "thread/start",
                         {
                             "cwd": self._cwd,
+                            # Named profiles classify :workspace_roots
+                            # independently from cwd in the app-server API.
+                            # Register the isolated chat checkout explicitly
+                            # so the write grant cannot resolve to an empty set.
+                            "runtimeWorkspaceRoots": [self._cwd],
                             "developerInstructions": system_prompt,
                             "approvalPolicy": "never",
-                            "sandbox": "workspace-write",
+                            "permissions": _WEB_PERMISSION_PROFILE,
                         },
                     ),
                     timeout=30,
@@ -270,6 +566,7 @@ class _CodexSession:
             if not self._started and self.initial_prompt
             else text
         )
+        self._last_turn_error = ""
 
         try:
             resume_resp, _ = await asyncio.wait_for(
@@ -334,7 +631,16 @@ class _CodexSession:
                     "without output"
                 ) from exc
             if not line:
-                break
+                exit_code = self._proc.returncode if self._proc else None
+                exit_info = (
+                    f" (exit code {exit_code})" if exit_code is not None else ""
+                )
+                stderr_detail = await self._collect_stderr_detail()
+                await self.stop()
+                raise RuntimeError(
+                    "Codex app-server exited before the chat turn completed"
+                    f"{exit_info}{stderr_detail}"
+                )
 
             try:
                 msg = json.loads(line.decode("utf-8").strip())
@@ -361,9 +667,26 @@ class _CodexSession:
         """
         # Support both plain-JSON ``type`` and JSON-RPC ``method``.
         event_type = msg.get("type") or msg.get("method", "")
-
-        if event_type in ("turn.completed", "turn/completed"):
+        if event_type in (
+            "turn.completed",
+            "turn/completed",
+            "turn.failed",
+            "turn/failed",
+            "turn.interrupted",
+            "turn/interrupted",
+            "turn.cancelled",
+            "turn/cancelled",
+            "turn.canceled",
+            "turn/canceled",
+        ):
             self._saw_delta_text = False
+            failure = _codex_terminal_failure(msg, event_type)
+            if failure:
+                self._last_turn_error = failure
+                return [
+                    AgentEvent(kind="error", text=failure),
+                    AgentEvent(kind="done"),
+                ]
             return [AgentEvent(kind="done")]
         elif event_type in ("item.started", "item/started"):
             params = msg.get("params", {})
@@ -569,21 +892,66 @@ class _CodexSession:
         async with self._stop_lock:
             stderr_task = self._stderr_task
             proc = self._proc
-            try:
-                if proc is not None:
-                    cleanup = asyncio.create_task(_terminate_process(proc))
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        # A caller cancellation must not detach the provider.
-                        await cleanup
-                        raise
-            finally:
-                self._proc = None
-                self._stderr_task = None
-                if stderr_task is not None:
-                    stderr_task.cancel()
-                    await asyncio.gather(stderr_task, return_exceptions=True)
+            if proc is not None:
+                cleanup = asyncio.create_task(_terminate_process(proc))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    # A caller cancellation must not detach the provider.
+                    await cleanup
+                    raise
+
+            # Release process and credential ownership only after wait()
+            # confirms that the provider leader has exited.
+            self._proc = None
+            self._stderr_task = None
+            if stderr_task is not None:
+                stderr_task.cancel()
+                await asyncio.gather(stderr_task, return_exceptions=True)
+            if self._isolated_home_context is not None:
+                self._isolated_home_context.cleanup()
+                self._isolated_home_context = None
+
+
+def _codex_terminal_failure(msg: dict, event_type: str) -> str:
+    """Return an actionable error for failed/interrupted terminal events."""
+    params = msg.get("params", {})
+    if not isinstance(params, dict):
+        params = {}
+    turn = msg.get("turn") or params.get("turn") or {}
+    if not isinstance(turn, dict):
+        turn = {}
+
+    status = str(
+        turn.get("status")
+        or msg.get("status")
+        or params.get("status")
+        or ""
+    ).strip().lower()
+    terminal_kind = event_type.replace("/", ".").rsplit(".", 1)[-1].lower()
+    if terminal_kind == "completed" and status in {
+        "",
+        "completed",
+        "success",
+        "succeeded",
+    }:
+        return ""
+
+    failure_status = status or terminal_kind or "failed"
+    detail: object = (
+        turn.get("error")
+        or turn.get("message")
+        or params.get("error")
+        or params.get("message")
+        or msg.get("error")
+        or msg.get("message")
+        or ""
+    )
+    if isinstance(detail, dict):
+        detail = detail.get("message") or detail.get("text") or detail
+    detail_text = str(detail).strip()
+    message = f"Codex chat turn {failure_status}"
+    return f"{message}: {detail_text}" if detail_text else message
 
 
 def _check_jsonrpc_error(resp: dict | None, method: str) -> None:

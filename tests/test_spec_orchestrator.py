@@ -1403,45 +1403,112 @@ def _portable_success_command() -> list[str]:
     return [sys.executable, "-c", "raise SystemExit(0)"]
 
 
+def _write_fake_agent_completion_outbox(
+    env: dict[str, str] | None,
+    run: orch.RunState,
+    result: orch.ImplementResult,
+) -> None:
+    """Emulate ``spec report`` through the launch's granted capability."""
+    assert env is not None
+    result.launch_number = int(env["SPEC_IMPLEMENT_LAUNCH"])
+    result_path = Path(env["SPEC_COMPLETION_OUTBOX"])
+    result_path.parent.mkdir(parents=True, exist_ok=True)
+    result_path.write_text(
+        json.dumps(
+            {
+                "artifact": "spec-agent-completion-report",
+                "version": 1,
+                "spec_id": run.spec_id,
+                "run_id": run.run_id,
+                "implement_result": vars(result),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 class TestPhaseImplementHandshake:
     @pytest.fixture(autouse=True)
     def _materialize_legacy_result_fixtures_after_prelaunch_clear(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ):
-        """Treat prebuilt launch-zero fixtures as reports from the fake agent.
+        """Route prebuilt launch-zero fixtures through the fake agent outbox.
 
         Most tests in this class predate launch identities and stage the
         handshake before calling ``phase_implement``. Production now correctly
-        clears that mutable alias before every launch, so move only those
-        legacy test fixtures across the boundary and stamp the launch that the
-        phase is about to reserve. Dedicated stale-handshake tests exercise the
-        real clearing behavior without this class-local compatibility shim.
+        clears those mutable aliases before every launch and trusts only the
+        freshly prepared scoped outbox. Capture only the legacy fixtures at the
+        clear boundary, then materialize the best current-attempt candidate in
+        that exact outbox after production prepares it. Dedicated outbox and
+        stale-handshake tests exercise the real boundary without this
+        class-local fake-agent shim.
         """
-        original = orch._discard_prelaunch_completion_artifacts
+        original_discard = orch._discard_prelaunch_completion_artifacts
+        original_prepare = orch._prepare_scoped_agent_completion_outbox
+        staged_by_run: dict[str, list[orch.ImplementResult]] = {}
+        monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
 
-        def discard_then_materialize(
+        def discard_then_stage(
             repo_root: Path,
             worktree_path: Path,
             run_id: str,
         ) -> None:
-            staged: list[tuple[orch.ImplementResult, Path]] = []
+            staged: list[orch.ImplementResult] = []
             for state_root in (
                 orch._state_root(repo_root),
                 orch._worktree_state_root(worktree_path),
             ):
                 result = orch.ImplementResult.load_from_state_root(state_root, run_id)
                 if result is not None and result.launch_number == 0:
-                    staged.append((result, state_root))
-            original(repo_root, worktree_path, run_id)
-            for result, state_root in staged:
-                result.launch_number = 1
-                result.save_to_state_root(state_root, run_id)
+                    staged.append(result)
+            if staged:
+                staged_by_run[run_id] = staged
+            original_discard(repo_root, worktree_path, run_id)
+
+        def prepare_then_materialize(
+            repo_root: Path,
+            run_id: str,
+            launch_number: int,
+        ) -> Path:
+            result_path = original_prepare(repo_root, run_id, launch_number)
+            staged = staged_by_run.pop(run_id, [])
+            if not staged:
+                return result_path
+
+            # The old loader preferred common state when attempts tied, but a
+            # fresh local result over a stale common result. Preserve that test
+            # behavior while representing the fake worker's single report.
+            result = max(
+                staged,
+                key=lambda candidate: (
+                    -1 if candidate.attempt is None else candidate.attempt
+                ),
+            )
+            result.launch_number = launch_number
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "artifact": "spec-agent-completion-report",
+                        "version": 1,
+                        "spec_id": run_id.rsplit("-", 1)[0],
+                        "run_id": run_id,
+                        "implement_result": vars(result),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return result_path
 
         monkeypatch.setattr(
             orch,
             "_discard_prelaunch_completion_artifacts",
-            discard_then_materialize,
+            discard_then_stage,
+        )
+        monkeypatch.setattr(
+            orch,
+            "_prepare_scoped_agent_completion_outbox",
+            prepare_then_materialize,
         )
 
     def _make_run(self) -> orch.RunState:
@@ -1466,6 +1533,186 @@ class TestPhaseImplementHandshake:
         assert status == "failed"
         assert "no_handshake" in run.last_error
         assert "spec report" in run.last_error
+
+    @pytest.mark.parametrize("failure_point", ["command", "sync"])
+    def test_prelaunch_failure_removes_private_claude_home(
+        self,
+        repo: Path,
+        tmp_path: Path,
+        failure_point: str,
+    ) -> None:
+        run = self._make_run()
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        operator_state = tmp_path / "operator-state"
+
+        sync_effect = (
+            RuntimeError("workspace sync failed")
+            if failure_point == "sync"
+            else None
+        )
+        command_effect = (
+            RuntimeError("command construction failed")
+            if failure_point == "command"
+            else None
+        )
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(
+                orch,
+                "specbutler_user_state_root",
+                return_value=operator_state,
+            ),
+            patch.object(
+                orch,
+                "_sync_orchestrator_paths_into_workspace",
+                side_effect=sync_effect,
+            ),
+            patch.object(
+                orch,
+                "_build_agent_command",
+                side_effect=command_effect,
+                return_value=_portable_success_command(),
+            ),
+        ):
+            if failure_point == "sync":
+                with pytest.raises(RuntimeError, match="workspace sync failed"):
+                    orch.phase_implement(run, repo)
+                status = "failed"
+            else:
+                status = orch.phase_implement(run, repo)
+
+        assert status == "failed"
+        private_home_parent = operator_state / "claude-provider-homes"
+        assert not list(private_home_parent.glob("launch-*"))
+
+    @pytest.mark.parametrize("failure_point", ["after-sync", "partial-sync"])
+    def test_codex_prelaunch_failure_scrubs_volume_provider_home(
+        self,
+        repo: Path,
+        failure_point: str,
+    ) -> None:
+        run = self._make_run()
+        run.agent = "codex"
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        volume_root = repo / "captured-volume"
+        workspace = eb.WorkspaceHandle(
+            path=worktree,
+            outbox_path=worktree / ".spec-state",
+            backend="container",
+        )
+
+        class VolumeBackend:
+            identity = eb.BackendIdentity(
+                backend="container",
+                safety_mode="container",
+                workspace_root="volume",
+            )
+
+            def __init__(self) -> None:
+                self.sync_calls = 0
+
+            def sync_host_paths_into_workspace(self, source, relative_paths):
+                self.sync_calls += 1
+                for relative_path in relative_paths:
+                    host_path = source / relative_path
+                    volume_path = volume_root / relative_path
+                    if volume_path.exists():
+                        shutil.rmtree(volume_path)
+                    if host_path.exists():
+                        shutil.copytree(host_path, volume_path)
+                if failure_point == "partial-sync" and self.sync_calls == 1:
+                    raise RuntimeError("partial provider-home copy")
+
+        backend = VolumeBackend()
+
+        def stage_then_fail(*_args, **_kwargs):
+            home = worktree / ".spec-codex-home"
+            home.mkdir()
+            (home / "auth.json").write_text('{"token":"operator-secret"}')
+            (home / "config.toml").write_text('args = ["mcp-secret"]')
+            orch._sync_orchestrator_paths_into_workspace(
+                backend,
+                worktree,
+                (".spec-codex-home",),
+                required=True,
+            )
+            raise RuntimeError("failure after provider-home staging")
+
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+            patch.object(orch, "_require_agent_available_for_backend"),
+            patch.object(orch, "_resolve_workspace_handle", return_value=workspace),
+            patch.object(
+                orch,
+                "_restore_container_workspace_for_retry",
+                return_value=workspace,
+            ),
+            patch.object(orch, "_validate_codex_exec", return_value=True),
+            patch.object(
+                orch,
+                "_prepare_implement_launch_plan",
+                side_effect=stage_then_fail,
+            ),
+        ):
+            status = orch.phase_implement(run, repo)
+
+        assert status == "failed"
+        assert backend.sync_calls == 2
+        assert not (worktree / ".spec-codex-home").exists()
+        assert not (volume_root / ".spec-codex-home").exists()
+
+    def test_recovery_prelaunch_failure_removes_private_claude_home(
+        self,
+        repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        run = self._make_run()
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        operator_state = tmp_path / "operator-state"
+        context = orch.ImplementContext(
+            implement_reason="recovery",
+            run_id=run.run_id,
+            attempt_number=1,
+            spec_path="specs/my-feature.md",
+            spec_revision="sha256:deadbeef",
+        )
+        backend = SimpleNamespace(
+            identity=eb.BackendIdentity(
+                backend="worktree",
+                safety_mode="provider-sandbox",
+                workspace_root=".worktrees",
+            )
+        )
+
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+            patch.object(orch, "_require_agent_available_for_backend"),
+            patch.object(orch, "_claude_credentials_preflight_error", return_value=""),
+            patch.object(
+                orch,
+                "specbutler_user_state_root",
+                return_value=operator_state,
+            ),
+            patch.object(
+                orch,
+                "_sync_orchestrator_paths_into_workspace",
+                side_effect=RuntimeError("workspace sync failed"),
+            ),
+            pytest.raises(RuntimeError, match="workspace sync failed"),
+        ):
+            orch._attempt_no_handshake_recovery(
+                run,
+                repo_root=repo,
+                worktree_path=worktree,
+                ctx=context,
+                use_stream_json=False,
+            )
+
+        private_home_parent = operator_state / "claude-provider-homes"
+        assert not list(private_home_parent.glob("launch-*"))
 
     def test_passes_when_agent_reports_passed(self, repo: Path):
         run = self._make_run()
@@ -2138,8 +2385,8 @@ class TestPhaseImplementHandshake:
         def fake_run_teardown_command(*args, **kwargs):
             del args, kwargs
 
-        def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None):
-            del cwd, env, timeout
+        def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None, **kwargs):
+            del cwd, env, timeout, kwargs
             if cmd[:2] == ["git", "log"]:
                 return subprocess.CompletedProcess(
                     args=cmd,
@@ -2178,10 +2425,13 @@ class TestPhaseImplementHandshake:
         assert kwargs["spec_revision"].startswith("sha256:")
         assert kwargs["setup_prompt"] == "App ready at http://127.0.0.1:43123/app/."
         assert kwargs["setup_mcp_prompt"] == "Use Playwright MCP to inspect the UI."
-        write_sandbox_config.assert_called_once_with(
-            "claude",
-            worktree,
-            extra_mcp_servers=manifest.mcp_servers,
+        write_sandbox_config.assert_called_once()
+        sandbox_call = write_sandbox_config.call_args
+        assert sandbox_call.args == ("claude", worktree)
+        assert sandbox_call.kwargs["extra_mcp_servers"] == manifest.mcp_servers
+        assert sandbox_call.kwargs["protect_claude_mcp_secrets"] is True
+        assert sandbox_call.kwargs["claude_mcp_secret_source"]["DATABASE_URL"] == (
+            "postgresql://example:secret@/example_app?host=/tmp/example-pg&port=55433"
         )
         register_setup_processes.assert_called_once_with(repo, worktree, manifest)
         assert captured_env["VIRTUAL_ENV"] == str(worktree / ".venv")
@@ -2217,8 +2467,8 @@ class TestPhaseImplementHandshake:
             mcp_servers={"playwright": {"command": "node", "args": ["cli.js"]}},
         )
 
-        def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None):
-            del cwd, env, timeout
+        def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None, **kwargs):
+            del cwd, env, timeout, kwargs
             if cmd[:2] == ["git", "log"]:
                 return subprocess.CompletedProcess(
                     args=cmd,
@@ -2247,11 +2497,16 @@ class TestPhaseImplementHandshake:
         kwargs = build_cmd.call_args.kwargs
         assert kwargs["setup_prompt"] == "Service ready."
         assert kwargs["setup_mcp_prompt"] == "Use Playwright MCP to inspect the UI."
-        assert kwargs["mcp_servers"] == manifest.mcp_servers
+        assert kwargs["mcp_servers"] == {
+            "playwright": {
+                "command": "node",
+                "args": ["cli.js", "--browser", "chromium"],
+            }
+        }
         write_sandbox_config.assert_called_once_with(
             "codex",
             worktree,
-            extra_mcp_servers=manifest.mcp_servers,
+            extra_mcp_servers=kwargs["mcp_servers"],
         )
 
         saved = orch.ImplementContext.load(repo, run.run_id)
@@ -2322,6 +2577,8 @@ class TestPhaseImplementHandshake:
                     "/workspace/source/frontend/node_modules/@playwright/mcp/cli.js",
                     "--config",
                     "/workspace/source/playwright.config.ts",
+                    "--browser",
+                    "chromium",
                 ],
             }
         }
@@ -3415,14 +3672,18 @@ class TestPhaseImplementHandshake:
             return ["agent"]
 
         def fake_spawn(cmd, cwd=None, env=None, **kwargs):
-            del cwd, env, kwargs
+            del cwd, kwargs
             if len(build_calls) >= 2:
-                orch.ImplementResult(
-                    status="passed",
-                    summary="Recovered and reported completion",
-                    attempt=run.attempts,
-                    launch_number=run.implement_launches,
-                ).save(repo, run.run_id)
+                _write_fake_agent_completion_outbox(
+                    env,
+                    run,
+                    orch.ImplementResult(
+                        status="passed",
+                        summary="Recovered and reported completion",
+                        attempt=run.attempts,
+                        launch_number=run.implement_launches,
+                    ),
+                )
             return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
@@ -3485,6 +3746,12 @@ class TestPhaseImplementHandshake:
         captured: dict[str, object] = {}
 
         class RecordingBackend:
+            identity = eb.BackendIdentity(
+                backend="worktree",
+                safety_mode="host",
+                workspace_root=".worktrees",
+            )
+
             def launch_agent(
                 self,
                 request: eb.AgentRequest,
@@ -3493,12 +3760,16 @@ class TestPhaseImplementHandshake:
             ) -> eb.AgentResult:
                 captured["request"] = request
                 captured["monitor_provided"] = monitor is not None
-                orch.ImplementResult(
-                    status="passed",
-                    summary="Recovered through backend",
-                    attempt=run.attempts,
-                    launch_number=run.implement_launches,
-                ).save(repo, run.run_id)
+                _write_fake_agent_completion_outbox(
+                    request.env,
+                    run,
+                    orch.ImplementResult(
+                        status="passed",
+                        summary="Recovered through backend",
+                        attempt=run.attempts,
+                        launch_number=run.implement_launches,
+                    ),
+                )
                 return eb.AgentResult(returncode=0)
 
         orch.set_execution_backend(RecordingBackend())  # type: ignore[arg-type]
@@ -4120,14 +4391,18 @@ class TestPhaseImplementHandshake:
             return ["agent"]
 
         def fake_spawn(cmd, cwd=None, env=None, **kwargs):
-            del cwd, env, kwargs
+            del cwd, kwargs
             if calls.count("recovery-build") == 1:
-                orch.ImplementResult(
-                    status="passed",
-                    summary="Recovered and reported completion",
-                    attempt=run.attempts,
-                    launch_number=run.implement_launches,
-                ).save(repo, run.run_id)
+                _write_fake_agent_completion_outbox(
+                    env,
+                    run,
+                    orch.ImplementResult(
+                        status="passed",
+                        summary="Recovered and reported completion",
+                        attempt=run.attempts,
+                        launch_number=run.implement_launches,
+                    ),
+                )
             return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
@@ -4182,12 +4457,16 @@ class TestPhaseImplementHandshake:
             popen_envs.append(launch_env)
             agent_launches = [recorded_env for recorded_env in popen_envs if recorded_env.get("SPEC_ID") == run.spec_id]
             if len(agent_launches) == 2:
-                orch.ImplementResult(
-                    status="passed",
-                    summary="Recovered and reported completion",
-                    attempt=run.attempts,
-                    launch_number=run.implement_launches,
-                ).save(repo, run.run_id)
+                _write_fake_agent_completion_outbox(
+                    env,
+                    run,
+                    orch.ImplementResult(
+                        status="passed",
+                        summary="Recovered and reported completion",
+                        attempt=run.attempts,
+                        launch_number=run.implement_launches,
+                    ),
+                )
             return _managed_test_process(_make_fake_popen(returncode=0)(["agent"]))
 
         with (
@@ -4213,12 +4492,12 @@ class TestPhaseImplementHandshake:
         assert len(agent_envs) == 2
         assert agent_envs[0]["DATABASE_URL"] == "postgresql://stale-db"
         assert "DATABASE_URL" not in agent_envs[1]
-        assert agent_envs[1]["BASE_ENV"] == "present"
+        assert "BASE_ENV" not in agent_envs[1]
         assert agent_envs[1]["SPEC_ID"] == run.spec_id
         assert agent_envs[1]["SPEC_RUN_ID"] == run.run_id
         assert agent_envs[1]["SPEC_PATH"] == f"specs/{run.spec_id}.md"
 
-    def test_build_implement_agent_env_strips_portable_claude_auth(self, repo: Path):
+    def test_build_implement_agent_env_keeps_only_provider_and_process_values(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
         worktree.mkdir(parents=True, exist_ok=True)
@@ -4234,12 +4513,48 @@ class TestPhaseImplementHandshake:
         ):
             env = orch._build_implement_agent_env(run, worktree)
 
-        assert env["BASE_ENV"] == "present"
-        assert "ANTHROPIC_API_KEY" not in env
-        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        assert "BASE_ENV" not in env
+        assert env["ANTHROPIC_API_KEY"] == "anthropic-secret"
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
         assert env["SPEC_ID"] == run.spec_id
         assert env["SPEC_RUN_ID"] == run.run_id
         assert env["SPEC_PATH"] == f"specs/{run.spec_id}.md"
+
+    def test_custom_adapter_declares_provider_environment_allowlist(
+        self,
+        repo: Path,
+    ) -> None:
+        from spec_runtime.agent_adapter import AgentCapabilities
+
+        run = self._make_run()
+        run.agent = "custom"
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        adapter = SimpleNamespace(
+            capabilities=AgentCapabilities(
+                name="custom",
+                provider_environment_keys=frozenset(
+                    {"CUSTOM_PROVIDER_TOKEN", "invalid key"}
+                ),
+            )
+        )
+
+        with (
+            patch.object(orch, "get_agent_adapter", return_value=adapter),
+            patch.dict(
+                orch.os.environ,
+                {
+                    "CUSTOM_PROVIDER_TOKEN": "provider-secret",
+                    "AMBIENT_SECRET": "must-not-pass",
+                },
+                clear=True,
+            ),
+        ):
+            env = orch._build_implement_agent_env(run, worktree)
+
+        assert env["CUSTOM_PROVIDER_TOKEN"] == "provider-secret"
+        assert "AMBIENT_SECRET" not in env
+        assert "invalid key" not in env
 
     def test_no_handshake_recovery_propagates_setup_failure_diagnostics(self, repo: Path):
         run = self._make_run()
@@ -4284,12 +4599,16 @@ class TestPhaseImplementHandshake:
             del cwd, kwargs
             captured_envs.append(dict(env or {}))
             if recovery_call_index:
-                orch.ImplementResult(
-                    status="passed",
-                    summary="Recovered and reported completion",
-                    attempt=run.attempts,
-                    launch_number=run.implement_launches,
-                ).save(repo, run.run_id)
+                _write_fake_agent_completion_outbox(
+                    env,
+                    run,
+                    orch.ImplementResult(
+                        status="passed",
+                        summary="Recovered and reported completion",
+                        attempt=run.attempts,
+                        launch_number=run.implement_launches,
+                    ),
+                )
             return _managed_test_process(_make_fake_popen(returncode=0)(cmd))
 
         with (
@@ -5556,15 +5875,27 @@ class TestReviewWorktreeBootstrap:
         captured: dict[str, object] = {}
 
         class Process:
+            pid = 43210
             returncode = 0
 
-            def communicate(self, timeout: float):
+            def communicate(self, input=None, timeout: float | None = None):  # noqa: ARG002
                 return "", ""
 
-        def popen(argv, **kwargs):
+            def poll(self) -> int:
+                return 0
+
+        def spawn(argv, **kwargs):
             captured["argv"] = argv
             captured.update(kwargs)
-            return Process()
+            process = Process()
+            token = SupervisionToken(
+                LifetimeMode.RUN_OWNED,
+                ProcessIdentity(process.pid, "test-double"),
+                os.getpid(),
+                "test-owner",
+                "review-bootstrap-test",
+            )
+            return process_supervisor.ManagedProcess(process, token)
 
         with (
             patch.object(
@@ -5575,7 +5906,7 @@ class TestReviewWorktreeBootstrap:
                     windows_argv=(sys.executable, "-c", "print('ok')"),
                 ),
             ),
-            patch.object(orch.subprocess, "Popen", side_effect=popen),
+            patch.object(orch.ProcessSupervisor, "spawn", side_effect=spawn),
         ):
             warning = orch._bootstrap_review_worktree(
                 tmp_path / "repo", worktree, warning_path=tmp_path / "warning.json"
@@ -11234,6 +11565,26 @@ class TestParseExportedEnv:
         }
 
 
+class TestSpecAuthoringPolicy:
+    def test_policy_check_fails_closed_when_git_inspection_errors(self, tmp_path: Path):
+        with patch.object(orch, "run_subprocess", side_effect=OSError("git unavailable")):
+            error = orch._check_spec_authoring_policy(tmp_path, "spec/example")
+
+        assert "refusing publication" in error
+
+    def test_no_merge_base_checks_every_tracked_head_path(self, tmp_path: Path):
+        def fake_run(cmd, **kwargs):  # noqa: ARG001
+            if cmd[:2] == ["git", "merge-base"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "no merge base")
+            assert cmd == ["git", "ls-tree", "-r", "--name-only", "HEAD"]
+            return subprocess.CompletedProcess(cmd, 0, "specs/example.md\nsrc/unsafe.py\n", "")
+
+        with patch.object(orch, "run_subprocess", side_effect=fake_run):
+            error = orch._check_spec_authoring_policy(tmp_path, "spec/example")
+
+        assert "src/unsafe.py" in error
+
+
 class TestPublishPhase:
     @staticmethod
     def _prepare_checked_no_diff_branch(repo: Path, branch: str) -> str:
@@ -11385,6 +11736,8 @@ class TestPublishPhase:
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
+            patch.object(orch, "_check_spec_authoring_policy", return_value=""),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(orch, "_repo_name_with_owner", return_value="acme/repo"),
             patch.object(
@@ -11413,8 +11766,8 @@ class TestPublishPhase:
     def _reconcile_subprocess(self, *, remote_head: str, fetch_rc: int = 0):
         calls: list[list[str]] = []
 
-        def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None):
-            del cwd, env, timeout
+        def fake_run_subprocess(cmd, cwd=None, env=None, timeout=None, **kwargs):
+            del cwd, env, timeout, kwargs
             calls.append(cmd)
             if cmd[:2] == ["git", "fetch"]:
                 return subprocess.CompletedProcess(cmd, fetch_rc, "", "")
@@ -11434,6 +11787,7 @@ class TestPublishPhase:
         with (
             patch.object(orch, "run_subprocess", side_effect=fake),
             patch.object(orch, "_head_sha", return_value="a" * 40),
+            patch.object(orch, "_assert_publication_transition_safe"),
         ):
             result = orch._reconcile_publish_push_rejection(
                 run,
@@ -11473,6 +11827,7 @@ class TestPublishPhase:
         with (
             patch.object(orch, "run_subprocess", side_effect=fake),
             patch.object(orch, "_head_sha", return_value="a" * 40),
+            patch.object(orch, "_assert_publication_transition_safe"),
         ):
             result = orch._reconcile_publish_push_rejection(
                 run,
@@ -11490,7 +11845,10 @@ class TestPublishPhase:
         )
         forge = MagicMock()
         calls, fake = self._reconcile_subprocess(remote_head="b" * 40, fetch_rc=1)
-        with patch.object(orch, "run_subprocess", side_effect=fake):
+        with (
+            patch.object(orch, "run_subprocess", side_effect=fake),
+            patch.object(orch, "_assert_publication_transition_safe"),
+        ):
             result = orch._reconcile_publish_push_rejection(
                 run,
                 forge,
@@ -11551,6 +11909,8 @@ class TestPublishPhase:
         with (
             patch.object(orch, "resolve_worktree_path", return_value=worktree),
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
+            patch.object(orch, "_check_spec_authoring_policy", return_value=""),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(orch, "_repo_name_with_owner", return_value="acme/repo"),
             patch.object(
@@ -11676,6 +12036,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="b" * 40),
             patch.object(orch, "_repo_name_with_owner", return_value="acme/repo"),
             patch.object(
@@ -11770,6 +12131,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="c" * 40),
             patch.object(orch, "_repo_name_with_owner", return_value="acme/repo"),
             patch.object(
@@ -11824,6 +12186,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(orch, "_repo_name_with_owner", return_value="acme/repo"),
             patch.object(
@@ -11887,6 +12250,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="b" * 40),
             patch.object(orch, "_repo_name_with_owner", return_value="acme/repo"),
             patch.object(
@@ -11942,6 +12306,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(orch, "_repo_name_with_owner", return_value="acme/repo"),
             patch.object(
@@ -12017,6 +12382,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(
                 orch,
@@ -12090,6 +12456,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(
                 orch,
@@ -12159,6 +12526,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(
                 orch,
@@ -12226,6 +12594,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(
                 orch,
@@ -12283,6 +12652,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(
                 orch,
@@ -12337,6 +12707,7 @@ class TestPublishPhase:
 
         with (
             patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_assert_publication_transition_safe"),
             patch.object(orch, "_head_sha", return_value="a" * 40),
             patch.object(
                 orch,
@@ -15349,6 +15720,10 @@ class TestImplementSetupTeardownHelpers:
         worktree = repo / ".worktrees" / run.spec_id
         worktree.mkdir(parents=True, exist_ok=True)
         manifest = orch.ImplementSetupManifest(
+            env={
+                "DB_PASSWORD": "database-secret",
+                "STRIPE_API_KEY": "stripe-secret",
+            },
             mcp_servers={
                 "playwright": {
                     "command": "node",
@@ -15364,6 +15739,7 @@ class TestImplementSetupTeardownHelpers:
         user_home.mkdir()
         (user_home / ".claude.json").write_text('{"oauthAccount":{"uuid":"u"}}')
         sync_calls: list[tuple[Path, tuple[str, ...]]] = []
+        runtime_aliases: list[str] = []
 
         class FakeContainerBackend:
             identity = eb.BackendIdentity(
@@ -15378,13 +15754,17 @@ class TestImplementSetupTeardownHelpers:
         def fake_build_agent_command(*args, **kwargs):
             del args, kwargs
             payload = json.loads((worktree / ".claude" / "mcp-servers.json").read_text())
-            assert payload["mcpServers"] == {
-                "playwright": {
-                    "command": "node",
-                    "args": ["/workspace/source/frontend/mcp.js"],
-                },
-            }
-            assert not (worktree / ".claude" / "settings.local.json").exists()
+            playwright = payload["mcpServers"]["playwright"]
+            assert playwright["command"] == "node"
+            assert len(playwright["args"]) == 1
+            runtime_reference = playwright["args"][0]
+            assert runtime_reference.startswith("${SPEC_MCP_RUNTIME_")
+            runtime_aliases.append(runtime_reference[2:-1])
+            settings = json.loads(
+                (worktree / ".claude" / "settings.local.json").read_text()
+            )
+            assert "enabled" not in settings["sandbox"]
+            assert settings["permissions"]["disableBypassPermissionsMode"] == "disable"
             return ["agent"]
 
         ctx = orch.ImplementContext(
@@ -15398,6 +15778,7 @@ class TestImplementSetupTeardownHelpers:
         with (
             patch.object(orch, "SPEC_RUNTIME_CONFIG", container_config),
             patch.object(orch, "_EXECUTION_BACKEND_OVERRIDE", FakeContainerBackend()),
+            patch.object(orch, "_prepare_agent_git_boundary", return_value=None),
             patch.object(orch, "_run_implement_setup_command", return_value=manifest),
             patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
             patch.object(orch.Path, "home", return_value=user_home),
@@ -15422,18 +15803,31 @@ class TestImplementSetupTeardownHelpers:
         assert plan.agent_env["HOME"] == str(worktree / ".spec-claude-home")
         assert plan.agent_env["ANTHROPIC_API_KEY"] == "anthropic-secret"
         assert plan.agent_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-secret"
-        assert plan.agent_env_redactions == ("anthropic-secret", "oauth-secret")
+        assert plan.agent_env["DB_PASSWORD"] == "database-secret"
+        assert plan.agent_env["STRIPE_API_KEY"] == "stripe-secret"
+        assert {"DB_PASSWORD", "STRIPE_API_KEY"} <= plan.declared_agent_env_keys
+        assert len(runtime_aliases) == 1
+        assert plan.agent_env[runtime_aliases[0]] == (
+            "/workspace/source/frontend/mcp.js"
+        )
+        assert plan.agent_env_redactions == (
+            "/workspace/source/frontend/mcp.js",
+            "anthropic-secret",
+            "oauth-secret",
+        )
         assert "start_new_session" not in plan.popen_kwargs
         assert plan.popen_kwargs["encoding"] == "utf-8"
         assert plan.popen_kwargs["errors"] == "replace"
-        assert (worktree / ".spec-claude-home" / ".claude.json").read_text() == (
-            '{"oauthAccount":{"uuid":"u"}}'
-        )
+        assert not (worktree / ".spec-claude-home" / ".claude.json").exists()
         assert (worktree / ".spec-claude-home" / ".gitignore").read_text() == "*\n"
         assert sync_calls == [
             (
                 worktree,
-                (".spec-claude-home", ".claude/mcp-servers.json"),
+                (
+                    ".spec-claude-home",
+                    ".claude/mcp-servers.json",
+                    ".claude/settings.local.json",
+                ),
             )
         ]
 
@@ -15480,6 +15874,7 @@ class TestImplementSetupTeardownHelpers:
         with (
             patch.object(orch, "_resolve_execution_backend", return_value=backend),
             patch.object(orch, "_require_agent_available_for_backend"),
+            patch.object(orch, "_prepare_agent_git_boundary", return_value=None),
             patch.object(orch, "_run_implement_setup_command", return_value=manifest),
             patch.object(orch, "_register_setup_manifest_processes", side_effect=register),
             patch.object(orch, "_write_sandbox_config", side_effect=fail_sandbox),
@@ -15995,6 +16390,7 @@ class TestResumeSandboxConfigRewrite:
 
         worktree_path = orch.resolve_worktree_path(run, repo)
         worktree_path.mkdir(parents=True, exist_ok=True)
+        (worktree_path / ".git").mkdir()
 
         handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
         with (
@@ -16023,6 +16419,7 @@ class TestResumeSandboxConfigRewrite:
 
         worktree_path = orch.resolve_worktree_path(run, repo)
         worktree_path.mkdir(parents=True, exist_ok=True)
+        (worktree_path / ".git").mkdir()
 
         handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
         with (
@@ -16342,6 +16739,34 @@ class TestVerifyPreflightMerge:
 
         return gate_env, fake_verify_test_environment
 
+    def test_verify_refuses_changed_shared_git_config_before_fetch(
+        self,
+        repo: Path,
+    ) -> None:
+        run = self._make_run()
+        run.implement_launches = 1
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        orch._capture_or_validate_run_publication_baseline(
+            run,
+            worktree,
+            allow_capture=True,
+        )
+        _run_git("config", "core.sshCommand", "hostile-transport", cwd=repo)
+
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch, "_verify_preflight_shared_memory", return_value=True),
+            patch.object(orch, "_fetch_origin_master") as fetch,
+            patch.object(orch, "_run_verify_gate") as gate,
+        ):
+            result = orch.phase_verify(run, repo)
+
+        assert result == "failed"
+        assert "git config changed" in run.last_error.lower()
+        fetch.assert_not_called()
+        gate.assert_not_called()
+
     def test_test_gate_diagnostic_command_uses_worktree_venv_python(self, repo: Path):
         worktree = repo / ".worktrees" / "my-feature"
         assert orch._test_gate_diagnostic_command(worktree) == [
@@ -16560,6 +16985,7 @@ class TestVerifyPreflightMerge:
             *,
             fetch_origin_master: bool = True,
             strategy_option: str | None = None,
+            **_kwargs,
         ) -> orch.MergeOriginMasterResult:
             merge_calls.append((fetch_origin_master, strategy_option))
             if strategy_option is None:
@@ -16590,7 +17016,10 @@ class TestVerifyPreflightMerge:
 
         assert result == "passed"
         assert merge_calls == [(False, None), (False, "theirs")]
-        abort_mock.assert_called_once_with(worktree)
+        abort_mock.assert_called_once()
+        abort_args, abort_kwargs = abort_mock.call_args
+        assert abort_args == (worktree,)
+        assert abort_kwargs["git_env"]["GIT_TERMINAL_PROMPT"] == "0"
         run_mock.assert_called_once_with(
             ["make", "test"],
             cwd=worktree,
@@ -18104,22 +18533,89 @@ class TestLocalReviewStatusHelpers:
         assert len(submitted_payloads[0]["description"]) <= 140
 
 
-class TestLocalReviewHelpers:
-    @pytest.mark.skip(reason="requires monorepo .github/prompts/codex-review.md")
-    def test_in_repo_local_review_prompt_documents_tool_contract(self):
-        prompt_path = Path(__file__).resolve().parent.parent / ".github" / "prompts" / "codex-review.md"
-        prompt = prompt_path.read_text()
+def test_interactive_agent_waits_for_strict_owned_tree_exit(tmp_path: Path) -> None:
+    class Leader:
+        pid = 43210
+        returncode = 0
 
-        assert "Local shell command execution is available in this environment for inspection." in prompt
-        assert "Run the diff command above before deciding." in prompt
-        assert "If this is an implementation PR, read `specs/${SPEC_ID}.md`." in prompt
+        def wait(self) -> int:
+            return self.returncode
+
+    leader = Leader()
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        ProcessIdentity(leader.pid, "test-double"),
+        os.getpid(),
+        "test-owner",
+        "interactive-agent-test",
+    )
+    managed = process_supervisor.ManagedProcess(leader, token)
+
+    with (
+        patch.object(orch.ProcessSupervisor, "spawn", return_value=managed),
+        patch.object(
+            orch,
+            "terminate_managed_process_tree",
+            side_effect=[False, False, True],
+        ) as strict_terminate,
+        patch.object(orch, "_poll_sleep") as poll_sleep,
+    ):
+        completed = orch._run_interactive_agent_owned(
+            ["provider", "interactive"],
+            cwd=tmp_path,
+            env={"PATH": os.defpath},
+        )
+
+    assert completed.returncode == 0
+    assert strict_terminate.call_count == 3
+    assert poll_sleep.call_count == 2
+    assert all(
+        invocation.args == (orch.AGENT_COMPLETION_POLL_SECONDS,)
+        for invocation in poll_sleep.call_args_list
+    )
+
+
+class TestLocalReviewHelpers:
+    def test_in_repo_local_review_prompt_documents_tool_contract(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        prompt_path = repo_root / ".github" / "prompts" / "review.md"
+        prompt = prompt_path.read_text()
+        bundled_prompt = (
+            repo_root / "src" / "spec_runtime" / "templates" / "review.md"
+        ).read_text()
+
+        assert prompt == bundled_prompt
+        assert "Review evidence access is provider-specific." in prompt
+        assert "intentionally have no shell" in prompt
+        assert "Local shell command execution is available" not in prompt
         assert (
-            "Use `blocked` only when a required local inspection step cannot be completed after actually attempting it."
-        ) in prompt
+            "Intentionally disabled command execution\nor test reruns in a built-in review are not missing tools"
+            in prompt
+        )
         assert (
-            "If you return `blocked` or `failed`, the summary must name the exact "
-            "command or file access that failed and why."
+            "If you return `blocked` or `failed`, the summary must name the exact evidence"
         ) in prompt
+
+    def test_custom_review_note_preserves_checkout_inspection_contract(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--run123",
+        )
+
+        note = orch._custom_review_checkout_prompt_note(
+            run,
+            tmp_path,
+            base_sha="b" * 40,
+            head_sha="a" * 40,
+        )
+
+        assert f"git diff --unified=0 {'b' * 40}...{'a' * 40}" in note
+        assert "the canonical spec is `specs/my-feature.md`" in note
+        assert "limitation alone is not a reason to return `blocked`" in note
 
     def test_render_local_review_prompt_uses_same_template_substitutions(
         self,
@@ -18222,11 +18718,11 @@ class TestLocalReviewHelpers:
         assert "SSH_AUTH_SOCK" not in env
         assert "OPENAI_API_KEY" not in env
         assert env["GIT_TERMINAL_PROMPT"] == "0"
-        assert env["GIT_CONFIG_COUNT"] == "3"
-        assert env["GIT_CONFIG_KEY_1"] == "credential.helper"
-        assert env["GIT_CONFIG_VALUE_1"] == ""
-        assert env["GIT_CONFIG_KEY_2"] == "remote.origin.pushurl"
-        assert env["GIT_CONFIG_VALUE_2"] == "codex-review-disabled://origin"
+        assert env["GIT_CONFIG_COUNT"] == "2"
+        assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
+        assert env["GIT_CONFIG_VALUE_0"] == ""
+        assert env["GIT_CONFIG_KEY_1"] == "remote.origin.pushurl"
+        assert env["GIT_CONFIG_VALUE_1"] == "codex-review-disabled://origin"
         assert env["TMPDIR"] == str(scratch_dir.resolve())
         assert env["TMP"] == str(scratch_dir.resolve())
         assert env["TEMP"] == str(scratch_dir.resolve())
@@ -18249,12 +18745,17 @@ class TestLocalReviewHelpers:
             writable_temp_dir=scratch_dir,
         )
 
-        assert cmd[0:5] == ["codex", "exec", "--ephemeral", "-s", "workspace-write"]
+        assert cmd[:3] == ["codex", "exec", "--ephemeral"]
+        assert cmd[cmd.index("-s") + 1] == "read-only"
+        assert "--ignore-user-config" in cmd
+        assert "features.shell_tool=false" in cmd
+        assert "shell_environment_policy.inherit=none" in cmd
         assert "--output-schema" in cmd
         assert cmd[cmd.index("-C") + 1] == str(scratch_dir)
         assert "--skip-git-repo-check" in cmd
         assert "--add-dir" not in cmd
-        assert "review this change" in cmd
+        assert "review this change" not in cmd
+        assert cmd[-1] == "-"
 
     def test_build_local_review_command_works_with_claude(
         self,
@@ -18270,8 +18771,11 @@ class TestLocalReviewHelpers:
             agent_name="claude",
         )
 
-        assert cmd[0] == "claude"
-        assert "review this change" in cmd
+        assert cmd[:2] == ["claude", "-p"]
+        assert "--restricted" in cmd
+        assert "--safe-mode" in cmd
+        assert "--dangerously-skip-permissions" not in cmd
+        assert "review this change" not in cmd
 
     def test_build_block_debugger_command_uses_codex_default_linux_sandbox(
         self,
@@ -18288,14 +18792,18 @@ class TestLocalReviewHelpers:
             writable_output_dir=output_dir,
         )
 
-        assert cmd[0:5] == ["codex", "exec", "--ephemeral", "-s", "read-only"]
+        assert cmd[:3] == ["codex", "exec", "--ephemeral"]
+        assert cmd[cmd.index("-s") + 1] == "read-only"
+        assert "--ignore-user-config" in cmd
+        assert "features.shell_tool=false" in cmd
         assert "features.use_legacy_landlock=true" not in cmd
-        assert "--add-dir" in cmd
-        assert str(output_dir) in cmd
+        assert "--add-dir" not in cmd
+        assert cmd[cmd.index("-C") + 1] == str(output_dir)
         assert str(state_dir) not in cmd
         assert cmd[cmd.index("-o") + 1] == str(output_path)
         assert "--output-schema" in cmd
-        assert "diagnose block" in cmd
+        assert "diagnose block" not in cmd
+        assert cmd[-1] == "-"
 
     def test_run_local_review_subprocess_records_sigterm_diagnostics(
         self,
@@ -18385,8 +18893,9 @@ class TestLocalReviewHelpers:
 
         fake_proc = FakeProcess()
 
-        def mark_terminated(proc: FakeProcess) -> None:
+        def mark_terminated(proc: FakeProcess) -> bool:
             proc.returncode = -15
+            return True
 
         with caplog.at_level(logging.WARNING, logger=orch.logger.name):
             with (
@@ -18427,7 +18936,44 @@ class TestLocalReviewHelpers:
         assert payload["stderr_tail"] == "partial stderr"
         assert "timed out after 45s; terminating process group" in caplog.text
 
-    def test_run_local_review_subprocess_removes_checkout_codex_auth_on_launch_failure(
+    def test_run_local_review_subprocess_does_not_hide_unconfirmed_tree(
+        self,
+        repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        worktree = tmp_path / "review"
+        worktree.mkdir()
+        error = process_supervisor.ProcessGroupTerminationError(
+            "owned review tree remains live"
+        )
+        fake_proc = SimpleNamespace(
+            pid=4321,
+            returncode=None,
+            token=SimpleNamespace(pgid=4321),
+            communicate=MagicMock(side_effect=error),
+        )
+
+        with (
+            patch.object(orch.ProcessSupervisor, "spawn", return_value=fake_proc),
+            patch.object(orch, "read_process_identity", return_value=None),
+            patch.object(orch, "_register_worktree_process_from_popen"),
+            patch.object(orch, "_prune_registered_worktree_processes") as prune,
+            pytest.raises(
+                process_supervisor.ProcessGroupTerminationError,
+                match="remains live",
+            ),
+        ):
+            orch._run_local_review_subprocess(
+                repo,
+                ["codex", "exec", "review prompt"],
+                cwd=worktree,
+                env={},
+                timeout=45,
+            )
+
+        prune.assert_called_once_with(repo, worktree)
+
+    def test_run_local_review_subprocess_does_not_manage_checkout_codex_auth(
         self,
         repo: Path,
         tmp_path: Path,
@@ -18451,7 +18997,10 @@ class TestLocalReviewHelpers:
                 timeout=45,
             )
 
-        assert not auth_path.exists()
+        # Review auth is now staged in an external ephemeral home and cleaned by
+        # the review lifecycle. The subprocess helper must not infer ownership
+        # from an attacker-controlled checkout path.
+        assert auth_path.read_text(encoding="utf-8") == '{"token":"secret"}'
 
     def test_run_local_review_subprocess_never_removes_inherited_operator_codex_auth(
         self,
@@ -18794,6 +19343,18 @@ class TestLocalReviewHelpers:
 
 
 class TestReviewPhaseRouting:
+    @pytest.fixture(autouse=True)
+    def _isolate_publication_boundary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Review routing tests use synthetic worktrees without Git metadata."""
+        monkeypatch.setattr(
+            orch,
+            "_assert_publication_transition_safe",
+            lambda *_args, **_kwargs: None,
+        )
+
     def _make_run(self) -> orch.RunState:
         return orch.RunState(
             run_id="review-routing-20260101T000000",
@@ -18908,6 +19469,7 @@ class TestReviewPhaseRouting:
             patch.object(orch, "_head_sha", return_value=pr["headRefOid"]),
             patch.object(orch, "_find_pr_for_branch", return_value=pr),
             patch.object(orch, "_phase_review_local", local_phase),
+            patch.object(orch, "_assert_publication_transition_safe"),
         ):
             result = orch.phase_review(run, repo)
 
@@ -19008,6 +19570,38 @@ class TestReviewPhaseRouting:
 
 
 class TestLocalReviewPhase:
+    @pytest.fixture(autouse=True)
+    def _stub_builtin_review_evidence(self):
+        """Keep lifecycle tests focused on orchestration, not git fixture setup."""
+        with (
+            patch.object(
+                orch,
+                "_assert_publication_transition_safe",
+                return_value=None,
+            ),
+            patch.object(
+                orch,
+                "_trusted_publication_repo_slug",
+                return_value="acme/repo",
+            ),
+            patch.object(
+                orch,
+                "_host_materialized_review_spec_note",
+                return_value="\n\n<BEGIN_HOST_MATERIALIZED_SPEC>\ncriterion\n<END_HOST_MATERIALIZED_SPEC>",
+            ),
+            patch.object(
+                orch,
+                "_claude_review_evidence_prompt_note",
+                return_value="\n\nrestricted Claude evidence",
+            ),
+            patch.object(
+                orch,
+                "_codex_review_sandbox_prompt_note",
+                return_value="\n\nrestricted Codex evidence",
+            ),
+        ):
+            yield
+
     def _make_run(self) -> orch.RunState:
         return orch.RunState(
             run_id="local-review-20260101T000000",
@@ -19066,6 +19660,14 @@ class TestLocalReviewPhase:
             inherit_env=True,
             input_text=None,
         ):  # noqa: ARG001
+            if cmd == ["claude", "--help"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "--restricted --safe-mode --permission-mode --strict-mcp-config "
+                    "--no-session-persistence --setting-sources --settings\n",
+                    "",
+                )
             if cmd == ["gh", "auth", "status"]:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
             if cmd == ["gh", "pr", "merge", "42", "--disable-auto"]:
@@ -19109,6 +19711,7 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             assert repo_root == repo
             assert cmd[0] == "claude"
@@ -19184,6 +19787,7 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             assert repo_root == repo
             assert cmd[0] == "claude"
@@ -19209,14 +19813,12 @@ class TestLocalReviewPhase:
 
         assert review_result.status == "approved"
 
-    def test_run_local_review_puts_worktree_venv_on_reviewer_path(
+    def test_builtin_local_review_does_not_expose_worktree_venv(
         self,
         repo: Path,
         tmp_path: Path,
     ):
-        """The reviewer subprocess must see the review worktree's venv on PATH,
-        otherwise bootstrapping the worktree yields nothing the reviewer can run
-        (bare ``pytest`` / ``ruff`` would still fall back to diff-only)."""
+        """Built-in reviewers have no shell and receive host evidence on stdin."""
         run = self._make_run()
 
         schema_dir = repo / ".github" / "schemas"
@@ -19235,7 +19837,7 @@ class TestLocalReviewPhase:
             }
         )
 
-        captured: dict[str, dict[str, str]] = {}
+        captured: dict[str, object] = {}
 
         @contextmanager
         def fake_review_worktree(repo_root: Path, *, head_sha: str, branch=None):  # noqa: ARG001
@@ -19249,8 +19851,10 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,  # noqa: ARG001
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,
         ) -> subprocess.CompletedProcess:
             captured["env"] = env
+            captured["input_text"] = input_text
             return subprocess.CompletedProcess(cmd, 0, raw_review_json, "")
 
         with (
@@ -19270,25 +19874,24 @@ class TestLocalReviewPhase:
 
         assert review_result.status == "approved"
         env = captured["env"]
+        assert isinstance(env, dict)
         venv_bin = str(orch._worktree_venv_executable_dir(review_worktree))
-        assert env["PATH"].split(os.pathsep)[0] == venv_bin
-        assert env["VIRTUAL_ENV"] == str(review_worktree / ".venv")
+        assert env["PATH"].split(os.pathsep)[0] != venv_bin
+        assert "VIRTUAL_ENV" not in env
+        assert "restricted Claude evidence" in str(captured["input_text"])
 
     @pytest.mark.parametrize(
         ("venv_present", "bootstrap_warning"),
         [(True, ""), (False, ""), (True, "bootstrap failed")],
     )
-    def test_run_local_review_tells_reviewer_how_to_run_bootstrapped_venv(
+    def test_builtin_local_review_ignores_bootstrapped_venv(
         self,
         repo: Path,
         tmp_path: Path,
         venv_present: bool,
         bootstrap_warning: str,
     ):
-        """When bootstrap produced a venv, the reviewer prompt must point at it by
-        absolute path — PATH injection alone is not enough because the agent's
-        shell can reset PATH, so bare ``pytest`` would still not resolve. When no
-        venv exists the prompt must not falsely promise a runnable project."""
+        """Built-ins never inherit bootstrap state, even if a stale venv exists."""
         run = self._make_run()
 
         schema_dir = repo / ".github" / "schemas"
@@ -19323,9 +19926,11 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,  # noqa: ARG001
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             captured["cmd"] = cmd
             captured["env"] = env
+            captured["input_text"] = input_text
             return subprocess.CompletedProcess(cmd, 0, raw_review_json, "")
 
         with (
@@ -19351,24 +19956,19 @@ class TestLocalReviewPhase:
         assert review_result.status == "approved"
         captured_cmd = captured["cmd"]
         assert isinstance(captured_cmd, list)
-        prompt_arg = captured_cmd[-1]
+        assert "prompt" not in captured_cmd
         expected_pytest_command = (
             r".venv\Scripts\python.exe -m pytest"
             if os.name == "nt"
             else ".venv/bin/pytest"
         )
-        if venv_present and not bootstrap_warning:
-            assert expected_pytest_command in prompt_arg
-        else:
-            assert expected_pytest_command not in prompt_arg
+        assert expected_pytest_command not in str(captured["input_text"])
+        assert "restricted Claude evidence" in str(captured["input_text"])
         captured_env = captured["env"]
         assert isinstance(captured_env, dict)
         venv_bin = str(orch._worktree_venv_executable_dir(review_worktree))
-        if bootstrap_warning:
-            assert captured_env["PATH"].split(os.pathsep)[0] != venv_bin
-            assert "VIRTUAL_ENV" not in captured_env
-        else:
-            assert captured_env["PATH"].split(os.pathsep)[0] == venv_bin
+        assert captured_env["PATH"].split(os.pathsep)[0] != venv_bin
+        assert "VIRTUAL_ENV" not in captured_env
 
     def test_windows_review_prompt_uses_scripts_python(self, tmp_path: Path):
         review_worktree = tmp_path / "review"
@@ -19395,6 +19995,14 @@ class TestLocalReviewPhase:
         review_worktree = tmp_path / "review"
         review_worktree.mkdir()
         observed_scratch: list[Path] = []
+        observed_copy_modes: list[bool | None] = []
+
+        def fake_write_codex_home(root: Path, **kwargs) -> Path:
+            observed_copy_modes.append(kwargs.get("copy_auth"))
+            home = root / ".spec-codex-home"
+            home.mkdir(parents=True)
+            (home / "config.toml").write_text("", encoding="utf-8")
+            return home
 
         @contextmanager
         def fake_review_worktree(repo_root: Path, *, head_sha: str, branch=None):  # noqa: ARG001
@@ -19409,24 +20017,25 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             assert repo_root == repo
             assert cmd[0] == "codex"
-            assert cwd == review_worktree
             scratch_dir = Path(cmd[cmd.index("-C") + 1])
+            assert cwd == scratch_dir
             observed_scratch.append(scratch_dir)
             assert scratch_dir.is_dir()
             assert scratch_dir != review_worktree
-            assert cmd[cmd.index("-s") + 1] == "workspace-write"
+            assert cmd[cmd.index("-s") + 1] == "read-only"
             assert "--skip-git-repo-check" in cmd
             assert "--add-dir" not in cmd
             assert env["TMPDIR"] == str(scratch_dir)
             assert env["TMP"] == str(scratch_dir)
             assert env["TEMP"] == str(scratch_dir)
             assert env["PYTHONDONTWRITEBYTECODE"] == "1"
-            assert str(review_worktree) in cmd[-1]
-            assert str(scratch_dir) in cmd[-1]
-            (scratch_dir / "pytest-probe").write_text("writable\n")
+            assert cmd[-1] == "-"
+            assert input_text is not None
+            assert "restricted Codex evidence" in input_text
             output_idx = cmd.index("-o")
             Path(cmd[output_idx + 1]).write_text(
                 json.dumps(
@@ -19445,6 +20054,12 @@ class TestLocalReviewPhase:
             patch.object(orch, "_run_local_review_subprocess", side_effect=mock_review_exec),
             patch.object(orch, "_render_local_review_prompt", return_value="prompt"),
             patch.object(orch, "_temporary_review_worktree", side_effect=fake_review_worktree),
+            patch.object(orch, "_write_codex_isolated_home", side_effect=fake_write_codex_home),
+            patch.object(
+                orch,
+                "_resolve_execution_backend",
+                side_effect=AssertionError("local review must not consult implementation backend"),
+            ),
         ):
             review_result, _ = orch._run_local_review(
                 run,
@@ -19457,6 +20072,7 @@ class TestLocalReviewPhase:
             )
 
         assert review_result.status == "approved"
+        assert observed_copy_modes == [None]
         assert len(observed_scratch) == 1
         assert not orch.LOCAL_REVIEW_SCRATCH_PREFIX.startswith(
             orch.LOCAL_REVIEW_WORKTREE_PREFIX
@@ -19490,6 +20106,7 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             assert repo_root == repo
             assert cmd[0] == "claude"
@@ -19556,6 +20173,7 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             assert repo_root == repo
             assert cmd[0] == "claude"
@@ -19624,6 +20242,14 @@ class TestLocalReviewPhase:
             inherit_env=True,
             input_text=None,
         ):  # noqa: ARG001
+            if cmd == ["claude", "--help"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "--restricted --safe-mode --permission-mode --strict-mcp-config "
+                    "--no-session-persistence --setting-sources --settings\n",
+                    "",
+                )
             if cmd == ["gh", "auth", "status"]:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
             if cmd == ["gh", "pr", "merge", "42", "--disable-auto"]:
@@ -19658,6 +20284,7 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             assert repo_root == repo
             assert cmd[0] == "claude"
@@ -19747,6 +20374,14 @@ class TestLocalReviewPhase:
             inherit_env=True,
             input_text=None,
         ):  # noqa: ARG001
+            if cmd == ["claude", "--help"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "--restricted --safe-mode --permission-mode --strict-mcp-config "
+                    "--no-session-persistence --setting-sources --settings\n",
+                    "",
+                )
             if cmd == ["gh", "auth", "status"]:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
             if cmd == ["gh", "pr", "merge", "42", "--disable-auto"]:
@@ -19781,6 +20416,7 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             assert repo_root == repo
             assert cmd[0] == "claude"
@@ -19865,6 +20501,14 @@ class TestLocalReviewPhase:
             inherit_env=True,
             input_text=None,
         ):  # noqa: ARG001
+            if cmd == ["claude", "--help"]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    "--restricted --safe-mode --permission-mode --strict-mcp-config "
+                    "--no-session-persistence --setting-sources --settings\n",
+                    "",
+                )
             if cmd == ["gh", "auth", "status"]:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
             if cmd == ["gh", "pr", "merge", "42", "--disable-auto"]:
@@ -19904,6 +20548,7 @@ class TestLocalReviewPhase:
             env: dict[str, str],
             timeout: int,
             artifact_paths: dict[str, Path] | None = None,  # noqa: ARG001
+            input_text: str | None = None,  # noqa: ARG001
         ) -> subprocess.CompletedProcess:
             assert repo_root == repo
             assert cmd[0] == "claude"
@@ -19938,11 +20583,23 @@ class TestLocalReviewPhase:
 class TestReviewPhase:
     @pytest.fixture(autouse=True)
     def _isolate_worktree(self, tmp_path: Path):
-        """Prevent resolve_worktree_path from hitting real worktrees on disk."""
-        with patch.object(
-            orch,
-            "resolve_worktree_path",
-            return_value=tmp_path / "nonexistent-worktree",
+        """Keep review behavior tests independent of publication/Git fixtures."""
+        with (
+            patch.object(
+                orch,
+                "resolve_worktree_path",
+                return_value=tmp_path / "nonexistent-worktree",
+            ),
+            patch.object(
+                orch,
+                "_assert_publication_transition_safe",
+                return_value=None,
+            ),
+            patch.object(
+                orch,
+                "_trusted_publication_repo_slug",
+                return_value="acme/repo",
+            ),
         ):
             yield
 
@@ -20776,7 +21433,8 @@ class TestBuildAgentCommand:
         assert "Prior attempt findings:" in prompt
         assert "previous abandoned attempt" in prompt
         assert "Address them proactively during your initial implementation" in prompt
-        assert ".spec-state/runs/my-feature-20260101T000000/review-result.json" in prompt
+        assert "Source review run: my-feature-20260101T000000" in prompt
+        assert ".spec-state" not in prompt
         assert "[P1] Request payload drift (api/routes.py:12-14; confidence 0.93)" in prompt
         assert "Align the initial implementation with the persisted schema." in prompt
 
@@ -20816,8 +21474,11 @@ class TestBuildAgentCommand:
         prompt = cmd[-1]
         assert orch.SPEC_PROMPT not in prompt
         assert "Retry failure package:" in prompt
-        assert ".spec-state/runs/my-feature-20260101T000000/" in prompt
-        assert "implement-context.json, gate-status.json, and review-result.json if present" in prompt
+        assert "authoritative retry evidence is inlined below" in prompt
+        assert ".spec-state" not in prompt
+        assert "implement-context.json" not in prompt
+        assert "gate-status.json" not in prompt
+        assert "review-result.json" not in prompt
         assert "Run ID: my-feature-20260101T000000" in prompt
         assert "Attempt: 2" in prompt
         assert "make lint" in prompt
@@ -20882,7 +21543,7 @@ class TestBuildAgentCommand:
         assert "Current local head SHA: abc1234" in prompt
         assert "Latest review head SHA: def5678 (differs from local head)" in prompt
         assert "Review findings: stale review evidence (2 structured findings)" in prompt
-        assert "Use it as hints only after you address the current live failures." in prompt
+        assert "Use it only as hints after addressing the current live failures." in prompt
 
     def test_retry_prompt_prioritizes_live_test_reproducer(self, tmp_path: Path):
         reproducer = orch._render_test_gate_targeted_diagnostic_command(
@@ -20905,16 +21566,14 @@ class TestBuildAgentCommand:
         assert "First failing test node: tests/test_api.py::test_alpha" in prompt
         assert f"Rerun this exact node first on the current head: {reproducer}" in prompt
         assert "Before claiming the branch is fixed, rerun the exact failing node" in prompt
-        assert "Use it as hints only after you address the current live failures." in prompt
+        assert "Use it only as hints after addressing the current live failures." in prompt
         assert prompt.index("Current local head SHA: abc1234") < prompt.index(
             "Latest review head SHA: def5678 (differs from local head)"
         )
         assert prompt.index(f"Rerun this exact node first on the current head: {reproducer}") < prompt.index(
             "Latest review head SHA: def5678 (differs from local head)"
         )
-        assert prompt.index(f"Rerun this exact node first on the current head: {reproducer}") < prompt.index(
-            "Triggering review artifact: .spec-state/runs/example/review-result.json"
-        )
+        assert ".spec-state" not in prompt
 
     def test_retry_prompt_merge_conflict_only(self, tmp_path: Path):
         ctx = self._retry_context(
@@ -20989,7 +21648,7 @@ class TestBuildAgentCommand:
         assert "low-confidence hypothesis" in prompt
         assert "sig-123" in prompt
 
-    def test_retry_prompt_without_active_signals_still_uses_evidence_root(
+    def test_retry_prompt_without_active_signals_uses_inline_evidence(
         self,
         tmp_path: Path,
     ):
@@ -20997,8 +21656,8 @@ class TestBuildAgentCommand:
         cmd = orch._build_agent_command("claude", tmp_path, retry_context=ctx)
         prompt = cmd[-1]
         assert orch.SPEC_PROMPT not in prompt
-        assert ".spec-state/runs/my-feature-20260101T000000/" in prompt
-        assert "Use the evidence directory to determine the remaining work" in prompt
+        assert ".spec-state" not in prompt
+        assert "Use the inline retry summary to determine the remaining work" in prompt
 
     def test_retry_prompt_codex_agent(self, tmp_path: Path):
         ctx = self._retry_context(
@@ -21007,13 +21666,15 @@ class TestBuildAgentCommand:
         )
         cmd = orch._build_agent_command("codex", tmp_path, retry_context=ctx)
         assert cmd[0] == "codex"
-        assert cmd[1:5] == ["-a", "never", "-s", "workspace-write"]
+        assert cmd[1:3] == ["-a", "never"]
+        assert "-s" not in cmd
+        assert 'default_permissions="specbutler-implement"' in cmd
         assert "--add-dir" in cmd
         add_dir_idx = cmd.index("--add-dir")
-        assert cmd[add_dir_idx + 1] == str(tmp_path / ".spec-state")
+        assert cmd[add_dir_idx + 1] == str(tmp_path / ".spec-agent-outbox")
         assert "exec" in cmd
         assert "--json" in cmd
-        assert ".spec-state/runs/my-feature-20260101T000000/" in cmd[-1]
+        assert ".spec-state" not in cmd[-1]
         assert "Before reporting completion, run the failing command yourself" in cmd[-1]
         assert "Do NOT re-implement from scratch" in cmd[-1]
 
@@ -21060,15 +21721,19 @@ class TestBuildAgentCommand:
     def test_codex_initial_uses_exec_subcommand(self, tmp_path: Path):
         cmd = orch._build_agent_command("codex", tmp_path)
         assert cmd[0] == "codex"
-        assert cmd[1:5] == ["-a", "never", "-s", "workspace-write"]
+        assert cmd[1:3] == ["-a", "never"]
         assert "--add-dir" in cmd
         add_dir_idx = cmd.index("--add-dir")
-        assert cmd[add_dir_idx + 1] == str(tmp_path / ".spec-state")
+        assert cmd[add_dir_idx + 1] == str(tmp_path / ".spec-agent-outbox")
         assert "exec" in cmd
         assert "--json" in cmd
         assert "-a" in cmd and "never" in cmd
-        assert "-s" in cmd and "workspace-write" in cmd
-        assert "sandbox_workspace_write.network_access=true" in cmd
+        assert "-s" not in cmd
+        assert 'default_permissions="specbutler-implement"' in cmd
+        assert (
+            'permissions.specbutler-implement.network='
+            '{enabled=true,mode="full",allow_local_binding=true}'
+        ) in cmd
         assert orch.SPEC_PROMPT.replace("<spec-revision>", "(unknown)") in cmd[-1]
 
     def test_codex_retry_uses_exec_subcommand(self, tmp_path: Path):
@@ -21078,18 +21743,19 @@ class TestBuildAgentCommand:
         )
         cmd = orch._build_agent_command("codex", tmp_path, retry_context=ctx)
         assert cmd[0] == "codex"
-        assert cmd[1:5] == ["-a", "never", "-s", "workspace-write"]
+        assert cmd[1:3] == ["-a", "never"]
         assert "--add-dir" in cmd
         add_dir_idx = cmd.index("--add-dir")
-        assert cmd[add_dir_idx + 1] == str(tmp_path / ".spec-state")
+        assert cmd[add_dir_idx + 1] == str(tmp_path / ".spec-agent-outbox")
         assert "exec" in cmd
         assert "--json" in cmd
         assert "-a" in cmd and "never" in cmd
-        assert "-s" in cmd and "workspace-write" in cmd
+        assert "-s" not in cmd
+        assert 'default_permissions="specbutler-implement"' in cmd
         assert "make test" in cmd[-1]
-        assert ".spec-state/runs/my-feature-20260101T000000/" in cmd[-1]
+        assert ".spec-state" not in cmd[-1]
 
-    def test_codex_add_dir_targets_common_state_from_worktree_path(
+    def test_codex_add_dir_never_targets_common_state_from_worktree_path(
         self,
         tmp_path: Path,
     ):
@@ -21097,16 +21763,20 @@ class TestBuildAgentCommand:
         worktree_path.mkdir(parents=True, exist_ok=True)
         cmd = orch._build_agent_command("codex", worktree_path)
         add_dir_idx = cmd.index("--add-dir")
-        assert cmd[add_dir_idx + 1] == str(tmp_path / ".spec-state")
+        assert cmd[add_dir_idx + 1] == str(worktree_path / ".spec-agent-outbox")
+        assert str(tmp_path / ".spec-state") not in cmd
 
     def test_claude_command_uses_prompt_separator(self, tmp_path: Path):
         cmd = orch._build_agent_command("claude", tmp_path)
         assert cmd[0] == "claude"
         assert "-p" in cmd
-        assert "--dangerously-skip-permissions" in cmd
+        assert "--dangerously-skip-permissions" not in cmd
+        assert "--restricted" in cmd
+        assert "--safe-mode" not in cmd
+        assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
         assert "--add-dir" in cmd
         add_dir_idx = cmd.index("--add-dir")
-        assert cmd[add_dir_idx + 1] == str(tmp_path / ".spec-state")
+        assert cmd[add_dir_idx + 1] == str(tmp_path / ".spec-agent-outbox")
         assert "--mcp-config" in cmd
         mcp_idx = cmd.index("--mcp-config")
         assert cmd[mcp_idx + 1] == str(tmp_path / ".claude" / "mcp-servers.json")
@@ -21114,6 +21784,23 @@ class TestBuildAgentCommand:
         separator_idx = cmd.index("--")
         assert cmd[separator_idx] == "--"
         assert "exec" not in cmd
+
+    def test_claude_container_command_uses_restricted_external_sandbox(
+        self,
+        tmp_path: Path,
+    ):
+        cmd = orch._build_agent_command(
+            "claude",
+            tmp_path,
+            externally_sandboxed=True,
+        )
+
+        assert "--dangerously-skip-permissions" not in cmd
+        assert "--restricted" in cmd
+        assert "--safe-mode" not in cmd
+        assert cmd[cmd.index("--settings") + 1] == str(
+            tmp_path / ".claude" / "settings.local.json"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -21193,20 +21880,43 @@ class TestValidateCodexExec:
         assert "does not support" in run.last_error
         assert "npm install" in run.last_error
 
+    def test_fails_when_strict_security_config_is_rejected(self):
+        run = orch.RunState(
+            run_id="test-20260101T000000",
+            spec_id="my-feature",
+            branch="spec/my-feature",
+        )
+        help_result = subprocess.CompletedProcess(
+            args=["codex", "exec", "--help"],
+            returncode=0,
+            stdout="--json --output-schema",
+            stderr="",
+        )
+        probe_result = subprocess.CompletedProcess(
+            args=["codex", "app-server"],
+            returncode=1,
+            stdout="",
+            stderr="unknown configuration field features.browser_use",
+        )
+        with patch.object(
+            orch,
+            "run_subprocess",
+            side_effect=[help_result, probe_result],
+        ):
+            assert orch._validate_codex_exec(run) is False
+        assert "rejected security controls" in run.last_error
+
 
 class TestWriteSandboxConfig:
-    @pytest.mark.parametrize(("agent", "config_name"), [("claude", ".claude"), ("codex", ".codex")])
     def test_refuses_agent_config_link(
         self,
         tmp_path: Path,
-        agent: str,
-        config_name: str,
     ) -> None:
         worktree = tmp_path / "worktree"
         external = tmp_path / "external"
         worktree.mkdir()
         external.mkdir()
-        config_path = worktree / config_name
+        config_path = worktree / ".claude"
         if os.name == "nt":
             subprocess.run(
                 ["cmd.exe", "/d", "/c", "mklink", "/J", str(config_path), str(external)],
@@ -21217,7 +21927,7 @@ class TestWriteSandboxConfig:
             config_path.symlink_to(external, target_is_directory=True)
 
         with pytest.raises(ValueError, match="non-directory path"):
-            orch._write_sandbox_config(agent, worktree)
+            orch._write_sandbox_config("claude", worktree)
 
         assert list(external.iterdir()) == []
 
@@ -21226,7 +21936,6 @@ class TestWriteSandboxConfig:
         [
             ("claude", Path(".claude/settings.local.json")),
             ("claude", Path(".claude/mcp-servers.json")),
-            ("codex", Path(".codex/config.toml")),
         ],
     )
     def test_replaces_agent_config_hardlink(
@@ -21263,6 +21972,18 @@ class TestWriteSandboxConfig:
 
         settings = json.loads(settings_path.read_text())
         assert settings["sandbox"]["failIfUnavailable"] is True
+        assert settings["sandbox"]["autoAllowBashIfSandboxed"] is True
+        assert settings["sandbox"]["allowUnsandboxedCommands"] is False
+        assert settings["permissions"]["disableBypassPermissionsMode"] == "disable"
+        credential_names = {
+            entry["name"]
+            for entry in settings["sandbox"]["credentials"]["envVars"]
+        }
+        assert "HTTPS_PROXY" in credential_names
+        assert any(
+            entry.startswith("Read(") and ".spec-claude-home" in entry
+            for entry in settings["permissions"]["deny"]
+        )
         assert "api.github.com" in settings["sandbox"]["network"]["allowedDomains"]
         assert "*.blob.core.windows.net" in settings["sandbox"]["network"]["allowedDomains"]
         assert "localhost" in settings["sandbox"]["network"]["allowedDomains"]
@@ -21277,6 +21998,48 @@ class TestWriteSandboxConfig:
             "--browser",
             "chromium",
         ]
+
+    def test_claude_interactive_sandbox_prompts_for_shell_and_hides_mcp_env(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        orch._write_sandbox_config(
+            "claude",
+            tmp_path,
+            interactive=True,
+            additional_protected_env_keys={"USER_MCP_SECRET"},
+        )
+
+        settings = json.loads(
+            (tmp_path / ".claude" / "settings.local.json").read_text()
+        )
+        assert settings["sandbox"]["autoAllowBashIfSandboxed"] is False
+        protected_names = {
+            entry["name"]
+            for entry in settings["sandbox"]["credentials"]["envVars"]
+        }
+        assert "USER_MCP_SECRET" in protected_names
+
+    def test_claude_sandbox_hides_allowlisted_mcp_parent_secret(self, tmp_path: Path):
+        orch._write_sandbox_config(
+            "claude",
+            tmp_path,
+            extra_mcp_servers={
+                "remote": {
+                    "url": "https://mcp.example.test",
+                    "bearer_token_env_var": "MCP_BEARER_CANARY",
+                }
+            },
+        )
+
+        settings = json.loads(
+            (tmp_path / ".claude" / "settings.local.json").read_text()
+        )
+        credential_names = {
+            entry["name"]
+            for entry in settings["sandbox"]["credentials"]["envVars"]
+        }
+        assert "MCP_BEARER_CANARY" in credential_names
 
     def test_claude_container_mcp_config_uses_worker_paths(self, tmp_path: Path):
         playwright_cli = tmp_path / "frontend" / "node_modules" / "@playwright" / "mcp" / "cli.js"
@@ -21298,23 +22061,14 @@ class TestWriteSandboxConfig:
             "chromium",
         ]
 
-    def test_codex_writes_workspace_config_without_playwright_mcp(self, tmp_path: Path):
-        # MCP servers for Codex are delivered via `-c mcp_servers.<name>.*` CLI
-        # overrides at launch (see CodexAgent.build_implement_command), not via
-        # .codex/config.toml — so even with extra_mcp_servers provided, the
-        # workspace config must remain MCP-free.
+    def test_codex_does_not_write_checkout_local_config(self, tmp_path: Path):
         orch._write_sandbox_config(
             "codex",
             tmp_path,
             extra_mcp_servers={"playwright": {"command": "node", "args": ["cli.js"]}},
         )
 
-        config_text = (tmp_path / ".codex" / "config.toml").read_text()
-        assert 'sandbox_mode = "workspace-write"' in config_text
-        assert "[mcp_servers.playwright]" not in config_text
-        assert "playwright-mcp" not in config_text
-        assert "--headless" not in config_text
-        assert "mcp_servers" not in config_text
+        assert not (tmp_path / ".codex").exists()
 
     def test_fails_when_codex_not_installed(self):
         run = orch.RunState(
@@ -21332,15 +22086,18 @@ class TestWriteSandboxConfig:
         assert "npm install" in run.last_error
 
 
-class TestCodexAgentMcpOverrides:
-    """CodexAgent injects manifest MCP servers as `-c` CLI overrides."""
+class TestCodexAgentMcpIsolation:
+    """Non-interactive MCP configuration never travels in process argv."""
 
     def _agent(self):
         from spec_runtime.agent_adapter import CodexAgent
 
         return CodexAgent()
 
-    def test_codex_build_implement_command_injects_mcp_overrides(self, tmp_path: Path):
+    def test_codex_build_implement_command_keeps_mcp_secrets_out_of_argv(
+        self, tmp_path: Path
+    ):
+        secret = "UNIQUE_MCP_ARGV_SECRET"
         cmd = self._agent().build_implement_command(
             prompt="do the work",
             worktree_path=tmp_path,
@@ -21348,30 +22105,23 @@ class TestCodexAgentMcpOverrides:
             mcp_servers={
                 "playwright": {
                     "command": "node",
-                    "args": ["/tmp/cli.js", "--headless"],
+                    "args": ["/tmp/cli.js", "--token", secret],
+                    "env": {"MCP_SECRET": secret},
+                },
+                "remote": {
+                    "url": f"https://{secret}@example.invalid/mcp",
+                    "bearer_token_env_var": "REMOTE_TOKEN",
                 },
             },
         )
 
         assert cmd[-1] == "do the work"
-        expected = [
-            "-c",
-            'mcp_servers.playwright.command="node"',
-            "-c",
-            'mcp_servers.playwright.args=["/tmp/cli.js", "--headless"]',
-            "-c",
-            'mcp_servers.playwright.default_tools_approval_mode="approve"',
-        ]
-        prompt_idx = cmd.index("do the work")
-        argv_before_prompt = cmd[:prompt_idx]
-        # Confirm the override block appears as a contiguous group in argv
-        for i in range(len(argv_before_prompt) - len(expected) + 1):
-            if argv_before_prompt[i : i + len(expected)] == expected:
-                break
-        else:
-            raise AssertionError(
-                f"Expected MCP overrides {expected!r} before prompt; got {argv_before_prompt!r}"
-            )
+        rendered = "\0".join(cmd)
+        assert secret not in rendered
+        assert "mcp_servers." not in rendered
+        # Referenced bearer variables remain excluded from the tool shell even
+        # though the parent Codex process receives them for MCP startup.
+        assert "REMOTE_TOKEN" in rendered
 
     def test_codex_build_implement_command_no_mcp_when_empty(self, tmp_path: Path):
         baseline = self._agent().build_implement_command(
@@ -21394,192 +22144,10 @@ class TestCodexAgentMcpOverrides:
         assert baseline == with_none == with_empty
         assert not any(arg.startswith("mcp_servers.") for arg in baseline)
 
-    def test_codex_build_implement_command_renders_sse_url_server(self, tmp_path: Path):
-        cmd = self._agent().build_implement_command(
-            prompt="do the work",
-            worktree_path=tmp_path,
-            state_dir=tmp_path / ".state",
-            mcp_servers={
-                "playwright": {
-                    "type": "sse",
-                    "url": "http://spec-playwright-mcp:3001/sse",
-                },
-            },
-        )
-        prompt_idx = cmd.index("do the work")
-        argv_before_prompt = cmd[:prompt_idx]
-        # URL field is rendered for non-stdio servers
-        assert any(
-            arg == 'mcp_servers.playwright.url="http://spec-playwright-mcp:3001/sse"'
-            for arg in argv_before_prompt
-        )
-        # The approval mode override still applies
-        assert any(
-            arg == 'mcp_servers.playwright.default_tools_approval_mode="approve"'
-            for arg in argv_before_prompt
-        )
-        # Codex's experimental rmcp client must be enabled so HTTP/SSE servers connect
-        assert "experimental_use_rmcp_client=true" in argv_before_prompt
-        # The non-Codex `type` field must not leak through (Codex's schema rejects it)
-        assert not any(
-            arg.startswith("mcp_servers.playwright.type=") for arg in argv_before_prompt
-        )
-        # No spurious command/args overrides for a URL-only server
-        assert not any(
-            arg.startswith("mcp_servers.playwright.command=") for arg in argv_before_prompt
-        )
-
-    def test_codex_build_implement_command_renders_sse_with_bearer_token(
-        self, tmp_path: Path
-    ):
-        cmd = self._agent().build_implement_command(
-            prompt="do the work",
-            worktree_path=tmp_path,
-            state_dir=tmp_path / ".state",
-            mcp_servers={
-                "remote": {
-                    "url": "https://example.com/mcp",
-                    "bearer_token_env_var": "REMOTE_TOKEN",
-                },
-            },
-        )
-        assert any(
-            arg == 'mcp_servers.remote.bearer_token_env_var="REMOTE_TOKEN"'
-            for arg in cmd
-        )
-
-    def test_codex_build_implement_command_url_only_skips_rmcp_when_no_url_servers(
-        self, tmp_path: Path
-    ):
-        cmd = self._agent().build_implement_command(
-            prompt="do the work",
-            worktree_path=tmp_path,
-            state_dir=tmp_path / ".state",
-            mcp_servers={
-                "playwright": {"command": "node", "args": ["cli.js"]},
-            },
-        )
-        assert "experimental_use_rmcp_client=true" not in cmd
-
-    def test_codex_build_implement_command_skips_server_without_command_or_url(
-        self, tmp_path: Path, caplog
-    ):
-        import logging
-
-        with caplog.at_level(logging.WARNING, logger="spec_runtime.agent_adapter"):
-            cmd = self._agent().build_implement_command(
-                prompt="do the work",
-                worktree_path=tmp_path,
-                state_dir=tmp_path / ".state",
-                mcp_servers={
-                    "broken": {"type": "sse"},
-                },
-            )
-        assert not any(arg.startswith("mcp_servers.broken.") for arg in cmd)
-        assert any("broken" in rec.message for rec in caplog.records)
-
-    def test_codex_build_implement_command_escapes_toml_strings(self, tmp_path: Path):
-        cmd = self._agent().build_implement_command(
-            prompt="do the work",
-            worktree_path=tmp_path,
-            state_dir=tmp_path / ".state",
-            mcp_servers={
-                "tricky": {
-                    "command": 'weird\\path"with"quotes',
-                },
-            },
-        )
-        command_overrides = [
-            cmd[i + 1]
-            for i, arg in enumerate(cmd)
-            if arg == "-c" and i + 1 < len(cmd) and cmd[i + 1].startswith("mcp_servers.tricky.command=")
-        ]
-        assert command_overrides == [
-            'mcp_servers.tricky.command="weird\\\\path\\"with\\"quotes"'
-        ]
-
-    def test_codex_build_implement_command_emits_env_table(self, tmp_path: Path):
-        import tomllib
-
-        cmd = self._agent().build_implement_command(
-            prompt="do the work",
-            worktree_path=tmp_path,
-            state_dir=tmp_path / ".state",
-            mcp_servers={
-                "playwright": {
-                    "command": "node",
-                    "env": {"FOO": "bar", "BAZ_QUX": "hello"},
-                },
-            },
-        )
-        env_overrides = [
-            cmd[i + 1]
-            for i, arg in enumerate(cmd)
-            if arg == "-c" and i + 1 < len(cmd) and cmd[i + 1].startswith("mcp_servers.playwright.env=")
-        ]
-        assert len(env_overrides) == 1
-        # The part after the '=' must parse as a TOML inline table
-        _, value = env_overrides[0].split("=", 1)
-        parsed = tomllib.loads(f"env = {value}")["env"]
-        assert parsed == {"FOO": "bar", "BAZ_QUX": "hello"}
-
-    def test_codex_build_implement_command_accepts_hyphenated_server_names(
-        self, tmp_path: Path, caplog
-    ):
-        # Hyphens are valid in TOML bare keys and in Codex's `-c` dotted-key
-        # parser, so `foo-bar` must flow through unquoted (quoting segments
-        # inside `-c mcp_servers."foo-bar".command=...` causes Codex to
-        # register the literal name `"foo-bar"` instead of `foo-bar`).
-        cmd = self._agent().build_implement_command(
-            prompt="do the work",
-            worktree_path=tmp_path,
-            state_dir=tmp_path / ".state",
-            mcp_servers={
-                "foo-bar": {"command": "node", "args": ["cli.js"]},
-            },
-        )
-        command_overrides = [
-            cmd[i + 1]
-            for i, arg in enumerate(cmd)
-            if arg == "-c"
-            and i + 1 < len(cmd)
-            and cmd[i + 1].startswith("mcp_servers.")
-            and ".command=" in cmd[i + 1]
-        ]
-        assert command_overrides == ['mcp_servers.foo-bar.command="node"']
-
-    def test_codex_build_implement_command_skips_non_bare_server_names(
-        self, tmp_path: Path, caplog
-    ):
-        # Server names containing characters outside TOML's bare-key charset
-        # (dots, whitespace, etc.) cannot be delivered via Codex `-c`
-        # overrides — the dotted-key parser does not honor quoted segments.
-        # The adapter must skip them with a warning rather than emit a broken
-        # override that Codex would register under the wrong name.
-        import logging
-
-        with caplog.at_level(logging.WARNING, logger="spec_runtime.agent_adapter"):
-            cmd = self._agent().build_implement_command(
-                prompt="do the work",
-                worktree_path=tmp_path,
-                state_dir=tmp_path / ".state",
-                mcp_servers={
-                    "foo.bar baz": {"command": "node", "args": ["cli.js"]},
-                    "playwright": {"command": "node"},
-                },
-            )
-        assert not any(
-            arg.startswith("mcp_servers.") and "foo" in arg for arg in cmd
-        )
-        assert any(
-            arg == 'mcp_servers.playwright.command="node"' for arg in cmd
-        )
-        assert any("foo.bar baz" in rec.message for rec in caplog.records)
-
     def test_codex_build_implement_command_accepts_mcp_config_path(self, tmp_path: Path):
-        # Codex ignores mcp_config_path (it uses `-c` overrides instead), but the
-        # AgentAdapter protocol exposes the kwarg for all adapters, so CodexAgent
-        # must accept it without raising.
+        # Codex loads non-interactive MCP from its isolated CODEX_HOME, but the
+        # AgentAdapter protocol exposes this Claude-specific kwarg to all
+        # adapters, so CodexAgent must accept it without raising.
         cmd = self._agent().build_implement_command(
             prompt="do the work",
             worktree_path=tmp_path,
@@ -21643,6 +22211,7 @@ class TestCodexAgentMcpOverrides:
 
         assert "mcp_config_path" in captured
         assert isinstance(captured["mcp_config_path"], Path)
+        assert captured["state_dir"] == worktree / ".spec-agent-outbox"
         assert captured["mcp_servers"] == {"playwright": {"command": "node"}}
 
     def test_build_agent_command_tolerates_legacy_adapter_without_mcp_servers(
@@ -23618,6 +24187,33 @@ class TestMergeCompletionFence:
             cwd=repo,
         )
 
+    def test_merge_refuses_changed_shared_git_config_before_remote_action(
+        self,
+        repo: Path,
+    ) -> None:
+        run = self._make_run()
+        run.implement_launches = 1
+        worktree = repo / ".worktrees" / "code-my-feature--abcd1234"
+        worktree.mkdir(parents=True, exist_ok=True)
+        run.worktree_path = str(worktree)
+        orch._capture_or_validate_run_publication_baseline(
+            run,
+            worktree,
+            allow_capture=True,
+        )
+        _run_git("config", "core.sshCommand", "hostile-transport", cwd=repo)
+
+        with (
+            patch.object(orch, "refresh_merge_completion_state") as refresh,
+            patch.object(orch, "_check_forge_auth") as auth,
+        ):
+            result = orch.phase_merge(run, repo)
+
+        assert result == "failed"
+        assert "git config changed" in run.last_error.lower()
+        auth.assert_not_called()
+        refresh.assert_not_called()
+
     def test_open_pr_not_merged_when_completion_tag_already_reachable(
         self,
         repo: Path,
@@ -24051,13 +24647,15 @@ class TestMergeRequiredChecks:
                     f"spec/merged/{run.spec_id}\n",
                     "",
                 )
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
             if cmd[:4] == ["git", "merge", "--ff-only", "origin/master"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
-            if cmd[:3] == ["git", "push", "origin"]:
+            if cmd[:2] == ["git", "push"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             raise AssertionError(f"Unexpected command: {cmd}")
 
@@ -24173,17 +24771,15 @@ class TestMergeRequiredChecks:
             ),
             patch.object(orch, "_wait_for_pr_merged", return_value=(True, "")),
             patch.object(orch.time, "time", side_effect=(clock := _FakeMergeClock()).time),
-            # Neutralized so the busy-wait spins instead of sleeping for real; it
-            # stands in for the counter the flaky assertions used to read.
-            patch.object(orch.time, "sleep") as raw_sleep_mock,
+            # Neutralize any stdlib busy-wait without using its runner-dependent
+            # call count as an assertion.
+            patch.object(orch.time, "sleep"),
             patch.object(orch, "_poll_sleep", side_effect=clock.sleep) as sleep_mock,
         ):
             result = orch.phase_merge(run, repo)
 
         assert result == "passed"
-        # The hazard is live: the stdlib busy-wait fired during this merge.
-        assert raw_sleep_mock.call_count > 0
-        # The seam stays clean regardless of how long that busy-wait ran.
+        # The seam stays clean regardless of whether/how long Popen busy-waits.
         assert sleep_mock.call_count == 1
 
     def test_merge_refuses_when_head_changes_during_check_evaluation(self, repo: Path):
@@ -24270,7 +24866,9 @@ class TestMergeRetryOnBranchPolicy:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -24431,7 +25029,9 @@ class TestMergeRetryOnBranchPolicy:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -24503,7 +25103,9 @@ class TestMergeAutoFallback:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -24563,7 +25165,9 @@ class TestMergeAutoFallback:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -24721,7 +25325,9 @@ class TestAutoMerge:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -24799,7 +25405,9 @@ class TestAutoMerge:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -25017,7 +25625,7 @@ class TestAutoMerge:
             if cmd[:3] == ["gh", "pr", "merge"]:
                 merge_commands.append(cmd)
                 return subprocess.CompletedProcess(cmd, 0, "merged", "")
-            if cmd[:3] == ["git", "push", "origin"]:
+            if cmd[:2] == ["git", "push"]:
                 push_called = True
                 return subprocess.CompletedProcess(cmd, 0, "pushed", "")
             if cmd[:3] == ["git", "worktree", "list"]:
@@ -25026,7 +25634,9 @@ class TestAutoMerge:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -25058,7 +25668,11 @@ class TestAutoMerge:
 
         assert result == "passed"
         assert disable_calls == [["gh", "pr", "merge", "12", "--disable-auto"]]
-        merge_master_mock.assert_called_once_with(worktree)
+        merge_master_mock.assert_called_once()
+        merge_args, merge_kwargs = merge_master_mock.call_args
+        assert merge_args == (worktree,)
+        assert merge_kwargs["remote_url"] == run.publish_remote_url
+        assert merge_kwargs["git_env"]["GIT_TERMINAL_PROMPT"] == "0"
         assert push_called
         assert merge_commands == [
             ["gh", "pr", "merge", "12", "--squash", "--auto", "--match-head-commit", "deadbeef1234567"],
@@ -25091,7 +25705,9 @@ class TestAutoMerge:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -25637,7 +26253,7 @@ class TestMergeBehindBranchUpdate:
             nonlocal push_called
             if cmd[:3] == ["gh", "auth", "status"]:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
-            if cmd[:3] == ["git", "push", "origin"]:
+            if cmd[:2] == ["git", "push"]:
                 push_called = True
                 return subprocess.CompletedProcess(cmd, 0, "pushed", "")
             if cmd[:3] == ["gh", "pr", "merge"]:
@@ -25648,7 +26264,9 @@ class TestMergeBehindBranchUpdate:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -25797,7 +26415,7 @@ class TestMergeBehindBranchUpdate:
         def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
             if cmd[:3] == ["gh", "auth", "status"]:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
-            if cmd[:3] == ["git", "push", "origin"]:
+            if cmd[:2] == ["git", "push"]:
                 return subprocess.CompletedProcess(cmd, 0, "pushed", "")
             raise AssertionError(f"Unexpected command: {cmd}")
 
@@ -25843,7 +26461,7 @@ class TestMergeBehindBranchUpdate:
         def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
             if cmd[:3] == ["gh", "auth", "status"]:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
-            if cmd[:3] == ["git", "push", "origin"]:
+            if cmd[:2] == ["git", "push"]:
                 return subprocess.CompletedProcess(cmd, 0, "pushed", "")
             raise AssertionError(f"Unexpected command: {cmd}")
 
@@ -26259,7 +26877,9 @@ class TestPostMergeSync:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 # Not on master
@@ -26303,7 +26923,9 @@ class TestPostMergeSync:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "some-other-branch\n", "")
@@ -26350,7 +26972,9 @@ class TestPostMergeSync:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "some-other-branch\n", "")
@@ -26385,7 +27009,9 @@ class TestPostMergeSync:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
             if cmd[:3] == ["git", "tag", "--list"]:
                 return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            if cmd[:4] == ["git", "fetch", "origin", "master"]:
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
                 return subprocess.CompletedProcess(cmd, 0, "master\n", "")
@@ -26529,7 +27155,11 @@ class TestBestEffortPostMergeLocalSync:
             branch=f"code/{spec_id}--20260101T000000",
             agent="codex",
         )
-        orch._best_effort_post_merge_local_sync(run, work)
+        orch._best_effort_post_merge_local_sync(
+            run,
+            work,
+            publication_worktree_path=work,
+        )
 
         assert run.nonfatal_warnings == []
         local_main_after = _run_git_stdout("rev-parse", "main", cwd=work).strip()
@@ -26573,7 +27203,11 @@ class TestBestEffortPostMergeLocalSync:
             branch=f"code/{spec_id}--20260101T000000",
             agent="codex",
         )
-        orch._best_effort_post_merge_local_sync(run, work)
+        orch._best_effort_post_merge_local_sync(
+            run,
+            work,
+            publication_worktree_path=work,
+        )
 
         assert run.nonfatal_warnings == []
         # Local master fast-forwarded too (off-master update-ref path).
@@ -26617,7 +27251,11 @@ class TestBestEffortPostMergeLocalSync:
             branch=f"code/{spec_id}--20260101T000000",
             agent="codex",
         )
-        orch._best_effort_post_merge_local_sync(run, work)
+        orch._best_effort_post_merge_local_sync(
+            run,
+            work,
+            publication_worktree_path=work,
+        )
 
         assert len(run.nonfatal_warnings) == 1
         warning = run.nonfatal_warnings[0]
@@ -27782,22 +28420,31 @@ class TestBlockedRunDebugger:
         assert run.block_debugger_auto_resumes == 1
 
     @pytest.mark.parametrize("agent_name", ["claude", "codex"])
-    def test_debugger_isolated_config_contains_no_mcp_servers(
+    def test_debugger_command_contains_no_mcp_or_prompt_argv(
         self,
         tmp_path: Path,
         agent_name: str,
     ):
-        adapter = orch.get_agent_adapter(agent_name)
-        mcp_path, codex_home = orch._stage_block_debugger_isolated_config(adapter, tmp_path)
-
+        mcp_path = tmp_path / "attacker-mcp.json"
+        cmd = orch._build_block_debugger_command(
+            prompt="diagnose secret checkout",
+            schema_path=tmp_path / "schema.json",
+            output_path=tmp_path / "output" / "diagnosis.json",
+            agent_name=agent_name,
+            writable_output_dir=tmp_path / "output",
+            mcp_config_path=mcp_path,
+        )
+        assert str(mcp_path) not in cmd
+        assert "diagnose secret checkout" not in cmd
         if agent_name == "claude":
-            assert mcp_path is not None
-            assert json.loads(mcp_path.read_text()) == {"mcpServers": {}}
-            assert codex_home is None
+            assert "--restricted" in cmd
+            assert "--strict-mcp-config" in cmd
+            assert cmd[cmd.index("--tools") + 1] == ""
         else:
-            assert mcp_path is None
-            assert codex_home is not None
-            assert "mcp_servers" not in (codex_home / "config.toml").read_text()
+            assert cmd[-1] == "-"
+            assert cmd[cmd.index("-s") + 1] == "read-only"
+            assert "--ignore-user-config" in cmd
+            assert "features.shell_tool=false" in cmd
 
     def test_launch_numbered_implement_artifacts_are_immutable_across_same_attempt(
         self,
@@ -28313,6 +28960,14 @@ class TestBlockedRunDebugger:
             "blocker_signature": "agent-placeholder",
         }
         observed: dict[str, Path] = {}
+        observed_copy_modes: list[bool | None] = []
+
+        def fake_write_codex_home(root: Path, **kwargs) -> Path:
+            observed_copy_modes.append(kwargs.get("copy_auth"))
+            home = root / ".spec-codex-home"
+            home.mkdir(parents=True)
+            (home / "config.toml").write_text("", encoding="utf-8")
+            return home
 
         @contextmanager
         def fake_debug_worktree(*_args, **kwargs):
@@ -28321,14 +28976,17 @@ class TestBlockedRunDebugger:
                 pre_seal(debug_worktree)
             yield debug_worktree, {}
 
-        def fake_run(_repo_root, cmd, **_kwargs):
-            add_dir = Path(cmd[cmd.index("--add-dir") + 1])
+        def fake_run(_repo_root, cmd, **kwargs):
             output_path = Path(cmd[cmd.index("-o") + 1])
-            observed["add_dir"] = add_dir
+            cwd = Path(kwargs["cwd"])
+            input_text = kwargs["input_text"]
+            observed["cwd"] = cwd
             observed["output_path"] = output_path
-            assert add_dir == output_path.parent
-            assert repo / ".spec-state" not in (add_dir, output_path)
-            assert "Inlined evidence context" in cmd[-1]
+            assert cwd == output_path.parent
+            assert repo / ".spec-state" not in (cwd, output_path)
+            assert "--add-dir" not in cmd
+            assert cmd[-1] == "-"
+            assert "Inlined evidence context" in input_text
             assert not raw_artifact.exists()
             output_path.write_text(json.dumps(payload))
             return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -28349,14 +29007,21 @@ class TestBlockedRunDebugger:
             ),
             patch.object(orch, "_validated_block_debugger_surviving_workspace", return_value=None),
             patch.object(orch, "_run_local_review_subprocess", side_effect=fake_run),
+            patch.object(orch, "_write_codex_isolated_home", side_effect=fake_write_codex_home),
+            patch.object(
+                orch,
+                "_resolve_execution_backend",
+                side_effect=AssertionError("block debugger must not consult implementation backend"),
+            ),
         ):
             diagnosis = orch._maybe_run_block_debugger(run, repo, source_phase="verify")
 
         assert diagnosis is not None
+        assert observed_copy_modes == [None]
         assert diagnosis.blocker_signature == "fresh-signature"
         assert json.loads(raw_artifact.read_text()) == payload
-        assert observed["add_dir"] != repo / ".spec-state"
-        assert not observed["add_dir"].exists()
+        assert observed["cwd"] != repo / ".spec-state"
+        assert not observed["cwd"].exists()
 
     def test_temporary_debugger_worktree_guards_common_dir(self, repo: Path):
         """The context manager yields env overrides that prevent writes through the common dir."""
@@ -28754,7 +29419,8 @@ class TestBuildAgentCommandMergeConflict:
         cmd = orch._build_agent_command("claude", tmp_path, retry_context=ctx)
         prompt = cmd[-1]
         assert "Retry failure package:" in prompt
-        assert ".spec-state/runs/my-feature-20260101T000000/" in prompt
+        assert ".spec-state" not in prompt
+        assert "authoritative retry evidence is inlined below" in prompt
         assert "not mergeable" in prompt
         assert "Do NOT push" in prompt
         assert "report STATUS=ok" in prompt
@@ -28771,7 +29437,8 @@ class TestBuildAgentCommandMergeConflict:
         )
         cmd = orch._build_agent_command("codex", tmp_path, retry_context=ctx)
         assert cmd[0] == "codex"
-        assert ".spec-state/runs/my-feature-20260101T000000/" in cmd[-1]
+        assert ".spec-state" not in cmd[-1]
+        assert "authoritative retry evidence is inlined below" in cmd[-1]
         assert "not mergeable" in cmd[-1]
 
 
@@ -30509,64 +31176,35 @@ class TestBaseOverride:
 
 
 class TestSpecAuthoring:
-    def test_windows_codex_authoring_passes_host_gh_token_without_profile_access(
+    @pytest.fixture(autouse=True)
+    def _isolate_interactive_process_and_publication_boundaries(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        monkeypatch.delenv("GH_TOKEN", raising=False)
-        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        forge = MagicMock()
-        forge.get_auth_token.return_value = "native-authoring-token"
+        """Keep command-flow tests focused on authoring behavior.
 
-        with (
-            patch.object(orch.sys, "platform", "win32"),
-            patch.object(orch, "_forge", return_value=forge),
-        ):
-            env = orch._windows_codex_authoring_env("codex")
+        Process ownership and Git-baseline enforcement have dedicated
+        adversarial tests. These older command tests intentionally replace the
+        attached provider with their existing ``subprocess.run`` fake.
+        """
 
-        assert env is not None
-        assert env["GH_TOKEN"] == "native-authoring-token"
-        assert "GH_TOKEN" not in os.environ
-        forge.get_auth_token.assert_called_once_with()
+        def run_interactive(cmd, *, cwd, env):
+            return orch.subprocess.run(cmd, cwd=cwd, env=env)
 
-    def test_windows_codex_authoring_preserves_explicit_token(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.setenv("GH_TOKEN", "explicit-token")
-        forge = MagicMock()
+        monkeypatch.setattr(orch, "_run_interactive_agent_owned", run_interactive)
+        monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
+        monkeypatch.setattr(
+            orch,
+            "capture_repository_publication_baseline",
+            lambda _path: ("https://example.invalid/repo", "trusted-config"),
+        )
+        monkeypatch.setattr(
+            orch,
+            "assert_repository_publication_baseline",
+            lambda *_args, **_kwargs: None,
+        )
 
-        with (
-            patch.object(orch.sys, "platform", "win32"),
-            patch.object(orch, "_forge", return_value=forge),
-        ):
-            env = orch._windows_codex_authoring_env("codex")
-
-        assert env is not None
-        assert env["GH_TOKEN"] == "explicit-token"
-        forge.get_auth_token.assert_not_called()
-
-    def test_windows_codex_authoring_uses_disposable_gh_config(
-        self,
-        tmp_path: Path,
-    ) -> None:
-        env = {
-            "GH_TOKEN": "native-authoring-token",
-            "GH_CONFIG_DIR": r"C:\\Users\\operator\\AppData\\Roaming\\GitHub CLI",
-        }
-
-        config_dir = orch._isolate_windows_codex_authoring_gh_config(env, tmp_path)
-
-        assert config_dir is not None
-        assert config_dir.is_dir()
-        assert config_dir.parent == tmp_path
-        assert env["GH_CONFIG_DIR"] == str(config_dir)
-        assert env["GH_HOST"] == "github.com"
-        assert list(config_dir.iterdir()) == []
-
-        shutil.rmtree(config_dir)
-
-    def test_windows_codex_authoring_disposable_gh_config_is_cleaned_after_launch(
+    def test_codex_authoring_does_not_inherit_forge_credentials(
         self,
         repo: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -30579,21 +31217,20 @@ class TestSpecAuthoring:
             label="",
         )
         monkeypatch.setenv("GH_TOKEN", "native-authoring-token")
-        observed: dict[str, Path] = {}
+        monkeypatch.setenv("OPENAI_API_KEY", "provider-token")
+        observed: dict[str, str] = {}
 
         def launch(_command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
             env = kwargs["env"]
             assert isinstance(env, dict)
-            config_dir = Path(str(env["GH_CONFIG_DIR"]))
-            assert config_dir.is_dir()
-            assert env["GH_HOST"] == "github.com"
-            observed["config_dir"] = config_dir
+            assert "GH_TOKEN" not in env
+            assert env["OPENAI_API_KEY"] == "provider-token"
+            assert env["GIT_CONFIG_COUNT"]
+            observed["provider"] = env["OPENAI_API_KEY"]
             return subprocess.CompletedProcess(["codex"], 130)
 
         with (
-            patch.object(orch.sys, "platform", "win32"),
             patch.object(orch, "resolve_repo_root", return_value=repo),
-            patch.object(orch, "_common_state_root", return_value=repo / ".spec-state"),
             patch.object(orch.sys.stdin, "isatty", return_value=True),
             patch.object(
                 orch,
@@ -30611,39 +31248,7 @@ class TestSpecAuthoring:
             status = orch.cmd_spec(args)
 
         assert status == 130
-        assert not observed["config_dir"].exists()
-
-    def test_windows_codex_authoring_missing_token_fails_before_worktree(
-        self,
-        repo: Path,
-        capsys: pytest.CaptureFixture[str],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        monkeypatch.delenv("GH_TOKEN", raising=False)
-        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        args = argparse.Namespace(
-            agent="codex",
-            base="origin/master",
-            spec="windows-authoring",
-            label="",
-        )
-        forge = MagicMock()
-        forge.get_auth_token.return_value = ""
-
-        with (
-            patch.object(orch.sys, "platform", "win32"),
-            patch.object(orch, "resolve_repo_root", return_value=repo),
-            patch.object(orch.sys.stdin, "isatty", return_value=True),
-            patch.object(orch, "_forge", return_value=forge),
-            patch.object(orch, "_prepare_spec_authoring_worktree") as prepare,
-            patch.object(orch.subprocess, "run") as launch,
-        ):
-            status = orch.cmd_spec(args)
-
-        assert status == 1
-        assert "gh auth token" in capsys.readouterr().err
-        prepare.assert_not_called()
-        launch.assert_not_called()
+        assert observed == {"provider": "provider-token"}
 
     def test_prepare_spec_authoring_worktree_ignores_prefix_matches(self, repo: Path):
         worktree = repo / ".worktrees" / "spec-foo"
@@ -30974,6 +31579,44 @@ class TestSpecAuthoring:
         assert code == 1
         assert "requires an interactive terminal" in err
 
+    def test_cmd_spec_reports_publication_guard_failure_without_traceback(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        worktree = repo / ".worktrees" / "spec-new-spec"
+        args = argparse.Namespace(
+            agent="codex",
+            base="origin/master",
+            spec="new-spec",
+            label="",
+        )
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.object(
+                orch,
+                "_prepare_spec_authoring_worktree",
+                return_value=(worktree, "spec/new-spec", False),
+            ),
+            patch.object(
+                orch,
+                "interactive_provider_environment",
+                return_value=({}, frozenset()),
+            ),
+            patch.object(
+                orch,
+                "apply_host_owned_publication_guard",
+                side_effect=RuntimeError("unsafe local Git credential helper"),
+            ),
+            patch.object(orch, "_write_sandbox_config") as write_sandbox,
+        ):
+            code = orch.cmd_spec(args)
+
+        assert code == 1
+        assert "Could not establish the authoring publication boundary" in capsys.readouterr().err
+        write_sandbox.assert_not_called()
+
     def test_cmd_task_launches_spec_authoring_session(
         self,
         repo: Path,
@@ -31001,7 +31644,6 @@ class TestSpecAuthoring:
                 "_build_spec_authoring_command",
                 return_value=["codex", "Author spec `new-spec`"],
             ) as build_cmd,
-            patch.object(orch, "_windows_codex_authoring_env", return_value=None),
             patch.object(
                 orch.subprocess,
                 "run",
@@ -31019,6 +31661,7 @@ class TestSpecAuthoring:
         out = capsys.readouterr().out
         assert code == 0
         assert "Launching spec authoring" in out
+        assert "Publication is operator-owned" in out
         build_cmd.assert_called_once_with(
             "codex",
             repo,
@@ -31026,14 +31669,17 @@ class TestSpecAuthoring:
             "new-spec",
             "spec/new-spec",
             resume=False,
+            protected_env_keys=frozenset(),
         )
         print_summary.assert_called_once_with(
             repo,
             "new-spec",
             "spec/new-spec",
             worktree_path,
+            repo_slug="",
         )
-        assert "Next step: spec implement --spec new-spec" in out
+        assert "spec PR is merged" in out
+        assert "spec implement --spec new-spec" in out
 
     def test_cmd_task_launches_anonymous_spec_authoring_session(
         self,
@@ -31066,7 +31712,6 @@ class TestSpecAuthoring:
                 "_build_spec_authoring_command",
                 return_value=["codex", "Author a new spec"],
             ) as build_cmd,
-            patch.object(orch, "_windows_codex_authoring_env", return_value=None),
             patch.object(
                 orch.subprocess,
                 "run",
@@ -31091,6 +31736,7 @@ class TestSpecAuthoring:
             None,
             "spec-authoring/20260312T101112131415",
             resume=False,
+            protected_env_keys=frozenset(),
         )
         assert "spec implement --spec new-spec" in out
 
@@ -31142,6 +31788,7 @@ class TestSpecAuthoring:
             "existing-spec",
             "spec/existing-spec",
             resume=True,
+            protected_env_keys=frozenset(),
         )
 
     def test_cmd_task_preserves_worktree_on_interrupted_session(
@@ -31171,7 +31818,6 @@ class TestSpecAuthoring:
                 "_build_spec_authoring_command",
                 return_value=["codex", "Author spec `new-spec`"],
             ),
-            patch.object(orch, "_windows_codex_authoring_env", return_value=None),
             patch.object(
                 orch.subprocess,
                 "run",
@@ -31186,6 +31832,27 @@ class TestSpecAuthoring:
 
 
 class TestMultiSpecAuthoring:
+    @pytest.fixture(autouse=True)
+    def _isolate_interactive_process_and_publication_boundaries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def run_interactive(cmd, *, cwd, env):
+            return orch.subprocess.run(cmd, cwd=cwd, env=env)
+
+        monkeypatch.setattr(orch, "_run_interactive_agent_owned", run_interactive)
+        monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
+        monkeypatch.setattr(
+            orch,
+            "capture_repository_publication_baseline",
+            lambda _path: ("https://example.invalid/repo", "trusted-config"),
+        )
+        monkeypatch.setattr(
+            orch,
+            "assert_repository_publication_baseline",
+            lambda *_args, **_kwargs: None,
+        )
+
     """Tests for multi-spec authoring in anonymous sessions."""
 
     def test_resolve_multi_spec_returns_all_new_specs(self, repo: Path):
@@ -31336,8 +32003,15 @@ class TestMultiSpecAuthoring:
             ["feat-a", "feat-b"],
             "spec-authoring/20260312T101112131415",
             worktree_path,
+            repo_slug="",
         )
         assert "Next steps:" in out
+        assert "git push --set-upstream origin spec-authoring/20260312T101112131415" in out
+        assert (
+            "gh pr create --head spec-authoring/20260312T101112131415 "
+            f"--base {orch.PR_BASE_BRANCH}"
+            in out
+        )
         assert "spec implement --spec feat-a" in out
         assert "spec implement --spec feat-b" in out
 
@@ -31390,8 +32064,16 @@ class TestMultiSpecAuthoring:
             "my-spec",
             "spec/my-spec",
             worktree_path,
+            repo_slug="",
         )
-        assert "Next step: spec implement --spec my-spec" in out
+        assert "spec PR is merged" in out
+        assert "git log -1 --stat" in out
+        assert "git push --set-upstream origin spec/my-spec" in out
+        assert (
+            f"gh pr create --head spec/my-spec --base {orch.PR_BASE_BRANCH}" in out
+        )
+        assert "git pull --ff-only" in out
+        assert "spec implement --spec my-spec" in out
 
     def test_load_spec_creation_prompt_multi_spec_anonymous(self, repo: Path):
         """Anonymous session prompt mentions multi-spec and individual commits."""
@@ -31404,8 +32086,23 @@ class TestMultiSpecAuthoring:
         assert "one or more specs" in prompt
         assert "commit it individually" in prompt
         assert "do not rename" in prompt.lower() or "Keep the session branch" in prompt
+        assert "Do not run `git push`" in prompt
+        assert "use an MCP integration" in prompt
         # status field no longer exists — prompt should not mention it
         assert "status:" not in prompt
+
+    def test_load_spec_creation_prompt_rejects_agent_owned_publication(
+        self,
+        repo: Path,
+    ) -> None:
+        with pytest.raises(ValueError, match="no longer supported"):
+            orch._load_spec_creation_prompt(
+                repo,
+                "my-spec",
+                "spec/my-spec",
+                resume=False,
+                publish=True,
+            )
 
     def test_load_spec_creation_prompt_single_spec_no_status_field(self, repo: Path):
         prompt = orch._load_spec_creation_prompt(
@@ -31417,6 +32114,7 @@ class TestMultiSpecAuthoring:
 
         # status field no longer exists — prompt should not mention it
         assert "status:" not in prompt
+        assert "Do not run `git push`" in prompt
 
     def test_bundled_template_does_not_mention_draft(self):
         """The bundled TEMPLATE.md must not suggest draft status."""
@@ -31468,6 +32166,74 @@ class TestMultiSpecAuthoring:
         initial_prompt = cmd[1]
         assert "multiple specs" in initial_prompt
 
+    def test_build_spec_authoring_command_keeps_publication_on_host(
+        self,
+        repo: Path,
+    ) -> None:
+        worktree = repo / ".worktrees" / "spec-my-spec"
+        captured: dict[str, object] = {}
+
+        class RecordingAdapter:
+            def build_authoring_command(self, **kwargs: object) -> list[str]:
+                captured.update(kwargs)
+                return ["mock"]
+
+        with patch.object(
+            orch,
+            "get_agent_adapter",
+            return_value=RecordingAdapter(),
+        ):
+            orch._build_spec_authoring_command(
+                "codex",
+                repo,
+                worktree,
+                "my-spec",
+                "spec/my-spec",
+                resume=False,
+                protected_env_keys=frozenset({"USER_MCP_SECRET"}),
+            )
+
+        assert "Do not run `git push`" in str(captured["prompt"])
+        assert captured["protected_env_keys"] == frozenset({"USER_MCP_SECRET"})
+
+    def test_build_spec_authoring_command_preserves_legacy_adapter_signature(
+        self,
+        repo: Path,
+    ) -> None:
+        worktree = repo / ".worktrees" / "spec-my-spec"
+
+        class LegacyAdapter:
+            def build_authoring_command(
+                self,
+                *,
+                prompt: str,
+                worktree_path: Path,
+                state_dir: Path | None = None,
+                mcp_config_path: Path | None = None,
+                initial_prompt: str = "",
+                mcp_servers: dict[str, dict[str, object]] | None = None,
+            ) -> list[str]:
+                del prompt, worktree_path, state_dir, mcp_config_path
+                del initial_prompt, mcp_servers
+                return ["legacy"]
+
+        with patch.object(
+            orch,
+            "get_agent_adapter",
+            return_value=LegacyAdapter(),
+        ):
+            command = orch._build_spec_authoring_command(
+                "custom",
+                repo,
+                worktree,
+                "my-spec",
+                "spec/my-spec",
+                resume=False,
+                protected_env_keys=frozenset({"USER_MCP_SECRET"}),
+            )
+
+        assert command == ["legacy"]
+
     def test_build_spec_authoring_command_forwards_mcp_config_path_to_any_adapter(
         self, repo: Path
     ):
@@ -31512,6 +32278,22 @@ class TestMultiSpecAuthoring:
 
 
 class TestCmdTask:
+    @pytest.fixture(autouse=True)
+    def _isolate_interactive_process_and_publication_boundaries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def run_interactive(cmd, *, cwd, env):
+            return orch.subprocess.run(cmd, cwd=cwd, env=env)
+
+        monkeypatch.setattr(orch, "_run_interactive_agent_owned", run_interactive)
+        monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
+        monkeypatch.setattr(
+            orch,
+            "_capture_or_validate_run_publication_baseline",
+            lambda *_args, **_kwargs: None,
+        )
+
     """Tests for cmd_task (make task) and phase_scoping."""
 
     @staticmethod
@@ -31535,6 +32317,30 @@ class TestCmdTask:
             raise AssertionError(f"Unexpected command: {cmd}")
 
         return fake_run_subprocess
+
+    @pytest.mark.parametrize("agent", ["claude", "codex"])
+    def test_task_scoping_command_grants_no_control_state(
+        self,
+        repo: Path,
+        agent: str,
+    ) -> None:
+        worktree = repo / ".worktrees" / "task-session"
+        captured: dict[str, object] = {}
+
+        class RecordingAdapter:
+            def build_authoring_command(self, **kwargs: object) -> list[str]:
+                captured.update(kwargs)
+                return [agent]
+
+        with patch.object(orch, "get_agent_adapter", return_value=RecordingAdapter()):
+            orch._build_task_scoping_command(
+                agent,
+                worktree,
+                "Scope one task.",
+                "Ask the user what to build.",
+            )
+
+        assert captured["state_dir"] is None
 
     def test_cmd_task_accepts_codex_agent(
         self,
@@ -31709,6 +32515,41 @@ class TestCmdTask:
 
         assert result == "failed"
         assert "interactive terminal" in run.last_error
+
+    def test_phase_scoping_fails_when_publication_guard_cannot_be_applied(
+        self,
+        repo: Path,
+    ) -> None:
+        worktree = repo / ".worktrees" / "task-fix--token123"
+        worktree.mkdir(parents=True)
+        run = orch.RunState(
+            run_id="fix-20260101T000000",
+            spec_id="fix",
+            branch="task/fix--token123",
+            worktree_path=str(worktree),
+            run_mode="task",
+            agent="claude",
+        )
+
+        with (
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.object(
+                orch,
+                "interactive_provider_environment",
+                return_value=({}, frozenset()),
+            ),
+            patch.object(
+                orch,
+                "apply_host_owned_publication_guard",
+                side_effect=RuntimeError("unsafe local Git include"),
+            ),
+            patch.object(orch, "_write_sandbox_config") as write_sandbox,
+        ):
+            result = orch.phase_scoping(run, repo)
+
+        assert result == "failed"
+        assert "Could not establish the authoring publication boundary" in run.last_error
+        write_sandbox.assert_not_called()
 
     def test_phase_scoping_launches_claude_and_renames_branch(self, repo: Path):
         worktree = repo / ".worktrees" / "task-task-token123--token123"
@@ -32787,6 +33628,22 @@ class TestCmdStep:
 
 
 class TestWaitingForInputWorkflow:
+    @pytest.fixture(autouse=True)
+    def _isolate_interactive_process_and_publication_boundaries(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def run_interactive(cmd, *, cwd, env):
+            return orch.subprocess.run(cmd, cwd=cwd, env=env)
+
+        monkeypatch.setattr(orch, "_run_interactive_agent_owned", run_interactive)
+        monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
+        monkeypatch.setattr(
+            orch,
+            "_capture_or_validate_run_publication_baseline",
+            lambda *_args, **_kwargs: None,
+        )
+
     """Tests for the needs-input/waiting-for-input orchestrator workflow."""
 
     def _make_run(self, agent: str = "claude") -> orch.RunState:
@@ -32813,13 +33670,22 @@ class TestWaitingForInputWorkflow:
             attempt=0,
         ).save(repo, run.run_id)
 
-        def report_needs_input(*_args, **_kwargs):
-            orch.ImplementResult(
-                status="needs-input",
-                summary="Which API version should we target?",
-                attempt=0,
-                launch_number=run.implement_launches,
-            ).save(repo, run.run_id)
+        def report_needs_input(
+            _run: orch.RunState,
+            _repo_root: Path,
+            _worktree_path: Path,
+            plan: orch.ImplementLaunchPlan,
+            **_kwargs: object,
+        ) -> int:
+            _write_fake_agent_completion_outbox(
+                plan.agent_env,
+                run,
+                orch.ImplementResult(
+                    status="needs-input",
+                    summary="Which API version should we target?",
+                    attempt=0,
+                ),
+            )
             return 0
 
         with (
@@ -32998,6 +33864,52 @@ class TestWaitingForInputWorkflow:
         err = capsys.readouterr().err
         assert "no active operator intervention" in err
 
+    def test_cmd_input_reports_publication_guard_failure_without_traceback(
+        self,
+        repo: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        run = self._make_run(agent="codex")
+        run.status = "waiting-for-input"
+        run.phase = "implement"
+        run.input_question = "Which API version?"
+        run.save(repo)
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True)
+        (worktree / "specs").mkdir()
+        (worktree / "specs" / "my-feature.md").write_text("spec content")
+
+        args = argparse.Namespace(spec="my-feature", agent=None)
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.object(
+                orch,
+                "run_subprocess",
+                return_value=MagicMock(returncode=0, stdout="abc123 initial commit"),
+            ),
+            patch.object(
+                orch,
+                "interactive_provider_environment",
+                return_value=({}, frozenset()),
+            ),
+            patch.object(
+                orch,
+                "apply_host_owned_publication_guard",
+                side_effect=RuntimeError("unsafe local Git extraheader"),
+            ),
+            patch.object(orch, "_write_sandbox_config") as write_sandbox,
+        ):
+            code = orch.cmd_input(args)
+
+        assert code == 1
+        assert (
+            "Could not establish the operator-intervention publication boundary"
+            in capsys.readouterr().err
+        )
+        write_sandbox.assert_not_called()
+
     def test_cmd_input_prefers_explicit_agent_override(self, repo: Path):
         """cmd_input launches the explicitly requested agent without mutating run.agent."""
         run = self._make_run(agent="claude")
@@ -33045,7 +33957,12 @@ class TestWaitingForInputWorkflow:
 
         assert len(captured_cmd) == 1
         assert captured_cmd[0][0] == "codex"
-        mock_write_sandbox.assert_called_once_with("codex", worktree)
+        mock_write_sandbox.assert_called_once_with(
+            "codex",
+            worktree,
+            interactive=True,
+            additional_protected_env_keys=frozenset(),
+        )
         reloaded = orch.RunState.find_latest(repo, "my-feature")
         assert reloaded.agent == "claude"
 
@@ -33144,7 +34061,12 @@ class TestWaitingForInputWorkflow:
 
         assert len(captured_cmd) == 1
         assert captured_cmd[0][0] == "codex"
-        mock_write_sandbox.assert_called_once_with("codex", worktree)
+        mock_write_sandbox.assert_called_once_with(
+            "codex",
+            worktree,
+            interactive=True,
+            additional_protected_env_keys=frozenset(),
+        )
 
     @pytest.mark.parametrize(
         "agent, expected_fragment, forbidden_fragment",
@@ -33180,12 +34102,16 @@ class TestWaitingForInputWorkflow:
                 captured_prompt = kwargs["prompt"]
                 return [agent]
 
-        def fake_subprocess_run(*_args, **_kwargs):
-            orch.ImplementResult(
-                status="passed",
-                summary="Resolved",
-                attempt=run.attempts,
-            ).save(repo, run.run_id)
+        def fake_subprocess_run(*_args, **kwargs):
+            _write_fake_agent_completion_outbox(
+                kwargs["env"],
+                run,
+                orch.ImplementResult(
+                    status="passed",
+                    summary="Resolved",
+                    attempt=run.attempts,
+                ),
+            )
             return MagicMock(returncode=0)
 
         args = argparse.Namespace(spec="my-feature")
@@ -33244,13 +34170,17 @@ class TestWaitingForInputWorkflow:
         (worktree / "specs").mkdir(parents=True, exist_ok=True)
         (worktree / "specs" / "my-feature.md").write_text("spec content")
 
-        def fake_subprocess_run(*_args, **_kwargs):
+        def fake_subprocess_run(*_args, **kwargs):
             # Simulate the input agent reporting STATUS=ok during this session.
-            orch.ImplementResult(
-                status="passed",
-                summary="Resolved",
-                attempt=run.attempts,
-            ).save(repo, run.run_id)
+            _write_fake_agent_completion_outbox(
+                kwargs["env"],
+                run,
+                orch.ImplementResult(
+                    status="passed",
+                    summary="Resolved",
+                    attempt=run.attempts,
+                ),
+            )
             return MagicMock(returncode=0)
 
         args = argparse.Namespace(spec="my-feature")
@@ -33340,14 +34270,18 @@ class TestWaitingForInputWorkflow:
         (worktree / "specs").mkdir(parents=True, exist_ok=True)
         (worktree / "specs" / "my-feature.md").write_text("spec content")
 
-        def fake_subprocess_run(*_args, **_kwargs):
+        def fake_subprocess_run(*_args, **kwargs):
             # Simulate `spec report --status ok` completing before the agent
             # exits non-zero.
-            orch.ImplementResult(
-                status="passed",
-                summary="Resolved",
-                attempt=run.attempts,
-            ).save(repo, run.run_id)
+            _write_fake_agent_completion_outbox(
+                kwargs["env"],
+                run,
+                orch.ImplementResult(
+                    status="passed",
+                    summary="Resolved",
+                    attempt=run.attempts,
+                ),
+            )
             return MagicMock(returncode=130)
 
         args = argparse.Namespace(spec="my-feature")
@@ -33433,8 +34367,8 @@ class TestWaitingForInputWorkflow:
             assert not request.response
             assert not request.resolved_at
 
-    def test_cmd_input_accepts_already_recorded_report_for_request(self, repo: Path):
-        """A current report recorded after the request can resolve a rerun."""
+    def test_cmd_input_rejects_already_recorded_common_report_for_request(self, repo: Path):
+        """Even a current common-state tuple cannot satisfy a fresh input launch."""
         run = self._make_run()
         run.status = "waiting-for-input"
         run.phase = "implement"
@@ -33479,11 +34413,95 @@ class TestWaitingForInputWorkflow:
             mock_stdin.isatty.return_value = True
             code = orch.cmd_input(args)
 
-        assert code == 0
+        assert code == 130
         reloaded = orch.RunState.find_latest(repo, "my-feature")
-        assert reloaded.status == "passed"
+        assert reloaded.status == "waiting-for-input"
         assert reloaded.input_question == "Which API version?"
-        assert reloaded.input_response == "Resolved before rerun"
+        assert reloaded.input_response == ""
+
+    def test_cmd_input_grants_only_scoped_outbox_and_minimal_environment(
+        self,
+        repo: Path,
+    ) -> None:
+        run = self._make_run(agent="codex")
+        run.status = "waiting-for-input"
+        run.phase = "implement"
+        run.input_question = "Which API version?"
+        run.save(repo)
+
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        (worktree / "specs").mkdir(parents=True, exist_ok=True)
+        (worktree / "specs" / "my-feature.md").write_text("spec content")
+
+        forged = orch.ImplementResult(
+            status="passed",
+            summary="forged alias",
+            attempt=run.attempts,
+            launch_number=1,
+        )
+        forged.save(repo, run.run_id)
+        forged.save_to_state_root(worktree / ".spec-state", run.run_id)
+        captured_adapter: dict[str, object] = {}
+        captured_launch: dict[str, object] = {}
+
+        class RecordingAdapter:
+            def build_authoring_command(self, **kwargs: object) -> list[str]:
+                captured_adapter.update(kwargs)
+                return ["codex"]
+
+        def fake_subprocess_run(cmd: list[str], **kwargs: object) -> MagicMock:
+            captured_launch["cmd"] = cmd
+            captured_launch.update(kwargs)
+            return MagicMock(returncode=0)
+
+        args = argparse.Namespace(spec="my-feature", agent=None)
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch, "_write_sandbox_config"),
+            patch.object(orch, "get_agent_adapter", return_value=RecordingAdapter()),
+            patch.object(
+                orch,
+                "run_subprocess",
+                return_value=MagicMock(returncode=0, stdout="abc1234 initial commit"),
+            ),
+            patch.object(orch.subprocess, "run", side_effect=fake_subprocess_run),
+            patch.object(orch.sys.stdin, "isatty", return_value=True),
+            patch.dict(
+                orch.os.environ,
+                _minimal_process_environment(
+                    OPENAI_API_KEY="provider-auth",
+                    DATABASE_URL="postgresql://ambient-secret",
+                    GH_TOKEN="forge-secret",
+                ),
+                clear=True,
+            ),
+        ):
+            code = orch.cmd_input(args)
+
+        assert code == 1
+        state_dir = captured_adapter["state_dir"]
+        assert isinstance(state_dir, Path)
+        assert state_dir != repo / ".spec-state"
+        assert state_dir != worktree / ".spec-state"
+        child_env = captured_launch["env"]
+        assert isinstance(child_env, dict)
+        assert child_env["OPENAI_API_KEY"] == "provider-auth"
+        assert "DATABASE_URL" not in child_env
+        assert "GH_TOKEN" not in child_env
+        assert Path(child_env["SPEC_COMPLETION_OUTBOX"]).parent == state_dir
+        assert child_env["SPEC_ID"] == run.spec_id
+        assert child_env["SPEC_RUN_ID"] == run.run_id
+        assert not state_dir.exists()
+        assert orch.ImplementResult.load(repo, run.run_id).summary == "forged alias"
+        assert (
+            orch.ImplementResult.load_from_state_root(
+                worktree / ".spec-state",
+                run.run_id,
+            ).summary
+            == "forged alias"
+        )
 
     # -------------------------------------------------------------------
     # (3) proactive steering and resume behavior
@@ -33596,12 +34614,16 @@ class TestWaitingForInputWorkflow:
             blocker_signature="sig-123",
             source_phase="verify",
         ).save(repo, run.run_id)
-        def fake_subprocess_run(*_args, **_kwargs):
-            orch.ImplementResult(
-                status="passed",
-                summary="Retry with the targeted lint fix.",
-                attempt=run.attempts,
-            ).save(repo, run.run_id)
+        def fake_subprocess_run(*_args, **kwargs):
+            _write_fake_agent_completion_outbox(
+                kwargs["env"],
+                run,
+                orch.ImplementResult(
+                    status="passed",
+                    summary="Retry with the targeted lint fix.",
+                    attempt=run.attempts,
+                ),
+            )
             return MagicMock(returncode=0)
 
         args = argparse.Namespace(spec="my-feature")
@@ -34252,6 +35274,45 @@ class TestCodexIsolatedHome:
         assert not (home / "auth.json").exists()
         assert any("missing auth.json" in record.message for record in caplog.records)
 
+    def test_write_codex_isolated_home_materializes_api_key_auth(
+        self,
+        tmp_path: Path,
+    ):
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        source_home = tmp_path / "user-codex"
+        source_home.mkdir()
+        (source_home / "auth.json").write_text(
+            '{"auth_mode":"chatgpt","tokens":{"refresh_token":"oauth"}}',
+            encoding="utf-8",
+        )
+
+        home = orch._write_codex_isolated_home(
+            worktree,
+            mcp_servers={},
+            source_home=source_home,
+            api_key="provider-canary",
+        )
+
+        assert json.loads((home / "auth.json").read_text(encoding="utf-8")) == {
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "provider-canary",
+        }
+        if os.name != "nt":
+            assert stat.S_IMODE((home / "auth.json").stat().st_mode) == 0o600
+
+    def test_strip_codex_provider_secret_env_preserves_project_values(self):
+        env = {
+            "OPENAI_API_KEY": "openai-secret",
+            "CODEX_API_KEY": "codex-secret",
+            "DATABASE_URL": "project-value",
+            "PATH": "/bin",
+        }
+
+        orch._strip_codex_provider_secret_env(env)
+
+        assert env == {"DATABASE_URL": "project-value", "PATH": "/bin"}
+
     def test_subprocess_env_with_codex_home_overrides(self, tmp_path: Path):
         env = orch._subprocess_env_with_codex_home({"PATH": "/usr/bin"}, tmp_path / "isolated")
         assert env["PATH"] == "/usr/bin"
@@ -34357,7 +35418,7 @@ class TestCodexIsolatedHome:
         )
         assert ".gitignore" in check.stdout
 
-    def test_remove_codex_isolated_auth_leaves_config_only(self, tmp_path: Path):
+    def test_remove_codex_isolated_auth_removes_entire_provider_home(self, tmp_path: Path):
         worktree = tmp_path / "worktree"
         worktree.mkdir()
         source_home = tmp_path / "user-codex"
@@ -34373,8 +35434,7 @@ class TestCodexIsolatedHome:
         orch._remove_codex_isolated_auth(worktree)
         orch._remove_codex_isolated_auth(worktree)
 
-        assert not (home / "auth.json").exists()
-        assert (home / "config.toml").is_file()
+        assert not home.exists()
 
     def test_agent_launch_removes_transient_auth_even_when_backend_fails(
         self, tmp_path: Path
@@ -34383,6 +35443,9 @@ class TestCodexIsolatedHome:
         home = worktree / ".spec-codex-home"
         home.mkdir(parents=True)
         (home / "auth.json").write_text('{"token":"secret"}')
+        (home / "config.toml").write_text(
+            '[mcp_servers.private]\nargs = ["literal-mcp-secret"]\n'
+        )
         run = SimpleNamespace(agent="codex", implement_launches=1, attempts=1, run_id="run-1")
         plan = orch.ImplementLaunchPlan(
             use_stream_json=False,
@@ -34403,8 +35466,13 @@ class TestCodexIsolatedHome:
         ):
             orch._launch_implement_attempt(run, tmp_path, worktree, plan)
 
-        assert not (home / "auth.json").exists()
-        sync.assert_called_once_with(backend, worktree, (".spec-codex-home",))
+        assert not home.exists()
+        sync.assert_called_once_with(
+            backend,
+            worktree,
+            (".spec-codex-home",),
+            required=True,
+        )
 
 
 class TestClaudeIsolatedHome:
@@ -35142,6 +36210,19 @@ class TestSyncOrchestratorPathsIntoWorkspace:
             )
         assert any("sync failed" in record.message for record in caplog.records)
 
+    def test_required_sync_propagates_backend_errors(self, tmp_path: Path):
+        class _Fake:
+            def sync_host_paths_into_workspace(self, workspace_path, relative_paths):
+                raise RuntimeError("partial secret copy")
+
+        with pytest.raises(RuntimeError, match="partial secret copy"):
+            orch._sync_orchestrator_paths_into_workspace(
+                _Fake(),
+                tmp_path,
+                (".spec-codex-home",),
+                required=True,
+            )
+
 
 class TestBlockDebuggerWorktreePreSeal:
     """Pre-seal hook lets the orchestrator stage MCP config before chmod."""
@@ -35516,10 +36597,10 @@ class TestWriteClaudeMcpConfigHostSubprocess:
         assert all("/workspace/source" not in str(arg) for arg in playwright["args"])
 
 
-class TestBlockDebuggerClaudeUsesMcpConfig:
-    """Block-debugger Claude branch uses --mcp-config when path is provided."""
+class TestBlockDebuggerClaudeRejectsMcpConfig:
+    """The restricted Claude debugger is always MCP-free."""
 
-    def test_claude_block_debugger_includes_strict_mcp_flags(self, tmp_path: Path):
+    def test_claude_block_debugger_ignores_mcp_path_and_is_restricted(self, tmp_path: Path):
         cmd = orch._build_block_debugger_command(
             prompt="Diagnose this",
             schema_path=tmp_path / "schema.json",
@@ -35528,13 +36609,15 @@ class TestBlockDebuggerClaudeUsesMcpConfig:
             writable_output_dir=tmp_path / "fresh-output",
             mcp_config_path=tmp_path / "mcp.json",
         )
-        assert cmd[0] == "claude"
-        assert "-p" in cmd
-        assert "--mcp-config" in cmd
-        assert str(tmp_path / "mcp.json") in cmd
+        assert cmd[:2] == ["claude", "-p"]
+        assert "--restricted" in cmd
+        assert "--safe-mode" in cmd
+        assert "--mcp-config" not in cmd
+        assert str(tmp_path / "mcp.json") not in cmd
         assert "--strict-mcp-config" in cmd
+        assert "Diagnose this" not in cmd
 
-    def test_claude_block_debugger_unchanged_without_mcp_config(self, tmp_path: Path):
+    def test_claude_block_debugger_remains_strict_without_mcp_config(self, tmp_path: Path):
         cmd = orch._build_block_debugger_command(
             prompt="Diagnose this",
             schema_path=tmp_path / "schema.json",
@@ -35543,11 +36626,11 @@ class TestBlockDebuggerClaudeUsesMcpConfig:
             writable_output_dir=tmp_path / "fresh-output",
         )
         assert "--mcp-config" not in cmd
-        assert "--strict-mcp-config" not in cmd
+        assert "--strict-mcp-config" in cmd
 
 
-class TestLocalReviewCommandAcceptsMcpConfig:
-    def test_claude_review_includes_mcp_config_flags(self, tmp_path: Path):
+class TestLocalReviewCommandRejectsMcpConfig:
+    def test_claude_review_ignores_mcp_config_path(self, tmp_path: Path):
         cmd = orch._build_local_review_command(
             prompt="Review this",
             schema_path=tmp_path / "schema.json",
@@ -35555,9 +36638,10 @@ class TestLocalReviewCommandAcceptsMcpConfig:
             agent_name="claude",
             mcp_config_path=tmp_path / "mcp.json",
         )
-        assert "--mcp-config" in cmd
-        assert str(tmp_path / "mcp.json") in cmd
+        assert "--mcp-config" not in cmd
+        assert str(tmp_path / "mcp.json") not in cmd
         assert "--strict-mcp-config" in cmd
+        assert "--restricted" in cmd
 
     def test_codex_review_ignores_mcp_config_path(self, tmp_path: Path):
         cmd = orch._build_local_review_command(
@@ -37590,6 +38674,22 @@ class TestRepositionRestoredWorkspaceHead:
 class TestAutoMergeTimeoutClassification:
     """Every auto-merge wait timeout must classify as pending-checks."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_publication_boundary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            orch,
+            "_assert_publication_transition_safe",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            orch,
+            "_trusted_publication_repo_slug",
+            lambda *_args, **_kwargs: "acme/repo",
+        )
+
     def _merge_ok(self):
         forge = MagicMock()
         forge.merge_pr.return_value = SimpleNamespace(ok=True, message="")
@@ -38163,6 +39263,29 @@ class TestEnforcePlaywrightBrowserPin:
         assert payload["mcpServers"]["playwright"]["args"][-2:] == ["--browser", "chromium"]
 
 
+def test_host_materialized_review_never_omits_large_spec_middle(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "review"
+    spec_path = worktree / "specs" / "large.md"
+    spec_path.parent.mkdir(parents=True)
+    middle_criterion = "MIDDLE-ONLY-ACCEPTANCE-CRITERION"
+    content = "# Large spec\n" + ("a" * 80_000) + middle_criterion + ("z" * 80_000)
+    spec_path.write_text(content, encoding="utf-8")
+    run = orch.RunState(
+        run_id="large-20260903T000000",
+        spec_id="large",
+        branch="code/large--run",
+        spec_path="specs/large.md",
+    )
+
+    note = orch._host_materialized_review_spec_note(run, worktree)
+
+    assert middle_criterion in note
+    assert content in note
+    assert "omitted" not in note
+
+
 class TestReviewGateEvidence:
     """The reviewer gets authoritative gates plus read-only re-execution."""
 
@@ -38191,8 +39314,9 @@ class TestReviewGateEvidence:
 
         assert "make test" in out and "passed" in out
         assert "authoritative" in out
-        assert "dedicated writable scratch directory" in out
-        assert "Do not report an inability to run tests as a product finding" in out
+        assert "do not receive executable shell capabilities" in out
+        assert "cannot run additional commands" in out
+        assert "Do not report that limitation as a product finding" in out
 
     def test_empty_when_no_gate_status(self, tmp_path: Path):
         run = self._run(tmp_path)

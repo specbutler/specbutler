@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -32,6 +33,17 @@ from spec_runtime.config import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_link_boundary_detects_windows_reparse_attribute_without_is_junction() -> None:
+    class ReparsePath:
+        def is_symlink(self) -> bool:
+            return False
+
+        def lstat(self) -> SimpleNamespace:
+            return SimpleNamespace(st_file_attributes=0x400)
+
+    assert eb.path_is_link_or_junction(ReparsePath()) is True
 
 # ---------------------------------------------------------------------------
 # Config defaults & validation
@@ -1031,6 +1043,59 @@ class TestCloneBackend:
         status = _git("status", "--porcelain", cwd=repo)
         assert status.stdout.strip() == ""
 
+    @pytest.mark.parametrize(
+        "run_id",
+        [
+            "../victim",
+            "/tmp/victim",
+            r"C:\victim",
+            "D:/victim",
+            "my-feature",
+            "other-feature-abc",
+            "my-feature-abc/child",
+            "my-feature-abc\\child",
+            " my-feature-abc",
+        ],
+    )
+    def test_prepare_workspace_rejects_noncanonical_run_identity(
+        self,
+        tmp_path: Path,
+        run_id: str,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+
+        with pytest.raises(RuntimeError, match="unsafe run identity"):
+            self._make().prepare_workspace(
+                run_id=run_id,
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert not (tmp_path / "victim").exists()
+
+    def test_prepare_workspace_rejects_symlinked_workspace_root(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        outside = tmp_path / "outside-workspaces"
+        outside.mkdir()
+        sentinel = outside / "sentinel"
+        sentinel.write_text("keep\n")
+        (repo / ".spec-workspaces").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(RuntimeError, match="symlink or junction"):
+            self._make().prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert sentinel.read_text() == "keep\n"
+
     def test_prepare_workspace_retries_no_local_after_cross_device_link(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -1286,6 +1351,260 @@ class TestCloneBackend:
             backend.cleanup(unsafe)
 
         assert (repo / ".spec-workspaces" / "my-feature-abc").exists()
+
+    def test_cleanup_rejects_corrupt_run_id_metadata(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        corrupt = replace(handle, metadata=handle.metadata | {"run_id": "../repo"})
+
+        with pytest.raises(OSError, match="invalid run_id"):
+            backend.cleanup(corrupt, allow_unpushed_work=True)
+
+        assert (repo / ".spec-workspaces" / "my-feature-abc" / "source").is_dir()
+
+    def test_cleanup_requires_spec_identity_even_for_owned_workspace_root(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        identity_free = replace(handle, branch="", metadata={})
+
+        with pytest.raises(OSError, match="invalid spec_id"):
+            backend.cleanup(identity_free, allow_unpushed_work=True)
+
+        assert handle.path.is_dir()
+
+    def test_cleanup_rejects_symlinked_run_directory(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        run_root = handle.outbox_path.parent
+        shutil.rmtree(run_root)
+        outside = tmp_path / "outside-run"
+        (outside / "source").mkdir(parents=True)
+        (outside / "outbox").mkdir()
+        sentinel = outside / "sentinel"
+        sentinel.write_text("keep\n")
+        run_root.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(OSError, match="symlink or junction"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert sentinel.read_text() == "keep\n"
+        assert run_root.is_symlink()
+
+    def test_cleanup_rejects_symlinked_workspace_root(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        workspace_root = handle.outbox_path.parent.parent
+        outside = tmp_path / "outside-workspaces"
+        workspace_root.rename(outside)
+        sentinel = outside / "keep.txt"
+        sentinel.write_text("keep\n")
+        workspace_root.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(OSError, match="symlink or junction"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert sentinel.read_text() == "keep\n"
+        assert workspace_root.is_symlink()
+
+    def test_cleanup_safely_migrates_legacy_workspace_without_owner_marker(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        owner_marker = handle.outbox_path.parent.parent / eb._WORKSPACE_OWNER_FILENAME
+        owner_marker.unlink()
+
+        backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert not handle.outbox_path.parent.exists()
+
+    def test_cleanup_safely_migrates_legacy_task_identity(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="task-feature-abc",
+            spec_id="task-feature",
+            branch="task/task-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        owner_marker = handle.outbox_path.parent.parent / eb._WORKSPACE_OWNER_FILENAME
+        owner_marker.unlink()
+
+        backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert not handle.outbox_path.parent.exists()
+
+    @pytest.mark.parametrize(
+        ("run_id", "spec_id", "branch"),
+        [
+            ("my-feature-abc", "my-feature", "code/my-feature--abc"),
+            ("task-feature-abc", "task-feature", "task/task-feature--abc"),
+        ],
+    )
+    def test_cleanup_safely_migrates_legacy_absolute_workspace_root(
+        self,
+        tmp_path: Path,
+        run_id: str,
+        spec_id: str,
+        branch: str,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        workspace_root = repo / ".absolute-spec-workspaces"
+        backend = self._make(str(workspace_root))
+        handle = backend.prepare_workspace(
+            run_id=run_id,
+            spec_id=spec_id,
+            branch=branch,
+            repo_root=repo,
+            base_ref="master",
+        )
+        (workspace_root / eb._WORKSPACE_OWNER_FILENAME).unlink()
+
+        backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert not handle.outbox_path.parent.exists()
+
+    def test_cleanup_refuses_malformed_workspace_owner_marker(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        owner_marker = handle.outbox_path.parent.parent / eb._WORKSPACE_OWNER_FILENAME
+        owner_marker.write_text("not-json\n")
+
+        with pytest.raises(OSError, match="invalid ownership marker"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert handle.path.is_dir()
+
+    def test_cleanup_refuses_symlinked_workspace_owner_marker(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        owner_marker = handle.outbox_path.parent.parent / eb._WORKSPACE_OWNER_FILENAME
+        owner_marker.unlink()
+        outside = tmp_path / "outside-owner.json"
+        outside.write_text(
+            json.dumps(
+                {
+                    "format": 1,
+                    "repo_root": str(repo.resolve()),
+                    "workspace_root": str(owner_marker.parent.resolve()),
+                }
+            )
+        )
+        owner_marker.symlink_to(outside)
+
+        with pytest.raises(OSError, match="linked ownership marker"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert handle.path.is_dir()
+        assert outside.is_file()
+
+    def test_cleanup_refuses_legacy_workspace_without_canonical_metadata(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        owner_marker = handle.outbox_path.parent.parent / eb._WORKSPACE_OWNER_FILENAME
+        owner_marker.unlink()
+
+        with pytest.raises(OSError, match="complete canonical metadata"):
+            backend.cleanup(replace(handle, metadata={}), allow_unpushed_work=True)
+
+        assert handle.path.is_dir()
+
+    def test_cleanup_refuses_mismatched_legacy_metadata(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        owner_marker = handle.outbox_path.parent.parent / eb._WORKSPACE_OWNER_FILENAME
+        owner_marker.unlink()
+        mismatched = replace(
+            handle,
+            metadata=handle.metadata | {"workspace_root": str(tmp_path / "outside")},
+        )
+
+        with pytest.raises(OSError, match="mismatched workspace_root metadata"):
+            backend.cleanup(mismatched, allow_unpushed_work=True)
+
+        assert handle.path.is_dir()
 
     def test_reprepare_preserves_uncommitted_changes(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -1684,6 +2003,7 @@ class _FakeContainerRunner:
         inspect_present_ids: Sequence[str] = (),
         cache_built_images: bool = False,
         build_delay_seconds: float = 0.0,
+        exec_stdout: str = "exec ok\n",
     ):
         self.calls: list[list[str]] = []
         self.cwd_calls: list[Path] = []
@@ -1696,7 +2016,12 @@ class _FakeContainerRunner:
         self.image_passwd = image_passwd
         self.image_group = image_group
         self.fail_cp = fail_cp
-        self.ps_container_ids = tuple(ps_container_ids)
+        # These sets model resources returned by an engine-side ownership-label
+        # query.  Cleanup must discover them from Docker, never trust names or
+        # ids copied out of the persisted backend state.
+        self.ps_container_ids = set(ps_container_ids)
+        self.owned_volume_ids: set[str] = set()
+        self.owned_network_ids: set[str] = set()
         self.fail_ps = fail_ps
         self.fail_rm_ids = set(fail_rm_ids)
         # Ids that ``docker inspect`` should report as still present (returncode
@@ -1704,6 +2029,7 @@ class _FakeContainerRunner:
         self.inspect_present_ids = set(inspect_present_ids)
         self.cache_built_images = cache_built_images
         self.build_delay_seconds = build_delay_seconds
+        self.exec_stdout = exec_stdout
         self.built_images: set[str] = set()
         self.image_state_lock = threading.Lock()
 
@@ -1740,11 +2066,67 @@ class _FakeContainerRunner:
                 return subprocess.CompletedProcess(argv, 1, "", "postgres failed\n")
             if self.fail_compose_stop and "stop" in argv:
                 return subprocess.CompletedProcess(argv, 1, "", "postgres still running\n")
+            if "up" in argv:
+                project = argv[3]
+                override = Path(argv[argv.index("-f", 5) + 1])
+                if override.is_file():
+                    payload = json.loads(override.read_text())
+                    for service in payload.get("services", {}):
+                        self.ps_container_ids.add(f"{project}-{service}-1")
+                    for volume in payload.get("volumes", {}):
+                        self.owned_volume_ids.add(f"{project}_{volume}")
+                    for network in payload.get("networks", {}):
+                        self.owned_network_ids.add(f"{project}_{network}")
             return subprocess.CompletedProcess(argv, 0, "compose ok\n", "")
         if argv[:2] == ["docker", "volume"] and "ls" in argv:
-            label = _value_after(argv, "--filter")
-            project = label.rsplit("=", 1)[-1] if label else "spec-stale"
-            return subprocess.CompletedProcess(argv, 0, f"{project}_postgres-data\n", "")
+            compose_filter = next(
+                (
+                    item
+                    for item in argv
+                    if item.startswith("label=com.docker.compose.project=")
+                ),
+                "",
+            )
+            if compose_filter:
+                project = compose_filter.rsplit("=", 1)[-1]
+                names = {
+                    name
+                    for name in self.owned_volume_ids
+                    if name.startswith(f"{project}_")
+                }
+                # Historical fake behavior exposed one compose-managed volume
+                # even for the minimal fixture. Keep that behavior while also
+                # recording it as engine-owned for the hardened cleanup query.
+                if not names:
+                    names = {f"{project}_postgres-data"}
+                    self.owned_volume_ids.update(names)
+            else:
+                names = self.owned_volume_ids
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "".join(f"{name}\n" for name in sorted(names)),
+                "",
+            )
+        if argv[:3] == ["docker", "volume", "create"]:
+            self.owned_volume_ids.add(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, f"{argv[-1]}\n", "")
+        if argv[:3] == ["docker", "volume", "rm"]:
+            self.owned_volume_ids.discard(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["docker", "network", "create"]:
+            self.owned_network_ids.add(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, f"{argv[-1]}\n", "")
+        if argv[:3] == ["docker", "network", "ls"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "".join(f"{name}\n" for name in sorted(self.owned_network_ids)),
+                "",
+            )
+        if argv[:3] == ["docker", "network", "rm"]:
+            self.owned_network_ids.discard(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:2] == ["docker", "create"]:
             return subprocess.CompletedProcess(argv, 0, "created\n", "")
         if argv[:2] == ["docker", "cp"]:
@@ -1767,11 +2149,17 @@ class _FakeContainerRunner:
         if argv[:2] == ["docker", "ps"]:
             if self.fail_ps:
                 return subprocess.CompletedProcess(argv, 1, "", "ps failed\n")
-            return subprocess.CompletedProcess(argv, 0, "".join(f"{cid}\n" for cid in self.ps_container_ids), "")
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "".join(f"{cid}\n" for cid in sorted(self.ps_container_ids)),
+                "",
+            )
         if argv[:3] == ["docker", "rm", "-f"]:
             target = argv[3] if len(argv) > 3 else ""
             if target in self.fail_rm_ids:
                 return subprocess.CompletedProcess(argv, 1, "", f"cannot remove {target}\n")
+            self.ps_container_ids.discard(target)
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:2] == ["docker", "inspect"]:
             target = argv[-1]
@@ -1797,6 +2185,14 @@ class _FakeContainerRunner:
                 Path(cidfile).write_text("container-123\n")
             if self.fail_in_worker_run and cidfile and "sleep infinity" in argv[-1]:
                 return subprocess.CompletedProcess(argv, 1, "", "worker failed\n")
+            if "-d" in argv:
+                container_id = (
+                    "container-123"
+                    if cidfile
+                    else _value_after(argv, "--name")
+                )
+                if container_id:
+                    self.ps_container_ids.add(container_id)
             snapshot_mount = next(
                 (
                     item
@@ -1821,7 +2217,7 @@ class _FakeContainerRunner:
                 return subprocess.CompletedProcess(argv, 1, "", "copy failed\n")
             return subprocess.CompletedProcess(argv, 0, "container ok\n", "")
         if argv[:2] == ["docker", "exec"]:
-            return subprocess.CompletedProcess(argv, 0, "exec ok\n", "")
+            return subprocess.CompletedProcess(argv, 0, self.exec_stdout, "")
         return subprocess.CompletedProcess(argv, 0, "", "")
 
 
@@ -1870,6 +2266,58 @@ class TestContainerBackend:
             runner=runner,
             system_name=system_name,
         )
+
+    def test_codex_provider_home_is_external_and_mounted_after_source(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        provider_home = backend.codex_provider_home_root(handle.path) / ".spec-codex-home"
+        with pytest.raises(ValueError):
+            provider_home.resolve().relative_to(handle.path.resolve())
+        assert provider_home.is_dir()
+        assert not (handle.path / ".spec-codex-home").exists()
+
+        worker_start = next(call for call in runner.calls if call[:3] == ["docker", "run", "-d"])
+        source_mount = next(
+            value for value in worker_start if value.endswith(":/workspace/source")
+        )
+        provider_mount = f"{provider_home}:/workspace/source/.spec-codex-home"
+        assert provider_mount in worker_start
+        assert worker_start.index(provider_mount) > worker_start.index(source_mount)
+
+        runner.calls.clear()
+        runner.envs.clear()
+        backend.launch_agent(
+            eb.AgentRequest(
+                argv=[
+                    "codex",
+                    "-c",
+                    f'permissions.provider.filesystem={{"{provider_home}"="deny"}}',
+                    "exec",
+                ],
+                cwd=handle.path,
+                env={"CODEX_HOME": str(provider_home)},
+            )
+        )
+
+        assert runner.calls[-1][:2] == ["docker", "exec"]
+        assert str(provider_home) not in " ".join(runner.calls[-1])
+        assert "/workspace/source/.spec-codex-home" in " ".join(runner.calls[-1])
+        assert runner.envs[-1]["CODEX_HOME"] == "/workspace/source/.spec-codex-home"
 
     def test_prepare_workspace_requires_docker_compatible_cli(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -3220,12 +3668,19 @@ class TestContainerBackend:
         assert "OPENAI_API_KEY=agent-secret" not in run_call
         assert "PATH=/host/bin" not in run_call
         assert "SPEC_SECRET_TOKEN=spec-secret" not in run_call
-        assert "APP_FEATURE_FLAG=enabled" in run_call
-        assert "DATABASE_URL=postgres://worker-db" in run_call
-        assert "SIM_TEST_DATABASE_URL=postgres://worker-test" in run_call
-        assert "SPEC_TEST=1" in run_call
-        assert "TEST_DATABASE_URL=postgres://worker-test-db" in run_call
-        assert "TERM=xterm-256color" in run_call
+        forwarded = {
+            "APP_FEATURE_FLAG": "enabled",
+            "DATABASE_URL": "postgres://worker-db",
+            "SIM_TEST_DATABASE_URL": "postgres://worker-test",
+            "SPEC_TEST": "1",
+            "TEST_DATABASE_URL": "postgres://worker-test-db",
+            "TERM": "xterm-256color",
+        }
+        assert runner.envs[-1] is not None
+        for key, value in forwarded.items():
+            assert key in run_call
+            assert f"{key}={value}" not in run_call
+            assert runner.envs[-1][key] == value
         state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
         assert "container-123" in state["containers"]
 
@@ -3247,6 +3702,13 @@ class TestContainerBackend:
             eb.AgentRequest(
                 argv=["claude", "-p", "implement"],
                 cwd=handle.path,
+                env={
+                    "APP_FEATURE_FLAG": "agent-feature-enabled",
+                    "DATABASE_URL": "postgres://agent:credential@db/spec",
+                    "DB_PASSWORD": "declared-db-password",
+                    "STRIPE_API_KEY": "declared-stripe-key",
+                },
+                declared_env_keys=frozenset({"DB_PASSWORD", "STRIPE_API_KEY"}),
             )
         )
 
@@ -3257,6 +3719,54 @@ class TestContainerBackend:
         # path — and their HOME comes from the launch env, never the pin.
         assert "SPEC_COMPLETION_OUTBOX=/workspace/outbox/completion-report.json" in agent_call
         assert "HOME=/workspace/source/.spec-claude-home" not in agent_call
+        assert runner.envs[-1] is not None
+        for key, value in {
+            "APP_FEATURE_FLAG": "agent-feature-enabled",
+            "DATABASE_URL": "postgres://agent:credential@db/spec",
+            "DB_PASSWORD": "declared-db-password",
+            "STRIPE_API_KEY": "declared-stripe-key",
+        }.items():
+            assert key in agent_call
+            assert f"{key}={value}" not in agent_call
+            assert runner.envs[-1][key] == value
+
+    def test_agent_launch_does_not_export_undeclared_ambient_secret(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        with patch.dict(
+            os.environ,
+            {"STRIPE_API_KEY": "operator-stripe-secret"},
+        ):
+            backend.launch_agent(
+                eb.AgentRequest(
+                    argv=["claude", "-p", "implement"],
+                    cwd=handle.path,
+                    env={"APP_FEATURE_FLAG": "enabled"},
+                )
+            )
+
+        agent_call = runner.calls[-1]
+        exported_names = {
+            agent_call[index + 1]
+            for index, value in enumerate(agent_call[:-1])
+            if value == "-e"
+        }
+        assert "APP_FEATURE_FLAG" in exported_names
+        assert "STRIPE_API_KEY" not in exported_names
 
     def test_non_agent_path_includes_workspace_venv_bin(self, tmp_path: Path):
         # Gate/prep commands run with the default cache-disabled bootstrap,
@@ -3376,7 +3886,10 @@ class TestContainerBackend:
         )
 
         run_call = runner.calls[-1]
-        assert "HOME=/workspace/source/.spec-claude-home" in run_call
+        assert "HOME" in run_call
+        assert "HOME=/workspace/source/.spec-claude-home" not in run_call
+        assert runner.envs[-1] is not None
+        assert runner.envs[-1]["HOME"] == "/workspace/source/.spec-claude-home"
         assert str(handle.path / ".spec-claude-home") not in run_call
 
     def test_run_command_allows_claude_secret_env_without_argv_values(self, tmp_path: Path):
@@ -3420,6 +3933,51 @@ class TestContainerBackend:
         assert "ANTHROPIC_API_KEY" in command_log_text
         assert "CLAUDE_CODE_OAUTH_TOKEN" in command_log_text
 
+    def test_run_command_redacts_every_forwarded_value_from_output(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner(
+            exec_stdout=(
+                "feature=enabled database=postgres://user:credential@db/spec "
+                "CI=1 identifier1 stays readable\n"
+            )
+        )
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        backend.run_command(
+            eb.CommandRequest(
+                argv=["printenv"],
+                cwd=handle.path,
+                env={
+                    "APP_FEATURE_FLAG": "enabled",
+                    "DATABASE_URL": "postgres://user:credential@db/spec",
+                    "CI": "1",
+                },
+            )
+        )
+
+        command_log = next(
+            (handle.outbox_path.parent / "logs").glob(
+                "*container-command-docker.log"
+            )
+        )
+        command_log_text = command_log.read_text()
+        assert "enabled" not in command_log_text
+        assert "credential" not in command_log_text
+        assert "CI=<redacted>" in command_log_text
+        assert "identifier1 stays readable" in command_log_text
+
     def test_backend_injects_postgres_env_for_in_worker_topology(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -3437,13 +3995,17 @@ class TestContainerBackend:
         backend.run_command(eb.CommandRequest(argv=["env"], cwd=handle.path))
 
         run_call = runner.calls[-1]
-        assert "DATABASE_URL=postgresql://spec:spec@127.0.0.1:5432/spec" in run_call
+        database_url = "postgresql://spec:spec@127.0.0.1:5432/spec"
+        assert "DATABASE_URL" in run_call
+        assert f"DATABASE_URL={database_url}" not in run_call
+        assert runner.envs[-1] is not None
+        assert runner.envs[-1]["DATABASE_URL"] == database_url
         state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
         assert state["service_env_redactions"]["DATABASE_URL"] == "<redacted>"
         command_log = next((handle.outbox_path.parent / "logs").glob("*container-command-docker.log"))
         command_log_text = command_log.read_text()
         assert "postgresql://spec:spec@127.0.0.1:5432/spec" not in command_log_text
-        assert "DATABASE_URL=<redacted>" in command_log_text
+        assert "DATABASE_URL" in command_log_text
 
     def test_backend_injects_postgres_env_and_network_for_sidecar_topology(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -3468,13 +4030,17 @@ class TestContainerBackend:
         )
         state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
         assert exec_call[:2] == ["docker", "exec"]
-        assert "DATABASE_URL=postgresql://spec:spec@postgres:5432/spec" in exec_call
+        database_url = "postgresql://spec:spec@postgres:5432/spec"
+        assert "DATABASE_URL" in exec_call
+        assert f"DATABASE_URL={database_url}" not in exec_call
+        assert runner.envs[-1] is not None
+        assert runner.envs[-1]["DATABASE_URL"] == database_url
         assert "--network" in worker_run_call
         assert worker_run_call[worker_run_call.index("--network") + 1] == state["service_networks"][0]
         command_log = next((handle.outbox_path.parent / "logs").glob("*container-command-docker.log"))
         command_log_text = command_log.read_text()
         assert "postgresql://spec:spec@postgres:5432/spec" not in command_log_text
-        assert "DATABASE_URL=<redacted>" in command_log_text
+        assert "DATABASE_URL" in command_log_text
 
     def test_bind_mode_runs_with_host_user_mapping_for_writable_mounts(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -3559,9 +4125,16 @@ class TestContainerBackend:
         assert "/workspace/source" in worker_argv
         assert "/workspace/outbox/result.json" in worker_argv
         assert "/workspace/logs." in worker_text
-        assert "SPEC_WORKTREE=/workspace/source" in run_call
-        assert "SPEC_OUTBOX=/workspace/outbox/result.json" in run_call
-        assert "SPEC_LOGS=/workspace/logs" in run_call
+        forwarded = {
+            "SPEC_WORKTREE": "/workspace/source",
+            "SPEC_OUTBOX": "/workspace/outbox/result.json",
+            "SPEC_LOGS": "/workspace/logs",
+        }
+        assert runner.envs[-1] is not None
+        for key, value in forwarded.items():
+            assert key in run_call
+            assert f"{key}={value}" not in run_call
+            assert runner.envs[-1][key] == value
         assert str(handle.path) not in worker_text
         assert str(handle.outbox_path) not in worker_text
         assert str(logs_dir) not in worker_text
@@ -4033,8 +4606,8 @@ class TestContainerBackend:
 
         assert runner.calls == []
 
-    def test_sync_host_paths_into_workspace_skips_missing_paths(self, tmp_path: Path):
-        """Relative paths that do not exist on the host are silently skipped."""
+    def test_sync_host_paths_into_workspace_removes_missing_paths(self, tmp_path: Path):
+        """Host absence is propagated so launch-only state leaves the volume."""
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         runner = _FakeContainerRunner()
@@ -4053,7 +4626,10 @@ class TestContainerBackend:
         backend.sync_host_paths_into_workspace(handle.path, (".does-not-exist",))
 
         sync_calls = [call for call in runner.calls if "/workspace/host:ro" in " ".join(call)]
-        assert sync_calls == []
+        assert sync_calls
+        joined = " ".join(sync_calls[-1])
+        assert "rm -rf /workspace/source/.does-not-exist" in joined
+        assert "cp -a" not in joined
 
     @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows cannot create file symlinks")
     def test_snapshot_restore_and_cleanup_are_idempotent(self, tmp_path: Path):
@@ -4359,9 +4935,219 @@ class TestContainerBackend:
 
         backend.cleanup(handle)
 
-        compose_calls = [call for call in runner.calls if call[:3] == ["docker", "compose", "-p"]]
-        assert any("down" in call and "--volumes" in call for call in compose_calls)
+        # Teardown is driven by exact engine-side ownership labels, not mutable
+        # compose paths/project names copied from the state file.
+        assert any(call[:3] == ["docker", "volume", "rm"] for call in runner.calls)
+        assert any(call[:3] == ["docker", "network", "rm"] for call in runner.calls)
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "down" in call
+            for call in runner.calls
+        )
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
+
+    def test_cleanup_refuses_service_data_directory_outside_source(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state_path = Path(handle.metadata["container_state_path"])
+        state = json.loads(state_path.read_text())
+        outside = tmp_path / "outside-data"
+        outside.mkdir()
+        sentinel = outside / "keep.txt"
+        sentinel.write_text("keep\n")
+        state["service_data_dirs"] = [str(outside)]
+        state_path.write_text(json.dumps(state))
+        runner.calls.clear()
+
+        with pytest.raises(OSError, match="outside source"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert sentinel.read_text() == "keep\n"
+        assert handle.path.is_dir()
+        assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
+
+    def test_cleanup_refuses_symlinked_service_data_directory(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state_path = Path(handle.metadata["container_state_path"])
+        state = json.loads(state_path.read_text())
+        data_dir = Path(state["service_data_dirs"][0])
+        data_dir.parent.mkdir(parents=True, exist_ok=True)
+        outside = tmp_path / "outside-data"
+        outside.mkdir()
+        sentinel = outside / "keep.txt"
+        sentinel.write_text("keep\n")
+        data_dir.symlink_to(outside, target_is_directory=True)
+        runner.calls.clear()
+
+        with pytest.raises(OSError, match="linked container service data"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert sentinel.read_text() == "keep\n"
+        assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
+
+    @pytest.mark.parametrize(
+        "relative_path",
+        ["src", "nested/../.local/postgres/data"],
+    )
+    def test_cleanup_refuses_noncanonical_service_data_directory_inside_source(
+        self,
+        tmp_path: Path,
+        relative_path: str,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state_path = Path(handle.metadata["container_state_path"])
+        state = json.loads(state_path.read_text())
+        state["service_data_dirs"] = [str(handle.path / relative_path)]
+        state_path.write_text(json.dumps(state))
+        runner.calls.clear()
+
+        with pytest.raises(OSError, match="service data directory|service_data_dirs"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert handle.path.is_dir()
+        assert runner.calls == []
+
+    def test_cleanup_refuses_mismatched_resource_labels_before_teardown(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state_path = Path(handle.metadata["container_state_path"])
+        state = json.loads(state_path.read_text())
+        state["resource_labels"]["spec.run_id"] = "some-other-run"
+        state_path.write_text(json.dumps(state))
+        runner.calls.clear()
+
+        with pytest.raises(OSError, match="resource labels"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert handle.path.is_dir()
+        assert runner.calls == []
+
+    def test_cleanup_refuses_unauthenticated_service_pid(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state_path = Path(handle.metadata["container_state_path"])
+        state = json.loads(state_path.read_text())
+        state["service_processes"].append({"pid": os.getpid()})
+        state_path.write_text(json.dumps(state))
+        runner.calls.clear()
+
+        with pytest.raises(OSError, match="unauthenticated service process PID"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert handle.path.is_dir()
+        assert runner.calls == []
+
+    def test_cleanup_fails_closed_when_owned_resource_discovery_fails(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        runner.calls.clear()
+        runner.fail_ps = True
+
+        with pytest.raises(OSError, match="owned container discovery failed"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert handle.path.is_dir()
+        assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
+
+    def test_cleanup_preserves_service_data_when_container_removal_fails(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        data_dir = Path(state["service_data_dirs"][0])
+        data_dir.mkdir(parents=True, exist_ok=True)
+        sentinel = data_dir / "database-file"
+        sentinel.write_text("keep\n")
+        runner.fail_rm_ids.add("container-123")
+        runner.calls.clear()
+
+        with pytest.raises(OSError, match="owned container cleanup failed"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert sentinel.read_text() == "keep\n"
+        assert handle.path.is_dir()
 
     def test_stale_service_cleanup_uses_persisted_state_without_running_worker(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -4375,17 +5161,28 @@ class TestContainerBackend:
         source.mkdir(parents=True)
         outbox.mkdir(parents=True)
         state_path.parent.mkdir(parents=True)
+        labels = backend._resource_labels(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            workspace_root=source,
+        )
+        runner.ps_container_ids.add("owned-container")
+        runner.owned_volume_ids.add("owned-volume")
+        runner.owned_network_ids.add("owned-network")
         state_path.write_text(
             json.dumps(
                 {
                     "service_topology": "sidecar",
                     "compose_file": str(repo / "compose.yaml"),
                     "compose_project": "spec-stale",
-                    "containers": ["container-123"],
-                    "volumes": ["spec-stale-postgres-data"],
-                    "networks": ["spec-stale-network"],
+                    # Raw state ids are intentionally unrelated to what the
+                    # ownership-filtered engine queries return.
+                    "containers": ["state-attacker-container"],
+                    "volumes": ["state-attacker-volume"],
+                    "networks": ["state-attacker-network"],
                     "service_processes": [],
                     "service_data_dirs": [],
+                    "resource_labels": labels,
                 }
             )
         )
@@ -4396,14 +5193,33 @@ class TestContainerBackend:
                 outbox_path=outbox,
                 branch="code/my-feature--abc",
                 backend="container",
+                metadata={
+                    "run_id": "my-feature-abc",
+                    "spec_id": "my-feature",
+                    "repo_root": str(repo.resolve()),
+                    "workspace_root": str((repo / ".spec-workspaces").resolve()),
+                },
             )
         )
 
         cleanup_text = "\n".join(" ".join(call) for call in runner.calls)
-        assert "docker compose -p spec-stale" in cleanup_text
-        assert "docker rm -f container-123" in cleanup_text
-        assert "docker volume rm -f spec-stale-postgres-data" in cleanup_text
-        assert "docker network rm spec-stale-network" in cleanup_text
+        assert "docker rm -f owned-container" in cleanup_text
+        assert "docker volume rm -f owned-volume" in cleanup_text
+        assert "docker network rm owned-network" in cleanup_text
+        assert "state-attacker" not in cleanup_text
+        expected_filters = {
+            f"label={key}={value}" for key, value in labels.items()
+        }
+        discovery_calls = [
+            call
+            for call in runner.calls
+            if call[:2] == ["docker", "ps"]
+            or call[:3] == ["docker", "volume", "ls"]
+            or call[:3] == ["docker", "network", "ls"]
+        ]
+        assert len(discovery_calls) == 3
+        assert all(expected_filters.issubset(set(call)) for call in discovery_calls)
+        assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
     def test_missing_snapshot_restore_recreates_fresh_workspace(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -4596,13 +5412,32 @@ class TestContainerBackend:
         state_path.write_text(json.dumps(state))
 
         runner.calls.clear()
+        runner.envs.clear()
         backend.run_command(
             eb.CommandRequest(
                 argv=["echo", "hello"],
                 cwd=handle.path,
+                env={
+                    "APP_FEATURE_FLAG": "fallback-feature-enabled",
+                    "DATABASE_URL": "postgres://fallback:credential@db/spec",
+                },
             )
         )
-        run_call = next(call for call in runner.calls if call[:3] == ["docker", "run", "--rm"])
+        run_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:3] == ["docker", "run", "--rm"] and call[-2:] == ["echo", "hello"]
+        )
+        run_call = runner.calls[run_index]
+        client_env = runner.envs[run_index]
+        assert client_env is not None
+        for key, value in {
+            "APP_FEATURE_FLAG": "fallback-feature-enabled",
+            "DATABASE_URL": "postgres://fallback:credential@db/spec",
+        }.items():
+            assert key in run_call
+            assert f"{key}={value}" not in run_call
+            assert client_env[key] == value
         passwd_mount = f"{run_root / 'passwd-shim' / 'passwd'}:/etc/passwd:ro"
         group_mount = f"{run_root / 'passwd-shim' / 'group'}:/etc/group:ro"
         assert "--user" in run_call
@@ -5365,6 +6200,7 @@ class TestImplementLaunchRoutesThroughBackend:
                 "text": True,
             },
             progress_tracker=None,
+            declared_agent_env_keys=frozenset({"STRIPE_API_KEY"}),
         )
 
         exit_code = orch._launch_implement_attempt(run, tmp_path, worktree, plan)
@@ -5376,6 +6212,7 @@ class TestImplementLaunchRoutesThroughBackend:
         assert request.argv == ["echo", "implement"]
         assert request.cwd == worktree
         assert request.env == {"FOO": "bar"}
+        assert request.declared_env_keys == frozenset({"STRIPE_API_KEY"})
         # cwd/env are owned by the backend via dedicated AgentRequest fields,
         # so they must not also appear in popen_kwargs (otherwise the backend
         # would receive duplicate keyword arguments).
@@ -5459,6 +6296,7 @@ class TestPublishHonorsOutboxMetadata:
             patch.object(orch, "_head_sha", return_value=head_sha),
             patch.object(orch, "_gate_status_path", return_value=tmp_path / "gate.json"),
             patch.object(orch, "_reset_local_review_gate_for_head"),
+            patch.object(orch, "_assert_publication_transition_safe"),
         ):
             result = orch.phase_publish(run, tmp_path)
 
@@ -5559,3 +6397,105 @@ class TestContainerWorkerEnvHostPathDenylist:
         assert "TMP" not in filtered
         assert "TEMP" not in filtered
         assert filtered["SPEC_ID"] == "example"
+
+    def test_filter_drops_invalid_names_and_values(self) -> None:
+        filtered = eb.ContainerExecutionBackend._filter_container_worker_env(
+            {
+                "VALID_NAME": "forwarded",
+                "BAD-NAME": "not-forwarded",
+                "NAME=SMUGGLED": "not-forwarded",
+                "NON_STRING_VALUE": None,
+            }
+        )
+
+        assert filtered == {"VALID_NAME": "forwarded"}
+
+    def test_sensitive_names_require_explicit_declaration(self) -> None:
+        env = {
+            "APP_FEATURE_FLAG": "enabled",
+            "DB_PASSWORD": "database-secret",
+            "STRIPE_API_KEY": "stripe-secret",
+            "UNDECLARED_API_KEY": "operator-secret",
+        }
+
+        filtered = eb.ContainerExecutionBackend._filter_container_worker_env(
+            env,
+            declared_env_keys=frozenset({"DB_PASSWORD", "STRIPE_API_KEY"}),
+        )
+
+        assert filtered == {
+            "APP_FEATURE_FLAG": "enabled",
+            "DB_PASSWORD": "database-secret",
+            "STRIPE_API_KEY": "stripe-secret",
+        }
+
+    @pytest.mark.parametrize(
+        "key",
+        ["NODE_OPTIONS", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONINSPECT"],
+    )
+    def test_declared_env_cannot_instrument_provider_startup(self, key: str) -> None:
+        filtered = eb.ContainerExecutionBackend._filter_container_worker_env(
+            {key: "repository-controlled"},
+            declared_env_keys=frozenset({key}),
+        )
+
+        assert filtered == {}
+
+    def test_client_env_overlays_empty_values_without_ambient_smuggling(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "APP_FEATURE_FLAG": "ambient-value",
+                "EMPTY_FEATURE": "ambient-value",
+                "OPERATOR_ONLY": "operator-secret",
+            },
+            clear=True,
+        ):
+            isolated = eb.ContainerExecutionBackend._container_client_env(
+                {
+                    "APP_FEATURE_FLAG": "request-value",
+                    "EMPTY_FEATURE": "",
+                },
+                inherit_env=False,
+            )
+            inherited = eb.ContainerExecutionBackend._container_client_env(
+                {
+                    "APP_FEATURE_FLAG": "request-value",
+                    "EMPTY_FEATURE": "",
+                }
+            )
+
+        assert isolated == {
+            "APP_FEATURE_FLAG": "request-value",
+            "EMPTY_FEATURE": "",
+        }
+        assert inherited["APP_FEATURE_FLAG"] == "request-value"
+        assert inherited["EMPTY_FEATURE"] == ""
+        assert inherited["OPERATOR_ONLY"] == "operator-secret"
+
+    def test_all_forwarded_values_are_log_redaction_candidates(self) -> None:
+        redactions = eb.ContainerExecutionBackend._request_env_log_redactions(
+            {
+                "DATABASE_URL": "postgres://user:credential@db/spec",
+                "FEATURE_FLAG": "enabled",
+                "CI": "1",
+                "EMPTY": "",
+            }
+        )
+
+        assert redactions == [
+            "postgres://user:credential@db/spec",
+            "enabled",
+            "1",
+        ]
+        redacted = eb._redact_log_text(
+            "database status enabled; CI=1; identifier1 stays readable",
+            redactions,
+        )
+        assert "credential" not in eb._redact_log_text(
+            "postgres://user:credential@db/spec",
+            redactions,
+        )
+        assert redacted == (
+            "database status <redacted>; CI=<redacted>; identifier1 stays readable"
+        )

@@ -91,6 +91,8 @@ class ForgeAdapter(Protocol):
         remote: str = "origin",
         force: bool = False,
         expect_sha: str = "",
+        env: dict[str, str] | None = None,
+        remote_url: str = "",
     ) -> PushResult:
         """Push a local branch to the remote.
 
@@ -234,8 +236,14 @@ class GitHubForge:
         mock command execution via a single patch point.
     """
 
-    def __init__(self, *, run_fn: RunFn | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        run_fn: RunFn | None = None,
+        repo_slug: str = "",
+    ) -> None:
         self._run = run_fn or _default_run_fn
+        self._repo_slug = repo_slug.strip()
 
     def get_auth_token(self) -> str:
         # Prefer explicit env vars over gh CLI to avoid unnecessary subprocess calls.
@@ -259,6 +267,13 @@ class GitHubForge:
         kwargs: dict[str, object] = {}
         if timeout is not None:
             kwargs["timeout"] = timeout
+        if self._repo_slug:
+            env = dict(os.environ)
+            # ``gh`` otherwise resolves the repository from cwd on every call.
+            # Agent-writable checkout metadata must never be allowed to retarget
+            # a host-owned forge query or mutation after launch.
+            env["GH_REPO"] = self._repo_slug
+            kwargs["env"] = env
         return self._run(["gh", *args], cwd=cwd, **kwargs)
 
     def push_branch(
@@ -270,16 +285,23 @@ class GitHubForge:
         force: bool = False,
         set_upstream: bool = True,
         expect_sha: str = "",
+        env: dict[str, str] | None = None,
+        remote_url: str = "",
     ) -> PushResult:
         cmd = ["git", "push"]
-        if set_upstream:
+        if set_upstream and not remote_url:
             cmd.append("-u")
         if expect_sha:
             cmd.append(f"--force-with-lease={branch}:{expect_sha}")
         elif force:
             cmd.append("--force-with-lease")
-        cmd.extend([remote, branch])
-        result = self._run(cmd, cwd=cwd)
+        destination = remote_url or remote
+        refspec = f"{branch}:refs/heads/{branch}" if remote_url else branch
+        cmd.extend([destination, refspec])
+        kwargs: dict[str, object] = {}
+        if env is not None:
+            kwargs["env"] = env
+        result = self._run(cmd, cwd=cwd, **kwargs)
         if result.returncode != 0:
             return PushResult(ok=False, message=result.stderr.strip())
         return PushResult(ok=True)
@@ -599,6 +621,8 @@ class GitHubForge:
             return False
 
     def get_repo_slug(self, *, cwd: Path | None = None) -> str:
+        if self._repo_slug:
+            return self._repo_slug
         result = self._gh(
             ["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
             cwd=cwd,

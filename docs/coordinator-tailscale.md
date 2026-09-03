@@ -40,6 +40,14 @@ operator tokens, prints each bearer token once, and prints the matching
 environment variable, or uncommitted local config file. The database stores
 only token hashes.
 
+On POSIX, missing database directories are created with mode `0700`; the
+database and its live WAL/SHM files use mode `0600`. Existing parent-directory
+permissions are left unchanged. The service refuses a database path that is a
+symlink or another non-regular file. The database's immediate parent must be
+owned by the current user and must not be group/world-writable. If an existing
+directory fails this check, choose a private directory or remove group/other
+write permission before starting the service.
+
 For a Tailscale-only listener, bind to the host's Tailscale IP:
 
 ```bash
@@ -52,6 +60,26 @@ For a local SSH tunnel, keep the service bound to loopback:
 ```bash
 spec coord serve --host 127.0.0.1 --port 8765 --db ~/.local/state/spec/coord.sqlite
 ```
+
+Normally the hashed tokens created by `spec coord init --server` are all the
+server needs. If you additionally configure fixed worker or operator bootstrap
+tokens, prefer private token files so the secrets do not appear in the process
+command line:
+
+```bash
+spec coord serve --host 127.0.0.1 --port 8765 \
+  --db ~/.local/state/spec/coord.sqlite \
+  --worker-token-file ~/.config/spec/coord-worker.token \
+  --operator-token-file ~/.config/spec/coord-operator.token
+```
+
+Each token file must contain one token. On POSIX it must be owned by the current
+user and not readable by group or other users (`chmod 600 FILE`), and its
+immediate parent directory must be user-owned and not group/world-writable. The
+raw `--worker-token` and `--operator-token` forms are deprecated because other
+local users may be able to observe command-line arguments. The corresponding
+`SPEC_COORDINATOR_WORKER_TOKEN` and `SPEC_COORDINATOR_OPERATOR_TOKEN`
+environment variables remain supported.
 
 Then create a tunnel from each worker:
 
@@ -176,7 +204,9 @@ spec coord token revoke --db ~/.local/state/spec/coord.sqlite --name worker-alic
 ```
 
 Existing workers using a revoked token will fail closed the next time they need
-to acquire or heartbeat a coordinator lease.
+to acquire or heartbeat a coordinator lease. A failed old-token heartbeat
+cannot extend the lease; it expires after its last accepted TTL, which the
+server caps at one hour.
 
 ## Machine IDs
 
@@ -202,9 +232,12 @@ lease before working on a spec. A second machine attempting the same repo/spec
 while the lease is active receives a conflict that names the current owner,
 run id, heartbeat age, and expiry time.
 
-The default coordinator lease TTL is 900 seconds. Active runs heartbeat during
-long phases so the lease expiry is extended while the owner is alive. You can
-override the TTL for orchestrator clients with:
+The default coordinator lease TTL is 900 seconds. The server accepts integer
+TTLs from 1 through 3600 seconds for both acquire and heartbeat requests and
+rejects values outside that range, so a client cannot create an indefinitely
+stale lease. Active runs heartbeat during long phases so the lease expiry is
+extended while the owner is alive. You can override the TTL for orchestrator
+clients with:
 
 ```bash
 export SPEC_COORDINATOR_LEASE_TTL_SECONDS=900
@@ -212,7 +245,9 @@ export SPEC_COORDINATOR_LEASE_TTL_SECONDS=900
 
 If a machine crashes or loses network access, its heartbeat stops. Once the TTL
 expires, another machine can acquire the spec. The old lease is marked
-`expired`, and the new lease becomes active.
+`expired`, and the new lease becomes active. The same bounded self-healing
+applies after token rotation or revocation: rejected old-token heartbeats leave
+the last accepted lease to expire after no more than 3600 seconds.
 
 Normal lifecycle outcomes:
 
