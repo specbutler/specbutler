@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -197,6 +198,8 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
     port = _free_port()
     stdout_path = tmp_path / "chrome-server.stdout.log"
     stderr_path = tmp_path / "chrome-server.stderr.log"
+    browser_stdout_path = tmp_path / "chrome.stdout.log"
+    browser_stderr_path = tmp_path / "chrome.stderr.log"
     profile = tmp_path / "chrome-profile"
     with (
         stdout_path.open("w", encoding="utf-8") as stdout,
@@ -227,25 +230,119 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
             assert token not in opening_url
             assert "bootstrap=" in opening_url
 
-            browser = subprocess.run(
-                [
-                    chrome,
-                    "--headless=new",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-dev-shm-usage",
-                    f"--user-data-dir={profile}",
-                    "--virtual-time-budget=3000",
-                    "--dump-dom",
-                    opening_url,
-                ],
-                text=True,
-                capture_output=True,
-                timeout=30,
-                check=False,
-            )
-            assert browser.returncode == 0, browser.stderr[-1000:]
-            assert 'class="summary-row"' in browser.stdout
+            with (
+                browser_stdout_path.open("w", encoding="utf-8") as browser_stdout,
+                browser_stderr_path.open("w", encoding="utf-8") as browser_stderr,
+            ):
+                browser = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+                    [
+                        chrome,
+                        "--headless=new",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--disable-dev-shm-usage",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        f"--user-data-dir={profile}",
+                        "--remote-debugging-address=127.0.0.1",
+                        "--remote-debugging-port=0",
+                        opening_url,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=browser_stdout,
+                    stderr=browser_stderr,
+                )
+                try:
+                    deadline = time.monotonic() + 30
+                    page_target: dict[str, object] | None = None
+                    last_browser_error: Exception | None = None
+                    debug_port: int | None = None
+                    while time.monotonic() < deadline:
+                        try:
+                            if debug_port is None:
+                                active_port = profile / "DevToolsActivePort"
+                                debug_port = int(
+                                    active_port.read_text(encoding="utf-8")
+                                    .splitlines()[0]
+                                    .strip()
+                                )
+                            with urllib.request.urlopen(
+                                f"http://127.0.0.1:{debug_port}/json/list",
+                                timeout=1,
+                            ) as response:
+                                targets = json.load(response)
+                            page_target = next(
+                                (
+                                    target
+                                    for target in targets
+                                    if target.get("type") == "page"
+                                    and target.get("title") == "spec web"
+                                    and str(target.get("url", "")).startswith(
+                                        f"http://127.0.0.1:{port}/"
+                                    )
+                                    and "bootstrap="
+                                    not in str(target.get("url", ""))
+                                ),
+                                None,
+                            )
+                            if page_target is not None:
+                                break
+                        except (
+                            IndexError,
+                            OSError,
+                            ValueError,
+                            urllib.error.URLError,
+                        ) as exc:
+                            last_browser_error = exc
+                        if browser.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                    assert page_target is not None, (
+                        "Chrome did not load the authenticated clean URL: "
+                        f"debug_port={debug_port}, error={last_browser_error}\n"
+                        f"{browser_stderr_path.read_text(errors='replace')[-2000:]}"
+                    )
+                    current_url = str(page_target["url"])
+                    assert token not in current_url
+                    assert "bootstrap=" not in current_url
+                    assert "spec-csrf" not in current_url
+                    target_id = str(page_target["id"])
+                    close_request = urllib.request.Request(
+                        (
+                            f"http://127.0.0.1:{debug_port}"
+                            f"/json/close/{target_id}"
+                        ),
+                        method="PUT",
+                    )
+                    with urllib.request.urlopen(close_request, timeout=2) as response:
+                        assert response.read().decode() == "Target is closing"
+
+                    # Closing the page through the browser protocol gives
+                    # Chrome a deterministic history-commit boundary without
+                    # depending on --dump-dom to exit while the app has live
+                    # timers and streams.
+                    close_deadline = time.monotonic() + 5
+                    while time.monotonic() < close_deadline:
+                        if browser.poll() is not None:
+                            break
+                        with urllib.request.urlopen(
+                            f"http://127.0.0.1:{debug_port}/json/list",
+                            timeout=1,
+                        ) as response:
+                            targets = json.load(response)
+                        if all(target.get("id") != target_id for target in targets):
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError("Chrome did not close the audited page")
+                finally:
+                    if browser.owned_tree_active():
+                        browser.send_signal(signal.SIGINT)
+                    try:
+                        browser.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        assert browser.terminate(grace_seconds=1)
+                        browser.wait(timeout=5)
 
             history_path = profile / "Default" / "History"
             assert history_path.is_file()
