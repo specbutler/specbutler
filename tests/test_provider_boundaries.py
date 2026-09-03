@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from spec_runtime import orchestrator as orch
+from spec_runtime import provider_env as pe
 from spec_runtime.agent_adapter import (
     ClaudeAgent,
     CodexAgent,
@@ -216,6 +217,23 @@ def test_protected_operator_paths_cover_common_and_configured_credentials(
     assert tmp_path / "state" / "specbutler" in protected
     if sys.platform.startswith("linux"):
         assert Path("/proc") in protected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="XDG state applies to POSIX hosts")
+def test_macos_user_state_honors_explicit_absolute_xdg_root(tmp_path: Path) -> None:
+    xdg_state = tmp_path / "xdg-state"
+    mac_home = tmp_path / "mac-home"
+
+    with (
+        patch.object(pe.sys, "platform", "darwin"),
+        patch.object(pe.Path, "home", return_value=mac_home),
+    ):
+        assert pe.specbutler_user_state_root(
+            {"XDG_STATE_HOME": str(xdg_state)}
+        ) == (xdg_state / "specbutler")
+        assert pe.specbutler_user_state_root(
+            {"XDG_STATE_HOME": "relative-state"}
+        ) == (mac_home / "Library" / "Application Support" / "SpecButler")
 
 
 def test_claude_provider_credential_classification_covers_auth_transports() -> None:

@@ -1439,11 +1439,11 @@ def specbutler_user_state_root(
         if configured:
             return Path(configured).expanduser() / "SpecButler"
         return Path.home() / "AppData" / "Local" / "SpecButler"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "SpecButler"
     configured = values.get("XDG_STATE_HOME")
     if configured and Path(configured).expanduser().is_absolute():
         return Path(configured).expanduser() / "specbutler"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "SpecButler"
     return Path.home() / ".local" / "state" / "specbutler"
 
 
