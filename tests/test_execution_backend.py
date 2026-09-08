@@ -1951,6 +1951,54 @@ class TestCloneBackend:
         assert index[-1]["preserved"] is False
         assert "unpushed commits" in index[-1]["unpreserved"]
 
+    def test_rescue_does_not_probe_worktree_state_after_finding_submodule(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+
+        with (
+            patch.object(
+                backend,
+                "_checked_out_submodules",
+                return_value=["child"],
+            ),
+            patch.object(
+                backend,
+                "_unpushed_commits",
+                side_effect=AssertionError("must not inspect history"),
+            ),
+            patch.object(
+                backend,
+                "_has_uncommitted_changes",
+                side_effect=AssertionError("must not inspect status"),
+            ),
+            patch.object(
+                backend,
+                "_untracked_files",
+                side_effect=AssertionError("must not inspect untracked files"),
+            ),
+        ):
+            manifest = backend._rescue_unpushed_work(
+                handle.path,
+                handle.outbox_path.parent,
+                reason="test",
+            )
+
+        assert manifest is not None
+        assert manifest["checked_out_submodules"] == ["child"]
+        assert manifest["preserved"] is False
+        assert manifest["unpreserved"] == ["checked-out submodule work"]
+
     @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows cannot create file symlinks")
     def test_rescue_preserves_untracked_symlink_without_following_it(self, tmp_path: Path):
         # An untracked symlink pointing outside the workspace must be captured
@@ -6426,17 +6474,34 @@ class TestContainerBackend:
         (handle.path / "child" / "README.md").write_text("dirty submodule\n")
 
         backend.prepare_host_access(handle)
+        probe = """
+import sys
+from pathlib import Path
+from spec_runtime.config import ExecutionConfig
+from spec_runtime.execution_backend import CloneExecutionBackend
+
+source = Path(sys.argv[1])
+backend = CloneExecutionBackend(
+    ExecutionConfig(
+        backend="clone",
+        workspace_root=str(source.parent.parent),
+        backend_explicit=True,
+    )
+)
+print(backend._has_uncommitted_changes(source))
+"""
         started = time.monotonic()
         status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=handle.path,
+            [sys.executable, "-c", probe, str(handle.path)],
+            cwd=PROJECT_ROOT,
             text=True,
             capture_output=True,
             timeout=5,
             check=False,
         )
 
-        assert status.returncode == 0, status.stderr
+        assert status.returncode == 0, status.stdout + status.stderr
+        assert status.stdout.strip() == "False"
         assert time.monotonic() - started < 5
         assert not marker.exists()
 

@@ -2658,10 +2658,22 @@ class CloneExecutionBackend:
         are captured. Self-gitignored orchestrator secrets under
         ``.spec-claude-home`` are excluded from every artifact.
         """
-        unpushed = self._unpushed_commits(source)
-        dirty = self._has_uncommitted_changes(source)
-        untracked = self._untracked_files(source)
         submodules = self._checked_out_submodules(source)
+        if submodules:
+            # Inspect gitlinks before any command that asks Git about worktree
+            # state. Newer Git versions may enter a checked-out submodule while
+            # answering those queries, which would let agent-controlled nested
+            # config (for example an included FIFO or fsmonitor) block the host
+            # orchestrator. Nested work cannot be captured safely without
+            # crossing that trust boundary, so record it as unpreserved and let
+            # restore abort with the original tree intact.
+            unpushed: list[str] = []
+            dirty = False
+            untracked: list[str] = []
+        else:
+            unpushed = self._unpushed_commits(source)
+            dirty = self._has_uncommitted_changes(source)
+            untracked = self._untracked_files(source)
         if not unpushed and not dirty and not untracked and not submodules:
             return None
 
@@ -2802,17 +2814,30 @@ class CloneExecutionBackend:
         """
         if allow_unpushed_work:
             return
+        # Check gitlinks first. Some Git versions enter checked-out submodules
+        # while answering broader worktree-status queries; nested config is
+        # agent-controlled and may contain a blocking include or executable
+        # helper. A populated submodule alone is enough to make automatic
+        # deletion unsafe, so fail before running any such query.
+        submodules = self._checked_out_submodules(source)
+        if submodules:
+            raise WorkspaceHasUnpushedWorkError(
+                source,
+                [],
+                dirty=False,
+                untracked=[],
+                submodules=submodules,
+            )
         unpushed = self._unpushed_commits(source)
         dirty = self._has_uncommitted_changes(source)
         untracked = self._untracked_files(source)
-        submodules = self._checked_out_submodules(source)
-        if unpushed or dirty or untracked or submodules:
+        if unpushed or dirty or untracked:
             raise WorkspaceHasUnpushedWorkError(
                 source,
                 unpushed,
                 dirty=dirty,
                 untracked=untracked,
-                submodules=submodules,
+                submodules=[],
             )
 
     @staticmethod
