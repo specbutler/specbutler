@@ -296,6 +296,8 @@ def test_host_publication_environment_disables_hooks_and_git_redirects(
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.hooksPath")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "/attacker/hooks")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/attacker/system-gitconfig")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "claude-secret")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "authorization: secret")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
@@ -309,6 +311,8 @@ def test_host_publication_environment_disables_hooks_and_git_redirects(
 
     assert "GIT_DIR" not in env
     assert "GIT_SSH_COMMAND" not in env
+    assert "GIT_CONFIG_NOSYSTEM" not in env
+    assert "GIT_CONFIG_SYSTEM" not in env
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
     assert "ANTHROPIC_CUSTOM_HEADERS" not in env
     assert "OPENAI_API_KEY" not in env

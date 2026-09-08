@@ -376,6 +376,8 @@ def host_publication_git_environment() -> dict[str, str]:
                 "GIT_ASKPASS",
                 "GIT_COMMON_DIR",
                 "GIT_CONFIG",
+                "GIT_CONFIG_NOSYSTEM",
+                "GIT_CONFIG_SYSTEM",
                 "GIT_DIR",
                 "GIT_OBJECT_DIRECTORY",
                 "GIT_PROXY_COMMAND",
@@ -402,7 +404,14 @@ def host_publication_git_environment() -> dict[str, str]:
     for index, (key, value) in enumerate(entries):
         env[f"GIT_CONFIG_KEY_{index}"] = key
         env[f"GIT_CONFIG_VALUE_{index}"] = value
-    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    # Retain the host installation's real system Git policy. In particular,
+    # Git for Windows commonly defines ``core.autocrlf`` there; disabling the
+    # system file after verification can make an unchanged spec appear dirty
+    # during publication and create an unverified line-ending-only commit.
+    # ``GIT_CONFIG_SYSTEM`` and ``GIT_CONFIG_NOSYSTEM`` were removed above so
+    # the inherited environment cannot redirect or suppress that trusted
+    # machine-level file. Command-scope entries still override hooks and other
+    # publication-sensitive settings below.
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
