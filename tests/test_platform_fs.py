@@ -13,7 +13,13 @@ from pathlib import Path
 import pytest
 
 from spec_runtime.platform import is_unc_path
-from spec_runtime.platform_fs import FileLock, _windows_extended_path, atomic_write_text, remove_tree
+from spec_runtime.platform_fs import (
+    FileLock,
+    _windows_extended_path,
+    atomic_write_text,
+    read_bounded_regular_text,
+    remove_tree,
+)
 from spec_runtime.spec_identity import SPEC_ID_RE
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +93,74 @@ def test_atomic_write_text_uses_bounded_temp_basename(
         assert temporary.parent == read_path.parent
         assert path.name not in temporary.name
         assert len(temporary.name) <= 32
+
+
+def test_read_bounded_regular_text_reads_regular_file(tmp_path: Path) -> None:
+    path = tmp_path / "result.json"
+    path.write_bytes(b'{"status": "ok"}\n')
+
+    assert read_bounded_regular_text(path, max_bytes=64) == '{"status": "ok"}\n'
+
+
+def test_read_bounded_regular_text_preserves_crlf(tmp_path: Path) -> None:
+    path = tmp_path / "result.txt"
+    path.write_bytes(b"first\r\nsecond\r\n")
+
+    assert read_bounded_regular_text(path, max_bytes=64) == "first\r\nsecond\r\n"
+
+
+def test_read_bounded_regular_text_rejects_oversized_file(tmp_path: Path) -> None:
+    path = tmp_path / "result.json"
+    path.write_text("12345")
+
+    with pytest.raises(OSError, match="oversized"):
+        read_bounded_regular_text(path, max_bytes=4)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX symbolic links")
+def test_read_bounded_regular_text_rejects_leaf_symlink(tmp_path: Path) -> None:
+    target = tmp_path / "operator-owned"
+    target.write_text("secret")
+    path = tmp_path / "result.json"
+    path.symlink_to(target)
+
+    with pytest.raises(OSError, match="non-regular"):
+        read_bounded_regular_text(path, max_bytes=64)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX FIFOs")
+def test_read_bounded_regular_text_rejects_fifo_without_blocking(tmp_path: Path) -> None:
+    path = tmp_path / "result.json"
+    os.mkfifo(path)
+    started = time.monotonic()
+
+    with pytest.raises(OSError, match="non-regular"):
+        read_bounded_regular_text(path, max_bytes=64)
+
+    assert time.monotonic() - started < 1
+
+
+def test_read_bounded_regular_text_rejects_leaf_replacement_race(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from spec_runtime import platform_fs
+
+    path = tmp_path / "result.json"
+    replacement = tmp_path / "replacement.json"
+    path.write_text("original")
+    replacement.write_text("replacement")
+    real_open = platform_fs.os.open
+
+    def replace_then_open(target: Path, flags: int) -> int:
+        if Path(target) == path:
+            os.replace(replacement, path)
+        return real_open(target, flags)
+
+    monkeypatch.setattr(platform_fs.os, "open", replace_then_open)
+
+    with pytest.raises(OSError, match="replaced"):
+        read_bounded_regular_text(path, max_bytes=64)
 
 
 def test_locked_state_updates_survive_multiple_processes(tmp_path: Path) -> None:

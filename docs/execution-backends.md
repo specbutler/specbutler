@@ -168,6 +168,35 @@ If the project publishes a maintained worker image, set `image` instead of
 Choose an explicit mode only after the `auto` smoke test demonstrates a reason
 to override it.
 
+Container resource names include a digest of the canonical workspace path, so
+two checkouts cannot collide when they happen to reuse a run ID. Treat those
+names as implementation details: automation should discover resources from the
+run state and `spec.*` labels, not reproduce the naming formula. A retry may
+retain a development-era resource name only when the saved run has every
+current safety marker and the engine proves exact ownership.
+
+Keep the same container engine and daemon endpoint/context for the lifetime of
+a run, including cleanup. Spec Butler rejects a changed engine command before
+contacting either engine, but a changed `DOCKER_HOST`, `DOCKER_CONTEXT`, Podman
+connection, or replaced daemon may be indistinguishable when the command name
+is unchanged. Restore the original selection before `spec implement`, `spec
+clean`, or `spec container gc`; otherwise an old writer can remain live on the
+now-hidden daemon.
+
+Container runs created before Spec Butler 0.5 do not meet that resume contract:
+volume-mode runs lack the crash-safe seed marker, while sidecar runs lack the
+operator-controlled protected Compose baseline. Version 0.5 therefore refuses
+to auto-resume either kind rather than guessing whether workspace data is
+complete or consulting an agent-editable Compose file.
+
+Finish valuable container runs before upgrading when practical, and do not run
+the 0.4 container backend against a shared daemon. If already upgraded,
+preserve the run directory and engine resources and manually inspect or export
+anything valuable. To permanently discard an inspected pre-0.5 run, use 0.5's
+`spec clean --spec ID`; its cleanup path verifies exact ownership. Do not use
+0.4 to recover a volume-mode run: that version can reseed from the host and
+overwrite newer volume-only work. Never delete a volume based on its name alone.
+
 Before enabling container mode for unattended autopilot runs, use the
 [container dogfood checklist](autopilot-container-dogfood.md) to capture startup,
 retry, cleanup, and capacity evidence.
@@ -210,6 +239,21 @@ sidecars. Playwright MCP defaults to `in-worker`, which keeps an app served on
 worker `localhost` reachable by the browser. Configure the `sidecar` topology
 only when the project supplies the necessary network and endpoint mapping.
 
+Managed Compose services must let Compose scope their names to the run. Do not
+set `container_name`, or `name` on a non-external volume or network. If a
+non-default network or volume is intentionally shared and independently
+administered, declare it with the literal `external: true`; Spec Butler will
+neither label nor remove that resource. The default network must remain managed
+so the worker can join the run-scoped service network. Environment-interpolated
+`external` values are intentionally treated as managed and fail closed if
+Compose later resolves them as external.
+Compose `include` and service `extends` are not supported because inherited
+resources and global names cannot yet be validated consistently across Docker
+and Podman providers; inline those services in the configured Compose file.
+When cleaning up a run created by an older Spec Butler release, cleanup also
+refuses an unexpected unlabeled resource in the same Compose project so the run
+metadata remains available for manual recovery.
+
 ## Operations and recovery
 
 Inspect the backend and recorded safety label with `spec status` or `spec
@@ -220,12 +264,27 @@ spec stop --spec <id>             # only when a run is active
 spec status --spec <id>
 spec clean --spec <id>
 spec container gc                 # dry run
-spec container gc --apply         # remove discovered stale spec resources
+spec container gc --apply         # revalidate and remove this checkout's resources
 ```
 
 `spec clean` refuses to remove a live run. It is destructive for unpublished
 worktrees and local branches, so inspect or commit anything you need first. For
 container runs, use `spec container gc` after cleanup to discover engine
-resources left by a crash. Do not remove `.spec-workspaces` or container
-volumes broadly. If a run fails, preserve its record and logs until the failure
-has been diagnosed.
+resources left by a crash. The engine inventory is host-global, but GC acts
+only on resources whose structured labels prove the exact current-checkout
+layout `<configured workspace root>/<run-id>/source`. It rechecks ownership,
+run liveness, and per-spec locks immediately before `--apply`. Resources from
+another checkout, running workers without a positively terminal local run, and
+ambiguous name-only or unlabeled legacy resources are left untouched. Inspect
+and remove those manually with the container engine only after establishing
+their owner. Do not remove `.spec-workspaces` or container volumes broadly. If
+a run fails, preserve its record and logs until the failure has been diagnosed.
+
+Clone and container workspaces also fail closed during automatic cleanup when a
+submodule has been checked out. The nested Git configuration is agent-controlled,
+so Spec Butler cannot safely prove that the child worktree contains no
+unpublished edits. It also rejects publication when the superproject changes a
+submodule pointer, because the child commit may exist only in the disposable
+workspace. Inspect, commit, and publish submodule work from an operator shell;
+after confirming nothing must be preserved, `spec clean` is the explicit
+discard action. Empty, uninitialized submodule paths do not block cleanup.

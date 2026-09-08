@@ -1304,7 +1304,6 @@ async def create_chat_session(request: Request) -> Response:
     # processing the user's prompt immediately — callers should not need
     # a second POST /messages to trigger the first agent response.
     session.status = "active"
-    session.initial_turn_dispatched = True
     _start_background_turn(session.session_id, session, bridge, prompt)
     session.startup_done.set()
 
@@ -1335,29 +1334,6 @@ async def send_chat_message(request: Request) -> Response:
     if bridge is None:
         return _json({"error": "Session bridge not available"}, 500)
 
-    # Handle initial-prompt reconnect: the client sends the initial prompt
-    # via /messages to obtain the SSE stream for the turn that was already
-    # started at session creation.  The flag is one-shot so that a
-    # subsequent identical message is treated as a genuinely new turn.
-    # This check runs *before* the status guard so that a fast-failing
-    # initial turn (session already in "error") still streams the real
-    # error events back to the client instead of returning a bare 409.
-    if (session.initial_turn_dispatched
-            and text == session.initial_prompt):
-        session.initial_turn_dispatched = False
-        session.touch()
-        notify = _turn_notifiers.get(session_id)
-        done_evt = _turn_completions.get(session_id)
-        if notify is not None and done_evt is not None:
-            return _streaming_response(
-                _make_sse_generator(session_id, done_evt, notify))
-        # Turn tracking was cleaned up (e.g. session stopped between
-        # create and this request) — return a done-only stream.
-        async def _done_only():
-            done_event = AgentEvent(kind="done")
-            yield f"event: agent_event\ndata: {json.dumps(asdict(done_event))}\n\n"
-        return _streaming_response(_done_only())
-
     # Reject messages to non-active sessions (e.g. after /stop).
     if session.status != "active":
         return _json({"error": "Session is no longer active"}, 409)
@@ -1365,6 +1341,9 @@ async def send_chat_message(request: Request) -> Response:
     if _is_turn_active(session_id):
         return _json({"error": "A turn is already in progress"}, 409)
 
+    # POST always means a new provider turn. Initial-turn attachment has its
+    # own GET /stream endpoint, so identical text can never be mistaken for a
+    # reconnect token and silently disappear from provider history.
     session.touch()
     session.history.append({"role": "user", "content": text})
 
@@ -1398,10 +1377,6 @@ async def stream_chat_session(request: Request) -> Response:
         return _json({"error": "from must be a non-negative integer"}, 422)
     if from_idx < 0:
         return _json({"error": "from must be a non-negative integer"}, 422)
-
-    # Only a valid reattach consumes the create-time turn. A malformed replay
-    # request must not change whether the initial prompt can still be claimed.
-    session.initial_turn_dispatched = False
 
     if not _is_turn_active(session_id):
         # No active turn — replay any buffered events the client hasn't

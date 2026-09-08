@@ -23,6 +23,7 @@ from pathlib import Path
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config, load_spec_runtime_config, resolve_spec_path
 from .git_common import resolve_common_root as _resolve_common_root
 from .git_common import run_git
+from .platform_fs import read_bounded_regular_text
 from .spec_identity import SPEC_ID_RE, implementation_branch_identity, parse_worktree_name
 from .spec_metadata import SpecMetadata, parse_spec_metadata
 
@@ -139,7 +140,7 @@ def _load_active_runs(
     for candidate in runs_dir.glob("*.json"):
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, TypeError):
+        except (ValueError, RecursionError, OSError, TypeError):
             continue
 
         status = str(data.get("status", "")).strip()
@@ -236,7 +237,7 @@ def _load_runs_for_spec(
     for candidate in runs_dir.glob("*.json"):
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, TypeError):
+        except (ValueError, RecursionError, OSError, TypeError):
             continue
 
         if str(data.get("spec_id", "")).strip() != spec_id:
@@ -304,7 +305,7 @@ def _load_run_payload(
         return None
     try:
         data = json.loads(payload.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError, TypeError):
+    except (ValueError, RecursionError, OSError, TypeError):
         return None
     return data if isinstance(data, dict) else None
 
@@ -823,9 +824,14 @@ def project_run_record_status(
         request_path = state_run_dir / "operator-request.json"
         try:
             operator_request_state = str(
-                json.loads(request_path.read_text(encoding="utf-8")).get("status", "")
+                json.loads(
+                    read_bounded_regular_text(
+                        request_path,
+                        max_bytes=1024 * 1024,
+                    )
+                ).get("status", "")
             ).strip().lower()
-        except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+        except (OSError, ValueError, RecursionError, TypeError, AttributeError):
             operator_request_state = ""
 
     return project_run_status(
@@ -865,7 +871,7 @@ def project_canonical_spec_status(
     for candidate in runs_dir.glob("*.json"):
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError, TypeError):
+        except (ValueError, RecursionError, OSError, TypeError):
             continue
         if str(data.get("spec_id", "")).strip() != spec_id:
             continue

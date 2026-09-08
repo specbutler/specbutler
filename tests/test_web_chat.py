@@ -2363,9 +2363,8 @@ class TestChatAPI:
         _sessions.pop(session_id, None)
         _bridges.pop(session_id, None)
 
-    def test_initial_prompt_not_duplicated_by_messages(self, tmp_path):
-        """When the frontend re-sends the initial prompt via POST /messages,
-        it must not be recorded twice in session history."""
+    def test_initial_prompt_stream_attachment_does_not_duplicate_history(self, tmp_path):
+        """GET /stream attaches to the create-time turn without a new message."""
         from spec_runtime.web.bridge import (
             _bridges,
             _sessions,
@@ -2375,16 +2374,14 @@ class TestChatAPI:
 
         session = create_session(mode="create", agent="claude")
         session.initial_prompt = "build a dashboard"
-        session.initial_turn_dispatched = True
         session.history.append({"role": "user", "content": "build a dashboard"})
 
         mock_bridge = MagicMock()
         register_bridge(session.session_id, mock_bridge)
 
         client = self._make_client(tmp_path)
-        resp = client.post(
-            f"/api/v1/chat/sessions/{session.session_id}/messages",
-            json={"text": "build a dashboard"},
+        resp = client.get(
+            f"/api/v1/chat/sessions/{session.session_id}/stream",
             headers=self._auth_headers(),
         )
         # Should return a done-only SSE stream (no turn tracking state)
@@ -2397,9 +2394,112 @@ class TestChatAPI:
         _sessions.pop(session.session_id, None)
         _bridges.pop(session.session_id, None)
 
+    def test_history_reload_then_same_text_is_a_new_provider_turn(self, tmp_path):
+        """A completed initial prompt is never used as content-keyed replay."""
+        from spec_runtime.web.bridge import (
+            AgentEvent,
+            _bridges,
+            _sessions,
+            create_session,
+            register_bridge,
+        )
+
+        session = create_session(mode="create", agent="claude")
+        session.initial_prompt = "repeat me"
+        session.history.extend(
+            [
+                {"role": "user", "content": "repeat me"},
+                {
+                    "role": "assistant",
+                    "events": [{"kind": "text", "text": "first response"}],
+                },
+            ]
+        )
+        provider_calls: list[str] = []
+
+        async def mock_send_message(_sid, text):
+            provider_calls.append(text)
+            yield AgentEvent(kind="text", text="second response")
+            yield AgentEvent(kind="done")
+
+        mock_bridge = MagicMock()
+        mock_bridge.send_message = mock_send_message
+        register_bridge(session.session_id, mock_bridge)
+        client = self._make_client(tmp_path)
+
+        history = client.get(
+            f"/api/v1/chat/sessions/{session.session_id}/history",
+            headers=self._auth_headers(),
+        )
+        follow_up = client.post(
+            f"/api/v1/chat/sessions/{session.session_id}/messages",
+            json={"text": "repeat me"},
+            headers=self._auth_headers(),
+        )
+
+        assert history.status_code == 200
+        assert follow_up.status_code == 200
+        assert provider_calls == ["repeat me"]
+        assert [
+            item["content"]
+            for item in session.history
+            if item.get("role") == "user"
+        ] == ["repeat me", "repeat me"]
+
+        _sessions.pop(session.session_id, None)
+        _bridges.pop(session.session_id, None)
+
+    def test_distinct_follow_up_expires_initial_prompt_replay_token(self, tmp_path):
+        """After any accepted follow-up, repeating the original text is a new
+        provider turn rather than a stale attachment to the latest response."""
+        from spec_runtime.web.bridge import (
+            AgentEvent,
+            _bridges,
+            _sessions,
+            create_session,
+            register_bridge,
+        )
+
+        session = create_session(mode="create", agent="claude")
+        session.initial_prompt = "alpha-original"
+        session.history.append({"role": "user", "content": "alpha-original"})
+        provider_calls: list[str] = []
+
+        async def mock_send_message(_sid, text):
+            provider_calls.append(text)
+            yield AgentEvent(kind="text", text=f"response-to-{text}")
+            yield AgentEvent(kind="done")
+
+        mock_bridge = MagicMock()
+        mock_bridge.send_message = mock_send_message
+        register_bridge(session.session_id, mock_bridge)
+        client = self._make_client(tmp_path)
+
+        follow_up = client.post(
+            f"/api/v1/chat/sessions/{session.session_id}/messages",
+            json={"text": "beta-followup"},
+            headers=self._auth_headers(),
+        )
+        repeated_original = client.post(
+            f"/api/v1/chat/sessions/{session.session_id}/messages",
+            json={"text": "alpha-original"},
+            headers=self._auth_headers(),
+        )
+
+        assert follow_up.status_code == 200
+        assert repeated_original.status_code == 200
+        assert provider_calls == ["beta-followup", "alpha-original"]
+        assert [
+            entry["content"]
+            for entry in session.history
+            if entry.get("role") == "user"
+        ] == ["alpha-original", "beta-followup", "alpha-original"]
+
+        _sessions.pop(session.session_id, None)
+        _bridges.pop(session.session_id, None)
+
     def test_initial_prompt_reconnect_after_turn_completes(self, tmp_path):
-        """If the initial turn finishes before the client's /messages POST
-        arrives, the server must NOT start a duplicate turn."""
+        """GET /stream replays a create-time turn that already completed."""
         import asyncio
         import json as json_mod
 
@@ -2418,7 +2518,6 @@ class TestChatAPI:
 
         session = create_session(mode="create", agent="claude")
         session.initial_prompt = "build it"
-        session.initial_turn_dispatched = True
         session.history.append({"role": "user", "content": "build it"})
 
         mock_bridge = MagicMock()
@@ -2437,9 +2536,8 @@ class TestChatAPI:
         # No task in _turn_tasks → _is_turn_active returns False
 
         client = self._make_client(tmp_path)
-        resp = client.post(
-            f"/api/v1/chat/sessions/{session.session_id}/messages",
-            json={"text": "build it"},
+        resp = client.get(
+            f"/api/v1/chat/sessions/{session.session_id}/stream",
             headers=self._auth_headers(),
         )
         assert resp.status_code == 200
@@ -2469,9 +2567,7 @@ class TestChatAPI:
         _turn_event_lists.pop(session.session_id, None)
 
     def test_initial_prompt_reconnect_streams_error_instead_of_409(self, tmp_path):
-        """When the initial turn fails before the client attaches, the
-        reconnect POST /messages must stream the error events back rather
-        than returning a bare 409 (F1 fix)."""
+        """GET /stream replays a fast create-time provider error."""
         import asyncio
         import json as json_mod
 
@@ -2490,7 +2586,6 @@ class TestChatAPI:
 
         session = create_session(mode="create", agent="claude")
         session.initial_prompt = "build it"
-        session.initial_turn_dispatched = True
         session.status = "error"  # initial turn failed quickly
         session.history.append({"role": "user", "content": "build it"})
 
@@ -2508,9 +2603,8 @@ class TestChatAPI:
         _turn_event_lists[session.session_id] = events
 
         client = self._make_client(tmp_path)
-        resp = client.post(
-            f"/api/v1/chat/sessions/{session.session_id}/messages",
-            json={"text": "build it"},
+        resp = client.get(
+            f"/api/v1/chat/sessions/{session.session_id}/stream",
             headers=self._auth_headers(),
         )
         # Must stream the error, not return 409
@@ -2792,11 +2886,10 @@ class TestChatAPI:
 
         _sessions.pop(session.session_id, None)
 
-    def test_stream_reattach_consumes_initial_turn_replay_flag(self, tmp_path):
+    def test_stream_reattach_without_active_turn_returns_done(self, tmp_path):
         from spec_runtime.web.bridge import _sessions, create_session
 
         session = create_session(mode="create", agent="claude")
-        session.initial_turn_dispatched = True
         client = self._make_client(tmp_path)
 
         resp = client.get(
@@ -2805,7 +2898,7 @@ class TestChatAPI:
         )
 
         assert resp.status_code == 200
-        assert session.initial_turn_dispatched is False
+        assert '"kind": "done"' in resp.text
         _sessions.pop(session.session_id, None)
 
     @pytest.mark.parametrize("from_value", ["nope", "-1"])
@@ -2813,7 +2906,6 @@ class TestChatAPI:
         from spec_runtime.web.bridge import _sessions, create_session
 
         session = create_session(mode="create", agent="claude")
-        session.initial_turn_dispatched = True
         client = self._make_client(tmp_path)
 
         resp = client.get(
@@ -2823,7 +2915,6 @@ class TestChatAPI:
 
         assert resp.status_code == 422
         assert "non-negative integer" in resp.json()["error"]
-        assert session.initial_turn_dispatched is True
         _sessions.pop(session.session_id, None)
 
     def test_get_history_endpoint(self, tmp_path):
@@ -6167,6 +6258,12 @@ class TestChatJavaScriptContract:
         assert "worktree and branch will be preserved" in source
         assert "if (data.worktree)" in source
         assert "if (data.branch)" in source
+
+    def test_new_chat_reveals_session_stop_control_after_creation(
+        self, source: str
+    ) -> None:
+        assert 'id="chat-stop" hidden' in source
+        assert "if (stopBtn) stopBtn.hidden = false" in source
 
     def test_spec_review_id_uses_attribute_escaping(self, source: str) -> None:
         assert "&quot;" in source

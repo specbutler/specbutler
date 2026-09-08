@@ -72,6 +72,56 @@ def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> None
         temporary.unlink(missing_ok=True)
 
 
+def read_bounded_regular_text(
+    path: Path,
+    *,
+    max_bytes: int,
+    encoding: str = "utf-8",
+) -> str:
+    """Read one bounded regular file without following a leaf link.
+
+    This is intended for capability/outbox files written by less-trusted
+    processes. The lstat/open/fstat identity check rejects links, devices,
+    FIFOs, replacement races, and oversized payloads before callers parse the
+    content. The decoded result preserves on-disk newline bytes; unlike a text
+    stream, this boundary does not apply platform newline translation.
+    """
+    if max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
+    metadata = path.lstat()
+    reparse = bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+    if not stat.S_ISREG(metadata.st_mode) or reparse or metadata.st_size > max_bytes:
+        raise OSError(f"refusing non-regular or oversized file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size > max_bytes
+            or (metadata.st_dev, metadata.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise OSError(f"refusing replaced or unsafe file: {path}")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > max_bytes:
+            raise OSError(f"refusing oversized file: {path}")
+        return payload.decode(encoding)
+    finally:
+        os.close(descriptor)
+
+
 def remove_tree(path: Path, *, ignore_errors: bool = False) -> None:
     """Remove a tree while tolerating read-only and transient Windows entries."""
     def onerror(function, name, exc_info) -> None:

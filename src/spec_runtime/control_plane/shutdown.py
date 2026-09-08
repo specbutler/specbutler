@@ -52,7 +52,7 @@ def _load(state_run_dir: Path) -> ShutdownState:
         return ShutdownState(phase=ShutdownPhase.RUNNING)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, RecursionError, OSError):
         return ShutdownState(phase=ShutdownPhase.RUNNING)
     if not isinstance(payload, dict):
         return ShutdownState(phase=ShutdownPhase.RUNNING)

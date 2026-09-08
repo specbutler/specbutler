@@ -202,6 +202,21 @@ def _send_turn(
         return _read_turn(response)
 
 
+def _attach_turn(
+    base_url: str,
+    token: str,
+    session_id: str,
+) -> list[dict[str, Any]]:
+    """Attach to the provider turn started atomically with session creation."""
+    with _request(
+        base_url,
+        f"/api/v1/chat/sessions/{session_id}/stream",
+        token=token,
+        timeout=600,
+    ) as response:
+        return _read_turn(response)
+
+
 def _assistant_text(base_url: str, token: str, session_id: str) -> str:
     history = _json_request(
         base_url,
@@ -574,7 +589,7 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
                 raise _ProofFailure("Claude session creation returned no session id")
             sessions.append(session_id)
 
-            _send_turn(base_url, token, session_id, first_prompt)
+            _attach_turn(base_url, token, session_id)
             first_text = _assistant_text(base_url, token, session_id)
             _assert_contains(first_text, marker_one, turn=1)
             turn_1_marker_returned = True
@@ -798,7 +813,7 @@ def test_linux_real_codex_web_chat_edits_and_preserves_context(
                 raise _ProofFailure("Codex session creation returned no session id")
             sessions.append(session_id)
 
-            turn_events = [_send_turn(base_url, token, session_id, first_prompt)]
+            turn_events = [_attach_turn(base_url, token, session_id)]
             codex_texts = [_assistant_text(base_url, token, session_id)]
             _assert_contains(
                 codex_texts[-1],

@@ -114,6 +114,8 @@ from .execution_backend import (
     ExecutionBackend,
     ExecutionBackendImportError,
     ExecutionBackendNotImplementedError,
+    ExecutionBackendQuiescenceError,
+    ExecutionBackendRuntimeResetError,
     SnapshotRef,
     UnknownExecutionBackendError,
     WorkspaceHandle,
@@ -131,7 +133,14 @@ from .git_publish_guard import (
     host_publication_git_environment,
 )
 from .interactive_authoring import interactive_provider_environment
-from .platform_fs import FileLock, atomic_write_text, lock_metadata_offset, read_lock_metadata, remove_tree
+from .platform_fs import (
+    FileLock,
+    atomic_write_text,
+    lock_metadata_offset,
+    read_bounded_regular_text,
+    read_lock_metadata,
+    remove_tree,
+)
 from .process_supervisor import (
     LifetimeMode,
     ManagedProcess,
@@ -841,7 +850,18 @@ def _resolve_workspace_handle(
     """Resolve the workspace handle for *run* via the execution backend."""
     backend = _resolve_execution_backend()
     worktree_path = resolve_worktree_path(run, repo_root)
-    return backend.prepare_workspace(
+    # Orchestrator phases perform host-only Git/preflight work before their
+    # first backend command.  Built-in containers must therefore materialize
+    # the checkout without starting project processes; public
+    # prepare_workspace remains eager for API compatibility.  A custom/legacy
+    # container adapter falls back to the published seam and is immediately
+    # quiesced by the phase's host-access hook.
+    prepare_backend_workspace = (
+        getattr(backend, "materialize_workspace", backend.prepare_workspace)
+        if backend.identity.backend == "container"
+        else backend.prepare_workspace
+    )
+    return prepare_backend_workspace(
         run_id=run.run_id,
         spec_id=run.spec_id,
         branch=run.branch,
@@ -921,6 +941,27 @@ def _resolve_publish_workspace_handle(
 def collect_workspace_outbox_metadata(workspace: WorkspaceHandle):
     """Collect optional PR/MR metadata from the backend outbox."""
     return _resolve_execution_backend().collect_outbox_metadata(workspace)
+
+
+def prepare_workspace_for_host_access(workspace: WorkspaceHandle) -> None:
+    """Ask the backend to release writers before host filesystem/Git access."""
+    hook = getattr(_resolve_execution_backend(), "prepare_host_access", None)
+    if callable(hook):
+        hook(workspace)
+
+
+def suspend_workspace_for_host_access(workspace: WorkspaceHandle) -> None:
+    """Freeze backend writers while keeping their runtime resumable."""
+    hook = getattr(_resolve_execution_backend(), "suspend_for_host_access", None)
+    if callable(hook):
+        hook(workspace)
+
+
+def resume_workspace_after_host_access(workspace: WorkspaceHandle) -> None:
+    """Let the backend restart services after the host-only transition."""
+    hook = getattr(_resolve_execution_backend(), "resume_after_host_access", None)
+    if callable(hook):
+        hook(workspace)
 
 
 def _parse_repo_from_remote_url(url: str) -> str | None:
@@ -2817,6 +2858,7 @@ def _run_implement_setup_command(
             message=redact_sensitive(message),
             launch_error=True,
         )
+        _snapshot_container_workspace_after_setup(run, worktree_path, backend)
         return ImplementSetupManifest(failure=failure)
     command_str = selected.display() if typed and selected is not None else command
     try:
@@ -2857,6 +2899,7 @@ def _run_implement_setup_command(
             message=redact_sensitive(message),
             launch_error=True,
         )
+        _snapshot_container_workspace_after_setup(run, worktree_path, backend)
         return ImplementSetupManifest(failure=failure)
     if result.returncode != 0:
         partial = _parse_implement_setup_manifest(
@@ -2902,6 +2945,12 @@ def _run_implement_setup_command(
             result.returncode,
             log_detail,
         )
+        # A failed setup is intentionally nonfatal: the implementation agent
+        # receives its diagnostics and may repair the workspace or service
+        # data. It still needs the same immutable retry recovery point as a
+        # successful setup; otherwise a later verify retry cannot restore a
+        # sidecar volume because no pre-implement archive exists.
+        _snapshot_container_workspace_after_setup(run, worktree_path, backend)
         return ImplementSetupManifest(
             env=partial.env,
             prompt=partial.prompt,
@@ -2923,10 +2972,13 @@ def _snapshot_container_workspace_after_setup(
 ) -> None:
     if backend.identity.backend != "container":
         return
-    run_root = worktree_path.parent
-    snapshot_path = run_root / "snapshots" / "pre-implement"
-    if snapshot_path.exists():
+    snapshot_hook = getattr(backend, "snapshot", None)
+    if not callable(snapshot_hook):
+        # Custom container adapters predating the recovery-point seam remain
+        # valid.  Built-in containers implement snapshot; an adapter that does
+        # not simply runs without orchestrator-managed retry restoration.
         return
+    run_root = worktree_path.parent
     workspace = WorkspaceHandle(
         path=worktree_path,
         outbox_path=run_root / "outbox",
@@ -2939,11 +2991,18 @@ def _snapshot_container_workspace_after_setup(
         },
     )
     try:
-        backend.snapshot(workspace, "pre-implement")
+        snapshot_hook(workspace, "pre-implement")
+    except (ExecutionBackendQuiescenceError, ExecutionBackendRuntimeResetError):
+        # Continuing could run the agent beside an incompletely restarted
+        # service generation or without setup-created descendants. Unlike an
+        # ordinary missing recovery point, either condition must abort and
+        # retry the complete setup phase.
+        raise
     except (NotImplementedError, OSError, RuntimeError) as exc:
         logs = run_root / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        (logs / "snapshot-restore-fallback.log").write_text(
+        atomic_write_text(
+            logs / "snapshot-restore-fallback.log",
             f"Container backend setup snapshot unavailable: {exc}\n",
             encoding="utf-8",
         )
@@ -2972,16 +3031,10 @@ def _restore_container_workspace_for_retry(
     head_probe = run_subprocess(["git", "rev-parse", "HEAD"], cwd=workspace.path)
     if head_probe.returncode == 0:
         prior_head = (head_probe.stdout or "").strip()
-    try:
-        restored = backend.restore(workspace, snapshot)
-    except (NotImplementedError, OSError, RuntimeError) as exc:
-        logs = run_root / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
-        (logs / "snapshot-restore-fallback.log").write_text(
-            f"Container backend retry restore unavailable: {exc}\n",
-            encoding="utf-8",
-        )
-        return workspace
+    # Container restore is a security boundary, not an optional optimization:
+    # it quiesces every writer before replacing host-visible Git state. Do not
+    # swallow removal/import/metadata failures and continue into host Git.
+    restored = backend.restore(workspace, snapshot)
     _reposition_restored_workspace_head(restored, backend, ctx, prior_head)
     return restored
 
@@ -7646,6 +7699,70 @@ def _spec_path_in_tree(tree_root: Path, run: RunState) -> Path:
     return tree_root / _spec_path_for_run(run)
 
 
+def _safe_workspace_leaf(
+    workspace_root: Path,
+    target: Path,
+    *,
+    create_parents: bool,
+) -> Path:
+    """Return a workspace leaf only after every parent is a real directory."""
+    root = Path(os.path.abspath(workspace_root))
+    leaf = Path(os.path.abspath(target))
+    try:
+        relative = leaf.relative_to(root)
+    except ValueError as exc:
+        raise OSError(f"refusing workspace path outside {root}: {leaf}") from exc
+    if not relative.parts:
+        raise OSError(f"refusing to use workspace root as a file: {leaf}")
+
+    try:
+        root_metadata = root.lstat()
+    except OSError as exc:
+        raise OSError(f"workspace root is unavailable: {root}") from exc
+    root_reparse = bool(
+        getattr(root_metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+    if not stat.S_ISDIR(root_metadata.st_mode) or root_reparse:
+        raise OSError(f"refusing linked or non-directory workspace root: {root}")
+
+    current = root
+    for part in relative.parts[:-1]:
+        current /= part
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            if not create_parents:
+                raise
+            current.mkdir()
+            metadata = current.lstat()
+        reparse = bool(
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        )
+        if not stat.S_ISDIR(metadata.st_mode) or reparse:
+            raise OSError(
+                "refusing workspace file operation through a linked or "
+                f"non-directory parent: {current}"
+            )
+    return leaf
+
+
+def _unlink_workspace_leaf(workspace_root: Path, target: Path) -> None:
+    leaf = _safe_workspace_leaf(
+        workspace_root,
+        target,
+        create_parents=False,
+    )
+    try:
+        metadata = leaf.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(metadata.st_mode):
+        raise OSError(f"refusing to unlink workspace directory as a file: {leaf}")
+    leaf.unlink()
+
+
 def _spec_path_for_run_id(repo_root: Path, run: RunState | None, spec_id: str) -> Path:
     if run is not None:
         source_path = _existing_spec_source_path(repo_root, run)
@@ -7840,12 +7957,25 @@ def _restore_pinned_spec_into_worktree(
         raise FileNotFoundError(f"Pinned spec snapshot missing for run {run.run_id}: {snapshot_path}")
 
     expected_text = snapshot_path.read_text(encoding="utf-8")
-    target_path = _spec_path_in_tree(worktree_path, run)
-    if target_path.exists() and target_path.read_text(encoding="utf-8") == expected_text:
+    target_path = _safe_workspace_leaf(
+        worktree_path,
+        _spec_path_in_tree(worktree_path, run),
+        create_parents=True,
+    )
+    try:
+        current_text = read_bounded_regular_text(
+            target_path,
+            max_bytes=max(1024 * 1024, len(expected_text.encode("utf-8"))),
+        )
+    except (OSError, UnicodeError):
+        current_text = None
+    if current_text == expected_text:
         return target_path
 
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    target_path.write_text(expected_text, encoding="utf-8")
+    # Atomic replacement unlinks a malicious leaf symlink rather than
+    # following it. Parent components were validated above while container
+    # writers were quiesced by the backend preparation boundary.
+    atomic_write_text(target_path, expected_text)
     return target_path
 
 
@@ -7861,7 +7991,19 @@ def _active_spec_path(
     if prefer_worktree and worktree_path.is_dir():
         snapshot_path = _run_spec_snapshot_path(repo_root, run.run_id)
         if snapshot_path.exists():
-            return _restore_pinned_spec_into_worktree(repo_root, run, worktree_path)
+            try:
+                return _restore_pinned_spec_into_worktree(
+                    repo_root,
+                    run,
+                    worktree_path,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "Refusing unsafe pinned spec path for %s: %s",
+                    run.run_id,
+                    exc,
+                )
+                return None
 
     source_path = _existing_spec_source_path(repo_root, run)
     if source_path is not None and source_path.exists():
@@ -7912,6 +8054,44 @@ def _ensure_run_spec_committed(
         action=f"git add {relative_spec}",
         env=git_env,
     ):
+        return False
+    staged_result = run_subprocess(
+        ["git", "diff", "--cached", "--quiet", "--", relative_spec],
+        cwd=worktree_path,
+        env=git_env,
+        inherit_env=git_env is None,
+    )
+    if staged_result.returncode == 0:
+        # On Windows, checkout line-ending normalization can make the first
+        # status call report a change that `git add` normalizes back to the
+        # existing blob. Do not invoke `git commit --only` in that case: Git
+        # correctly rejects it as an empty commit. Recheck that the worktree is
+        # now genuinely clean so this compatibility path cannot conceal an
+        # unstaged spec mutation.
+        refreshed_status = run_subprocess(
+            ["git", "status", "--porcelain", "--", relative_spec],
+            cwd=worktree_path,
+            env=git_env,
+            inherit_env=git_env is None,
+        )
+        if refreshed_status.returncode != 0:
+            detail = refreshed_status.stderr.strip() or refreshed_status.stdout.strip()
+            if not detail:
+                detail = f"exit code {refreshed_status.returncode}"
+            run.last_error = f"git status -- {relative_spec} failed after staging: {detail}"
+            return False
+        if not refreshed_status.stdout.strip():
+            return True
+        run.last_error = (
+            f"git add {relative_spec} produced no tracked change, but the spec "
+            "remains dirty after staging."
+        )
+        return False
+    if staged_result.returncode != 1:
+        detail = staged_result.stderr.strip() or staged_result.stdout.strip()
+        if not detail:
+            detail = f"exit code {staged_result.returncode}"
+        run.last_error = f"git diff --cached -- {relative_spec} failed: {detail}"
         return False
     return run_or_fail(
         run,
@@ -8628,6 +8808,10 @@ class RunState:
     publish_remote_url: str = ""
     publish_git_config_fingerprint: str = ""
     publish_repo_slug: str = ""
+    # Immutable pre-agent HEAD used for superproject-only publication checks.
+    # Unlike a branch/ref name, this content-addressed object cannot be moved
+    # by an agent to hide an outgoing gitlink change.
+    publication_base_sha: str = ""
     pending_block_debugger_signature: str = ""
     last_block_debugger_guided_retry_signature: str = ""
     block_debugger_auto_resumes: int = 0
@@ -8728,6 +8912,7 @@ class RunState:
         payload.setdefault("review_decision_status", "")
         payload.setdefault("review_decision_summary", "")
         payload.setdefault("review_decision_check_url", "")
+        payload.setdefault("publication_base_sha", "")
         payload.setdefault("readiness_status", "")
         payload.setdefault("readiness_head_sha", "")
         payload.setdefault("readiness_blocker", "")
@@ -14226,7 +14411,12 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
 
     if backend.identity.backend != "worktree":
         try:
-            workspace = backend.prepare_workspace(
+            prepare_backend_workspace = (
+                getattr(backend, "materialize_workspace", backend.prepare_workspace)
+                if backend.identity.backend == "container"
+                else backend.prepare_workspace
+            )
+            workspace = prepare_backend_workspace(
                 run_id=run.run_id,
                 spec_id=run.spec_id,
                 branch=branch,
@@ -14242,33 +14432,40 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
             return "failed"
         worktree_path = workspace.path
         run.worktree_path = str(worktree_path)
+        # The built-in container backend materializes without starting its
+        # runtime.  Legacy/custom container adapters may only expose the
+        # published prepare_workspace seam, so establish the normal host-access
+        # boundary immediately after that fallback before touching the checkout
+        # with Python or host Git.
+        try:
+            prepare_workspace_for_host_access(workspace)
+        except (OSError, RuntimeError) as exc:
+            run.last_error = f"Could not establish safe bootstrap host access: {exc}"
+            return "failed"
 
         if run.run_mode == "task":
             inherited_spec = _spec_path_in_tree(worktree_path, run)
-            if inherited_spec.exists():
-                inherited_spec.unlink()
+            try:
+                _unlink_workspace_leaf(worktree_path, inherited_spec)
+            except OSError as exc:
+                run.last_error = f"Refusing unsafe inherited task spec path: {exc}"
+                return "failed"
         else:
-            spec_path = _restore_pinned_spec_into_worktree(repo_root, run, worktree_path)
-            relative_spec = spec_path.relative_to(worktree_path).as_posix()
-            status_result = run_subprocess(
-                ["git", "status", "--porcelain", "--", relative_spec],
-                cwd=worktree_path,
-            )
-            if status_result.returncode == 0 and status_result.stdout.strip():
-                if not run_or_fail(
+            try:
+                spec_path = _restore_pinned_spec_into_worktree(
+                    repo_root,
                     run,
-                    ["git", "add", relative_spec],
-                    cwd=worktree_path,
-                    action=f"git add {relative_spec}",
-                ):
-                    return "failed"
-                if not run_or_fail(
-                    run,
-                    ["git", "commit", "-m", f"Pin spec contract for {run.spec_id}"],
-                    cwd=worktree_path,
-                    action="git commit (pin spec contract)",
-                ):
-                    return "failed"
+                    worktree_path,
+                )
+            except OSError as exc:
+                run.last_error = f"Refusing unsafe pinned spec path: {exc}"
+                return "failed"
+            if not _ensure_run_spec_committed(
+                run,
+                worktree_path=worktree_path,
+                spec_path=spec_path,
+            ):
+                return "failed"
 
         if _backend_uses_provider_sandbox_config(backend):
             _write_sandbox_config(run.agent, worktree_path)
@@ -14375,31 +14572,28 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
     if run.run_mode == "task":
         if not worktree_exists:
             inherited_spec = _spec_path_in_tree(worktree_path, run)
-            if inherited_spec.exists():
-                inherited_spec.unlink()
+            try:
+                _unlink_workspace_leaf(worktree_path, inherited_spec)
+            except OSError as exc:
+                run.last_error = f"Refusing unsafe inherited task spec path: {exc}"
+                return "failed"
     else:
-        spec_path = _restore_pinned_spec_into_worktree(repo_root, run, worktree_path)
-        if not worktree_exists:
-            relative_spec = spec_path.relative_to(worktree_path).as_posix()
-            status_result = run_subprocess(
-                ["git", "status", "--porcelain", "--", relative_spec],
-                cwd=worktree_path,
+        try:
+            spec_path = _restore_pinned_spec_into_worktree(
+                repo_root,
+                run,
+                worktree_path,
             )
-            if status_result.returncode == 0 and status_result.stdout.strip():
-                if not run_or_fail(
-                    run,
-                    ["git", "add", relative_spec],
-                    cwd=worktree_path,
-                    action=f"git add {relative_spec}",
-                ):
-                    return "failed"
-                if not run_or_fail(
-                    run,
-                    ["git", "commit", "-m", f"Pin spec contract for {run.spec_id}"],
-                    cwd=worktree_path,
-                    action="git commit (pin spec contract)",
-                ):
-                    return "failed"
+        except OSError as exc:
+            run.last_error = f"Refusing unsafe pinned spec path: {exc}"
+            return "failed"
+        if not worktree_exists:
+            if not _ensure_run_spec_committed(
+                run,
+                worktree_path=worktree_path,
+                spec_path=spec_path,
+            ):
+                return "failed"
 
     # Linked worktrees receive a launch-scoped private GIT_DIR immediately
     # before the provider starts. Their sandbox cannot be materialized here
@@ -15762,6 +15956,7 @@ def _prepare_implement_launch_plan(
     *,
     reason: str,
     use_stream_json: bool,
+    setup_manifest: ImplementSetupManifest | None = None,
     private_homes_to_cleanup: list[
         tuple[tempfile.TemporaryDirectory[str], Path]
     ] | None = None,
@@ -15772,15 +15967,16 @@ def _prepare_implement_launch_plan(
 ) -> ImplementLaunchPlan:
     backend = _resolve_execution_backend()
     _require_agent_available_for_backend(run.agent, backend)
-    setup_manifest = _run_implement_setup_command(run, worktree_path)
-    # Persist cleanup ownership immediately after setup returns. Later MCP or
-    # sandbox preparation may fail, but declared services must never become an
-    # undiscoverable side effect of that failure.
-    _register_setup_manifest_processes(
-        repo_root,
-        worktree_path,
-        setup_manifest,
-    )
+    if setup_manifest is None:
+        setup_manifest = _run_implement_setup_command(run, worktree_path)
+        # Persist cleanup ownership immediately after setup returns. Later MCP
+        # or sandbox preparation may fail, but declared services must never
+        # become an undiscoverable side effect of that failure.
+        _register_setup_manifest_processes(
+            repo_root,
+            worktree_path,
+            setup_manifest,
+        )
     admitted_setup_env, blocked_setup_env = (
         sanitize_implement_setup_environment(
             run.agent,
@@ -16722,7 +16918,29 @@ def _validate_targeted_test_after_implement(
 
 
 def phase_implement(run: RunState, repo_root: Path) -> str:
-    """Write implement-context, launch agent, read implement-result on exit."""
+    """Run implement and never return while a container writer remains live."""
+    result = "failed"
+    boundary_error = ""
+    try:
+        result = _phase_implement_with_runtime(run, repo_root)
+    finally:
+        backend = _resolve_execution_backend()
+        if backend.identity.backend == "container":
+            workspace = _resolve_publish_workspace_handle(run, repo_root)
+            if workspace.path.exists():
+                try:
+                    prepare_workspace_for_host_access(workspace)
+                except (OSError, RuntimeError) as exc:
+                    boundary_error = str(exc)
+                    run.last_error = (
+                        "Implement could not release the container runtime before "
+                        f"returning host ownership: {exc}"
+                    )
+    return "failed" if boundary_error else result
+
+
+def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
+    """Write implement context, launch the agent, and interpret its result."""
     # First statement in the phase, ahead of every early return below, so a
     # prelaunch failure is never judged on the previous attempt's agent report.
     run.implement_agent_reported_failure = False
@@ -16733,6 +16951,12 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
         run.last_error = str(exc)
         return "failed"
     workspace = _resolve_workspace_handle(run, repo_root)
+    if backend.identity.backend == "container":
+        try:
+            prepare_workspace_for_host_access(workspace)
+        except (OSError, RuntimeError) as exc:
+            run.last_error = f"Refusing host implement Git operation: {exc}"
+            return "failed"
     worktree_path = workspace.path
     # Clone/container backends materialize their checkout outside the legacy
     # ``.worktrees`` location recorded by older runs. Persist the authoritative
@@ -16760,7 +16984,7 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
     ctx = attempt_bundle.context
     try:
         workspace = _restore_container_workspace_for_retry(workspace, backend, ctx)
-    except ValueError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         run.last_error = str(exc)
         ctx.save(repo_root, run.run_id)
         run.save(repo_root)
@@ -16841,6 +17065,17 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
         run.attempts + 1,
     )
     head_before = _head_sha(worktree_path)
+    _migrate_legacy_publication_base(run)
+    if not run.publication_base_sha:
+        if run.implement_launches == 0 and head_before:
+            run.publication_base_sha = head_before
+        else:
+            run.last_error = (
+                "Cannot establish the immutable pre-agent publication base for "
+                "this existing run. Start a fresh run before publishing so "
+                "submodule pointer changes can be checked safely."
+            )
+            return "failed"
     run.implement_head_sha_before = head_before or ""
     run.implement_head_sha_after = ""
     run.implement_has_new_commit = False
@@ -16874,6 +17109,16 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
             # persists the context and may fail after setup. The durable
             # sequence prevents a resume from reusing this launch's files.
             ctx.launch_number = _reserve_implement_launch(run, repo_root)
+            if backend.identity.backend == "container":
+                resume_workspace_after_host_access(workspace)
+            setup_manifest = _run_implement_setup_command(run, worktree_path)
+            _register_setup_manifest_processes(
+                repo_root,
+                worktree_path,
+                setup_manifest,
+            )
+            if backend.identity.backend == "container":
+                suspend_workspace_for_host_access(workspace)
             launch_plan = _prepare_implement_launch_plan(
                 run,
                 repo_root,
@@ -16881,10 +17126,13 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
                 ctx,
                 reason=reason,
                 use_stream_json=use_stream_json,
+                setup_manifest=setup_manifest,
                 private_homes_to_cleanup=claude_private_homes_to_cleanup,
                 codex_homes_to_cleanup=codex_homes_to_cleanup,
                 git_isolations_to_cleanup=git_isolations_to_cleanup,
             )
+            if backend.identity.backend == "container":
+                resume_workspace_after_host_access(workspace)
             exit_code = _launch_implement_attempt(
                 run,
                 repo_root,
@@ -16903,7 +17151,7 @@ def phase_implement(run: RunState, repo_root: Path) -> str:
         except ExecutionBackendImportError as exc:
             run.last_error = f"Container backend import failed after worker execution: {exc}"
             return "failed"
-        except RuntimeError as exc:
+        except (OSError, RuntimeError) as exc:
             run.last_error = str(exc)
             return "failed"
 
@@ -17202,12 +17450,32 @@ def _attempt_no_handshake_recovery(
             )
         recovery_env["SPEC_COMPLETION_OUTBOX"] = str(recovery_outbox_path)
         recovery_env_redactions: tuple[str, ...] = ()
+        if backend.identity.backend == "container":
+            resume_workspace_after_host_access(
+                WorkspaceHandle(
+                    path=worktree_path,
+                    outbox_path=worktree_path.parent / "outbox",
+                    branch=run.branch,
+                    backend="container",
+                    metadata={"run_id": run.run_id, "spec_id": run.spec_id},
+                )
+            )
         setup_manifest = _run_implement_setup_command(run, worktree_path)
         _register_setup_manifest_processes(
             repo_root,
             worktree_path,
             setup_manifest,
         )
+        if backend.identity.backend == "container":
+            suspend_workspace_for_host_access(
+                WorkspaceHandle(
+                    path=worktree_path,
+                    outbox_path=worktree_path.parent / "outbox",
+                    branch=run.branch,
+                    backend="container",
+                    metadata={"run_id": run.run_id, "spec_id": run.spec_id},
+                )
+            )
         admitted_recovery_setup_env, blocked_recovery_setup_env = (
             sanitize_implement_setup_environment(
                 run.agent,
@@ -17478,6 +17746,16 @@ def _attempt_no_handshake_recovery(
             git_isolation=recovery_git_isolation,
         )
         try:
+            if backend.identity.backend == "container":
+                resume_workspace_after_host_access(
+                    WorkspaceHandle(
+                        path=worktree_path,
+                        outbox_path=worktree_path.parent / "outbox",
+                        branch=run.branch,
+                        backend="container",
+                        metadata={"run_id": run.run_id, "spec_id": run.spec_id},
+                    )
+                )
             _launch_implement_attempt(
                 run,
                 repo_root,
@@ -18121,11 +18399,11 @@ def _load_completion_outbox_result(
     spec_id: str | None = None,
 ) -> ImplementResult | None:
     """Load and validate a report from one explicitly granted outbox path."""
-    if not result_path.is_file():
-        return None
     try:
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        payload = json.loads(
+            read_bounded_regular_text(result_path, max_bytes=1024 * 1024)
+        )
+    except (ValueError, RecursionError, OSError, UnicodeError):
         return None
     if not isinstance(payload, dict) or payload.get("run_id") != run_id:
         return None
@@ -19344,8 +19622,36 @@ def _merge_origin_master(
 
 
 def phase_verify(run: RunState, repo_root: Path) -> str:
-    """Run configured verify gates in worktree and record gate results."""
+    """Run verify and always release container writers before returning."""
+    result = "failed"
+    boundary_error = ""
+    try:
+        result = _phase_verify_with_runtime(run, repo_root)
+    finally:
+        backend = _resolve_execution_backend()
+        if backend.identity.backend == "container":
+            workspace = _resolve_publish_workspace_handle(run, repo_root)
+            try:
+                prepare_workspace_for_host_access(workspace)
+            except (OSError, RuntimeError) as exc:
+                boundary_error = str(exc)
+                run.last_error = (
+                    "Verify could not release the container runtime before "
+                    f"returning host ownership: {exc}"
+                )
+    return "failed" if boundary_error else result
+
+
+def _phase_verify_with_runtime(run: RunState, repo_root: Path) -> str:
+    """Run configured verify gates in the backend workspace."""
     workspace = _resolve_workspace_handle(run, repo_root)
+    backend = _resolve_execution_backend()
+    if backend.identity.backend == "container":
+        try:
+            prepare_workspace_for_host_access(workspace)
+        except (OSError, RuntimeError) as exc:
+            run.last_error = f"Refusing host verification Git operation: {exc}"
+            return "failed"
     worktree_path = workspace.path
     if not worktree_path.is_dir():
         run.last_error = f"Worktree missing: {worktree_path}"
@@ -19448,6 +19754,13 @@ def phase_verify(run: RunState, repo_root: Path) -> str:
         logger.warning("Verify preflight merge failed for %s: %s", run.spec_id, detail)
         return "failed"
     run.last_merged_master_sha = origin_master_sha
+
+    if backend.identity.backend == "container":
+        try:
+            resume_workspace_after_host_access(workspace)
+        except (OSError, RuntimeError) as exc:
+            run.last_error = f"Could not resume container verification runtime: {exc}"
+            return "failed"
 
     parallel_gates: list[str] = []
     sequential_gates: list[str] = []
@@ -20010,11 +20323,97 @@ def _assert_publication_transition_safe(
     run: RunState,
     worktree_path: Path,
 ) -> None:
+    _migrate_legacy_publication_base(run)
     _capture_or_validate_run_publication_baseline(
         run,
         worktree_path,
         allow_capture=run.implement_launches == 0,
     )
+    if run.implement_launches > 0:
+        _assert_no_submodule_pointer_changes(run, worktree_path)
+
+
+def _migrate_legacy_publication_base(run: RunState) -> None:
+    """Recover the immutable first-launch base for one-launch legacy runs."""
+    if run.publication_base_sha or run.implement_launches != 1:
+        return
+    previous_base = str(run.implement_head_sha_before or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", previous_base):
+        run.publication_base_sha = previous_base
+
+
+def _assert_no_submodule_pointer_changes(
+    run: RunState,
+    worktree_path: Path,
+) -> None:
+    """Reject outgoing gitlink changes without entering nested repositories.
+
+    Agent sessions cannot publish submodule repositories. Publishing a changed
+    superproject gitlink could therefore point at a child commit that exists
+    only in the disposable workspace. Superproject plumbing is sufficient to
+    detect the mode-160000 delta and does not consult agent-controlled nested
+    Git config.
+    """
+    git_env = host_publication_git_environment()
+    base_sha = str(run.publication_base_sha or "").strip()
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", base_sha) is None:
+        raise UnsafeRepositoryGitConfigError(
+            "Immutable pre-agent publication base is missing or invalid."
+        )
+    try:
+        base_check = run_subprocess(
+            ["git", "rev-parse", "--verify", f"{base_sha}^{{commit}}"],
+            cwd=worktree_path,
+            env=git_env,
+        )
+        if base_check.returncode != 0 or base_check.stdout.strip() != base_sha:
+            raise UnsafeRepositoryGitConfigError(
+                "Immutable pre-agent publication base is unavailable."
+            )
+        changed = run_subprocess(
+            [
+                "git",
+                "diff-tree",
+                "--no-commit-id",
+                "--raw",
+                "-r",
+                "--no-renames",
+                base_sha,
+                "HEAD",
+            ],
+            cwd=worktree_path,
+            env=git_env,
+        )
+    except UnsafeRepositoryGitConfigError:
+        raise
+    except Exception as exc:
+        raise UnsafeRepositoryGitConfigError(
+            "Could not safely inspect outgoing submodule pointers."
+        ) from exc
+    if changed.returncode != 0:
+        raise UnsafeRepositoryGitConfigError(
+            "Could not safely inspect outgoing submodule pointers."
+        )
+    changed_gitlinks: list[str] = []
+    for line in changed.stdout.splitlines():
+        metadata, separator, path = line.partition("\t")
+        fields = metadata.removeprefix(":").split()
+        if not separator or len(fields) < 5:
+            raise UnsafeRepositoryGitConfigError(
+                "Git returned malformed submodule-pointer inspection data."
+            )
+        old_mode, new_mode = fields[:2]
+        if "160000" in {old_mode, new_mode}:
+            changed_gitlinks.append(path)
+    if changed_gitlinks:
+        preview = ", ".join(changed_gitlinks[:5])
+        raise UnsafeRepositoryGitConfigError(
+            "Refusing publication because the branch changes submodule "
+            f"pointer(s): {preview}. Spec Butler cannot prove those child "
+            "commits are published without entering agent-controlled nested "
+            "Git repositories. Publish the child commits independently, then "
+            "update the superproject from an operator shell."
+        )
 
 
 def _trusted_publication_repo_slug(run: RunState) -> str:
@@ -20272,6 +20671,11 @@ def _create_verified_no_diff_completion_commit(
 def phase_publish(run: RunState, repo_root: Path) -> str:
     """Push branch and create PR (idempotent)."""
     workspace = _resolve_publish_workspace_handle(run, repo_root)
+    try:
+        prepare_workspace_for_host_access(workspace)
+    except (OSError, RuntimeError) as exc:
+        run.last_error = f"Refusing host publication: {exc}"
+        return "failed"
     worktree_path = workspace.path
     if not worktree_path.is_dir():
         run.last_error = f"Worktree missing: {worktree_path}"
@@ -23528,13 +23932,14 @@ def phase_cleanup(run: RunState, repo_root: Path) -> str:
             },
         )
         try:
-            # The cleanup phase runs after a successful merge, so unpushed work
-            # is expected to be absent — but even if the branch tip was not yet
-            # mirrored to origin, the merge means the work is durably captured.
-            # Opt out of the resume-safety deletion guard here (the spec allows
-            # deletion in the post-merge cleanup phase and in `spec clean`).
-            backend.cleanup(workspace, allow_unpushed_work=True)
-        except OSError as exc:
+            # A successful merge should make every intended change reachable
+            # from origin. Keep the deletion guard enabled anyway: it is the
+            # last chance to preserve edits omitted from publication (notably
+            # nested submodule work, which host Git intentionally does not
+            # enter). Only the operator's explicit `spec clean` action waives
+            # this recoverability check.
+            backend.cleanup(workspace)
+        except (OSError, RuntimeError) as exc:
             detail = f"Could not remove clone backend workspace {run_root}: {exc}"
             _record_nonfatal_warning(
                 run,
@@ -24111,12 +24516,59 @@ def _classify_phase_result(
     return metadata
 
 
+def _backend_resume_mismatch(
+    run: RunState,
+    repo_root: Path,
+) -> str:
+    """Return a fail-closed error when current config cannot own this run."""
+    recorded_backend = str(run.backend or "").strip()
+    if not recorded_backend:
+        return ""
+    current = _resolve_execution_backend().identity
+    if recorded_backend != current.backend:
+        return (
+            f"Run {run.run_id} was created with execution backend "
+            f"{recorded_backend!r}, but current config selects {current.backend!r}. "
+            "Restore the original backend before resuming phases, or use the "
+            "explicit cleanup command for the recorded run."
+        )
+    if recorded_backend not in {"clone", "container"}:
+        return ""
+    recorded_root_text = str(run.backend_workspace_root or "").strip()
+    if not recorded_root_text:
+        return ""
+
+    def canonical_root(value: str) -> Path:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = repo_root / path
+        return path.resolve(strict=False)
+
+    recorded_root = canonical_root(recorded_root_text)
+    current_root = canonical_root(str(current.workspace_root or ""))
+    if recorded_root != current_root:
+        return (
+            f"Run {run.run_id} was created in execution workspace root "
+            f"{recorded_root}, but current config selects {current_root}. Restore "
+            "the original workspace root before resuming phases or cleaning the run."
+        )
+    return ""
+
+
 def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
     """Execute one phase, update run state, persist audit trail."""
     handler = PHASE_HANDLERS.get(phase)
     if handler is None:
         run.last_error = f"Unknown phase: {phase}"
         run.status = "failed"
+        run.save(repo_root)
+        return "failed"
+
+    backend_mismatch = _backend_resume_mismatch(run, repo_root)
+    if backend_mismatch:
+        run.phase = phase
+        run.status = "failed"
+        run.last_error = backend_mismatch
         run.save(repo_root)
         return "failed"
 
@@ -25497,7 +25949,11 @@ def cmd_task(args: argparse.Namespace) -> int:
         run = _create_task_run(repo_root, agent=agent, review_agent=review_agent, base_ref=base_ref)
         logger.info("Starting new task run %s", run.run_id)
         retry_cap = getattr(args, "retry_cap", None) or run.retry_cap
-        result = run_full_workflow(run, repo_root, retry_cap=retry_cap)
+        # Task IDs are unique, so this normally has no contention cost. It
+        # makes the same per-spec lock used by container GC authoritative for
+        # the task's full state/lease lifecycle.
+        with SpecLock(repo_root, run.spec_id):
+            result = run_full_workflow(run, repo_root, retry_cap=retry_cap)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

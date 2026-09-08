@@ -399,7 +399,11 @@ Cleanup is also run automatically as the final phase of a successful
 implementation lifecycle. `spec clean` refuses to remove a live run, but it is
 otherwise destructive: commit or copy any work you need before running it. If
 container GC reports crash leftovers, review its ownership labels before using
-`spec container gc --apply`.
+`spec container gc --apply`. Container GC is scoped to the current checkout's
+configured workspace root and revalidates ownership and liveness before
+deletion. It deliberately ignores resources from other checkouts and ambiguous
+unlabeled legacy resources; inspect those with the container engine and remove
+them manually only after confirming their owner.
 
 ## Quick reference
 
