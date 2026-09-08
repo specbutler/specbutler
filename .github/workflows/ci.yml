@@ -500,14 +500,6 @@ jobs:
           Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests/test_spec_orchestrator.py::TestPublishPhase::test_publish_retries_with_verified_no_diff_completion_provenance -q 2>&1 | Tee-Object artifacts/publication-smoke.log
           exit $LASTEXITCODE
-      - name: Run full portable test suite
-        if: ${{ matrix.full_suite }}
-        shell: pwsh
-        run: |
-          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force artifacts/ci-evidence | Out-Null
-          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests -v --ignore=tests/test_windows_probe.py --junitxml artifacts/ci-evidence/full-suite.xml 2>&1 | Tee-Object artifacts/full-suite.log
-          exit $LASTEXITCODE
       - name: Run Windows integration probes
         if: ${{ matrix.full_suite }}
         shell: pwsh
@@ -515,6 +507,14 @@ jobs:
           Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force artifacts/ci-evidence | Out-Null
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests/test_windows_probe.py -v --junitxml artifacts/ci-evidence/focused.xml 2>&1 | Tee-Object artifacts/focused.log
+          exit $LASTEXITCODE
+      - name: Run full portable test suite
+        if: ${{ matrix.full_suite }}
+        shell: pwsh
+        run: |
+          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force artifacts/ci-evidence | Out-Null
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests -v --ignore=tests/test_windows_probe.py --junitxml artifacts/ci-evidence/full-suite.xml 2>&1 | Tee-Object artifacts/full-suite.log
           exit $LASTEXITCODE
       - name: Run installed-artifact Windows CLI matrix
         if: ${{ matrix.cli_matrix }}
