@@ -1092,16 +1092,25 @@ def _codex_provider_homes_root(source: Mapping[str, str] | None) -> Path:
         local_app_data = values.get("LOCALAPPDATA")
         if local_app_data:
             return Path(local_app_data).expanduser() / "SpecButler" / "provider-homes"
-        return Path.home() / "AppData" / "Local" / "SpecButler" / "provider-homes"
+        home = _operator_home(values)
+        if home is not None:
+            return home / "AppData" / "Local" / "SpecButler" / "provider-homes"
+        return specbutler_user_state_root(values) / "provider-homes"
     if sys.platform == "darwin":
-        return (
-            Path.home()
-            / "Library"
-            / "Application Support"
-            / "SpecButler"
-            / "provider-homes"
-        )
-    return Path.home() / ".local" / "state" / "specbutler" / "provider-homes"
+        home = _operator_home(values)
+        if home is not None:
+            return (
+                home
+                / "Library"
+                / "Application Support"
+                / "SpecButler"
+                / "provider-homes"
+            )
+        return specbutler_user_state_root(values) / "provider-homes"
+    home = _operator_home(values)
+    if home is not None:
+        return home / ".local" / "state" / "specbutler" / "provider-homes"
+    return specbutler_user_state_root(values) / "provider-homes"
 
 
 _CODEX_EPHEMERAL_HOME_LEASE = ".specbutler-home.lease"
@@ -1424,6 +1433,26 @@ def create_ephemeral_codex_home(
     ), home
 
 
+def _operator_home(source: Mapping[str, str]) -> Path | None:
+    """Resolve an operator home without assuming a complete process environment."""
+    try:
+        return Path.home()
+    except RuntimeError:
+        pass
+    for key in ("HOME", "USERPROFILE"):
+        configured = str(source.get(key, "")).strip()
+        if configured:
+            return Path(configured).expanduser()
+    drive = str(source.get("HOMEDRIVE", "")).strip()
+    relative = str(source.get("HOMEPATH", "")).strip()
+    if drive and relative:
+        return Path(f"{drive}{relative}").expanduser()
+    # A deliberately sparse child environment can omit every platform profile
+    # variable. Callers still need a private, user-scoped fallback for launch
+    # state; tempfile resolves the OS account's temporary root.
+    return None
+
+
 def specbutler_user_state_root(
     source: Mapping[str, str] | None = None,
 ) -> Path:
@@ -1434,17 +1463,26 @@ def specbutler_user_state_root(
     or duplicating platform-specific paths.
     """
     values = os.environ if source is None else source
-    if os.name == "nt":
-        configured = values.get("LOCALAPPDATA")
-        if configured:
-            return Path(configured).expanduser() / "SpecButler"
-        return Path.home() / "AppData" / "Local" / "SpecButler"
     configured = values.get("XDG_STATE_HOME")
     if configured and Path(configured).expanduser().is_absolute():
         return Path(configured).expanduser() / "specbutler"
+    if os.name == "nt":
+        local_app_data = values.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data).expanduser() / "SpecButler"
+        home = _operator_home(values)
+        if home is not None:
+            return home / "AppData" / "Local" / "SpecButler"
+        return Path(tempfile.gettempdir()) / "SpecButler"
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "SpecButler"
-    return Path.home() / ".local" / "state" / "specbutler"
+        home = _operator_home(values)
+        if home is not None:
+            return home / "Library" / "Application Support" / "SpecButler"
+        return Path(tempfile.gettempdir()) / "SpecButler"
+    home = _operator_home(values)
+    if home is not None:
+        return home / ".local" / "state" / "specbutler"
+    return Path(tempfile.gettempdir()) / "specbutler"
 
 
 def protected_operator_paths(
@@ -1465,26 +1503,29 @@ def protected_operator_paths(
     unusable.
     """
     values = os.environ if source is None else source
-    home = Path.home()
-    paths = {
-        specbutler_user_state_root(values),
-        home / ".aws",
-        home / ".azure",
-        home / ".claude",
-        home / ".claude.json",
-        home / ".codex",
-        home / ".config" / "gh",
-        home / ".config" / "gcloud",
-        home / ".docker" / "config.json",
-        home / ".gitconfig",
-        home / ".git-credentials",
-        home / ".config" / "git",
-        home / ".kube",
-        home / ".netrc",
-        home / ".npmrc",
-        home / ".pypirc",
-        home / ".ssh",
-    }
+    home = _operator_home(values)
+    paths = {specbutler_user_state_root(values)}
+    if home is not None:
+        paths.update(
+            {
+                home / ".aws",
+                home / ".azure",
+                home / ".claude",
+                home / ".claude.json",
+                home / ".codex",
+                home / ".config" / "gh",
+                home / ".config" / "gcloud",
+                home / ".docker" / "config.json",
+                home / ".gitconfig",
+                home / ".git-credentials",
+                home / ".config" / "git",
+                home / ".kube",
+                home / ".netrc",
+                home / ".npmrc",
+                home / ".pypirc",
+                home / ".ssh",
+            }
+        )
     for home_key in ("HOME", "USERPROFILE"):
         configured_home = str(values.get(home_key, "")).strip()
         if configured_home:

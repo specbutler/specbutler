@@ -313,6 +313,6 @@ def test_host_publication_environment_disables_hooks_and_git_redirects(
     assert "ANTHROPIC_CUSTOM_HEADERS" not in env
     assert "OPENAI_API_KEY" not in env
     assert "CODEX_HOME" not in env
-    assert rendered["core.hooksPath"] == os.devnull
+    assert rendered["core.hooksPath"] == "/dev/null"
     assert rendered["credential.interactive"] == "false"
     assert rendered["extensions.worktreeConfig"] == "false"

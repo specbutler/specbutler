@@ -219,9 +219,17 @@ def test_protected_operator_paths_cover_common_and_configured_credentials(
         assert Path("/proc") in protected
 
 
-@pytest.mark.skipif(os.name == "nt", reason="XDG state applies to POSIX hosts")
-def test_macos_user_state_honors_explicit_absolute_xdg_root(tmp_path: Path) -> None:
+def test_user_state_honors_explicit_absolute_xdg_root(tmp_path: Path) -> None:
     xdg_state = tmp_path / "xdg-state"
+
+    with patch.object(pe.Path, "home", side_effect=RuntimeError("no home")):
+        assert pe.specbutler_user_state_root(
+            {"XDG_STATE_HOME": str(xdg_state)}
+        ) == (xdg_state / "specbutler")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX Path semantics")
+def test_macos_user_state_ignores_relative_xdg_root(tmp_path: Path) -> None:
     mac_home = tmp_path / "mac-home"
 
     with (
@@ -229,11 +237,19 @@ def test_macos_user_state_honors_explicit_absolute_xdg_root(tmp_path: Path) -> N
         patch.object(pe.Path, "home", return_value=mac_home),
     ):
         assert pe.specbutler_user_state_root(
-            {"XDG_STATE_HOME": str(xdg_state)}
-        ) == (xdg_state / "specbutler")
-        assert pe.specbutler_user_state_root(
             {"XDG_STATE_HOME": "relative-state"}
         ) == (mac_home / "Library" / "Application Support" / "SpecButler")
+
+
+def test_protected_paths_tolerate_sparse_environment_without_home(
+    tmp_path: Path,
+) -> None:
+    with patch.object(pe.Path, "home", side_effect=RuntimeError("no home")):
+        protected = pe.protected_operator_paths(
+            {"XDG_STATE_HOME": str(tmp_path / "state")}
+        )
+
+    assert tmp_path / "state" / "specbutler" in protected
 
 
 def test_claude_provider_credential_classification_covers_auth_transports() -> None:

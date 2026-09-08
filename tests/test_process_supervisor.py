@@ -1108,6 +1108,27 @@ def test_partial_windows_job_abort_retains_unconfirmed_handle() -> None:
         process_supervisor._RETAINED_ABORT_WINDOWS_JOBS.pop(id(job), None)
 
 
+def test_unassigned_windows_job_abort_closes_after_termination_failure() -> None:
+    events: list[str] = []
+
+    class Job:
+        def terminate(self) -> None:
+            events.append("terminate")
+            raise OSError("job termination failed")
+
+        def close(self) -> None:
+            events.append("close")
+
+    job = Job()
+
+    assert process_supervisor._abort_windows_job(  # type: ignore[arg-type]
+        job,
+        assigned=False,
+    )
+    assert events == ["terminate", "close"]
+    assert id(job) not in process_supervisor._RETAINED_ABORT_WINDOWS_JOBS
+
+
 def test_managed_close_failure_retains_facade() -> None:
     class Process:
         pid = 42
@@ -3432,7 +3453,6 @@ def test_windows_async_terminate_is_nonblocking(tmp_path: Path) -> None:
     asyncio.run(exercise())
 
 
-@pytest.mark.skipif(os.name != "nt", reason="native Windows BaseException cleanup integration")
 def test_windows_sync_launch_baseexception_closes_unassigned_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3440,10 +3460,12 @@ def test_windows_sync_launch_baseexception_closes_unassigned_job(
         pass
 
     events: list[str] = []
+    jobs: list[Job] = []
 
     class Job:
         def __init__(self, _name: str) -> None:
             events.append("open")
+            jobs.append(self)
 
         def terminate(self) -> None:
             events.append("terminate")
@@ -3456,11 +3478,17 @@ def test_windows_sync_launch_baseexception_closes_unassigned_job(
     def aborting_popen(*_args: object, **_kwargs: object) -> subprocess.Popen[object]:
         raise LaunchAbort
 
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setattr(process_supervisor, "_ensure_control_state_reconciled", lambda: None)
     monkeypatch.setattr(process_supervisor, "_WindowsJob", Job)
     monkeypatch.setattr(process_supervisor.subprocess, "Popen", aborting_popen)
 
-    with pytest.raises(LaunchAbort):
-        ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn([sys.executable, "-c", "pass"])
+    try:
+        with pytest.raises(LaunchAbort):
+            ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn([sys.executable, "-c", "pass"])
+    finally:
+        for job in jobs:
+            process_supervisor._RETAINED_ABORT_WINDOWS_JOBS.pop(id(job), None)
 
     assert events == ["open", "terminate", "close"]
 
@@ -3574,7 +3602,6 @@ def test_windows_async_spawn_captures_identity_before_resume(
     asyncio.run(exercise())
 
 
-@pytest.mark.skipif(os.name != "nt", reason="native Windows BaseException cleanup integration")
 def test_windows_async_launch_baseexception_closes_unassigned_job(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3596,6 +3623,8 @@ def test_windows_async_launch_baseexception_closes_unassigned_job(
     async def aborting_create(*_args: object, **_kwargs: object) -> asyncio.subprocess.Process:
         raise LaunchAbort
 
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setattr(process_supervisor, "_ensure_control_state_reconciled", lambda: None)
     monkeypatch.setattr(process_supervisor, "_WindowsJob", Job)
     monkeypatch.setattr(process_supervisor.asyncio, "create_subprocess_exec", aborting_create)
 

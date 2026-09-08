@@ -5,12 +5,14 @@ import json
 import os
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+from spec_runtime import agent_git_isolation as git_isolation
 from spec_runtime.agent_git_isolation import (
     UnsafeAgentGitIsolationError,
     agent_git_added_paths,
@@ -198,6 +200,26 @@ def test_private_git_accepts_plain_local_origin_with_internal_spaces(
     assert _agent_git(worktree, environment, "rev-parse", "origin/main") == (
         isolation.initial_head
     )
+
+
+def test_origin_sanitizer_accepts_drive_absolute_windows_path_with_spaces() -> None:
+    remote = r"C:\Users\Test Operator\remote repository.git"
+
+    assert git_isolation._sanitize_origin_url(remote) == remote
+
+
+@pytest.mark.parametrize(
+    "remote",
+    (
+        r"\\server\share\repository.git",
+        r"\\?\C:\repository.git",
+        r"\\.\C:\repository.git",
+        "//server/share/repository.git",
+    ),
+)
+def test_origin_sanitizer_rejects_windows_unc_and_device_paths(remote: str) -> None:
+    with pytest.raises(UnsafeAgentGitIsolationError, match="UNC path"):
+        git_isolation._sanitize_origin_url(remote)
 
 
 @pytest.mark.parametrize(
@@ -397,7 +419,9 @@ def test_reconcile_refuses_private_config_or_alternates_poisoning(
 def test_reconcile_refuses_layout_or_branch_changes(tmp_path: Path) -> None:
     repository, worktree = _linked_worktree(tmp_path)
     isolation = prepare_agent_git_isolation(worktree)
-    (worktree / ".git").write_text("gitdir: /tmp/not-the-worktree\n", encoding="utf-8")
+    dot_git = worktree / ".git"
+    dot_git.chmod(dot_git.stat().st_mode | stat.S_IWRITE)
+    dot_git.write_text("gitdir: /tmp/not-the-worktree\n", encoding="utf-8")
 
     with pytest.raises(UnsafeAgentGitIsolationError):
         reconcile_agent_git_isolation(isolation)
@@ -509,6 +533,92 @@ def test_private_hardlink_is_rejected_before_reconciliation(tmp_path: Path) -> N
 
     with pytest.raises(UnsafeAgentGitIsolationError, match="hardlink"):
         reconcile_agent_git_isolation(isolation)
+
+
+def test_private_tree_ignores_incomplete_windows_direntry_link_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use a full lstat instead of Windows' incomplete scandir metadata."""
+    _repository, worktree = _linked_worktree(tmp_path)
+    isolation = prepare_agent_git_isolation(worktree)
+    real_scandir = os.scandir
+    cached_stat_calls: list[str] = []
+
+    class IncompleteDirEntry:
+        def __init__(self, entry: os.DirEntry[str]) -> None:
+            self._entry = entry
+            self.path = entry.path
+
+        def is_symlink(self) -> bool:
+            return self._entry.is_symlink()
+
+        def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+            return self._entry.is_dir(follow_symlinks=follow_symlinks)
+
+        def is_file(self, *, follow_symlinks: bool = True) -> bool:
+            return self._entry.is_file(follow_symlinks=follow_symlinks)
+
+        def stat(self, *, follow_symlinks: bool = True) -> object:
+            del follow_symlinks
+            cached_stat_calls.append(self.path)
+            return type("IncompleteStat", (), {"st_nlink": 0})()
+
+    def incomplete_scandir(path: str | os.PathLike[str]) -> list[IncompleteDirEntry]:
+        with real_scandir(path) as entries:
+            return [IncompleteDirEntry(entry) for entry in entries]
+
+    monkeypatch.setattr(git_isolation.os, "scandir", incomplete_scandir)
+
+    assert os.lstat(isolation.private_git_dir / "config").st_nlink == 1
+    assert agent_git_head(isolation) == isolation.initial_head
+    assert cached_stat_calls == []
+
+
+def test_git_metadata_kind_rejects_windows_reparse_attribute() -> None:
+    class ReparseDirectory:
+        def lstat(self) -> object:
+            return type(
+                "ReparseStat",
+                (),
+                {
+                    "st_mode": stat.S_IFDIR | 0o700,
+                    "st_file_attributes": stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                },
+            )()
+
+        def __str__(self) -> str:
+            return "reparse-directory"
+
+    with pytest.raises(UnsafeAgentGitIsolationError, match="real directory"):
+        git_isolation._lstat_kind(  # type: ignore[arg-type]
+            ReparseDirectory(),
+            required=True,
+            directory=True,
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows junctions")
+def test_git_metadata_kind_rejects_real_windows_junction(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    junction = tmp_path / "junction"
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(f"junction creation is unavailable: {completed.stderr}")
+
+    try:
+        with pytest.raises(UnsafeAgentGitIsolationError, match="real directory"):
+            git_isolation._lstat_kind(junction, required=True, directory=True)
+    finally:
+        # Remove the junction explicitly so pytest's recursive temporary-tree
+        # cleanup never has to decide whether to traverse a reparse point.
+        junction.rmdir()
 
 
 @pytest.mark.skipif(

@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -1403,7 +1402,10 @@ class TestCloneBackend:
             base_ref="master",
         )
         run_root = handle.outbox_path.parent
-        shutil.rmtree(run_root)
+        # Git object files can be read-only on native Windows.  Use the same
+        # cross-platform removal primitive as production cleanup so this test
+        # reaches the symlink-boundary assertion on every supported platform.
+        eb.remove_tree(run_root)
         outside = tmp_path / "outside-run"
         (outside / "source").mkdir(parents=True)
         (outside / "outbox").mkdir()

@@ -720,7 +720,7 @@ def test_implement_policy_denies_the_whole_external_provider_home(tmp_path: Path
         for value in command
         if value.startswith("permissions.specbutler-implement.filesystem=")
     )
-    assert f'"{provider_home.resolve()}"="deny"' in filesystem
+    assert f'{json.dumps(str(provider_home.resolve()))}="deny"' in filesystem
     assert f'"{provider_home.resolve() / "auth.json"}"' not in filesystem
     assert not (workspace / ".spec-codex-home").exists()
 

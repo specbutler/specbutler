@@ -22,9 +22,9 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlsplit
 
 _PRIVATE_GIT_DIR_NAME = "specbutler-private-git"
@@ -134,10 +134,17 @@ def _absolute(path: Path) -> Path:
     return Path(os.path.abspath(path))
 
 
+def _is_windows_reparse_stat(metadata: os.stat_result) -> bool:
+    """Return whether a stat result identifies a Windows reparse point."""
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    return bool(attributes & reparse_flag)
+
+
 def _lstat_kind(path: Path, *, required: bool, directory: bool) -> bool:
     """Validate a path without following its final component."""
     try:
-        mode = path.lstat().st_mode
+        metadata = path.lstat()
     except FileNotFoundError:
         if required:
             raise UnsafeAgentGitIsolationError(
@@ -148,8 +155,16 @@ def _lstat_kind(path: Path, *, required: bool, directory: bool) -> bool:
         raise UnsafeAgentGitIsolationError(
             f"Unable to inspect Git metadata: {path}"
         ) from exc
-    wanted = stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)
-    if stat.S_ISLNK(mode) or not wanted:
+    wanted = (
+        stat.S_ISDIR(metadata.st_mode)
+        if directory
+        else stat.S_ISREG(metadata.st_mode)
+    )
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or _is_windows_reparse_stat(metadata)
+        or not wanted
+    ):
         expected = "directory" if directory else "regular file"
         raise UnsafeAgentGitIsolationError(
             f"Git metadata must be a real {expected}: {path}"
@@ -290,14 +305,25 @@ def _assert_private_tree_is_plain(root: Path) -> None:
                     "Private Git metadata contains too many filesystem entries"
                 )
             try:
-                if entry.is_symlink():
+                metadata = os.lstat(entry.path)
+                if stat.S_ISLNK(metadata.st_mode):
                     raise UnsafeAgentGitIsolationError(
                         f"Private Git metadata contains a symlink: {entry.path}"
                     )
-                if entry.is_dir(follow_symlinks=False):
+                if _is_windows_reparse_stat(metadata):
+                    raise UnsafeAgentGitIsolationError(
+                        f"Private Git metadata contains a reparse point: {entry.path}"
+                    )
+                if stat.S_ISDIR(metadata.st_mode):
                     pending.append(Path(entry.path))
-                elif entry.is_file(follow_symlinks=False):
-                    if entry.stat(follow_symlinks=False).st_nlink != 1:
+                elif stat.S_ISREG(metadata.st_mode):
+                    # Windows' directory-enumeration metadata does not include
+                    # a reliable link count.  In particular, Python 3.11 may
+                    # expose ``st_nlink == 0`` from this DirEntry cache for an
+                    # ordinary single-link file.  ``os.lstat`` asks the
+                    # filesystem for the real count while retaining the
+                    # no-follow behavior required by this boundary.
+                    if metadata.st_nlink != 1:
                         raise UnsafeAgentGitIsolationError(
                             f"Private Git metadata contains a hardlink: {entry.path}"
                         )
@@ -482,6 +508,7 @@ def _is_safe_empty_config_worktree_creation(
         before = os.lstat(path)
         if (
             stat.S_ISLNK(before.st_mode)
+            or _is_windows_reparse_stat(before)
             or not stat.S_ISREG(before.st_mode)
             or before.st_size != 0
             or before.st_nlink != 1
@@ -494,6 +521,7 @@ def _is_safe_empty_config_worktree_creation(
         return False
     return (
         (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+        and not _is_windows_reparse_stat(after)
         and after.st_size == 0
         and after.st_nlink == 1
         and after_snapshot == current
@@ -619,7 +647,15 @@ def _sanitize_origin_url(value: str) -> str:
         raise UnsafeAgentGitIsolationError("remote.origin.url uses an unsafe transport")
     if _SCP_SECRET_RE.search(value):
         raise UnsafeAgentGitIsolationError("remote.origin.url contains credentials")
-    if " " in value and ":" in value:
+    windows_path = PureWindowsPath(value)
+    windows_local_path = bool(
+        re.fullmatch(r"[A-Za-z]:", windows_path.drive) and windows_path.root
+    )
+    if value.startswith(("\\\\", "//")):
+        raise UnsafeAgentGitIsolationError(
+            "remote.origin.url uses an unsafe Windows namespace or UNC path"
+        )
+    if " " in value and ":" in value and not windows_local_path:
         raise UnsafeAgentGitIsolationError("remote.origin.url is malformed")
 
     if "://" not in value:
@@ -627,7 +663,11 @@ def _sanitize_origin_url(value: str) -> str:
         # value and never through a shell, so internal ASCII spaces are data,
         # not an injection boundary. URL and SCP-like syntaxes remain stricter
         # because their parsers give whitespace transport-specific meaning.
-        if ":" in value and not _SCP_REMOTE_RE.fullmatch(value):
+        if (
+            ":" in value
+            and not windows_local_path
+            and not _SCP_REMOTE_RE.fullmatch(value)
+        ):
             raise UnsafeAgentGitIsolationError("remote.origin.url is malformed")
         return value
 
@@ -895,7 +935,10 @@ def prepare_agent_git_isolation(worktree_path: Path) -> AgentGitIsolation:
         )
     except BaseException:
         if private_git_dir.exists() and not private_git_dir.is_symlink():
-            shutil.rmtree(private_git_dir, ignore_errors=True)
+            try:
+                _rmtree_private_git(private_git_dir)
+            except OSError:
+                pass
         raise
 
 
@@ -1281,6 +1324,32 @@ def reconcile_agent_git_isolation(
     )
 
 
+def _rmtree_private_git(path: Path) -> None:
+    """Remove disposable metadata, retrying Windows read-only Git files."""
+
+    def remove_read_only(
+        function: Callable[..., object],
+        failed_path: str,
+        exc_info: tuple[type[BaseException], BaseException, object],
+    ) -> None:
+        error = exc_info[1]
+        if os.name != "nt" or not isinstance(error, PermissionError):
+            raise error
+        try:
+            metadata = os.lstat(failed_path)
+        except OSError as inspection_error:
+            raise inspection_error from error
+        if stat.S_ISLNK(metadata.st_mode) or _is_windows_reparse_stat(metadata):
+            raise error
+        try:
+            os.chmod(failed_path, stat.S_IWRITE)
+            function(failed_path)
+        except OSError as retry_error:
+            raise retry_error from error
+
+    shutil.rmtree(path, onerror=remove_read_only)
+
+
 def cleanup_agent_git_isolation(isolation: AgentGitIsolation) -> None:
     """Remove this attempt's disposable Git metadata without following symlinks."""
     expected = isolation.real_git_dir / _PRIVATE_GIT_DIR_NAME
@@ -1291,7 +1360,7 @@ def cleanup_agent_git_isolation(isolation: AgentGitIsolation) -> None:
     _lstat_kind(isolation.real_git_dir, required=True, directory=True)
     _lstat_kind(isolation.private_git_dir, required=True, directory=True)
     try:
-        shutil.rmtree(isolation.private_git_dir)
+        _rmtree_private_git(isolation.private_git_dir)
     except OSError as exc:
         raise UnsafeAgentGitIsolationError("Unable to remove private Git metadata") from exc
 
@@ -1303,7 +1372,7 @@ def reset_agent_git_isolation(worktree_path: Path) -> AgentGitIsolation:
     if private_git_dir.exists() or private_git_dir.is_symlink():
         _lstat_kind(private_git_dir, required=True, directory=True)
         try:
-            shutil.rmtree(private_git_dir)
+            _rmtree_private_git(private_git_dir)
         except OSError as exc:
             raise UnsafeAgentGitIsolationError(
                 "Unable to reset private Git metadata"

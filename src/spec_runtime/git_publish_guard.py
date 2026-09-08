@@ -387,7 +387,11 @@ def host_publication_git_environment() -> dict[str, str]:
         ):
             env.pop(name, None)
     entries = (
-        ("core.hooksPath", os.devnull),
+        # Git documents /dev/null as the portable per-command value that
+        # disables hooks, and Git for Windows special-cases it accordingly.
+        # Python's Windows os.devnull is ``nul``; treating that device name as
+        # a hooks directory can make commit fail while probing ``nul/<hook>``.
+        ("core.hooksPath", "/dev/null"),
         ("credential.interactive", "false"),
         # Ignore a repository-selected config.worktree during every host Git
         # publication command. The baseline still fingerprints that file so

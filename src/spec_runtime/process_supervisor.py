@@ -1656,8 +1656,20 @@ def _terminate_held_windows_job(token: SupervisionToken, job: _WindowsJob, grace
         return False
 
 
-def _abort_windows_job(job: _WindowsJob | None) -> bool:
-    """Abort a partial launch without discarding an unconfirmed Job handle."""
+def _abort_windows_job(
+    job: _WindowsJob | None,
+    *,
+    assigned: bool = True,
+) -> bool:
+    """Abort a partial launch without discarding an unconfirmed Job handle.
+
+    Before ``Popen``/``create_subprocess_exec`` returns, the Job is provably
+    unassigned: assignment is a separate step performed by this module.  In
+    that state a failed ``TerminateJobObject`` must not prevent us from closing
+    the otherwise leaked kernel handle.  Once assignment may have happened,
+    retain the handle on a termination failure so callers keep a capability
+    for explicit cleanup of an unconfirmed process tree.
+    """
     if job is None:
         return True
     try:
@@ -1665,8 +1677,13 @@ def _abort_windows_job(job: _WindowsJob | None) -> bool:
         if not job.wait_empty(_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS):
             raise OSError("partial-launch Windows Job remained populated")
     except BaseException:
-        _RETAINED_ABORT_WINDOWS_JOBS[id(job)] = job
-        return False
+        if assigned:
+            _RETAINED_ABORT_WINDOWS_JOBS[id(job)] = job
+            return False
+        # The launch API did not return, so this Job cannot contain a process
+        # assigned by Spec Butler.  Still close it even if the defensive
+        # terminate/query sequence failed (including through a BaseException).
+        return _close_windows_job_retaining_on_failure(job)
     try:
         job.close()
     except BaseException:
@@ -3384,7 +3401,7 @@ class ProcessSupervisor:
         try:
             process = subprocess.Popen(list(argv), **kwargs)
         except BaseException as exc:
-            windows_confirmed = _abort_windows_job(job)
+            windows_confirmed = _abort_windows_job(job, assigned=False)
             linux_confirmed = _abort_linux_run_cgroup(cgroup)
             for fd in (
                 cgroup_ready_read,
@@ -3659,7 +3676,7 @@ class ProcessSupervisor:
         try:
             process = await asyncio.create_subprocess_exec(*argv, **kwargs)
         except BaseException as exc:
-            windows_confirmed = _abort_windows_job(job)
+            windows_confirmed = _abort_windows_job(job, assigned=False)
             linux_confirmed = _abort_linux_run_cgroup(cgroup)
             for fd in (
                 cgroup_ready_read,
