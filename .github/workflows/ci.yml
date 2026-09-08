@@ -493,6 +493,13 @@ jobs:
         run: |
           & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m ruff check . 2>&1 | Tee-Object artifacts/lint.log
           exit $LASTEXITCODE
+      - name: Run Windows publication smoke
+        if: ${{ matrix.full_suite }}
+        shell: pwsh
+        run: |
+          Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests/test_spec_orchestrator.py::TestPublishPhase::test_publish_retries_with_verified_no_diff_completion_provenance -q 2>&1 | Tee-Object artifacts/publication-smoke.log
+          exit $LASTEXITCODE
       - name: Run full portable test suite
         if: ${{ matrix.full_suite }}
         shell: pwsh

@@ -11652,7 +11652,7 @@ class TestPublishPhase:
             result = orch.phase_publish(run, repo)
 
         marker_head = _run_git_stdout("rev-parse", "HEAD", cwd=repo).strip()
-        assert result == "passed"
+        assert result == "passed", run.last_error
         assert marker_head != verified_head
         assert _run_git_stdout("diff", "--stat", verified_head, marker_head, cwd=repo) == ""
         assert _run_git_stdout("log", "-1", "--format=%s", cwd=repo).strip() == (
