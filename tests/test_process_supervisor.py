@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import os
 import signal
@@ -2073,6 +2074,107 @@ def test_windows_job_close_is_serialized_and_idempotent_across_callers() -> None
     assert not second.is_alive()
     assert calls == [1234]
     assert job.handle is None
+
+
+def test_windows_job_empty_close_remains_observable_to_shared_facade() -> None:
+    class Kernel:
+        def QueryInformationJobObject(
+            self,
+            _handle: int,
+            _info_class: int,
+            buffer: object,
+            _size: int,
+            _returned: object,
+        ) -> bool:
+            ctypes.c_uint32.from_buffer(buffer, 0).value = 0  # type: ignore[arg-type]
+            ctypes.c_uint32.from_buffer(buffer, 4).value = 0  # type: ignore[arg-type]
+            return True
+
+        def CloseHandle(self, _handle: int) -> bool:
+            return True
+
+    job = process_supervisor._WindowsJob.__new__(process_supervisor._WindowsJob)
+    job._kernel32 = Kernel()
+    job._handle_lock = threading.RLock()
+    job._closed_after_empty = False
+    job.handle = 1234
+
+    job.close_after_empty()
+
+    assert job.handle is None
+    assert job.active_process_ids() == ()
+    job.close_after_empty()
+
+
+def test_windows_job_plain_close_does_not_forge_empty_proof() -> None:
+    class Kernel:
+        def CloseHandle(self, _handle: int) -> bool:
+            return True
+
+    job = process_supervisor._WindowsJob.__new__(process_supervisor._WindowsJob)
+    job._kernel32 = Kernel()
+    job._handle_lock = threading.RLock()
+    job._closed_after_empty = False
+    job.handle = 1234
+
+    job.close()
+
+    with pytest.raises(OSError, match="Job handle is closed"):
+        job.active_process_ids()
+
+
+def test_managed_wait_accepts_job_retired_after_shared_empty_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Kernel:
+        def QueryInformationJobObject(
+            self,
+            _handle: int,
+            _info_class: int,
+            buffer: object,
+            _size: int,
+            _returned: object,
+        ) -> bool:
+            ctypes.c_uint32.from_buffer(buffer, 0).value = 0  # type: ignore[arg-type]
+            ctypes.c_uint32.from_buffer(buffer, 4).value = 0  # type: ignore[arg-type]
+            return True
+
+        def CloseHandle(self, _handle: int) -> bool:
+            return True
+
+    class Process:
+        pid = 42
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            return 0
+
+    identity = ProcessIdentity(42, "created")
+    token = SupervisionToken(
+        LifetimeMode.RUN_OWNED,
+        identity,
+        7,
+        "owner",
+        "shared-empty-close",
+    )
+    job = process_supervisor._WindowsJob.__new__(process_supervisor._WindowsJob)
+    job._kernel32 = Kernel()
+    job._handle_lock = threading.RLock()
+    job._closed_after_empty = False
+    job.handle = 1234
+    key = (identity.pid, identity.started_at)
+    monkeypatch.setattr(process_supervisor.os, "name", "nt")
+    monkeypatch.setitem(process_supervisor._LIVE_WINDOWS_JOBS, key, job)
+    managed = process_supervisor.ManagedProcess(Process(), token, job)  # type: ignore[arg-type]
+
+    process_supervisor.close_empty_held_windows_jobs()
+
+    assert key not in process_supervisor._LIVE_WINDOWS_JOBS
+    assert managed.wait(timeout=1) == 0
+    assert managed._job is None
 
 
 def test_bind_held_windows_job_payload_requires_kernel_membership(

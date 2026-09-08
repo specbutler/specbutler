@@ -156,9 +156,22 @@ import subprocess
 import sys
 
 def main():
-    if sys.argv[1:3] == ["exec", "--help"]:
-        print("codex exec --json --output-schema")
+    args = sys.argv[1:]
+    if args == ["login", "status"]:
+        print("Logged in using fixture credentials")
         return 0
+    if args == ["exec", "--help"]:
+        print("codex exec --add-dir --ephemeral --ignore-rules --ignore-user-config "
+              "--json --output-schema --strict-config")
+        return 0
+    if args == ["sandbox", "--help"]:
+        print("codex sandbox --permission-profile")
+        return 0
+    if args[:1] == ["app-server"]:
+        return 0
+    if not args or args[0] != "exec":
+        print(f"unsupported fixture codex command: {args!r}", file=sys.stderr)
+        return 2
     marker = pathlib.Path(".fixture-agent-needs-input")
     python = os.environ["SPEC_FIXTURE_PYTHON"]
     if not marker.exists():

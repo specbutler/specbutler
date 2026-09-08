@@ -1320,6 +1320,7 @@ class _WindowsJob:
     def __init__(self, name: str | None = None) -> None:
         self._kernel32 = _kernel32()
         self._handle_lock = threading.RLock()
+        self._closed_after_empty = False
         self.handle = self._kernel32.CreateJobObjectW(None, name)
         if not self.handle:
             raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
@@ -1341,6 +1342,7 @@ class _WindowsJob:
         job = cls.__new__(cls)
         job._kernel32 = kernel32
         job._handle_lock = threading.RLock()
+        job._closed_after_empty = False
         job.handle = handle
         return job
 
@@ -1364,6 +1366,8 @@ class _WindowsJob:
 
         with self._handle_lock:
             if not self.handle:
+                if self._closed_after_empty:
+                    return ()
                 raise OSError("Job handle is closed")
             capacity = 16
             pointer_size = ctypes.sizeof(ctypes.c_size_t)
@@ -1395,6 +1399,27 @@ class _WindowsJob:
                 # Grow geometrically rather than accepting an incomplete
                 # membership list at a security boundary.
                 capacity *= 2
+
+    def close_after_empty(self) -> None:
+        """Close only after atomically proving the Job has no members.
+
+        A registry reaper and the ManagedProcess facade can share this wrapper.
+        Remembering the empty proof lets the second owner finish idempotently
+        without turning an already-completed cleanup into an unconfirmed tree.
+        An ordinary close does not create that proof.
+        """
+        with self._handle_lock:
+            if not self.handle:
+                if self._closed_after_empty:
+                    return
+                raise OSError("Job handle is closed without an empty proof")
+            if self.active_process_ids():
+                raise OSError("cannot close a populated RUN_OWNED Job")
+            handle = self.handle
+            if not self._kernel32.CloseHandle(handle):
+                raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+            self.handle = None
+            self._closed_after_empty = True
 
     def active_identities(self) -> list[ProcessIdentity]:
         return [identity for pid in self.active_process_ids() if (identity := inspect_process(pid)) is not None]
@@ -1612,9 +1637,7 @@ def close_empty_held_windows_jobs() -> None:
         return
     for key, job in tuple(_LIVE_WINDOWS_JOBS.items()):
         try:
-            if job.active_process_ids():
-                continue
-            job.close()
+            job.close_after_empty()
         except OSError:
             continue
         if _LIVE_WINDOWS_JOBS.get(key) is job:
@@ -2705,7 +2728,11 @@ class ManagedProcess:
                         _STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
                     ):
                         raise OSError("cannot close a populated RUN_OWNED Job")
-                self._job.close()
+                close_after_empty = getattr(self._job, "close_after_empty", None)
+                if callable(close_after_empty):
+                    close_after_empty()
+                else:
+                    self._job.close()
                 _LIVE_WINDOWS_JOBS.pop(
                     (self.token.identity.pid, self.token.identity.started_at),
                     None,
@@ -3017,7 +3044,11 @@ class ManagedAsyncProcess:
                         _STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS
                     ):
                         raise OSError("cannot close a populated RUN_OWNED Job")
-                self._job.close()
+                close_after_empty = getattr(self._job, "close_after_empty", None)
+                if callable(close_after_empty):
+                    close_after_empty()
+                else:
+                    self._job.close()
                 _LIVE_WINDOWS_JOBS.pop(
                     (self.token.identity.pid, self.token.identity.started_at),
                     None,
