@@ -149,8 +149,11 @@ raise SystemExit(0)
         f'@echo off\r\n"{python}" -I "%~dp0fake-gh.py" %*\r\n',
         encoding="utf-8",
     )
-    (fake_bin / "fixture_codex.py").write_text(
-        """import os
+    codex_source_dir = fake_bin / "fixture-codex-source"
+    codex_source_dir.mkdir()
+    (codex_source_dir / "codex").write_text(
+        """#!/usr/bin/env python
+import os
 import pathlib
 import subprocess
 import sys
@@ -195,21 +198,27 @@ def main():
         python, "-I", "-m", "spec_runtime.cli", "report",
         "--status", "ok", "--summary", "Selected fixture behavior A",
     ]).returncode
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 """,
         encoding="utf-8",
     )
-    maker = ScriptMaker(None, str(fake_bin))
+    maker = ScriptMaker(str(codex_source_dir), str(fake_bin))
     maker.executable = str(python)
     maker.variants = {""}
-    generated = maker.make("codex = fixture_codex:main")
+    generated = maker.make("codex")
     assert generated
 
 
 def _write_fake_spec_launcher(fake_bin: Path, python: Path) -> None:
     from pip._vendor.distlib.scripts import ScriptMaker
 
-    (fake_bin / "fixture_spec.py").write_text(
-        """import json
+    spec_source_dir = fake_bin / "fixture-spec-source"
+    spec_source_dir.mkdir()
+    (spec_source_dir / "spec").write_text(
+        """#!/usr/bin/env python
+import json
 import os
 import pathlib
 import time
@@ -224,13 +233,16 @@ def main():
     while not release.exists():
         time.sleep(0.2)
     return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 """,
         encoding="utf-8",
     )
-    maker = ScriptMaker(None, str(fake_bin))
+    maker = ScriptMaker(str(spec_source_dir), str(fake_bin))
     maker.executable = str(python)
     maker.variants = {""}
-    generated = maker.make("spec = fixture_spec:main")
+    generated = maker.make("spec")
     assert generated
 
 
@@ -1004,6 +1016,22 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
     subprocess_env["PATH"] = os.pathsep.join(
         [str(fake_bin), subprocess_env.get("PATH", "")]
     )
+    codex_path = fake_bin / "codex.exe"
+    for arguments, marker in (
+        (("login", "status"), "fixture credentials"),
+        (("exec", "--help"), "--strict-config"),
+        (("sandbox", "--help"), "--permission-profile"),
+    ):
+        probe = subprocess.run(
+            [str(codex_path), *arguments],
+            cwd=tmp_path,
+            env=subprocess_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert probe.returncode == 0, probe.stdout + probe.stderr
+        assert marker in probe.stdout
 
     subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
     (tmp_path / "README.md").write_text("probe\n")
