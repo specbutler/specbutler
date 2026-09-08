@@ -151,9 +151,7 @@ raise SystemExit(0)
     )
     codex_source_dir = fake_bin / "fixture-codex-source"
     codex_source_dir.mkdir()
-    (codex_source_dir / "codex").write_text(
-        """#!/usr/bin/env python
-import os
+    codex_script = """#!/usr/bin/env python
 import pathlib
 import subprocess
 import sys
@@ -176,7 +174,7 @@ def main():
         print(f"unsupported fixture codex command: {args!r}", file=sys.stderr)
         return 2
     marker = pathlib.Path(".fixture-agent-needs-input")
-    python = os.environ["SPEC_FIXTURE_PYTHON"]
+    python = __FIXTURE_PYTHON__
     if not marker.exists():
         marker.write_text("waiting")
         return subprocess.run([
@@ -201,7 +199,9 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-""",
+"""
+    (codex_source_dir / "codex").write_text(
+        codex_script.replace("__FIXTURE_PYTHON__", repr(str(python))),
         encoding="utf-8",
     )
     maker = ScriptMaker(str(codex_source_dir), str(fake_bin))
@@ -1235,12 +1235,8 @@ def test_installed_artifact_cli_matrix(tmp_path: Path) -> None:
         {
             "CODEX_HOME": str(operator_codex_home),
             "PATH": os.pathsep.join([str(fake_bin), env.get("PATH", "")]),
-            # Used only by generated native fake-provider launchers. Product
-            # CLI subprocesses use -I and cannot import from this directory.
-            "PYTHONPATH": str(fake_bin),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
-            "SPEC_FIXTURE_PYTHON": sys.executable,
             "SPEC_NO_UPDATE_CHECK": "1",
             "SPEC_PROCESS_CONTROL_ROOT": str(process_control_root),
             "LOCALAPPDATA": str(tmp_path / "operator local state"),
@@ -1422,7 +1418,13 @@ with patch("spec_runtime.update.resolve_repo_slug", return_value="fixture/spec")
             encoding="utf-8"
         )
     )
-    assert waiting_payload["status"] == "waiting-for-input"
+    assert waiting_payload["status"] == "waiting-for-input", (
+        "first implement phase did not preserve the provider's needs-input "
+        "report\n"
+        f"stdout:\n{first_implement.stdout}\n"
+        f"stderr:\n{first_implement.stderr}\n"
+        f"run state:\n{json.dumps(waiting_payload, indent=2, sort_keys=True)}"
+    )
     assert waiting_payload["input_question"] == "Choose fixture behavior A or B"
     waiting_status = _cli(repo, "status", "--spec", lifecycle_id, env=env)
     assert "waiting-for-input" in waiting_status.stdout
