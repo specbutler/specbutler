@@ -166,16 +166,25 @@ def main():
         return 0
     if args[:1] == ["app-server"]:
         return 0
-    try:
-        exec_index = args.index("exec")
-    except ValueError:
-        print(f"unsupported fixture codex command: {args!r}", file=sys.stderr)
-        return 2
-    exec_args = args[exec_index + 1:]
-    if exec_args == ["--help"]:
-        print("codex exec --add-dir --ephemeral --ignore-rules --ignore-user-config "
-              "--json --output-schema --strict-config")
-        return 0
+    is_authoring = (
+        len(args) >= 5
+        and args[:4] == ["-a", "on-request", "-s", "workspace-write"]
+    )
+    if is_authoring:
+        if args[-1:] == ["--fixture-mode-probe"]:
+            print("fixture Codex authoring invocation")
+            return 0
+    else:
+        try:
+            exec_index = args.index("exec")
+        except ValueError:
+            print(f"unsupported fixture codex command: {args!r}", file=sys.stderr)
+            return 2
+        exec_args = args[exec_index + 1:]
+        if exec_args == ["--help"]:
+            print("codex exec --add-dir --ephemeral --ignore-rules --ignore-user-config "
+                  "--json --output-schema --strict-config")
+            return 0
     marker = pathlib.Path(".fixture-agent-needs-input")
     python = __FIXTURE_PYTHON__
     if not marker.exists():
@@ -1026,6 +1035,10 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
         (
             ("-a", "never", "--add-dir", str(tmp_path), "exec", "--help"),
             "--strict-config",
+        ),
+        (
+            ("-a", "on-request", "-s", "workspace-write", "--fixture-mode-probe"),
+            "authoring invocation",
         ),
         (("sandbox", "--help"), "--permission-profile"),
     ):
