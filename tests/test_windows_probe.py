@@ -138,7 +138,7 @@ if args[:2] == ["auth", "token"]:
 elif args[:2] == ["pr", "list"]:
     print("[]")
 elif args[:2] == ["repo", "view"]:
-    print(json.dumps({"nameWithOwner": "example/windows-ci-fixture"}))
+    print("example/windows-ci-fixture")
 elif args and args[0] == "api":
     print("[]")
 raise SystemExit(0)
@@ -1073,6 +1073,7 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
         check=False,
     )
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert "0 warning(s)" in doctor.stdout
 
 
 def test_foreground_web_bind_and_authenticated_request(tmp_path: Path) -> None:
