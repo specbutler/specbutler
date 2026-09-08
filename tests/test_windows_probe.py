@@ -161,18 +161,21 @@ def main():
     if args == ["login", "status"]:
         print("Logged in using fixture credentials")
         return 0
-    if args == ["exec", "--help"]:
-        print("codex exec --add-dir --ephemeral --ignore-rules --ignore-user-config "
-              "--json --output-schema --strict-config")
-        return 0
     if args == ["sandbox", "--help"]:
         print("codex sandbox --permission-profile")
         return 0
     if args[:1] == ["app-server"]:
         return 0
-    if not args or args[0] != "exec":
+    try:
+        exec_index = args.index("exec")
+    except ValueError:
         print(f"unsupported fixture codex command: {args!r}", file=sys.stderr)
         return 2
+    exec_args = args[exec_index + 1:]
+    if exec_args == ["--help"]:
+        print("codex exec --add-dir --ephemeral --ignore-rules --ignore-user-config "
+              "--json --output-schema --strict-config")
+        return 0
     marker = pathlib.Path(".fixture-agent-needs-input")
     python = __FIXTURE_PYTHON__
     if not marker.exists():
@@ -1020,6 +1023,10 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
     for arguments, marker in (
         (("login", "status"), "fixture credentials"),
         (("exec", "--help"), "--strict-config"),
+        (
+            ("-a", "never", "--add-dir", str(tmp_path), "exec", "--help"),
+            "--strict-config",
+        ),
         (("sandbox", "--help"), "--permission-profile"),
     ):
         probe = subprocess.run(
