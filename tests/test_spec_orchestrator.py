@@ -707,6 +707,62 @@ class TestRunState:
 
         assert orch._active_spec_path(repo, run, prefer_worktree=True) is None
 
+    def test_ensure_run_spec_committed_accepts_clean_post_add_normalization(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="my-feature-20260101T000006",
+            spec_id="my-feature",
+            branch="code/my-feature--token123",
+        )
+        spec_path = repo / "specs" / "my-feature.md"
+        responses = [
+            subprocess.CompletedProcess([], 0, " M specs/my-feature.md\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+        ]
+
+        with patch.object(orch, "run_subprocess", side_effect=responses) as run_git:
+            assert orch._ensure_run_spec_committed(
+                run,
+                worktree_path=repo,
+                spec_path=spec_path,
+            )
+
+        assert [call.args[0] for call in run_git.call_args_list] == [
+            ["git", "status", "--porcelain", "--", "specs/my-feature.md"],
+            ["git", "add", "--", "specs/my-feature.md"],
+            ["git", "diff", "--cached", "--quiet", "--", "specs/my-feature.md"],
+            ["git", "status", "--porcelain", "--", "specs/my-feature.md"],
+        ]
+
+    def test_ensure_run_spec_committed_rejects_dirty_post_add_normalization(
+        self,
+        repo: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="my-feature-20260101T000007",
+            spec_id="my-feature",
+            branch="code/my-feature--token123",
+        )
+        responses = [
+            subprocess.CompletedProcess([], 0, " M specs/my-feature.md\n", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, "", ""),
+            subprocess.CompletedProcess([], 0, " M specs/my-feature.md\n", ""),
+        ]
+
+        with patch.object(orch, "run_subprocess", side_effect=responses):
+            assert not orch._ensure_run_spec_committed(
+                run,
+                worktree_path=repo,
+                spec_path=repo / "specs" / "my-feature.md",
+            )
+
+        assert "remains dirty after staging" in run.last_error
+
     @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink support")
     def test_restore_pinned_spec_replaces_leaf_symlink_without_following_it(
         self,
@@ -12112,6 +12168,8 @@ class TestPublishPhase:
                 return subprocess.CompletedProcess(cmd, 0, "?? specs/my-feature.md\n", "")
             if cmd[:3] == ["git", "add", "--"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:4] == ["git", "diff", "--cached", "--quiet"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
             if cmd[:3] == ["git", "commit", "-m"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["gh", "auth", "status"]:
@@ -12237,6 +12295,8 @@ class TestPublishPhase:
                 )
             if cmd[:3] == ["git", "add", "--"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:4] == ["git", "diff", "--cached", "--quiet"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
             if cmd[:3] == ["git", "commit", "-m"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["gh", "auth", "status"]:
@@ -12332,6 +12392,8 @@ class TestPublishPhase:
                 )
             if cmd[:3] == ["git", "add", "--"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:4] == ["git", "diff", "--cached", "--quiet"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
             if cmd[:3] == ["git", "commit", "-m"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd[:3] == ["gh", "auth", "status"]:

@@ -8055,6 +8055,44 @@ def _ensure_run_spec_committed(
         env=git_env,
     ):
         return False
+    staged_result = run_subprocess(
+        ["git", "diff", "--cached", "--quiet", "--", relative_spec],
+        cwd=worktree_path,
+        env=git_env,
+        inherit_env=git_env is None,
+    )
+    if staged_result.returncode == 0:
+        # On Windows, checkout line-ending normalization can make the first
+        # status call report a change that `git add` normalizes back to the
+        # existing blob. Do not invoke `git commit --only` in that case: Git
+        # correctly rejects it as an empty commit. Recheck that the worktree is
+        # now genuinely clean so this compatibility path cannot conceal an
+        # unstaged spec mutation.
+        refreshed_status = run_subprocess(
+            ["git", "status", "--porcelain", "--", relative_spec],
+            cwd=worktree_path,
+            env=git_env,
+            inherit_env=git_env is None,
+        )
+        if refreshed_status.returncode != 0:
+            detail = refreshed_status.stderr.strip() or refreshed_status.stdout.strip()
+            if not detail:
+                detail = f"exit code {refreshed_status.returncode}"
+            run.last_error = f"git status -- {relative_spec} failed after staging: {detail}"
+            return False
+        if not refreshed_status.stdout.strip():
+            return True
+        run.last_error = (
+            f"git add {relative_spec} produced no tracked change, but the spec "
+            "remains dirty after staging."
+        )
+        return False
+    if staged_result.returncode != 1:
+        detail = staged_result.stderr.strip() or staged_result.stdout.strip()
+        if not detail:
+            detail = f"exit code {staged_result.returncode}"
+        run.last_error = f"git diff --cached -- {relative_spec} failed: {detail}"
+        return False
     return run_or_fail(
         run,
         [
