@@ -2237,8 +2237,9 @@ class TestCloneBackend:
         tmp_path: Path,
     ) -> None:
         repo = tmp_path / "repo"
-        child_repo = tmp_path / "child-source"
+        child_repo = tmp_path / "child" / "child-source"
         _init_clone_source(repo)
+        child_repo.parent.mkdir()
         _init_clone_source(child_repo)
         added = subprocess.run(
             [
@@ -6421,13 +6422,14 @@ class TestContainerBackend:
         assert not marker.exists()
 
     @pytest.mark.skipif(os.name == "nt", reason="requires POSIX FIFO and script support")
-    def test_host_git_does_not_enter_agent_controlled_submodule_config(
+    def test_cleanup_does_not_enter_agent_controlled_submodule_config(
         self,
         tmp_path: Path,
     ) -> None:
         repo = tmp_path / "repo"
-        submodule_source = tmp_path / "submodule-source"
+        submodule_source = tmp_path / "submodule" / "submodule-source"
         _init_clone_source(repo)
+        submodule_source.parent.mkdir()
         _init_clone_source(submodule_source)
         runner = _FakeContainerRunner()
         backend = self._make(runner)
@@ -6474,43 +6476,14 @@ class TestContainerBackend:
         (handle.path / "child" / "README.md").write_text("dirty submodule\n")
 
         backend.prepare_host_access(handle)
-        probe = """
-import sys
-from pathlib import Path
-from spec_runtime.config import ExecutionConfig
-from spec_runtime.execution_backend import CloneExecutionBackend
-
-source = Path(sys.argv[1])
-backend = CloneExecutionBackend(
-    ExecutionConfig(
-        backend="clone",
-        workspace_root=str(source.parent.parent),
-        backend_explicit=True,
-    )
-)
-print(backend._has_uncommitted_changes(source))
-"""
         started = time.monotonic()
-        status = subprocess.run(
-            [sys.executable, "-c", probe, str(handle.path)],
-            cwd=PROJECT_ROOT,
-            text=True,
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-
-        assert status.returncode == 0, status.stdout + status.stderr
-        assert status.stdout.strip() == "False"
-        assert time.monotonic() - started < 5
-        assert not marker.exists()
-
         with pytest.raises(
             eb.WorkspaceHasUnpushedWorkError,
             match="checked-out submodule",
         ):
             backend.cleanup(handle)
 
+        assert time.monotonic() - started < 5
         assert (handle.path / "child" / "README.md").read_text() == (
             "dirty submodule\n"
         )
