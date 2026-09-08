@@ -20193,7 +20193,9 @@ def _create_verified_no_diff_completion_commit(
     if not run.verify_passed_once or not verified_head or current_head != verified_head:
         run.last_error = (
             f"{create_error}. Refusing to synthesize completion provenance because "
-            "the exact current head has not passed verify."
+            "the exact current head has not passed verify "
+            f"(current {_short_sha(current_head) or '(missing)'}, "
+            f"verified {_short_sha(verified_head) or '(missing)'})."
         )
         return False
 
