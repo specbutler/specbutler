@@ -1493,6 +1493,7 @@ with patch.object(orchestrator, "cmd_run", return_value=0):
     assert token
     foreground_port = _free_port()
     foreground_log = repo / ".spec-state" / "web" / "foreground-test.log"
+    foreground_log.parent.mkdir(parents=True, exist_ok=True)
     with foreground_log.open("w", encoding="utf-8") as web_log:
         foreground = subprocess.Popen(
             [
