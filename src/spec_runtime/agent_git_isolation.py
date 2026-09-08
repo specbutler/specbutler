@@ -963,14 +963,16 @@ def prepare_agent_git_isolation_if_linked(
 
     dot_git = worktree / ".git"
     try:
-        mode = dot_git.lstat().st_mode
+        metadata = dot_git.lstat()
     except OSError as exc:
         raise UnsafeAgentGitIsolationError("Worktree .git entry is unavailable") from exc
-    if stat.S_ISLNK(mode):
-        raise UnsafeAgentGitIsolationError("Worktree .git entry must not be a symlink")
-    if stat.S_ISREG(mode):
+    if stat.S_ISLNK(metadata.st_mode) or _is_windows_reparse_stat(metadata):
+        raise UnsafeAgentGitIsolationError(
+            "Worktree .git entry must not be a symlink or reparse point"
+        )
+    if stat.S_ISREG(metadata.st_mode):
         return prepare_agent_git_isolation(worktree)
-    if not stat.S_ISDIR(mode):
+    if not stat.S_ISDIR(metadata.st_mode):
         raise UnsafeAgentGitIsolationError(
             "Worktree .git entry is neither a linked pointer nor a directory"
         )

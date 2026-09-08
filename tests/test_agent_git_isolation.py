@@ -598,6 +598,35 @@ def test_git_metadata_kind_rejects_windows_reparse_attribute() -> None:
         )
 
 
+def test_full_clone_classifier_rejects_reparse_shaped_dot_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "--initial-branch=main")
+    dot_git = repository / ".git"
+    real_lstat = Path.lstat
+
+    def reparse_dot_git(path: Path) -> object:
+        metadata = real_lstat(path)
+        if path != dot_git:
+            return metadata
+        return type(
+            "ReparseStat",
+            (),
+            {
+                "st_mode": metadata.st_mode,
+                "st_file_attributes": stat.FILE_ATTRIBUTE_REPARSE_POINT,
+            },
+        )()
+
+    monkeypatch.setattr(git_isolation.Path, "lstat", reparse_dot_git)
+
+    with pytest.raises(UnsafeAgentGitIsolationError, match="reparse point"):
+        prepare_agent_git_isolation_if_linked(repository)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows junctions")
 def test_git_metadata_kind_rejects_real_windows_junction(tmp_path: Path) -> None:
     target = tmp_path / "target"
