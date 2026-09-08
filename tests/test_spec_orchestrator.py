@@ -5746,9 +5746,26 @@ class TestBootstrapGuards:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd == ["git", "status", "--porcelain", "--", "specs/my-feature.md"]:
                 return subprocess.CompletedProcess(cmd, 0, "A  specs/my-feature.md\n", "")
-            if cmd == ["git", "add", "specs/my-feature.md"]:
+            if cmd == ["git", "add", "--", "specs/my-feature.md"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
-            if cmd == ["git", "commit", "-m", "Pin spec contract for my-feature"]:
+            if cmd == [
+                "git",
+                "diff",
+                "--cached",
+                "--quiet",
+                "--",
+                "specs/my-feature.md",
+            ]:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            if cmd == [
+                "git",
+                "commit",
+                "-m",
+                "Pin spec contract for my-feature",
+                "--only",
+                "--",
+                "specs/my-feature.md",
+            ]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd == ["make", "install"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -5763,8 +5780,16 @@ class TestBootstrapGuards:
 
         assert status == "passed"
         assert (worktree / "specs" / "my-feature.md").read_text() == source_spec
-        assert ["git", "add", "specs/my-feature.md"] in git_calls
-        assert ["git", "commit", "-m", "Pin spec contract for my-feature"] in git_calls
+        assert ["git", "add", "--", "specs/my-feature.md"] in git_calls
+        assert [
+            "git",
+            "commit",
+            "-m",
+            "Pin spec contract for my-feature",
+            "--only",
+            "--",
+            "specs/my-feature.md",
+        ] in git_calls
 
     def test_clone_backend_bootstrap_uses_full_checkout_workspace(self, repo: Path):
         run = orch._create_spec_run(
@@ -5789,6 +5814,11 @@ class TestBootstrapGuards:
             with (
                 patch.object(orch, "resolve_worktree_path", return_value=fallback_worktree),
                 patch.object(orch, "_write_sandbox_config"),
+                patch.object(
+                    orch,
+                    "_ensure_run_spec_committed",
+                    wraps=orch._ensure_run_spec_committed,
+                ) as ensure_spec_committed,
             ):
                 status = orch.phase_bootstrap(run, repo)
         finally:
@@ -5796,6 +5826,11 @@ class TestBootstrapGuards:
 
         clone_source = repo / ".spec-workspaces" / run.run_id / "source"
         assert status == "passed", run.last_error
+        ensure_spec_committed.assert_called_once_with(
+            run,
+            worktree_path=clone_source,
+            spec_path=clone_source / "specs" / "my-feature.md",
+        )
         assert run.worktree_path == str(clone_source)
         assert clone_source.is_dir()
         assert (clone_source / ".git").is_dir()

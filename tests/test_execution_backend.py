@@ -4642,7 +4642,7 @@ class TestContainerBackend:
             "services:\n  db:\n    image: postgres:17\n",
             encoding="utf-8",
         )
-        shutil.rmtree(handle.path)
+        eb.remove_tree(handle.path)
         runner.calls.clear()
 
         with patch("shutil.which", return_value="/usr/bin/docker"):
@@ -7296,9 +7296,9 @@ class TestContainerBackend:
         import_mount = next(
             item for item in import_calls[-1] if item.endswith(":/workspace/host")
         )
-        assert import_mount.startswith(
-            f"{handle.outbox_path.parent}/.spec-volume-import-"
-        )
+        import_path = Path(import_mount.removesuffix(":/workspace/host"))
+        assert import_path.parent == handle.outbox_path.parent
+        assert import_path.name.startswith(".spec-volume-import-")
         assert not any(
             child.name.startswith(".spec-volume-import-")
             for child in handle.outbox_path.parent.iterdir()

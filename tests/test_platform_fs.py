@@ -97,9 +97,16 @@ def test_atomic_write_text_uses_bounded_temp_basename(
 
 def test_read_bounded_regular_text_reads_regular_file(tmp_path: Path) -> None:
     path = tmp_path / "result.json"
-    path.write_text('{"status": "ok"}\n')
+    path.write_bytes(b'{"status": "ok"}\n')
 
     assert read_bounded_regular_text(path, max_bytes=64) == '{"status": "ok"}\n'
+
+
+def test_read_bounded_regular_text_preserves_crlf(tmp_path: Path) -> None:
+    path = tmp_path / "result.txt"
+    path.write_bytes(b"first\r\nsecond\r\n")
+
+    assert read_bounded_regular_text(path, max_bytes=64) == "first\r\nsecond\r\n"
 
 
 def test_read_bounded_regular_text_rejects_oversized_file(tmp_path: Path) -> None:

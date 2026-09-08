@@ -14460,26 +14460,12 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
             except OSError as exc:
                 run.last_error = f"Refusing unsafe pinned spec path: {exc}"
                 return "failed"
-            relative_spec = spec_path.relative_to(worktree_path).as_posix()
-            status_result = run_subprocess(
-                ["git", "status", "--porcelain", "--", relative_spec],
-                cwd=worktree_path,
-            )
-            if status_result.returncode == 0 and status_result.stdout.strip():
-                if not run_or_fail(
-                    run,
-                    ["git", "add", relative_spec],
-                    cwd=worktree_path,
-                    action=f"git add {relative_spec}",
-                ):
-                    return "failed"
-                if not run_or_fail(
-                    run,
-                    ["git", "commit", "-m", f"Pin spec contract for {run.spec_id}"],
-                    cwd=worktree_path,
-                    action="git commit (pin spec contract)",
-                ):
-                    return "failed"
+            if not _ensure_run_spec_committed(
+                run,
+                worktree_path=worktree_path,
+                spec_path=spec_path,
+            ):
+                return "failed"
 
         if _backend_uses_provider_sandbox_config(backend):
             _write_sandbox_config(run.agent, worktree_path)
@@ -14602,26 +14588,12 @@ def phase_bootstrap(run: RunState, repo_root: Path) -> str:
             run.last_error = f"Refusing unsafe pinned spec path: {exc}"
             return "failed"
         if not worktree_exists:
-            relative_spec = spec_path.relative_to(worktree_path).as_posix()
-            status_result = run_subprocess(
-                ["git", "status", "--porcelain", "--", relative_spec],
-                cwd=worktree_path,
-            )
-            if status_result.returncode == 0 and status_result.stdout.strip():
-                if not run_or_fail(
-                    run,
-                    ["git", "add", relative_spec],
-                    cwd=worktree_path,
-                    action=f"git add {relative_spec}",
-                ):
-                    return "failed"
-                if not run_or_fail(
-                    run,
-                    ["git", "commit", "-m", f"Pin spec contract for {run.spec_id}"],
-                    cwd=worktree_path,
-                    action="git commit (pin spec contract)",
-                ):
-                    return "failed"
+            if not _ensure_run_spec_committed(
+                run,
+                worktree_path=worktree_path,
+                spec_path=spec_path,
+            ):
+                return "failed"
 
     # Linked worktrees receive a launch-scoped private GIT_DIR immediately
     # before the provider starts. Their sandbox cannot be materialized here

@@ -83,7 +83,8 @@ def read_bounded_regular_text(
     This is intended for capability/outbox files written by less-trusted
     processes. The lstat/open/fstat identity check rejects links, devices,
     FIFOs, replacement races, and oversized payloads before callers parse the
-    content.
+    content. The decoded result preserves on-disk newline bytes; unlike a text
+    stream, this boundary does not apply platform newline translation.
     """
     if max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
