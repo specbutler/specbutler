@@ -2781,7 +2781,11 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(
+                orch.os.environ,
+                _minimal_process_environment(),
+                clear=True,
+            ),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2853,7 +2857,11 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(
+                orch.os.environ,
+                _minimal_process_environment(),
+                clear=True,
+            ),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -2924,7 +2932,11 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn()),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(
+                orch.os.environ,
+                _minimal_process_environment(),
+                clear=True,
+            ),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -3247,7 +3259,11 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_worktree_dirty_files", return_value=[]),
             patch.object(orch, "run_subprocess", side_effect=fake_run_subprocess),
             patch.object(orch.ProcessSupervisor, "spawn", return_value=managed),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(
+                orch.os.environ,
+                _minimal_process_environment(),
+                clear=True,
+            ),
         ):
             status = orch.phase_implement(run, repo)
 
@@ -4075,7 +4091,11 @@ class TestPhaseImplementHandshake:
             patch.object(
                 orch.ProcessSupervisor, "spawn", side_effect=_make_fake_managed_spawn(captured_env=captured_env)
             ),
-            patch.dict(orch.os.environ, {}, clear=True),
+            patch.dict(
+                orch.os.environ,
+                _minimal_process_environment(),
+                clear=True,
+            ),
         ):
             status = orch.phase_implement(run, repo)
 

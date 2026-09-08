@@ -421,7 +421,13 @@ def test_reconcile_refuses_layout_or_branch_changes(tmp_path: Path) -> None:
     isolation = prepare_agent_git_isolation(worktree)
     dot_git = worktree / ".git"
     dot_git.chmod(dot_git.stat().st_mode | stat.S_IWRITE)
-    dot_git.write_text("gitdir: /tmp/not-the-worktree\n", encoding="utf-8")
+    # Git for Windows marks the linked-worktree pointer as hidden. Opening an
+    # existing hidden file is allowed, but ``write_text`` uses CREATE_ALWAYS,
+    # which Windows rejects even after the read-only attribute is cleared.
+    with dot_git.open("r+b") as handle:
+        handle.seek(0)
+        handle.write(b"gitdir: /tmp/not-the-worktree\n")
+        handle.truncate()
 
     with pytest.raises(UnsafeAgentGitIsolationError):
         reconcile_agent_git_isolation(isolation)
