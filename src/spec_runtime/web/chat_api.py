@@ -15,15 +15,31 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from spec_runtime.agent_git_isolation import (
+    UnsafeAgentGitIsolationError,
+    agent_git_added_paths,
+    agent_git_head,
+    agent_git_show_file,
+    cleanup_agent_git_isolation,
+    prepare_agent_git_isolation_if_linked,
+    reconcile_agent_git_isolation,
+)
+from spec_runtime.git_publish_guard import (
+    UnsafeRepositoryGitConfigError,
+    assert_repository_publication_baseline,
+    capture_repository_publication_baseline,
+)
 from spec_runtime.platform_fs import remove_tree
 from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
 from spec_runtime.worktree_safety import (
@@ -61,7 +77,9 @@ _turn_notifiers: dict[str, asyncio.Event] = {}
 _turn_completions: dict[str, asyncio.Event] = {}
 _turn_event_lists: dict[str, list] = {}
 _turn_owners: dict[str, str] = {}
+_provider_stop_tasks: dict[str, asyncio.Task] = {}
 _TURN_CANCEL_TIMEOUT_SECONDS = 5.0
+_PROVIDER_STOP_TIMEOUT_SECONDS = 12.0
 
 
 def _is_turn_active(session_id: str) -> bool:
@@ -102,6 +120,51 @@ def _sessions_for_request(request: Request) -> list[ChatSession]:
 
 def _json(data: object, status: int = 200) -> JSONResponse:
     return JSONResponse(data, status_code=status)
+
+
+def _publication_baseline_error(session: ChatSession) -> str:
+    """Return a safe error if agent-visible Git publication state changed."""
+    baseline = session.publication_baseline
+    if baseline is None:
+        # Legacy and narrowly constructed unit-test sessions predate the
+        # launch invariant. Externally created sessions always receive one.
+        return ""
+    try:
+        assert_repository_publication_baseline(
+            Path(session.worktree_path),
+            expected_remote_url=baseline[0],
+            expected_config_fingerprint=baseline[1],
+        )
+    except UnsafeRepositoryGitConfigError:
+        return (
+            "Repository publication configuration changed during chat. "
+            "The session was terminated and cannot be handed off; inspect "
+            "and restore the repository Git config from an operator shell."
+        )
+    return ""
+
+
+def _task_slug_from_content(text: str) -> str:
+    """Read a task id from the exact committed bytes selected for handoff."""
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        for index, line in enumerate(lines[1:], start=1):
+            if line.strip() != "---":
+                continue
+            try:
+                frontmatter = yaml.safe_load("\n".join(lines[1:index])) or {}
+            except yaml.YAMLError:
+                frontmatter = {}
+            if isinstance(frontmatter, dict):
+                spec_id = str(frontmatter.get("id", "")).strip()
+                if spec_id:
+                    return spec_id
+            break
+    for line in lines:
+        stripped = line.strip()
+        if stripped.lower().startswith("slug:"):
+            return stripped.split(":", 1)[1].strip()
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -252,21 +315,58 @@ def _cleanup_chat_worktree(
             )
         except UnsafeWorktreePathError as exc:
             raise RuntimeError(f"Refusing unsafe chat worktree cleanup: {exc}") from exc
-        run_subprocess(
-            ["git", "worktree", "remove", "--force", str(worktree_path)],
-            cwd=repo_root,
-        )
+
+        listing = run_subprocess(["git", "worktree", "list", "--porcelain"], cwd=repo_root)
+        if listing.returncode != 0:
+            raise RuntimeError("Could not inspect chat worktree registration")
+        registered = {
+            line.removeprefix("worktree ").strip()
+            for line in listing.stdout.splitlines()
+            if line.startswith("worktree ")
+        }
+        path_exists = os.path.lexists(worktree_path)
+        if path_exists or worktree_path in registered:
+            removed = run_subprocess(
+                ["git", "worktree", "remove", "--force", str(worktree_path)],
+                cwd=repo_root,
+            )
+            if removed.returncode != 0:
+                detail = removed.stderr.strip() or removed.stdout.strip()
+                raise RuntimeError(f"Failed to remove chat worktree: {detail}")
+
+        verified = run_subprocess(["git", "worktree", "list", "--porcelain"], cwd=repo_root)
+        if verified.returncode != 0:
+            raise RuntimeError("Could not verify chat worktree removal")
+        if os.path.lexists(worktree_path) or any(
+            line == f"worktree {worktree_path}"
+            for line in verified.stdout.splitlines()
+        ):
+            raise RuntimeError("Chat worktree removal was not confirmed")
 
     if branch:
-        run_subprocess(
-            ["git", "branch", "-D", branch],
+        ref = f"refs/heads/{branch}"
+        exists = run_subprocess(
+            ["git", "show-ref", "--verify", "--quiet", ref],
             cwd=repo_root,
         )
+        if exists.returncode not in {0, 1}:
+            raise RuntimeError("Could not inspect chat branch registration")
+        if exists.returncode == 0:
+            deleted = run_subprocess(["git", "branch", "-D", branch], cwd=repo_root)
+            if deleted.returncode != 0:
+                detail = deleted.stderr.strip() or deleted.stdout.strip()
+                raise RuntimeError(f"Failed to delete chat branch: {detail}")
+        verified = run_subprocess(
+            ["git", "show-ref", "--verify", "--quiet", ref],
+            cwd=repo_root,
+        )
+        if verified.returncode != 1:
+            raise RuntimeError("Chat branch deletion was not confirmed")
 
 
 # ---------------------------------------------------------------------------
-# Prompt loading — delegates to orchestrator builders so web chat and CLI
-# use identical prompts (spec paths, commit/push instructions, etc.)
+# Prompt loading — delegates to orchestrator builders while adapting lifecycle
+# ownership to the browser's credential-free, host-published workflow.
 # ---------------------------------------------------------------------------
 
 
@@ -280,8 +380,9 @@ def _load_system_prompt(
 ) -> str:
     """Load the system prompt for *mode* using the orchestrator prompt builders.
 
-    For ``create`` mode this delegates to ``_load_spec_creation_prompt`` so
-    the web chat uses the same instructions as ``spec create``.
+    For ``create`` mode this delegates to ``_load_spec_creation_prompt`` but
+    keeps publication host-owned: chat writes and commits locally, then hands
+    the branch/worktree back to the user.
 
     For ``task`` mode the agent only scopes (writes and commits the task
     spec).  The orchestrator handles implementation after the user reviews
@@ -298,6 +399,7 @@ def _load_system_prompt(
             spec_id=None,
             branch=branch,
             resume=False,
+            publish=False,
         )
 
     # task mode — scoping only, no implementation
@@ -339,11 +441,9 @@ def _available_backends(repo_root: Path | None = None) -> dict[str, bool]:
     codex_ok = False
 
     try:
-        from spec_runtime.agent_adapter import host_agent_unavailability_reason
+        from .bridge_claude import _claude_cli_unavailability_reason, _sdk_available
 
-        from .bridge_claude import _sdk_available
-
-        claude_ok = _sdk_available() and not host_agent_unavailability_reason("claude")
+        claude_ok = _sdk_available() and not _claude_cli_unavailability_reason()
     except Exception:
         pass
 
@@ -372,16 +472,14 @@ def _available_backends(repo_root: Path | None = None) -> dict[str, bool]:
 def _backend_unavailability_reason(agent: str, repo_root: Path) -> str:
     """Explain a known provider preflight failure without starting a process."""
     if agent == "claude":
-        from spec_runtime.agent_adapter import host_agent_unavailability_reason
-
-        from .bridge_claude import _sdk_available
+        from .bridge_claude import _claude_cli_unavailability_reason, _sdk_available
 
         if not _sdk_available():
             return (
                 "Claude backend unavailable — install the `web` extra and "
                 "authenticate Claude Code."
             )
-        reason = host_agent_unavailability_reason("claude")
+        reason = _claude_cli_unavailability_reason()
         if reason:
             return reason
     elif agent == "codex":
@@ -474,7 +572,7 @@ def _start_background_turn(
 
 def _begin_turn_cancel(session_id: str) -> asyncio.Task | None:
     """Request cancellation without waiting, so its provider can stop first."""
-    task = _turn_tasks.pop(session_id, None)
+    task = _turn_tasks.get(session_id)
     if task is not None and not task.done():
         task.cancel()
     return task
@@ -483,20 +581,98 @@ def _begin_turn_cancel(session_id: str) -> asyncio.Task | None:
 async def _finish_turn_cancel(
     session_id: str,
     task: asyncio.Task | None,
-) -> None:
-    """Reap a cancelled turn with a bounded wait and clear relay state."""
+) -> bool:
+    """Reap a cancelled turn and clear relay state only after confirmation."""
     if task is not None:
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(task, return_exceptions=True),
-                timeout=_TURN_CANCEL_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
+        done, _ = await asyncio.wait(
+            {task},
+            timeout=_TURN_CANCEL_TIMEOUT_SECONDS,
+        )
+        if task not in done:
             logger.warning("Chat turn did not exit after cancellation: %s", session_id)
+            return False
+        await asyncio.gather(task, return_exceptions=True)
+    _turn_tasks.pop(session_id, None)
     _turn_notifiers.pop(session_id, None)
     _turn_completions.pop(session_id, None)
     _turn_event_lists.pop(session_id, None)
     _turn_owners.pop(session_id, None)
+    return True
+
+
+async def _confirm_provider_stop(session_id: str, bridge: object) -> None:
+    """Run or rejoin provider cleanup without abandoning a timed-out stop."""
+    task = _provider_stop_tasks.get(session_id)
+    if task is None:
+        task = asyncio.create_task(bridge.stop_session(session_id))
+        _provider_stop_tasks[session_id] = task
+
+    done, _ = await asyncio.wait(
+        {task},
+        timeout=_PROVIDER_STOP_TIMEOUT_SECONDS,
+    )
+    if task not in done:
+        raise TimeoutError("provider cleanup is still running")
+
+    _provider_stop_tasks.pop(session_id, None)
+    try:
+        task.result()
+    except asyncio.CancelledError as exc:
+        raise RuntimeError("provider cleanup was cancelled") from exc
+
+
+async def _finalize_agent_git(
+    session: ChatSession,
+    *,
+    expected_head: str = "",
+    discard: bool = False,
+) -> str:
+    """Reconcile or discard private Git metadata, then remove it.
+
+    Callers must first confirm that both the provider and the background turn
+    relay have stopped.  ``expected_head`` pins an implementation handoff to
+    the exact private commit whose spec bytes were reviewed.
+    """
+    isolation = session.agent_git_isolation
+    if isolation is None:
+        return session.agent_git_reconciled_head or expected_head
+
+    if discard:
+        await asyncio.to_thread(cleanup_agent_git_isolation, isolation)
+        session.agent_git_isolation = None
+        session.agent_git_reconciled_head = ""
+        return ""
+
+    reconciled_head = session.agent_git_reconciled_head
+    if not reconciled_head:
+        try:
+            private_head = await asyncio.to_thread(agent_git_head, isolation)
+            if expected_head and private_head != expected_head:
+                raise UnsafeAgentGitIsolationError(
+                    "Private Git HEAD changed after the task spec was selected"
+                )
+            reconciliation = await asyncio.to_thread(
+                reconcile_agent_git_isolation,
+                isolation,
+            )
+        except BaseException:
+            # A poisoned or racing private repository must never become a
+            # permanent terminal-state trap. Its working files are outside the
+            # disposable GIT_DIR and remain available for operator recovery.
+            await asyncio.to_thread(cleanup_agent_git_isolation, isolation)
+            session.agent_git_isolation = None
+            session.agent_git_reconciled_head = ""
+            raise
+        reconciled_head = reconciliation.final_head
+        session.agent_git_reconciled_head = reconciled_head
+
+    if expected_head and reconciled_head != expected_head:
+        raise UnsafeAgentGitIsolationError(
+            "Reconciled Git HEAD does not match the selected task spec"
+        )
+    await asyncio.to_thread(cleanup_agent_git_isolation, isolation)
+    session.agent_git_isolation = None
+    return reconciled_head
 
 
 async def _shutdown_chat_sessions(*, owner_id: str | None = None) -> None:
@@ -516,25 +692,58 @@ async def _shutdown_chat_sessions(*, owner_id: str | None = None) -> None:
         session_id: _begin_turn_cancel(session_id)
         for session_id in session_ids
     }
-    for session in sessions:
-        bridge = get_bridge(session.session_id)
-        if bridge is not None:
+    sessions_by_id = {session.session_id: session for session in sessions}
+    provider_stopped: set[str] = set()
+    for session_id in session_ids:
+        session = sessions_by_id.get(session_id)
+        if session is not None:
+            session.status = "stopping"
+        bridge = get_bridge(session_id)
+        if bridge is None:
+            provider_stopped.add(session_id)
+            continue
+        while session_id not in provider_stopped:
             try:
-                await bridge.stop_session(session.session_id)
+                await _confirm_provider_stop(session_id, bridge)
+                provider_stopped.add(session_id)
             except Exception:
+                # Lifespan exit is the final in-process ownership boundary.
+                # Keep joining/retrying the exact provider cleanup rather than
+                # returning and orphaning a process or credential directory.
                 logger.warning(
-                    "Failed to stop chat provider during shutdown: %s",
-                    session.session_id,
+                    "Waiting for chat provider stop during shutdown: %s",
+                    session_id,
                     exc_info=True,
                 )
+                await asyncio.sleep(0.05)
     for session_id, task in pending_turns.items():
-        await _finish_turn_cancel(session_id, task)
-    for session in sessions:
-        remove_session(session.session_id)
+        relay_stopped = await _finish_turn_cancel(session_id, task)
+        while not relay_stopped:
+            await asyncio.sleep(0.05)
+            relay_stopped = await _finish_turn_cancel(session_id, task)
+        if relay_stopped and session_id in provider_stopped:
+            session = sessions_by_id.get(session_id)
+            try:
+                if session is not None:
+                    await _finalize_agent_git(
+                        session,
+                        discard=session.cleanup_worktree_on_stop,
+                    )
+            except Exception:
+                # The provider and relay are gone, so retaining the session and
+                # private metadata is safe and leaves evidence recoverable for
+                # an operator instead of silently discarding committed work.
+                logger.error(
+                    "Could not finalize private Git metadata during shutdown: %s",
+                    session_id,
+                    exc_info=True,
+                )
+            else:
+                remove_session(session_id)
 
     # Defensive cleanup for partially-created or completed turns whose session
     # record is gone. Ownership remains recorded until relay state is removed.
-    if owner_id is None:
+    if owner_id is None and not _provider_stop_tasks and not _turn_owners:
         _turn_notifiers.clear()
         _turn_completions.clear()
         _turn_event_lists.clear()
@@ -571,6 +780,36 @@ def _detect_task_spec(session) -> dict | None:  # noqa: ANN001
     from spec_runtime.orchestrator import TASK_SPEC_DIR, run_subprocess
 
     wt = Path(session.worktree_path)
+    isolation = getattr(session, "agent_git_isolation", None)
+    if isolation is not None:
+        base_sha = getattr(session, "base_sha", "")
+        if not base_sha:
+            return None
+        head_sha = agent_git_head(isolation)
+        new_files = list(
+            agent_git_added_paths(
+                isolation,
+                base_sha,
+                f"{TASK_SPEC_DIR}/*.md",
+            )
+        )
+        if not new_files:
+            return None
+        if len(new_files) > 1:
+            raise ValueError(
+                f"Multiple task specs detected ({', '.join(new_files)}). "
+                "Keep exactly one specs/tasks/<spec-id>.md file."
+            )
+        rel_path = new_files[0]
+        content = agent_git_show_file(isolation, head_sha, rel_path)
+        if not content.strip():
+            return None
+        return {
+            "spec_id": Path(rel_path).stem,
+            "spec_content": content,
+            "head_sha": head_sha,
+        }
+
     task_dir = wt / TASK_SPEC_DIR
     if not task_dir.is_dir():
         return None
@@ -678,6 +917,25 @@ async def _run_turn_bg(
         if notify:
             notify.set()
     finally:
+        publication_error = _publication_baseline_error(session)
+        if publication_error:
+            err = asdict(AgentEvent(kind="error", text=publication_error))
+            events.append(err)
+            session.live_turn.append(err)
+            session.status = "error"
+            if notify:
+                notify.set()
+            try:
+                await _confirm_provider_stop(session_id, bridge)
+            except Exception:
+                # Keep the bridge registration as the retryable ownership
+                # capability for Stop/server shutdown.
+                logger.warning(
+                    "Provider cleanup remains pending after Git config violation: %s",
+                    session_id,
+                    exc_info=True,
+                )
+
         # Promote live turn into permanent history and clear it.
         if session.live_turn:
             session.history.append(
@@ -694,17 +952,18 @@ async def _run_turn_bg(
         # When the user clicks "Keep Editing" the clear-review endpoint
         # saves last_reviewed_head_sha, so we only re-surface the spec
         # when a new commit touching the spec has been made.
-        if session.mode == "task" and session.status != "error":
+        if session.mode == "task" and session.status == "active":
             already_surfaced = {
                 h["spec_id"] for h in session.history
                 if h.get("role") == "spec_review"
             }
             try:
                 spec_info = _detect_task_spec(session)
-            except ValueError as exc:
+            except Exception as exc:
                 spec_info = None
                 err_event = {"kind": "error", "text": str(exc)}
                 events.append(err_event)
+                session.status = "error"
                 session.history.append(
                     {"role": "assistant", "events": [err_event]}
                 )
@@ -837,20 +1096,78 @@ async def create_chat_session(request: Request) -> Response:
     except RuntimeError as exc:
         return _json({"error": f"Worktree setup failed: {exc}"}, 500)
 
+    # The linked worktree exposes repository Git metadata to both providers.
+    # Capture the trusted URL/config state before either provider can inspect
+    # or mutate it, then verify the same immutable baseline after every turn
+    # and immediately before implementation handoff.
+    try:
+        publication_baseline = await asyncio.to_thread(
+            capture_repository_publication_baseline,
+            worktree_path,
+        )
+    except UnsafeRepositoryGitConfigError as exc:
+        try:
+            await asyncio.to_thread(
+                _cleanup_chat_worktree,
+                repo_root,
+                str(worktree_path),
+                branch,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to clean up chat worktree after Git baseline rejection",
+                exc_info=True,
+            )
+        return _json({"error": str(exc)}, 422)
+
+    # Give the provider a disposable Git directory so staging and commits do
+    # not require write access to shared refs, objects, config, or another
+    # worktree's administrative metadata. Prepare it before materializing any
+    # sandbox policy so an obsolete shared-metadata grant can never be used.
+    try:
+        git_isolation = await asyncio.to_thread(
+            prepare_agent_git_isolation_if_linked,
+            worktree_path,
+        )
+    except UnsafeAgentGitIsolationError as exc:
+        try:
+            await asyncio.to_thread(
+                _cleanup_chat_worktree,
+                repo_root,
+                str(worktree_path),
+                branch,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to clean up chat worktree after Git isolation rejection",
+                exc_info=True,
+            )
+        return _json({"error": f"Git isolation setup failed: {exc}"}, 422)
+
     # Write sandbox config so the agent session has the same permissions
     # as the CLI path (mirroring _write_sandbox_config in orchestrator).
     try:
         from spec_runtime.orchestrator import _write_sandbox_config
 
-        await asyncio.to_thread(_write_sandbox_config, agent, worktree_path)
+        await asyncio.to_thread(
+            _write_sandbox_config,
+            agent,
+            worktree_path,
+            git_isolation=git_isolation,
+        )
     except Exception:
         logger.warning("Failed to write sandbox config for %s", worktree_path, exc_info=True)
         try:
+            if git_isolation is not None:
+                await asyncio.to_thread(cleanup_agent_git_isolation, git_isolation)
             await asyncio.to_thread(
                 _cleanup_chat_worktree, repo_root, str(worktree_path), branch,
             )
         except Exception:
-            pass  # best-effort cleanup
+            logger.warning(
+                "Failed to clean up chat worktree after sandbox config rejection",
+                exc_info=True,
+            )
         return _json({"error": "Sandbox config write failed — refusing to start session without sandbox policy"}, 500)
 
     system_prompt = _load_system_prompt(
@@ -866,17 +1183,23 @@ async def create_chat_session(request: Request) -> Response:
         agent=agent,
         owner_id=_chat_owner_id(request),
     )
+    session.status = "starting"
     session.initial_prompt = prompt
     session.worktree_path = str(worktree_path)
     session.branch = branch
     session.base_sha = base_sha
     session.base_ref = base_ref
+    session.publication_baseline = publication_baseline
+    session.agent_git_isolation = git_isolation
     session.history.append({"role": "user", "content": prompt})
 
     # Instantiate and register the bridge
     bridge = None
     try:
         bridge = _create_bridge(agent)
+        # Register before provider startup so failed connect/handshake cleanup
+        # remains reachable through the public Stop endpoint.
+        register_bridge(session.session_id, bridge)
         # Only pass allowed_tools for Claude — Codex uses its own native
         # tool set (edit, command, etc.) and would be crippled by a
         # Claude-specific whitelist.
@@ -888,34 +1211,102 @@ async def create_chat_session(request: Request) -> Response:
             allowed_tools=tools,
             session_id=session.session_id,
             initial_prompt=prompt,
+            git_isolation=git_isolation,
         )
-        register_bridge(session.session_id, bridge)
     except BaseException as exc:
+        cleanup_confirmed = bridge is None
         if bridge is not None:
             try:
                 await bridge.stop_session(session.session_id)
+                cleanup_confirmed = True
             except Exception:
                 logger.warning(
                     "Failed to stop partially-started chat provider: %s",
                     session.session_id,
                     exc_info=True,
                 )
-        remove_session(session.session_id)
+        if not cleanup_confirmed:
+            # Preserve the session, bridge, and worktree as retryable ownership
+            # capabilities. Removing any of them here can orphan an auth-bearing
+            # provider process after a startup timeout.
+            session.status = "stopping"
+            session.cleanup_worktree_on_stop = True
+            session.startup_done.set()
+            if isinstance(exc, asyncio.CancelledError) or not isinstance(exc, Exception):
+                raise
+            return _json(
+                {
+                    "error": f"Provider startup failed and cleanup is still pending: {exc}",
+                    "session_id": session.session_id,
+                    "status": "stopping",
+                },
+                503,
+            )
+        try:
+            await _finalize_agent_git(session, discard=True)
+        except Exception as cleanup_exc:
+            session.status = "stopping"
+            session.cleanup_worktree_on_stop = True
+            session.startup_done.set()
+            if isinstance(exc, asyncio.CancelledError) or not isinstance(exc, Exception):
+                raise
+            return _json(
+                {
+                    "error": (
+                        "Provider startup failed and private Git cleanup is "
+                        f"pending: {cleanup_exc}"
+                    ),
+                    "session_id": session.session_id,
+                    "status": "stopping",
+                },
+                503,
+            )
         try:
             await asyncio.to_thread(
                 _cleanup_chat_worktree, repo_root, str(worktree_path), branch,
             )
-        except Exception:
-            pass  # best-effort cleanup
+        except Exception as cleanup_exc:
+            session.status = "stopping"
+            session.cleanup_worktree_on_stop = True
+            session.startup_done.set()
+            if isinstance(exc, asyncio.CancelledError) or not isinstance(exc, Exception):
+                raise
+            return _json(
+                {
+                    "error": f"Provider startup failed and worktree cleanup is pending: {cleanup_exc}",
+                    "session_id": session.session_id,
+                    "status": "stopping",
+                },
+                503,
+            )
+        remove_session(session.session_id)
+        session.startup_done.set()
         if isinstance(exc, asyncio.CancelledError) or not isinstance(exc, Exception):
             raise
         return _json({"error": str(exc)}, 422)
 
+    if session.stop_requested:
+        # Stop joined startup rather than racing provider connect/handshake.
+        # Leave the now-owned provider reachable for the waiting Stop request;
+        # in particular, never start the initial turn after cancellation won.
+        session.status = "stopping"
+        session.startup_done.set()
+        return _json(
+            {
+                "error": "Session stop was requested during provider startup",
+                "session_id": session.session_id,
+                "status": "stopping",
+            },
+            409,
+        )
+
     # Kick off the initial turn in the background so the session starts
     # processing the user's prompt immediately — callers should not need
     # a second POST /messages to trigger the first agent response.
+    session.status = "active"
     session.initial_turn_dispatched = True
     _start_background_turn(session.session_id, session, bridge, prompt)
+    session.startup_done.set()
 
     return _json({"session_id": session.session_id})
 
@@ -1091,31 +1482,143 @@ async def list_chat_sessions(request: Request) -> Response:
 
 
 async def stop_chat_session(request: Request) -> Response:
+    """Serialize Stop with provider startup and implementation handoff."""
     session_id = request.path_params["id"]
     session = _session_for_request(request, session_id)
     if session is None:
         return _json({"error": "Session not found"}, 404)
 
+    # Publishing intent before waiting closes the window where startup or a
+    # handoff could resume after Stop had already begun waiting on the lock.
+    session.stop_requested = True
+    if session.status == "starting":
+        await asyncio.shield(session.startup_done.wait())
+
+    async with session.terminal_lock:
+        if session.handoff_completed:
+            return _json(
+                {
+                    "error": "Session ownership was transferred to an implementation run",
+                    "session_id": session_id,
+                    "status": "handed_off",
+                },
+                409,
+            )
+        return await _stop_chat_session_locked(request)
+
+
+async def _stop_chat_session_locked(request: Request) -> Response:
+    session_id = request.path_params["id"]
+    session = _session_for_request(request, session_id)
+    if session is None:
+        return _json({"error": "Session not found"}, 404)
+
+    session.status = "stopping"
     turn_task = _begin_turn_cancel(session_id)
     bridge = get_bridge(session_id)
     if bridge is not None:
         try:
-            await bridge.stop_session(session_id)
-        except Exception:
+            await _confirm_provider_stop(session_id, bridge)
+        except TimeoutError as exc:
             logger.warning(
-                "Failed to stop chat provider for session %s",
+                "Timed out while stopping chat provider for session %s",
                 session_id,
                 exc_info=True,
             )
-    await _finish_turn_cancel(session_id, turn_task)
+            return _json(
+                {
+                    "error": f"Provider stop was not confirmed: {exc}",
+                    "session_id": session_id,
+                    "status": "stopping",
+                },
+                504,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to confirm chat provider stop for session %s",
+                session_id,
+                exc_info=True,
+            )
+            return _json(
+                {
+                    "error": f"Provider stop was not confirmed: {exc}",
+                    "session_id": session_id,
+                    "status": "stopping",
+                },
+                503,
+            )
+    relay_stopped = await _finish_turn_cancel(session_id, turn_task)
+    if not relay_stopped:
+        return _json(
+            {
+                "error": "Chat turn cancellation is still pending",
+                "session_id": session_id,
+                "status": "stopping",
+            },
+            503,
+        )
+
+    branch = getattr(session, "branch", None)
+    worktree_path = getattr(session, "worktree_path", None)
+    try:
+        await _finalize_agent_git(
+            session,
+            discard=bool(getattr(session, "cleanup_worktree_on_stop", False)),
+        )
+    except Exception as exc:
+        session.status = "error"
+        logger.error(
+            "Failed to finalize private Git metadata for session %s",
+            session_id,
+            exc_info=True,
+        )
+        return _json(
+            {
+                "error": f"Private Git finalization failed: {exc}",
+                "session_id": session_id,
+                "status": "error",
+            },
+            409,
+        )
+    if getattr(session, "cleanup_worktree_on_stop", False):
+        # A provider that failed during startup never produced a usable chat
+        # session. Once its exit is confirmed, finish the deferred rollback
+        # that was unsafe while provider ownership remained unresolved.
+        try:
+            await asyncio.to_thread(
+                _cleanup_chat_worktree,
+                _repo_root(request),
+                worktree_path,
+                branch,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed deferred startup worktree cleanup: %s",
+                session_id,
+                exc_info=True,
+            )
+            return _json(
+                {
+                    "error": f"Worktree cleanup is still pending: {exc}",
+                    "session_id": session_id,
+                    "status": "stopping",
+                },
+                503,
+            )
+        session.status = "completed"
+        remove_session(session_id)
+        return _json({
+            "session_id": session_id,
+            "status": "stopped",
+            "branch": branch,
+            "worktree_removed": True,
+        })
 
     session.status = "completed"
 
     # Stop is cancellation only — do NOT auto-commit or push partial work.
     # The worktree is left in place so the user can inspect, commit, or
     # discard the changes explicitly.
-    branch = getattr(session, "branch", None)
-    worktree_path = getattr(session, "worktree_path", None)
 
     return _json({
         "session_id": session_id,
@@ -1131,12 +1634,32 @@ async def stop_chat_session(request: Request) -> Response:
 
 
 async def implement_chat_task(request: Request) -> Response:
+    """Serialize handoff against Stop and other terminal transitions."""
+    session_id = request.path_params["id"]
+    session = _session_for_request(request, session_id)
+    if session is None:
+        return _json({"error": "Session not found"}, 404)
+    async with session.terminal_lock:
+        if session.stop_requested:
+            return _json(
+                {
+                    "error": "Session stop has already been requested",
+                    "session_id": session_id,
+                    "status": "stopping",
+                },
+                409,
+            )
+        return await _implement_chat_task_locked(request)
+
+
+async def _implement_chat_task_locked(request: Request) -> Response:
     """Hand a scoped task spec off to the orchestrator for implementation.
 
     Validates that the session is a task-mode session with a detected spec,
     then spawns ``spec implement`` for the task spec on the session's branch.
-    The session is marked ``completed`` so the worktree ownership transfers
-    to the orchestrator run (AC 6).
+    Provider and relay shutdown are confirmed before the implementation is
+    launched.  Only then is the session marked ``completed`` and worktree
+    ownership transferred to the orchestrator run (AC 6).
     """
     session_id = request.path_params["id"]
     session = _session_for_request(request, session_id)
@@ -1155,9 +1678,9 @@ async def implement_chat_task(request: Request) -> Response:
         return _json({"error": "A chat turn is still running"}, 409)
 
     # Atomically claim the session so a concurrent request from another tab
-    # cannot pass the status guard above.  If anything fails below we restore
-    # the status to "active".
-    session.status = "completed"
+    # cannot pass the status guard above. Validation failures restore the
+    # active chat; once shutdown begins, failures remain retryable via Stop.
+    session.status = "stopping"
 
     # Detect the spec in the worktree
     try:
@@ -1175,18 +1698,13 @@ async def implement_chat_task(request: Request) -> Response:
 
     # Validate the spec id the same way the CLI does in
     # _resolve_scoped_task_spec / _assert_task_spec_id_is_unambiguous.
-    from spec_runtime.orchestrator import (  # noqa: I001
-        TASK_SPEC_DIR as _TASK_SPEC_DIR,
-        _read_slug_from_spec,
-        _specs_root,
-    )
+    from spec_runtime.orchestrator import _specs_root
     from spec_runtime.spec_identity import SPEC_ID_RE
 
     wt = Path(session.worktree_path)
-    spec_file_for_validation = wt / _TASK_SPEC_DIR / f"{spec_id}.md"
-
-    # Frontmatter id must match filename
-    frontmatter_id = _read_slug_from_spec(spec_file_for_validation)
+    # Frontmatter id must match the filename selected from committed HEAD.
+    # Never validate a mutable worktree file and then pin different bytes.
+    frontmatter_id = _task_slug_from_content(spec_info["spec_content"])
     if frontmatter_id and frontmatter_id != spec_id:
         session.status = "active"
         return _json(
@@ -1221,6 +1739,111 @@ async def implement_chat_task(request: Request) -> Response:
         pass
     agent = session.agent or body.get("agent", "")
     review_agent = body.get("review_agent", "")
+
+    # Worktree ownership cannot transfer while either the provider or its
+    # background event relay may still be writing to it.  Do this before
+    # creating durable run state or spawning an adoptable process so a failed
+    # stop cannot leave a ghost run or an unowned implementation behind.
+    turn_task = _begin_turn_cancel(session_id)
+    bridge = get_bridge(session_id)
+    if bridge is not None:
+        try:
+            await _confirm_provider_stop(session_id, bridge)
+        except TimeoutError as exc:
+            logger.warning(
+                "Timed out stopping chat provider during implementation handoff: %s",
+                session_id,
+                exc_info=True,
+            )
+            return _json(
+                {
+                    "error": f"Provider stop was not confirmed: {exc}",
+                    "session_id": session_id,
+                    "status": "stopping",
+                },
+                504,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to stop chat provider during implementation handoff: %s",
+                session_id,
+                exc_info=True,
+            )
+            return _json(
+                {
+                    "error": f"Provider stop was not confirmed: {exc}",
+                    "session_id": session_id,
+                    "status": "stopping",
+                },
+                503,
+            )
+
+    relay_stopped = await _finish_turn_cancel(session_id, turn_task)
+    if not relay_stopped:
+        return _json(
+            {
+                "error": "Chat turn cancellation is still pending",
+                "session_id": session_id,
+                "status": "stopping",
+            },
+            503,
+        )
+
+    try:
+        reconciled_head = await _finalize_agent_git(
+            session,
+            expected_head=spec_info.get("head_sha", ""),
+        )
+    except Exception as exc:
+        session.status = "error"
+        logger.error(
+            "Failed to reconcile private Git metadata during handoff: %s",
+            session_id,
+            exc_info=True,
+        )
+        return _json(
+            {
+                "error": f"Private Git reconciliation failed: {exc}",
+                "session_id": session_id,
+                "status": "error",
+            },
+            409,
+        )
+    if spec_info.get("head_sha") and reconciled_head != spec_info["head_sha"]:
+        session.status = "error"
+        return _json(
+            {
+                "error": "The reconciled commit does not match the reviewed task spec",
+                "session_id": session_id,
+                "status": "error",
+            },
+            409,
+        )
+
+    if session.stop_requested:
+        # Stop can publish intent while waiting for this terminal lock. It won
+        # the transition as long as no implementation process exists yet.
+        session.status = "stopping"
+        return _json(
+            {
+                "error": "Session stop was requested during implementation handoff",
+                "session_id": session_id,
+                "status": "stopping",
+            },
+            409,
+        )
+
+    publication_error = _publication_baseline_error(session)
+    if publication_error:
+        session.status = "error"
+        return _json(
+            {
+                "error": publication_error,
+                "session_id": session_id,
+                "status": "error",
+            },
+            409,
+        )
 
     # Pre-create a task-mode RunState so the orchestrator picks up the correct
     # run_mode and spec_path.  The spec file only exists in the session's
@@ -1297,7 +1920,7 @@ async def implement_chat_task(request: Request) -> Response:
         )
     except (OSError, RuntimeError) as exc:
         _cleanup_orphaned_run()
-        session.status = "active"
+        session.status = "error"
         return _json(
             {"error": f"Failed to launch spec implement: {exc}",
              "spec_id": spec_id},
@@ -1318,27 +1941,15 @@ async def implement_chat_task(request: Request) -> Response:
     if exit_code is not None and exit_code != 0:
         _cleanup_orphaned_run()
         started_processes.pop(spec_id, None)
-        session.status = "active"
+        session.status = "error"
         return _json(
             {"error": f"spec implement exited immediately (code {exit_code})",
              "spec_id": spec_id},
             422,
         )
 
-    # Stop the chat agent process — worktree ownership transfers to the
-    # orchestrator.  Mirrors the cleanup in stop_chat_session().
-    turn_task = _begin_turn_cancel(session_id)
-    bridge = get_bridge(session_id)
-    if bridge is not None:
-        try:
-            await bridge.stop_session(session_id)
-        except Exception:
-            logger.warning(
-                "Failed to stop chat provider during implementation handoff: %s",
-                session_id,
-                exc_info=True,
-            )
-    await _finish_turn_cancel(session_id, turn_task)
+    session.status = "completed"
+    session.handoff_completed = True
 
     # Clear stale spec_review entries so that replayHistory() on reload
     # does not re-surface Implement/Keep Editing buttons for a completed

@@ -138,7 +138,7 @@ if args[:2] == ["auth", "token"]:
 elif args[:2] == ["pr", "list"]:
     print("[]")
 elif args[:2] == ["repo", "view"]:
-    print(json.dumps({"nameWithOwner": "example/windows-ci-fixture"}))
+    print("example/windows-ci-fixture")
 elif args and args[0] == "api":
     print("[]")
 raise SystemExit(0)
@@ -149,18 +149,44 @@ raise SystemExit(0)
         f'@echo off\r\n"{python}" -I "%~dp0fake-gh.py" %*\r\n',
         encoding="utf-8",
     )
-    (fake_bin / "fixture_codex.py").write_text(
-        """import os
+    codex_source_dir = fake_bin / "fixture-codex-source"
+    codex_source_dir.mkdir()
+    codex_script = """#!/usr/bin/env python
 import pathlib
 import subprocess
 import sys
 
 def main():
-    if sys.argv[1:3] == ["exec", "--help"]:
-        print("codex exec --json --output-schema")
+    args = sys.argv[1:]
+    if args == ["login", "status"]:
+        print("Logged in using fixture credentials")
         return 0
+    if args == ["sandbox", "--help"]:
+        print("codex sandbox --permission-profile")
+        return 0
+    if args[:1] == ["app-server"]:
+        return 0
+    is_authoring = (
+        len(args) >= 5
+        and args[:4] == ["-a", "on-request", "-s", "workspace-write"]
+    )
+    if is_authoring:
+        if args[-1:] == ["--fixture-mode-probe"]:
+            print("fixture Codex authoring invocation")
+            return 0
+    else:
+        try:
+            exec_index = args.index("exec")
+        except ValueError:
+            print(f"unsupported fixture codex command: {args!r}", file=sys.stderr)
+            return 2
+        exec_args = args[exec_index + 1:]
+        if exec_args == ["--help"]:
+            print("codex exec --add-dir --ephemeral --ignore-rules --ignore-user-config "
+                  "--json --output-schema --strict-config")
+            return 0
     marker = pathlib.Path(".fixture-agent-needs-input")
-    python = os.environ["SPEC_FIXTURE_PYTHON"]
+    python = __FIXTURE_PYTHON__
     if not marker.exists():
         marker.write_text("waiting")
         return subprocess.run([
@@ -182,21 +208,29 @@ def main():
         python, "-I", "-m", "spec_runtime.cli", "report",
         "--status", "ok", "--summary", "Selected fixture behavior A",
     ]).returncode
-""",
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+"""
+    (codex_source_dir / "codex").write_text(
+        codex_script.replace("__FIXTURE_PYTHON__", repr(str(python))),
         encoding="utf-8",
     )
-    maker = ScriptMaker(None, str(fake_bin))
+    maker = ScriptMaker(str(codex_source_dir), str(fake_bin))
     maker.executable = str(python)
     maker.variants = {""}
-    generated = maker.make("codex = fixture_codex:main")
+    generated = maker.make("codex")
     assert generated
 
 
 def _write_fake_spec_launcher(fake_bin: Path, python: Path) -> None:
     from pip._vendor.distlib.scripts import ScriptMaker
 
-    (fake_bin / "fixture_spec.py").write_text(
-        """import json
+    spec_source_dir = fake_bin / "fixture-spec-source"
+    spec_source_dir.mkdir()
+    (spec_source_dir / "spec").write_text(
+        """#!/usr/bin/env python
+import json
 import os
 import pathlib
 import time
@@ -211,13 +245,16 @@ def main():
     while not release.exists():
         time.sleep(0.2)
     return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 """,
         encoding="utf-8",
     )
-    maker = ScriptMaker(None, str(fake_bin))
+    maker = ScriptMaker(str(spec_source_dir), str(fake_bin))
     maker.executable = str(python)
     maker.variants = {""}
-    generated = maker.make("spec = fixture_spec:main")
+    generated = maker.make("spec")
     assert generated
 
 
@@ -991,6 +1028,30 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
     subprocess_env["PATH"] = os.pathsep.join(
         [str(fake_bin), subprocess_env.get("PATH", "")]
     )
+    codex_path = fake_bin / "codex.exe"
+    for arguments, marker in (
+        (("login", "status"), "fixture credentials"),
+        (("exec", "--help"), "--strict-config"),
+        (
+            ("-a", "never", "--add-dir", str(tmp_path), "exec", "--help"),
+            "--strict-config",
+        ),
+        (
+            ("-a", "on-request", "-s", "workspace-write", "--fixture-mode-probe"),
+            "authoring invocation",
+        ),
+        (("sandbox", "--help"), "--permission-profile"),
+    ):
+        probe = subprocess.run(
+            [str(codex_path), *arguments],
+            cwd=tmp_path,
+            env=subprocess_env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert probe.returncode == 0, probe.stdout + probe.stderr
+        assert marker in probe.stdout
 
     subprocess.run(["git", "init", "-b", "main"], cwd=tmp_path, check=True, capture_output=True)
     (tmp_path / "README.md").write_text("probe\n")
@@ -1032,17 +1093,21 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
         check=False,
     )
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
+    assert "0 warning(s)" in doctor.stdout
 
 
 def test_foreground_web_bind_and_authenticated_request(tmp_path: Path) -> None:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    token = "windows-probe-token"
-    token_path = tmp_path / ".spec-state" / "web" / "auth-token"
-    token_path.parent.mkdir(parents=True)
-    token_path.write_text(token)
     (tmp_path / ".spec.toml").write_text('[project]\nbase_ref = "main"\n')
+    web_env = _clean_subprocess_env()
+    web_env["LOCALAPPDATA"] = str(tmp_path / "operator-local-state")
+    from spec_runtime.web.auth import load_or_create_token
+
+    with pytest.MonkeyPatch.context() as token_env:
+        token_env.setenv("LOCALAPPDATA", web_env["LOCALAPPDATA"])
+        token = load_or_create_token(tmp_path)
     stdout_path = tmp_path / "web-probe.stdout.log"
     stderr_path = tmp_path / "web-probe.stderr.log"
     with (
@@ -1062,7 +1127,7 @@ def test_foreground_web_bind_and_authenticated_request(tmp_path: Path) -> None:
                 str(port),
             ],
             cwd=tmp_path,
-            env=_clean_subprocess_env(),
+            env=web_env,
             stdout=stdout_log,
             stderr=stderr_log,
             text=True,
@@ -1190,14 +1255,11 @@ def test_installed_artifact_cli_matrix(tmp_path: Path) -> None:
         {
             "CODEX_HOME": str(operator_codex_home),
             "PATH": os.pathsep.join([str(fake_bin), env.get("PATH", "")]),
-            # Used only by generated native fake-provider launchers. Product
-            # CLI subprocesses use -I and cannot import from this directory.
-            "PYTHONPATH": str(fake_bin),
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUTF8": "1",
-            "SPEC_FIXTURE_PYTHON": sys.executable,
             "SPEC_NO_UPDATE_CHECK": "1",
             "SPEC_PROCESS_CONTROL_ROOT": str(process_control_root),
+            "LOCALAPPDATA": str(tmp_path / "operator local state"),
         }
     )
 
@@ -1376,7 +1438,13 @@ with patch("spec_runtime.update.resolve_repo_slug", return_value="fixture/spec")
             encoding="utf-8"
         )
     )
-    assert waiting_payload["status"] == "waiting-for-input"
+    assert waiting_payload["status"] == "waiting-for-input", (
+        "first implement phase did not preserve the provider's needs-input "
+        "report\n"
+        f"stdout:\n{first_implement.stdout}\n"
+        f"stderr:\n{first_implement.stderr}\n"
+        f"run state:\n{json.dumps(waiting_payload, indent=2, sort_keys=True)}"
+    )
     assert waiting_payload["input_question"] == "Choose fixture behavior A or B"
     waiting_status = _cli(repo, "status", "--spec", lifecycle_id, env=env)
     assert "waiting-for-input" in waiting_status.stdout
@@ -1418,12 +1486,14 @@ with patch.object(orchestrator, "cmd_run", return_value=0):
     # Foreground and background web modes both bind real sockets and serve an
     # authenticated request. Background status/stop traverse durable Windows
     # supervision rather than terminating a pytest-owned process directly.
-    token = "windows-installed-matrix-token"
-    token_path = repo / ".spec-state" / "web" / "auth-token"
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(token, encoding="utf-8")
+    token_result = _cli(repo, "web", "token", "--reset", env=env)
+    prefix = "Token reset: "
+    assert token_result.stdout.startswith(prefix)
+    token = token_result.stdout.removeprefix(prefix).strip()
+    assert token
     foreground_port = _free_port()
     foreground_log = repo / ".spec-state" / "web" / "foreground-test.log"
+    foreground_log.parent.mkdir(parents=True, exist_ok=True)
     with foreground_log.open("w", encoding="utf-8") as web_log:
         foreground = subprocess.Popen(
             [

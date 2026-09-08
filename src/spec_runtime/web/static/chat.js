@@ -22,6 +22,10 @@
     return d.innerHTML;
   }
 
+  function escapeAttribute(s) {
+    return escapeHtml(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
   // ---- State ----
 
   var currentSessionId = null;
@@ -46,7 +50,7 @@
       if (callback) callback();
       return;
     }
-    fetch("/api/v1/chat/backends")
+    window.specFetch("/api/v1/chat/backends")
       .then(function (r) { return r.json(); })
       .then(function (data) {
         availableBackends = data.backends || {};
@@ -200,7 +204,7 @@
     });
 
     // Load session metadata and history
-    fetch("/api/v1/chat/sessions/" + encodeURIComponent(sessionId))
+    window.specFetch("/api/v1/chat/sessions/" + encodeURIComponent(sessionId))
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (data.error) {
@@ -220,7 +224,7 @@
         }
 
         // Fetch and replay conversation history
-        return fetch("/api/v1/chat/sessions/" + encodeURIComponent(sessionId) + "/history")
+        return window.specFetch("/api/v1/chat/sessions/" + encodeURIComponent(sessionId) + "/history")
           .then(function (r) { return r.json(); })
           .then(function (histData) {
             if (histData.history && histData.history.length > 0) {
@@ -308,7 +312,7 @@
     isStreaming = true;
     updateSendButton();
 
-    fetch("/api/v1/chat/sessions", {
+    window.specFetch("/api/v1/chat/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode: mode, agent: getSelectedAgent(), prompt: text }),
@@ -361,7 +365,7 @@
     activeAbortController = controller;
     var boundSessionId = currentSessionId;
 
-    fetch("/api/v1/chat/sessions/" + encodeURIComponent(currentSessionId) + "/messages", {
+    window.specFetch("/api/v1/chat/sessions/" + encodeURIComponent(currentSessionId) + "/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: text }),
@@ -551,7 +555,7 @@
         html += '<pre class="spec-content">' + escapeHtml(msg.specContent) + '</pre>';
         html += '<div class="spec-review-actions">';
         html += '<button class="btn btn-primary spec-implement-btn" data-spec-id="' +
-          escapeHtml(msg.specId) + '">Implement</button> ';
+          escapeAttribute(msg.specId) + '">Implement</button> ';
         html += '<button class="btn btn-secondary spec-keep-editing-btn">Keep Editing</button>';
         html += '</div></div></div>';
       } else if (msg.role === "error") {
@@ -602,7 +606,7 @@
   // ---- Tool action cards ----
 
   function renderToolCard(type, event) {
-    var html = '<div class="chat-card chat-card-' + escapeHtml(type) + '">';
+    var html = '<div class="chat-card chat-card-' + escapeAttribute(type) + '">';
 
     switch (type) {
       case "file_change":
@@ -666,7 +670,7 @@
     var btns = document.querySelectorAll(".spec-implement-btn, .spec-keep-editing-btn");
     for (var i = 0; i < btns.length; i++) btns[i].disabled = true;
 
-    fetch("/api/v1/chat/sessions/" + encodeURIComponent(currentSessionId) + "/implement", {
+    window.specFetch("/api/v1/chat/sessions/" + encodeURIComponent(currentSessionId) + "/implement", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ spec_id: specId, agent: selectedAgent || "claude" }),
@@ -707,7 +711,7 @@
     // Clear server-side spec_review history first, then update UI on success.
     // If the clear fails the review card stays so dedupe remains consistent.
     var clearDone = currentSessionId
-      ? fetch("/api/v1/chat/sessions/" + encodeURIComponent(currentSessionId) + "/clear-review", {
+      ? window.specFetch("/api/v1/chat/sessions/" + encodeURIComponent(currentSessionId) + "/clear-review", {
           method: "POST",
         })
       : Promise.resolve();
@@ -737,7 +741,7 @@
   function stopSession() {
     if (!currentSessionId) return;
     if (!window.confirm("Stop this chat? Its worktree and branch will be preserved.")) return;
-    fetch("/api/v1/chat/sessions/" + encodeURIComponent(currentSessionId) + "/stop", {
+    window.specFetch("/api/v1/chat/sessions/" + encodeURIComponent(currentSessionId) + "/stop", {
       method: "POST",
     }).then(function (response) {
       if (!response.ok) {
@@ -779,7 +783,7 @@
     activeAbortController = controller;
     var boundSessionId = sessionId;
 
-    fetch("/api/v1/chat/sessions/" + encodeURIComponent(sessionId) + "/stream?from=" + fromIdx, {
+    window.specFetch("/api/v1/chat/sessions/" + encodeURIComponent(sessionId) + "/stream?from=" + fromIdx, {
       signal: controller.signal,
     })
       .then(function (response) {

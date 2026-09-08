@@ -82,13 +82,15 @@ src/spec_runtime/
 
 Non-interactive agent sessions (implement, recovery, review, block-debugger)
 only see MCP servers the orchestrator explicitly provides — they do **not**
-inherit user-level Codex/Claude MCP registrations. Codex isolation uses a
-per-worktree `CODEX_HOME` at `<worktree>/.spec-codex-home`; Claude isolation
-uses `--mcp-config <path> --strict-mcp-config` against
+inherit user-level Codex/Claude MCP registrations. Codex uses a launch-scoped
+`CODEX_HOME` outside the model-writable checkout; Claude uses
+`--mcp-config <path> --strict-mcp-config` against
 `<worktree>/.claude/mcp-servers.json`. Interactive authoring (`spec create`,
-`spec task` scoping) keeps the user's full MCP toolbox. To selectively allow a
-user-registered server through into non-interactive sessions, list its name
-under `[mcp] allow_from_user` in `.spec.toml`.
+`spec task` scoping) keeps the user's trusted MCP registrations, but forwards
+only provider variables and environment names explicitly referenced by that
+user MCP configuration. To selectively allow a user-registered server through
+into non-interactive sessions, list its name under `[mcp] allow_from_user` in
+`.spec.toml`.
 
 ### Testing
 

@@ -10,12 +10,17 @@ from pathlib import Path
 import yaml
 
 from .config import resolve_specs_root
+from .spec_identity import SPEC_ID_RE
 
 VALID_SPEC_AREAS = ("frontend", "backend", "fullstack", "orchestrator")
 DEFAULT_SPEC_PRIORITY = 50
 
 logger = logging.getLogger(__name__)
 _WARNED_LEGACY_STATUS_PATHS: set[Path] = set()
+
+
+class InvalidSpecIdError(ValueError):
+    """Raised when spec frontmatter contains a non-canonical identifier."""
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,13 @@ def intake_required_from_frontmatter(frontmatter: dict) -> bool:
 
 def parse_spec_metadata(spec_path: Path) -> SpecMetadata:
     frontmatter = parse_spec_frontmatter(spec_path)
+    spec_id = str(frontmatter.get("id", "")).strip()
+    if spec_id and not SPEC_ID_RE.fullmatch(spec_id):
+        raise InvalidSpecIdError(
+            f"Spec {spec_path} has invalid frontmatter id {spec_id!r}; "
+            "use lowercase letters, digits, and hyphens, starting with a letter or digit"
+        )
+
     # Backwards compatibility: if legacy ``status`` is ``obsolete``, treat as obsolete.
     raw_status = str(frontmatter.get("status", "")).strip().lower()
     if raw_status and raw_status != "obsolete":
@@ -114,7 +126,7 @@ def parse_spec_metadata(spec_path: Path) -> SpecMetadata:
     obsolete_flag = _to_bool(frontmatter.get("obsolete", False)) or raw_status == "obsolete"
 
     return SpecMetadata(
-        spec_id=str(frontmatter.get("id", "")).strip(),
+        spec_id=spec_id,
         obsolete=obsolete_flag,
         depends_on=normalize_depends_on(frontmatter.get("depends_on")),
         description=str(frontmatter.get("description", "")).strip(),
@@ -132,7 +144,17 @@ def iter_spec_metadata(repo_root: Path) -> list[SpecMetadata]:
     for spec_path in sorted(specs_root.glob("*.md")):
         if spec_path.name == "TEMPLATE.md":
             continue
-        metadata = parse_spec_metadata(spec_path)
+        try:
+            metadata = parse_spec_metadata(spec_path)
+        except InvalidSpecIdError:
+            # A malformed committed spec must not become a path, branch, or DOM
+            # identifier. Keep discovery usable for the remaining specs while
+            # making the rejected file visible to operators.
+            logger.warning(
+                "Ignoring spec %s because its frontmatter id is not a canonical slug",
+                spec_path,
+            )
+            continue
         if not metadata.spec_id or metadata.spec_id == "<slug>":
             continue
         specs.append(metadata)

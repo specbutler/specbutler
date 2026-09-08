@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -270,7 +271,7 @@ def run_doctor_checks(
 
     checks.extend(_execution_policy_checks(config))
     checks.extend(_git_checks(repo_root, config, run))
-    checks.extend(_agent_checks(repo_root, config, resolve_executable))
+    checks.extend(_agent_checks(repo_root, config, resolve_executable, run))
     checks.extend(_github_checks(repo_root, run, resolve_executable))
     checks.extend(_command_checks(repo_root, config, run, resolve_executable))
     path_checks, runtime_paths = _runtime_path_checks(repo_root, config, run)
@@ -356,10 +357,96 @@ def _agent_install_remediation(agent: str) -> str:
     return f"Install the `{agent}` agent executable or remove it from `[agents].allowed`."
 
 
+_PROVIDER_AUTH_ENV_HINTS = {
+    "claude": (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_VERTEX",
+    ),
+    "codex": ("CODEX_API_KEY", "OPENAI_API_KEY"),
+}
+
+
+def _provider_auth_check(
+    agent: str,
+    path: str,
+    repo_root: Path,
+    run: CommandRunner,
+    *,
+    required: bool,
+) -> DoctorCheck | None:
+    """Check provider login without a model request or credential output."""
+    commands = {
+        "claude": [path, "auth", "status"],
+        "codex": [path, "login", "status"],
+    }
+    command = commands.get(agent)
+    if command is None:
+        return None
+
+    result = run(command, repo_root, 10.0)
+    auth_configured = tuple(
+        name for name in _PROVIDER_AUTH_ENV_HINTS[agent] if os.environ.get(name)
+    )
+    logged_in: bool | None = None
+    if agent == "claude" and result.returncode == 0:
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("loggedIn"), bool):
+            logged_in = payload["loggedIn"]
+    elif agent == "codex" and result.returncode == 0:
+        logged_in = True
+
+    name = f"agent authentication ({agent})"
+    if logged_in is True:
+        return _ok(name, "provider CLI reports an authenticated session")
+
+    output = f"{result.stdout}\n{result.stderr}".casefold()
+    explicitly_logged_out = logged_in is False or any(
+        marker in output
+        for marker in (
+            '"loggedin": false',
+            "authentication required",
+            "login required",
+            "no authentication",
+            "not authenticated",
+            "not logged in",
+        )
+    )
+    if auth_configured:
+        return _warning(
+            name,
+            "provider account login is absent or unverified, but environment-based authentication is configured; "
+            "credential validity is not tested without a model request",
+            f"Run `{agent} {'auth status' if agent == 'claude' else 'login status'}` to inspect account login.",
+        )
+    if explicitly_logged_out:
+        severity = _error if required else _warning
+        login_command = "claude" if agent == "claude" else "codex login"
+        return severity(
+            name,
+            "provider CLI reports that it is not authenticated",
+            f"Run `{login_command}` and complete provider sign-in.",
+        )
+
+    return _warning(
+        name,
+        f"provider login state could not be verified (status command exited {result.returncode})",
+        f"Run `{agent} {'auth status' if agent == 'claude' else 'login status'}` directly.",
+        f"Upgrade {agent} if this installed CLI does not support the status command.",
+    )
+
+
 def _agent_checks(
     repo_root: Path,
     config: SpecRuntimeConfig,
     which: ExecutableResolver,
+    run: CommandRunner,
 ) -> list[DoctorCheck]:
     checks: list[DoctorCheck] = []
     allowed = tuple(dict.fromkeys(config.agents.allowed))
@@ -415,8 +502,20 @@ def _agent_checks(
             continue
 
         severity = _error if agent in required else _warning
+        auth_check = _provider_auth_check(
+            agent,
+            path,
+            repo_root,
+            run,
+            required=agent in required,
+        )
+        if auth_check is not None:
+            checks.append(auth_check)
         if agent == "claude":
-            from .agent_adapter import claude_sandbox_unavailability_reason
+            from .agent_adapter import (
+                claude_restricted_mode_unavailability_reason,
+                claude_sandbox_unavailability_reason,
+            )
 
             sandbox_reason = claude_sandbox_unavailability_reason(which=which)
             if sandbox_reason:
@@ -435,7 +534,68 @@ def _agent_checks(
                         "host sandbox prerequisites are installed",
                     )
                 )
+            help_result = run([path, "--help"], repo_root, 10.0)
+            restricted_reason = claude_restricted_mode_unavailability_reason(
+                f"{help_result.stdout}\n{help_result.stderr}"
+                if help_result.returncode == 0
+                else ""
+            )
+            if restricted_reason:
+                checks.append(
+                    severity(
+                        "agent review isolation (claude)",
+                        restricted_reason,
+                        "Upgrade Claude Code: `npm install -g @anthropic-ai/claude-code`.",
+                    )
+                )
+            else:
+                checks.append(
+                    _ok(
+                        "agent review isolation (claude)",
+                        "restricted read-only review mode is available",
+                    )
+                )
         elif agent == "codex":
+            from .agent_adapter import (
+                codex_capability_probe_command,
+                codex_capability_probe_unavailability_reason,
+                codex_isolation_unavailability_reason,
+            )
+
+            exec_help = run([path, "exec", "--help"], repo_root, 10.0)
+            sandbox_help = run([path, "sandbox", "--help"], repo_root, 10.0)
+            isolation_reason = codex_isolation_unavailability_reason(
+                f"{exec_help.stdout}\n{exec_help.stderr}"
+                if exec_help.returncode == 0
+                else "",
+                f"{sandbox_help.stdout}\n{sandbox_help.stderr}"
+                if sandbox_help.returncode == 0
+                else "",
+            )
+            if not isolation_reason:
+                capability_probe = run(
+                    codex_capability_probe_command(path), repo_root, 10.0
+                )
+                isolation_reason = codex_capability_probe_unavailability_reason(
+                    capability_probe.returncode,
+                    capability_probe.stdout,
+                    capability_probe.stderr,
+                )
+            if isolation_reason:
+                checks.append(
+                    severity(
+                        "agent isolation (codex)",
+                        isolation_reason,
+                        "Upgrade Codex: `npm install -g @openai/codex`.",
+                    )
+                )
+            else:
+                checks.append(
+                    _ok(
+                        "agent isolation (codex)",
+                        "required permission-profile and non-interactive controls are available",
+                    )
+                )
             config_path = repo_root / ".codex"
             if config_path.is_symlink() or (
                 config_path.exists() and not config_path.is_dir()
@@ -478,6 +638,31 @@ def _github_checks(
     auth = run([gh_path, "auth", "status"], repo_root, 15.0)
     if auth.returncode == 0:
         checks.append(_ok("GitHub authentication", "`gh auth status` succeeded"))
+        repository = run(
+            [
+                gh_path,
+                "repo",
+                "view",
+                "--json",
+                "nameWithOwner",
+                "--jq",
+                ".nameWithOwner",
+            ],
+            repo_root,
+            15.0,
+        )
+        slug = repository.stdout.strip()
+        if repository.returncode == 0 and re.fullmatch(r"[^/\s]+/[^/\s]+", slug):
+            checks.append(_ok("GitHub repository", f"resolved as {slug}"))
+        else:
+            checks.append(
+                _warning(
+                    "GitHub repository",
+                    "the current origin could not be resolved to a GitHub repository",
+                    "Confirm that `origin` is a GitHub remote accessible to the authenticated `gh` account.",
+                    "Run `gh repo view --json nameWithOwner --jq .nameWithOwner` from the repository root.",
+                )
+            )
     else:
         auth_lines = [
             line

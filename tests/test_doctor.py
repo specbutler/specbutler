@@ -130,8 +130,15 @@ def _resolver(
 
 
 class _Runner:
-    def __init__(self, *, gh_auth_ok: bool = True, docker_info_ok: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        gh_auth_ok: bool = True,
+        gh_repo_ok: bool = True,
+        docker_info_ok: bool = True,
+    ) -> None:
         self.gh_auth_ok = gh_auth_ok
+        self.gh_repo_ok = gh_repo_ok
         self.docker_info_ok = docker_info_ok
         self.calls: list[list[str]] = []
 
@@ -143,13 +150,47 @@ class _Runner:
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(argv)
         if Path(argv[0]).name == "gh":
-            if self.gh_auth_ok:
-                return subprocess.CompletedProcess(argv, 0, "Logged in to github.com", "")
-            return subprocess.CompletedProcess(argv, 1, "", "not logged in")
+            if argv[1:] == ["auth", "status"]:
+                if self.gh_auth_ok:
+                    return subprocess.CompletedProcess(argv, 0, "Logged in to github.com", "")
+                return subprocess.CompletedProcess(argv, 1, "", "not logged in")
+            if argv[1:3] == ["repo", "view"]:
+                if self.gh_repo_ok:
+                    return subprocess.CompletedProcess(argv, 0, "example/project\n", "")
+                return subprocess.CompletedProcess(argv, 1, "", "repository not found")
         if Path(argv[0]).name == "docker" and argv[1:] == ["info"]:
             if self.docker_info_ok:
                 return subprocess.CompletedProcess(argv, 0, "daemon ready", "")
             return subprocess.CompletedProcess(argv, 1, "", "daemon unavailable")
+        if Path(argv[0]).name == "codex" and argv[1:] == ["exec", "--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                (
+                    "--add-dir --ephemeral --ignore-rules --ignore-user-config "
+                    "--json --output-schema --strict-config"
+                ),
+                "",
+            )
+        if Path(argv[0]).name == "codex" and argv[1:] == ["sandbox", "--help"]:
+            return subprocess.CompletedProcess(argv, 0, "--permission-profile", "")
+        if Path(argv[0]).name == "codex" and argv[1:] == ["login", "status"]:
+            return subprocess.CompletedProcess(argv, 0, "Logged in using ChatGPT", "")
+        if Path(argv[0]).name == "codex" and argv[1:2] == ["app-server"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if Path(argv[0]).name == "claude" and argv[1:] == ["auth", "status"]:
+            return subprocess.CompletedProcess(argv, 0, '{"loggedIn": true}\n', "")
+        if Path(argv[0]).name == "claude" and argv[1:] == ["--help"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                (
+                    "--restricted --safe-mode --permission-mode "
+                    "--strict-mcp-config --no-session-persistence "
+                    "--setting-sources --settings"
+                ),
+                "",
+            )
         return doctor._run_command(argv, cwd, timeout)
 
 
@@ -307,6 +348,8 @@ def test_doctor_happy_path_has_no_blockers_or_warnings(tmp_path: Path) -> None:
     assert checks["base ref"].status == "ok"
     assert checks["origin remote"].status == "ok"
     assert checks["GitHub authentication"].status == "ok"
+    assert checks["GitHub repository"].status == "ok"
+    assert checks["agent authentication (codex)"].status == "ok"
     assert checks["verify command (test)"].status == "ok"
     assert checks["runtime path separation"].status == "ok"
 
@@ -326,6 +369,173 @@ def test_missing_optional_allowed_agent_is_warning_only(tmp_path: Path) -> None:
     assert report.exit_code == 0
     assert report.blocker_count == 0
     assert _checks_by_name(report)["agent binary (claude)"].status == "warning"
+
+
+def test_required_provider_logged_out_is_blocked(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, _config_text())
+
+    class _LoggedOutRunner(_Runner):
+        def __call__(self, argv, cwd, timeout):
+            if Path(argv[0]).name == "codex" and argv[1:] == ["login", "status"]:
+                return subprocess.CompletedProcess(argv, 1, "Not logged in", "")
+            return super().__call__(argv, cwd, timeout)
+
+    report = doctor.run_doctor_checks(
+        repo,
+        runner=_LoggedOutRunner(),
+        which=_resolver(),
+    )
+
+    check = _checks_by_name(report)["agent authentication (codex)"]
+    assert check.status == "error"
+    assert "not authenticated" in check.detail
+    assert "codex login" in " ".join(check.remediation)
+    assert report.exit_code == 1
+
+
+def test_optional_provider_logged_out_is_warning_only(tmp_path: Path) -> None:
+    repo = _make_repo(
+        tmp_path,
+        _config_text(allowed_agents=("codex", "claude")),
+    )
+
+    class _LoggedOutRunner(_Runner):
+        def __call__(self, argv, cwd, timeout):
+            if Path(argv[0]).name == "claude" and argv[1:] == ["auth", "status"]:
+                return subprocess.CompletedProcess(argv, 0, '{"loggedIn": false}\n', "")
+            return super().__call__(argv, cwd, timeout)
+
+    report = doctor.run_doctor_checks(
+        repo,
+        runner=_LoggedOutRunner(),
+        which=_resolver(claude=True, claude_sandbox=True),
+    )
+
+    check = _checks_by_name(report)["agent authentication (claude)"]
+    assert check.status == "warning"
+    assert report.exit_code == 0
+
+
+def test_unsupported_provider_auth_status_warns_without_blocking(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, _config_text())
+
+    class _OldRunner(_Runner):
+        def __call__(self, argv, cwd, timeout):
+            if Path(argv[0]).name == "codex" and argv[1:] == ["login", "status"]:
+                return subprocess.CompletedProcess(argv, 2, "", "unknown command status")
+            return super().__call__(argv, cwd, timeout)
+
+    report = doctor.run_doctor_checks(
+        repo,
+        runner=_OldRunner(),
+        which=_resolver(),
+    )
+
+    check = _checks_by_name(report)["agent authentication (codex)"]
+    assert check.status == "warning"
+    assert "could not be verified" in check.detail
+    assert report.exit_code == 0
+
+
+def test_environment_auth_avoids_false_logged_out_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path, _config_text())
+    monkeypatch.setenv("OPENAI_API_KEY", "synthetic-test-value")
+
+    class _LoggedOutRunner(_Runner):
+        def __call__(self, argv, cwd, timeout):
+            if Path(argv[0]).name == "codex" and argv[1:] == ["login", "status"]:
+                return subprocess.CompletedProcess(argv, 1, "Not logged in", "")
+            return super().__call__(argv, cwd, timeout)
+
+    report = doctor.run_doctor_checks(
+        repo,
+        runner=_LoggedOutRunner(),
+        which=_resolver(),
+    )
+
+    check = _checks_by_name(report)["agent authentication (codex)"]
+    assert check.status == "warning"
+    assert "environment-based authentication" in check.detail
+    assert "synthetic-test-value" not in check.detail
+    assert report.exit_code == 0
+
+
+def test_required_codex_without_isolation_controls_is_blocked(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, _config_text())
+
+    class _OldCodexRunner(_Runner):
+        def __call__(self, argv, cwd, timeout):
+            if Path(argv[0]).name == "codex" and "--help" in argv:
+                return subprocess.CompletedProcess(argv, 0, "--json", "")
+            return super().__call__(argv, cwd, timeout)
+
+    report = doctor.run_doctor_checks(
+        repo,
+        runner=_OldCodexRunner(),
+        which=_resolver(),
+    )
+
+    check = _checks_by_name(report)["agent isolation (codex)"]
+    assert check.status == "error"
+    assert "lacks isolation controls" in check.detail
+    assert report.exit_code == 1
+
+
+def test_required_codex_rejecting_strict_security_config_is_blocked(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path, _config_text())
+
+    class _RejectingCodexRunner(_Runner):
+        def __call__(self, argv, cwd, timeout):
+            if Path(argv[0]).name == "codex" and argv[1:2] == ["app-server"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "",
+                    "unknown configuration field features.browser_use",
+                )
+            return super().__call__(argv, cwd, timeout)
+
+    report = doctor.run_doctor_checks(
+        repo,
+        runner=_RejectingCodexRunner(),
+        which=_resolver(),
+    )
+
+    check = _checks_by_name(report)["agent isolation (codex)"]
+    assert check.status == "error"
+    assert "rejected security controls" in check.detail
+    assert report.exit_code == 1
+
+
+def test_required_claude_without_restricted_controls_is_blocked(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(
+        tmp_path,
+        _config_text(default_agent="claude", allowed_agents=("claude",)),
+    )
+
+    class _OldClaudeRunner(_Runner):
+        def __call__(self, argv, cwd, timeout):
+            if Path(argv[0]).name == "claude" and argv[1:] == ["--help"]:
+                return subprocess.CompletedProcess(argv, 0, "--permission-mode", "")
+            return super().__call__(argv, cwd, timeout)
+
+    report = doctor.run_doctor_checks(
+        repo,
+        runner=_OldClaudeRunner(),
+        which=_resolver(claude=True, claude_sandbox=True),
+    )
+
+    check = _checks_by_name(report)["agent review isolation (claude)"]
+    assert check.status == "error"
+    assert "lacks isolation controls" in check.detail
+    assert report.exit_code == 1
 
 
 def test_required_claude_without_sandbox_dependencies_is_blocked(
@@ -554,6 +764,33 @@ def test_base_origin_and_gh_auth_failures_are_blockers(tmp_path: Path) -> None:
     assert checks["base ref"].status == "error"
     assert checks["GitHub authentication"].status == "error"
     assert report.exit_code == 1
+
+
+def test_unresolvable_github_repository_warns_without_forge_mutation(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path, _config_text())
+    runner = _Runner(gh_repo_ok=False)
+
+    report = doctor.run_doctor_checks(
+        repo,
+        runner=runner,
+        which=_resolver(),
+    )
+
+    check = _checks_by_name(report)["GitHub repository"]
+    assert check.status == "warning"
+    assert "could not be resolved" in check.detail
+    assert report.exit_code == 0
+    assert [
+        "/usr/bin/gh",
+        "repo",
+        "view",
+        "--json",
+        "nameWithOwner",
+        "--jq",
+        ".nameWithOwner",
+    ] in runner.calls
 
 
 def test_container_checks_are_read_only_and_direct_to_deep_doctor(tmp_path: Path) -> None:

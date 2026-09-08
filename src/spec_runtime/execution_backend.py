@@ -22,6 +22,7 @@ import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,7 @@ import time
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -43,7 +44,7 @@ from .config import (
     SpecRuntimeConfig,
 )
 from .git_common import run_git, subprocess_text_kwargs
-from .platform_fs import FileLock, remove_tree
+from .platform_fs import FileLock, atomic_write_text, remove_tree
 from .process_supervisor import (
     LifetimeMode,
     ManagedProcess,
@@ -56,6 +57,81 @@ from .process_supervisor import run as run_supervised
 from .process_supervisor import (
     terminate as terminate_supervision_token,
 )
+from .provider_env import is_provider_process_startup_control_env_name
+from .spec_identity import SPEC_ID_RE, implementation_branch_identity
+
+_WORKSPACE_RUN_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{1,191}$")
+_WORKSPACE_OWNER_FILENAME = ".specbutler-workspace-owner.json"
+
+
+def validate_workspace_run_identity(run_id: str, spec_id: str) -> str:
+    """Validate a backend run directory name against its owning spec.
+
+    Run identifiers cross a destructive filesystem boundary. Treat values
+    loaded from run/active state as untrusted even though normal producers use
+    ``<spec-id>-<timestamp>``.
+    """
+    if not isinstance(run_id, str) or run_id != run_id.strip():
+        raise ValueError(f"invalid non-canonical run_id {run_id!r}")
+    if not isinstance(spec_id, str) or not SPEC_ID_RE.fullmatch(spec_id):
+        raise ValueError(f"invalid spec_id {spec_id!r}")
+    posix = PurePosixPath(run_id)
+    windows = PureWindowsPath(run_id)
+    if (
+        not _WORKSPACE_RUN_COMPONENT_RE.fullmatch(run_id)
+        or posix.is_absolute()
+        or windows.is_absolute()
+        or bool(windows.drive)
+        or len(posix.parts) != 1
+        or len(windows.parts) != 1
+        or posix.name in {".", ".."}
+        or windows.name in {".", ".."}
+    ):
+        raise ValueError(f"invalid run_id path component {run_id!r}")
+    if not run_id.startswith(f"{spec_id}-") or run_id == f"{spec_id}-":
+        raise ValueError(
+            f"run_id {run_id!r} does not belong to spec {spec_id!r}"
+        )
+    return run_id
+
+
+def _lexical_absolute(path: Path) -> Path:
+    """Return an absolute normalized path without following links."""
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def path_is_link_or_junction(path: Path) -> bool:
+    """Detect every Windows reparse-point boundary, including on Python 3.11.
+
+    ``Path.is_junction`` was added after the oldest supported Python. Checking
+    the native file attribute keeps destructive cleanup fail-closed for
+    junctions and other directory reparse points on 3.11 as well.
+    """
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is not None and is_junction():
+        return True
+    try:
+        attributes = path.lstat().st_file_attributes
+    except (AttributeError, OSError):
+        return False
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+def _first_link_or_junction(path: Path, *, floor: Path) -> Path | None:
+    target = _lexical_absolute(path)
+    base = _lexical_absolute(floor)
+    try:
+        relative = target.relative_to(base)
+    except ValueError:
+        return target
+    current = base
+    for component in relative.parts:
+        current /= component
+        if path_is_link_or_junction(current):
+            return current
+    return None
 
 CONTAINER_WORKER_ENV_DENYLIST = frozenset(
     {
@@ -102,10 +178,12 @@ CONTAINER_WORKER_ENV_SECRET_ALLOWLIST = frozenset(
         "CLAUDE_CODE_OAUTH_TOKEN",
     }
 )
+_CLAUDE_MCP_RUNTIME_ENV_RE = re.compile(r"SPEC_MCP_RUNTIME_[0-9A-F]{24}")
 CONTAINER_COMPLETION_OUTBOX_ENV = "SPEC_COMPLETION_OUTBOX"
 CONTAINER_COMPLETION_ARTIFACT = "completion-report.json"
 CONTAINER_BOOTSTRAP_SOURCE = "/workspace/bootstrap/source"
 CONTAINER_RUNTIME_SOURCE = "/workspace/source"
+CONTAINER_CODEX_HOME = f"{CONTAINER_RUNTIME_SOURCE}/.spec-codex-home"
 CONTAINER_RUNTIME_STATE = f"{CONTAINER_RUNTIME_SOURCE}/.spec-state"
 CONTAINER_RUNTIME_STATE_TMPFS = f"{CONTAINER_RUNTIME_STATE}:rw,noexec,nosuid,nodev,mode=1777"
 CONTAINER_CODEX_SANDBOX_MODE = "danger-full-access"
@@ -418,6 +496,11 @@ class AgentRequest:
     capture_stdout: bool = False
     popen_kwargs: dict[str, Any] = field(default_factory=dict)
     redactions: Sequence[str] = ()
+    # Names whose values came from an explicit repository setup manifest or
+    # another declared launch input. Container backends use this provenance to
+    # admit secret-shaped project variables without inheriting same-named
+    # operator variables from the ambient environment.
+    declared_env_keys: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -1168,16 +1251,30 @@ class CloneExecutionBackend:
         base_ref: str = "",
     ) -> WorkspaceHandle:
         del worktree_path
+        try:
+            run_id = validate_workspace_run_identity(run_id, spec_id)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Clone backend refuses unsafe run identity: {exc}"
+            ) from exc
         repo_root = repo_root.resolve()
         workspace_root = self._resolve_workspace_root(repo_root)
         self._ensure_safe_workspace_root(repo_root, workspace_root)
         self._ensure_workspace_root_ignored(repo_root, workspace_root)
+        self._ensure_workspace_root_owner(repo_root, workspace_root)
         publish_remote_url = self._resolve_publish_remote_url(repo_root)
 
         run_root = workspace_root / run_id
         source = run_root / "source"
         outbox = run_root / "outbox"
         logs = run_root / "logs"
+        self._assert_run_layout_has_no_links(
+            repo_root=repo_root,
+            workspace_root=workspace_root,
+            run_root=run_root,
+            source=source,
+            outbox=outbox,
+        )
         outbox.mkdir(parents=True, exist_ok=True)
         logs.mkdir(parents=True, exist_ok=True)
 
@@ -1394,18 +1491,125 @@ class CloneExecutionBackend:
         return workspace
 
     def cleanup(self, workspace: WorkspaceHandle, *, allow_unpushed_work: bool = False) -> None:
-        run_root = workspace.outbox_path.parent.resolve()
-        source = workspace.path.resolve()
-        expected_source = run_root / "source"
-        expected_outbox = run_root / "outbox"
-        if source != expected_source or workspace.outbox_path.resolve() != expected_outbox:
+        run_root, source, _outbox = self._validated_cleanup_layout(workspace)
+        self._assert_workspace_deletable(source, allow_unpushed_work=allow_unpushed_work)
+        # Recheck the link-sensitive boundary immediately before deletion. A
+        # corrupt run directory must never redirect rmtree outside the
+        # backend-owned workspace root.
+        self._assert_run_layout_has_no_links(
+            repo_root=self._workspace_owner_repo_root(run_root.parent),
+            workspace_root=run_root.parent,
+            run_root=run_root,
+            source=source,
+            outbox=run_root / "outbox",
+        )
+        remove_tree(run_root)
+
+    def _validated_cleanup_layout(
+        self,
+        workspace: WorkspaceHandle,
+    ) -> tuple[Path, Path, Path]:
+        """Resolve an owned cleanup target without trusting handle paths."""
+        outbox = _lexical_absolute(workspace.outbox_path)
+        run_root = outbox.parent
+        source = _lexical_absolute(workspace.path)
+        recorded_run_id = workspace.metadata.get("run_id")
+        recorded_spec_id = workspace.metadata.get("spec_id")
+        run_id = str(recorded_run_id or run_root.name)
+        spec_id = str(recorded_spec_id or "")
+        branch_identity = implementation_branch_identity(workspace.branch)
+        if not spec_id:
+            if branch_identity is not None:
+                spec_id = branch_identity.spec_id
+            elif workspace.branch.startswith("task/"):
+                legacy_task_spec_id = f"task-{workspace.branch.removeprefix('task/')}"
+                if SPEC_ID_RE.fullmatch(legacy_task_spec_id) and run_id.startswith(
+                    f"{legacy_task_spec_id}-"
+                ):
+                    spec_id = legacy_task_spec_id
+        try:
+            validate_workspace_run_identity(run_id, spec_id)
+        except ValueError as exc:
+            raise OSError(f"refusing to clean clone backend workspace: {exc}") from exc
+        if branch_identity is not None and branch_identity.spec_id != spec_id:
+            raise OSError(
+                "refusing to clean clone backend workspace with mismatched branch/spec identity"
+            )
+
+        expected_run_root = run_root.parent / run_id
+        expected_source = expected_run_root / "source"
+        expected_outbox = expected_run_root / "outbox"
+        if (
+            run_root != expected_run_root
+            or source != expected_source
+            or outbox != expected_outbox
+        ):
             raise OSError(
                 "refusing to clean clone backend workspace with inconsistent paths: "
-                f"source={source}, outbox={workspace.outbox_path.resolve()}, run_root={run_root}"
+                f"source={source}, outbox={outbox}, run_root={run_root}"
             )
-        self._assert_workspace_deletable(source, allow_unpushed_work=allow_unpushed_work)
-        if run_root.name and run_root.parent.name:
-            remove_tree(run_root)
+
+        workspace_root = run_root.parent
+        for candidate in (workspace_root, run_root, source, outbox):
+            if path_is_link_or_junction(candidate):
+                raise OSError(
+                    "refusing to clean clone backend workspace through symlink "
+                    f"or junction: {candidate}"
+                )
+        owner_marker = workspace_root / _WORKSPACE_OWNER_FILENAME
+        if not owner_marker.is_file():
+            required_metadata = {
+                "run_id": run_id,
+                "spec_id": spec_id,
+                "repo_root": str(workspace.metadata.get("repo_root") or "").strip(),
+                "workspace_root": str(
+                    workspace.metadata.get("workspace_root") or ""
+                ).strip(),
+            }
+            if (
+                not isinstance(recorded_run_id, str)
+                or recorded_run_id != run_id
+                or not isinstance(recorded_spec_id, str)
+                or recorded_spec_id != spec_id
+                or not required_metadata["repo_root"]
+                or not required_metadata["workspace_root"]
+            ):
+                raise OSError(
+                    "refusing legacy workspace migration without complete canonical metadata"
+                )
+        repo_root = self._workspace_owner_repo_root(
+            workspace_root,
+            workspace=workspace,
+        )
+        configured_root = self._resolve_workspace_root(repo_root)
+        if configured_root != workspace_root:
+            raise OSError(
+                "refusing to clean clone backend workspace outside its configured root: "
+                f"run_root={run_root}, configured_root={configured_root}"
+            )
+        metadata_repo_root = str(workspace.metadata.get("repo_root") or "").strip()
+        if metadata_repo_root and Path(metadata_repo_root).resolve() != repo_root:
+            raise OSError(
+                "refusing to clean clone backend workspace with mismatched repo_root metadata"
+            )
+        metadata_workspace_root = str(
+            workspace.metadata.get("workspace_root") or ""
+        ).strip()
+        if (
+            metadata_workspace_root
+            and Path(metadata_workspace_root).resolve() != workspace_root
+        ):
+            raise OSError(
+                "refusing to clean clone backend workspace with mismatched workspace_root metadata"
+            )
+        self._assert_run_layout_has_no_links(
+            repo_root=repo_root,
+            workspace_root=workspace_root,
+            run_root=run_root,
+            source=source,
+            outbox=outbox,
+        )
+        return run_root, source, outbox
 
     def _record_snapshot_fallback(
         self,
@@ -1482,7 +1686,196 @@ class CloneExecutionBackend:
         configured = Path(self._identity.workspace_root).expanduser()
         if not configured.is_absolute():
             configured = repo_root / configured
+        configured = _lexical_absolute(configured)
+        linked = _first_link_or_junction(configured, floor=repo_root)
+        if linked is not None:
+            raise RuntimeError(
+                "Clone backend refuses a workspace_root containing a symlink or "
+                f"junction (or outside the checkout): {linked}"
+            )
         return configured.resolve()
+
+    def _ensure_workspace_root_owner(
+        self,
+        repo_root: Path,
+        workspace_root: Path,
+    ) -> None:
+        """Persist the host-owned root identity used by destructive cleanup."""
+        workspace_root.mkdir(parents=True, exist_ok=True)
+        linked = _first_link_or_junction(workspace_root, floor=repo_root)
+        if linked is not None:
+            raise RuntimeError(
+                f"Clone backend refuses linked workspace root component: {linked}"
+            )
+        marker = workspace_root / _WORKSPACE_OWNER_FILENAME
+        if path_is_link_or_junction(marker):
+            raise RuntimeError(
+                f"Clone backend refuses linked workspace ownership marker: {marker}"
+            )
+        expected = {
+            "format": 1,
+            "repo_root": str(repo_root.resolve()),
+            "workspace_root": str(workspace_root.resolve()),
+        }
+        if marker.exists():
+            try:
+                payload = json.loads(marker.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, TypeError) as exc:
+                raise RuntimeError(
+                    f"Clone backend workspace ownership marker is unreadable: {marker}"
+                ) from exc
+            if payload != expected:
+                raise RuntimeError(
+                    "Clone backend workspace ownership marker does not match this "
+                    f"checkout: {marker}"
+                )
+            return
+        atomic_write_text(
+            marker,
+            json.dumps(expected, indent=2, sort_keys=True) + "\n",
+        )
+
+    def _workspace_owner_repo_root(
+        self,
+        workspace_root: Path,
+        *,
+        workspace: WorkspaceHandle | None = None,
+    ) -> Path:
+        marker = workspace_root / _WORKSPACE_OWNER_FILENAME
+        if path_is_link_or_junction(marker):
+            raise OSError(
+                f"refusing to clean clone backend workspace through linked ownership marker: {marker}"
+            )
+        if not marker.is_file():
+            repo_path = self._legacy_workspace_owner_repo_root(
+                workspace_root,
+                workspace=workspace,
+            )
+            # Released workspaces predate the marker. Migrate only after the
+            # caller paths, run identity, branch/spec relationship, root
+            # containment, and link checks have all passed.
+            self._ensure_workspace_root_owner(repo_path, workspace_root)
+            return repo_path
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+            repo_raw = payload["repo_root"]
+            recorded_root_raw = payload["workspace_root"]
+            marker_format = payload["format"]
+        except (json.JSONDecodeError, OSError, KeyError, TypeError) as exc:
+            raise OSError(
+                f"refusing to clean clone backend workspace with invalid ownership marker: {marker}"
+            ) from exc
+        repo_path = Path(str(repo_raw)).expanduser()
+        recorded_root = Path(str(recorded_root_raw)).expanduser()
+        if (
+            marker_format != 1
+            or not repo_path.is_absolute()
+            or not recorded_root.is_absolute()
+            or repo_path.resolve() != repo_path
+            or recorded_root.resolve() != workspace_root
+        ):
+            raise OSError(
+                f"refusing to clean clone backend workspace with mismatched ownership marker: {marker}"
+            )
+        try:
+            workspace_root.relative_to(repo_path)
+        except ValueError as exc:
+            raise OSError(
+                f"refusing to clean clone backend workspace outside its owner checkout: {workspace_root}"
+            ) from exc
+        if workspace_root == repo_path:
+            raise OSError(
+                f"refusing to clean clone backend workspace at repository root: {workspace_root}"
+            )
+        linked = _first_link_or_junction(workspace_root, floor=repo_path)
+        if linked is not None:
+            raise OSError(
+                f"refusing to clean clone backend workspace through symlink or junction: {linked}"
+            )
+        return repo_path
+
+    def _legacy_workspace_owner_repo_root(
+        self,
+        workspace_root: Path,
+        *,
+        workspace: WorkspaceHandle | None,
+    ) -> Path:
+        configured = Path(self._identity.workspace_root).expanduser()
+        metadata_repo = (
+            str(workspace.metadata.get("repo_root") or "").strip()
+            if workspace is not None
+            else ""
+        )
+        if metadata_repo:
+            candidate_repo = Path(metadata_repo).expanduser()
+            if not candidate_repo.is_absolute():
+                raise OSError(
+                    "refusing legacy workspace migration with relative repo_root metadata"
+                )
+            candidate_repo = candidate_repo.resolve()
+        else:
+            if configured.is_absolute():
+                raise OSError(
+                    "refusing legacy absolute workspace-root migration without repo_root metadata"
+                )
+            if any(part in {"", ".", ".."} for part in configured.parts):
+                raise OSError(
+                    "refusing legacy workspace migration for non-canonical workspace_root"
+                )
+            candidate_repo = workspace_root
+            for _component in configured.parts:
+                candidate_repo = candidate_repo.parent
+            candidate_repo = candidate_repo.resolve()
+        if not ((candidate_repo / ".git").is_dir() or (candidate_repo / ".git").is_file()):
+            raise OSError(
+                f"refusing legacy workspace migration outside a Git checkout: {candidate_repo}"
+            )
+        expected_root = configured
+        if not expected_root.is_absolute():
+            expected_root = candidate_repo / expected_root
+        expected_root = _lexical_absolute(expected_root)
+        if expected_root != workspace_root or expected_root.resolve() != workspace_root:
+            raise OSError(
+                "refusing legacy workspace migration outside the configured root: "
+                f"{workspace_root}"
+            )
+        linked = _first_link_or_junction(workspace_root, floor=candidate_repo)
+        if linked is not None:
+            raise OSError(
+                f"refusing legacy workspace migration through symlink or junction: {linked}"
+            )
+        if workspace is not None:
+            metadata_root = str(
+                workspace.metadata.get("workspace_root") or ""
+            ).strip()
+            if metadata_root and Path(metadata_root).resolve() != workspace_root:
+                raise OSError(
+                    "refusing legacy workspace migration with mismatched workspace_root metadata"
+                )
+        return candidate_repo
+
+    def _assert_run_layout_has_no_links(
+        self,
+        *,
+        repo_root: Path,
+        workspace_root: Path,
+        run_root: Path,
+        source: Path,
+        outbox: Path,
+    ) -> None:
+        try:
+            if run_root.parent != workspace_root:
+                raise ValueError("run root is not a direct workspace-root child")
+            run_root.resolve(strict=False).relative_to(workspace_root.resolve())
+            for candidate in (workspace_root, run_root, source, outbox):
+                linked = _first_link_or_junction(candidate, floor=repo_root)
+                if linked is not None:
+                    raise ValueError(f"symlink or junction at {linked}")
+        except (OSError, ValueError) as exc:
+            raise OSError(
+                "refusing backend workspace operation outside the owned, "
+                f"link-free run layout: {run_root} ({exc})"
+            ) from exc
 
     def _ensure_safe_workspace_root(self, repo_root: Path, workspace_root: Path) -> None:
         try:
@@ -2048,14 +2441,25 @@ def _safe_artifact_name(value: str) -> str:
 
 
 def _is_container_worker_env_allowed(key: str) -> bool:
-    normalized = key.upper()
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+    if not _is_valid_container_env_name(key):
         return False
+    normalized = key.upper()
     if normalized in CONTAINER_WORKER_ENV_DENYLIST:
+        return False
+    if is_provider_process_startup_control_env_name(key):
         return False
     if any(marker in normalized for marker in CONTAINER_WORKER_ENV_SENSITIVE_MARKERS):
         return False
     return True
+
+
+def _is_valid_container_env_name(key: object) -> bool:
+    return isinstance(key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is not None
+
+
+def _is_claude_mcp_runtime_env_key(key: str) -> bool:
+    """Accept only orchestrator-generated MCP alias names for key-only export."""
+    return _CLAUDE_MCP_RUNTIME_ENV_RE.fullmatch(key) is not None
 
 
 def _replace_host_path_reference(value: str, *, host_path: str, container_path: str) -> str:
@@ -2100,10 +2504,24 @@ def _replace_host_path_reference(value: str, *, host_path: str, container_path: 
 
 
 def _redact_log_text(text: str, redactions: Sequence[str]) -> str:
+    """Redact values while avoiding destructive one-character replacement.
+
+    Short environment values are common (for example ``CI=1``). Replacing
+    every occurrence of such a value would make a command log unreadable, so
+    values shorter than four characters are redacted only when they appear as
+    a complete non-identifier token. Longer values use literal replacement.
+    """
     redacted = text
-    for secret in redactions:
-        if secret:
+    secrets = sorted({secret for secret in redactions if secret}, key=len, reverse=True)
+    for secret in secrets:
+        if len(secret) >= 4:
             redacted = redacted.replace(secret, "<redacted>")
+        else:
+            redacted = re.sub(
+                rf"(?<![A-Za-z0-9_]){re.escape(secret)}(?![A-Za-z0-9_])",
+                "<redacted>",
+                redacted,
+            )
     return redacted
 
 
@@ -2196,6 +2614,17 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         )
         run_root = handle.outbox_path.parent
         logs = run_root / "logs"
+        codex_provider_home = self.codex_provider_home_root(handle.path) / ".spec-codex-home"
+        for candidate in (codex_provider_home.parent, codex_provider_home):
+            if path_is_link_or_junction(candidate) or (
+                candidate.exists() and not candidate.is_dir()
+            ):
+                raise RuntimeError(
+                    f"Container backend refuses unsafe Codex provider-home path: {candidate}"
+                )
+            candidate.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if os.name != "nt":
+                candidate.chmod(0o700)
         image = self._resolve_worker_image(repo_root=repo_root, run_root=run_root, logs=logs)
         self._ensure_container_passwd_shim(run_root=run_root, image=image)
         mode = self._effective_workspace_mode()
@@ -2365,15 +2794,20 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         if run_root is None:
             raise RuntimeError(f"Container backend command cwd is not inside a prepared workspace: {request.cwd}")
         state = self._read_container_state(run_root)
+        worker_env = self._container_worker_environment(
+            run_root=run_root,
+            env=request.env or {},
+            state=state,
+        )
         argv = self._container_run_argv(
             run_root=run_root,
             cwd=request.cwd,
             command=request.argv,
-            env=request.env or {},
+            worker_env=worker_env,
             state=state,
         )
         env = self._container_client_env(
-            request.env or {},
+            worker_env,
             inherit_env=request.inherit_env,
         )
         completed = self._runner.run(
@@ -2394,7 +2828,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             stderr=completed.stderr or "",
             redactions=(
                 *self._service_log_redactions(state),
-                *self._request_env_log_redactions(request.env or {}),
+                *self._request_env_log_redactions(worker_env),
                 *request.redactions,
             ),
         )
@@ -2415,15 +2849,21 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         if run_root is None:
             raise RuntimeError(f"Container backend agent cwd is not inside a prepared workspace: {request.cwd}")
         state = self._read_container_state(run_root)
+        worker_env = self._container_worker_environment(
+            run_root=run_root,
+            env=request.env or {},
+            state=state,
+            declared_env_keys=request.declared_env_keys,
+        )
         argv = self._container_run_argv(
             run_root=run_root,
             cwd=request.cwd,
             command=request.argv,
-            env=request.env or {},
+            worker_env=worker_env,
             state=state,
             agent=True,
         )
-        client_env = self._container_client_env(request.env or {})
+        client_env = self._container_client_env(worker_env)
         if monitor is None:
             completed = self._runner.run(argv, cwd=run_root, env=client_env)
             self._remember_container_id(run_root, state)
@@ -2437,7 +2877,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 stderr=completed.stderr or "",
                 redactions=(
                     *self._service_log_redactions(state),
-                    *self._request_env_log_redactions(request.env or {}),
+                    *self._request_env_log_redactions(worker_env),
                     *request.redactions,
                 ),
             )
@@ -2473,7 +2913,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             stderr="",
             redactions=(
                 *self._service_log_redactions(state),
-                *self._request_env_log_redactions(request.env or {}),
+                *self._request_env_log_redactions(worker_env),
                 *request.redactions,
             ),
         )
@@ -2939,8 +3379,26 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         self._write_image_log(run_root / "logs", "previous-attempt-postmaster-cleanup.log", result)
 
     def cleanup(self, workspace: WorkspaceHandle, *, allow_unpushed_work: bool = False) -> None:
-        run_root = workspace.outbox_path.parent.resolve()
+        # Validate host path ownership before reading attacker-influenced state
+        # or tearing down any external container resources. Clone cleanup
+        # repeats this check immediately before deleting the run directory.
+        run_root, source, _outbox = self._validated_cleanup_layout(workspace)
         state = self._read_container_state(run_root, missing_ok=True)
+        expected_labels = self._validated_container_cleanup_state(
+            workspace,
+            run_root=run_root,
+            source=source,
+            state=state,
+        )
+        service_data_dirs = self._validated_cleanup_service_data_dirs(
+            source,
+            state.get("service_data_dirs", []),
+            topology=str(state.get("service_topology") or ""),
+        )
+        owned_resources = self._discover_owned_cleanup_resources(
+            run_root,
+            expected_labels,
+        )
         # For volume-mode workspaces the authoritative git state lives inside the
         # Docker volume, not the host ``source`` mirror. The post-run sync
         # (``_sync_volume_workspace_to_host``) normally keeps them in step, but a
@@ -2951,50 +3409,237 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         # would destroy. Skipped when deletion is already authorized
         # (post-merge cleanup / ``spec clean``), where the work is durable.
         if not allow_unpushed_work and state.get("workspace_mode") == "volume":
-            self._sync_volume_workspace_to_host(run_root, state)
+            workspace_volumes = {
+                str(item)
+                for item in state.get("workspace_volumes") or state.get("volumes", [])
+                if str(item)
+            }
+            owned_workspace_volumes = workspace_volumes & owned_resources["volume"]
+            if workspace_volumes and not owned_workspace_volumes:
+                raise OSError(
+                    "refusing container cleanup because the recorded workspace "
+                    "volume is not owned by this run"
+                )
+            if owned_workspace_volumes:
+                safe_state = dict(state)
+                safe_state["workspace_volumes"] = sorted(owned_workspace_volumes)
+                safe_state["volumes"] = sorted(owned_resources["volume"])
+                self._sync_volume_workspace_to_host(run_root, safe_state)
         # Refuse before tearing down any docker resources so a guarded deletion
         # leaves the run fully recoverable.
         self._assert_workspace_deletable(
-            (run_root / "source").resolve(),
+            source,
             allow_unpushed_work=allow_unpushed_work,
         )
-        if state.get("service_topology") == "sidecar":
-            self._remove_sidecar_services(run_root, state)
-        self._remove_playwright_mcp_sidecar(run_root, state)
-        for process in state.get("service_processes", []):
-            pid = process.get("pid") if isinstance(process, dict) else None
-            if pid:
-                self._runner.run(
-                    [self._container.engine, "kill", str(pid)],
-                    cwd=run_root,
-                )
-        for data_dir in state.get("service_data_dirs", []):
-            path = Path(str(data_dir))
-            try:
-                path.relative_to((run_root / "source").resolve())
-            except ValueError:
-                continue
+        # Never trust raw ids/names in persisted state. Discover resources from
+        # the engine using the complete host-generated label set and remove
+        # only those matches. This also collects resources from older attempts
+        # that a single latest-id state record may not mention.
+        for container_id in sorted(owned_resources["container"]):
+            result = self._runner.run(
+                [self._container.engine, "rm", "-f", container_id],
+                cwd=run_root,
+            )
+            self._require_owned_cleanup_success("container", container_id, result)
+        # Only remove host service data after every owned container is stopped;
+        # otherwise a still-running database could race the deletion or keep
+        # writing through its bind mount.
+        for path in service_data_dirs:
             if path.exists():
-                remove_tree(path, ignore_errors=True)
-        for container_id in state.get("containers", []):
-            if container_id:
-                self._runner.run(
-                    [self._container.engine, "rm", "-f", str(container_id)],
-                    cwd=run_root,
-                )
-        for volume in state.get("volumes", []):
-            if volume:
-                self._runner.run(
-                    [self._container.engine, "volume", "rm", "-f", str(volume)],
-                    cwd=run_root,
-                )
-        for network in state.get("networks", []):
-            if network:
-                self._runner.run(
-                    [self._container.engine, "network", "rm", str(network)],
-                    cwd=run_root,
-                )
+                remove_tree(path)
+        for volume in sorted(owned_resources["volume"]):
+            result = self._runner.run(
+                [self._container.engine, "volume", "rm", "-f", volume],
+                cwd=run_root,
+            )
+            self._require_owned_cleanup_success("volume", volume, result)
+        for network in sorted(owned_resources["network"]):
+            result = self._runner.run(
+                [self._container.engine, "network", "rm", network],
+                cwd=run_root,
+            )
+            self._require_owned_cleanup_success("network", network, result)
         super().cleanup(workspace, allow_unpushed_work=allow_unpushed_work)
+
+    @staticmethod
+    def _require_owned_cleanup_success(
+        kind: str,
+        resource_id: str,
+        result: subprocess.CompletedProcess[str],
+    ) -> None:
+        if result.returncode == 0:
+            return
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        raise OSError(
+            f"owned {kind} cleanup failed for {resource_id}: {detail}"
+        )
+
+    def _validated_container_cleanup_state(
+        self,
+        workspace: WorkspaceHandle,
+        *,
+        run_root: Path,
+        source: Path,
+        state: dict[str, Any],
+    ) -> dict[str, str]:
+        run_id = str(workspace.metadata.get("run_id") or run_root.name)
+        spec_id = str(workspace.metadata.get("spec_id") or "")
+        if not spec_id:
+            branch_identity = implementation_branch_identity(workspace.branch)
+            if branch_identity is not None:
+                spec_id = branch_identity.spec_id
+            elif workspace.branch.startswith("task/"):
+                legacy_task_spec_id = f"task-{workspace.branch.removeprefix('task/')}"
+                if SPEC_ID_RE.fullmatch(legacy_task_spec_id) and run_id.startswith(
+                    f"{legacy_task_spec_id}-"
+                ):
+                    spec_id = legacy_task_spec_id
+        try:
+            validate_workspace_run_identity(run_id, spec_id)
+        except ValueError as exc:
+            raise OSError(
+                f"refusing container cleanup for invalid run ownership: {exc}"
+            ) from exc
+        expected = self._resource_labels(
+            run_id=run_id,
+            spec_id=spec_id,
+            workspace_root=source,
+        )
+        labels = state.get("resource_labels")
+        if labels != expected:
+            raise OSError(
+                "refusing container cleanup because persisted resource labels "
+                "do not exactly match the canonical run identity"
+            )
+        for key, expected_path in (
+            ("source_path", source),
+            ("outbox_path", run_root / "outbox"),
+        ):
+            recorded = str(state.get(key) or "").strip()
+            if recorded and _lexical_absolute(Path(recorded)) != expected_path:
+                raise OSError(
+                    f"refusing container cleanup with mismatched {key}: {recorded}"
+                )
+        if any(
+            isinstance(process, dict) and process.get("pid")
+            for process in state.get("service_processes", [])
+        ):
+            # Current container service records use container_id, never a host
+            # PID. A raw PID in mutable state has no authenticated supervision
+            # token and must not reach `docker kill` or host signalling.
+            raise OSError(
+                "refusing container cleanup for unauthenticated service process PID"
+            )
+        return expected
+
+    def _validated_cleanup_service_data_dirs(
+        self,
+        source: Path,
+        raw_paths: object,
+        *,
+        topology: str,
+    ) -> list[Path]:
+        if not isinstance(raw_paths, list):
+            raise OSError("refusing container cleanup with malformed service_data_dirs")
+        if topology not in {"", "in-worker", "sidecar"}:
+            raise OSError(
+                f"refusing container cleanup with invalid service topology: {topology!r}"
+            )
+        validated: list[Path] = []
+        for item in raw_paths:
+            raw_path = str(item)
+            if ".." in PurePosixPath(raw_path).parts or ".." in PureWindowsPath(
+                raw_path
+            ).parts:
+                raise OSError(
+                    f"refusing traversing container service data directory: {raw_path}"
+                )
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                raise OSError(
+                    f"refusing relative container service data directory: {path}"
+                )
+            lexical = _lexical_absolute(path)
+            try:
+                relative = lexical.relative_to(source)
+            except ValueError as exc:
+                raise OSError(
+                    f"refusing container service data directory outside source: {path}"
+                ) from exc
+            if not relative.parts:
+                raise OSError(
+                    f"refusing to treat the entire workspace source as service data: {path}"
+                )
+            linked = _first_link_or_junction(lexical, floor=source)
+            if linked is not None:
+                raise OSError(
+                    f"refusing linked container service data directory: {path}"
+                )
+            try:
+                lexical.resolve(strict=False).relative_to(source.resolve())
+            except ValueError as exc:
+                raise OSError(
+                    f"refusing container service data directory escape: {path}"
+                ) from exc
+            validated.append(lexical)
+        expected = (
+            [_lexical_absolute(Path(item)) for item in self._service_data_dirs(source, topology)]
+            if topology
+            else []
+        )
+        if validated != expected:
+            raise OSError(
+                "refusing container cleanup because service_data_dirs do not "
+                "exactly match the canonical service layout"
+            )
+        return validated
+
+    def _discover_owned_cleanup_resources(
+        self,
+        run_root: Path,
+        labels: dict[str, str],
+    ) -> dict[str, set[str]]:
+        filters = [
+            argument
+            for key, value in sorted(labels.items())
+            for argument in ("--filter", f"label={key}={value}")
+        ]
+        commands = {
+            "container": [
+                self._container.engine,
+                "ps",
+                "-a",
+                "-q",
+                "--no-trunc",
+                *filters,
+            ],
+            "volume": [
+                self._container.engine,
+                "volume",
+                "ls",
+                "-q",
+                *filters,
+            ],
+            "network": [
+                self._container.engine,
+                "network",
+                "ls",
+                "-q",
+                *filters,
+            ],
+        }
+        discovered: dict[str, set[str]] = {}
+        for kind, argv in commands.items():
+            result = self._runner.run(argv, cwd=run_root)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "unknown error").strip()
+                raise OSError(
+                    f"refusing container cleanup because owned {kind} discovery failed: {detail}"
+                )
+            discovered[kind] = {
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            }
+        return discovered
 
     def _ensure_engine_available(self) -> None:
         if shutil.which(self._container.engine):
@@ -3284,23 +3929,24 @@ class ContainerExecutionBackend(CloneExecutionBackend):
 
     @staticmethod
     def _request_env_log_redactions(env: dict[str, str]) -> list[str]:
-        return [value for key, value in env.items() if key in CONTAINER_WORKER_ENV_SECRET_ALLOWLIST and value]
+        # Worker values are intentionally absent from Docker argv, but the
+        # command may echo them. Treat every forwarded non-empty value as
+        # sensitive rather than trying to infer secrecy from its variable name.
+        return list(dict.fromkeys(value for value in env.values() if value))
 
     @staticmethod
     def _container_client_env(
-        env: dict[str, str],
+        worker_env: dict[str, str],
         *,
         inherit_env: bool = True,
-    ) -> dict[str, str] | None:
-        client_env = os.environ.copy() if inherit_env else None
-        secret_env = {
-            key: value for key, value in env.items() if key in CONTAINER_WORKER_ENV_SECRET_ALLOWLIST and value
-        }
-        if not secret_env:
-            return client_env
-        if client_env is None:
-            client_env = os.environ.copy()
-        client_env.update(secret_env)
+    ) -> dict[str, str]:
+        # Docker's ``-e NAME`` form reads NAME from the client environment.
+        # Overlay every value, including empty strings, so a same-named
+        # operator variable can never replace the value admitted by the
+        # orchestrator. ``inherit_env=False`` must not silently recover the
+        # ambient process environment merely because worker values exist.
+        client_env = os.environ.copy() if inherit_env else {}
+        client_env.update(worker_env)
         return client_env
 
     @staticmethod
@@ -3990,6 +4636,12 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             argv.extend(["-v", f"{workspace_volumes[0]}:/workspace/source"])
         else:
             argv.extend(["-v", f"{run_root / 'source'}:/workspace/source"])
+        argv.extend(
+            [
+                "-v",
+                f"{run_root / 'provider-homes' / 'codex' / '.spec-codex-home'}:{CONTAINER_CODEX_HOME}",
+            ]
+        )
         attached_networks = list(
             dict.fromkeys(
                 [
@@ -4167,8 +4819,9 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         ``prepare_workspace`` time — files written to the host worktree after
         seeding (e.g. ``.spec-codex-home/``, ``.claude/mcp-servers.json``)
         are not visible inside ``/workspace/source`` until they are copied
-        in. This method runs a one-shot container that mounts both the host
-        worktree and the workspace volume and copies each requested path.
+        in. Absence is synchronized too, so removing launch-scoped credentials
+        on the host also scrubs the volume. This method runs a one-shot
+        container that mounts both the host worktree and the workspace volume.
         """
         if not relative_paths:
             return
@@ -4189,9 +4842,10 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             rel = entry.strip()
             if not rel or rel.startswith("/"):
                 continue
-            if not (host_source / rel).exists():
+            posix_path = PurePosixPath(rel.replace("\\", "/"))
+            if ".." in posix_path.parts or posix_path.is_absolute():
                 continue
-            posix = rel.replace("\\", "/").rstrip("/")
+            posix = posix_path.as_posix().rstrip("/")
             if posix and posix not in normalized:
                 normalized.append(posix)
         if not normalized:
@@ -4201,12 +4855,20 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         for rel in normalized:
             quoted = shlex.quote(rel)
             parent = "/".join(rel.split("/")[:-1])
-            parent_clause = f"mkdir -p /workspace/source/{shlex.quote(parent)} && " if parent else ""
-            copy_cmds.append(
-                f"{parent_clause}"
-                f"rm -rf /workspace/source/{quoted} && "
-                f"cp -a /workspace/host/{quoted} /workspace/source/{quoted}"
-            )
+            remove_clause = f"rm -rf /workspace/source/{quoted}"
+            host_path = host_source / rel
+            if host_path.exists() or host_path.is_symlink():
+                parent_clause = (
+                    f"mkdir -p /workspace/source/{shlex.quote(parent)} && "
+                    if parent
+                    else ""
+                )
+                copy_cmds.append(
+                    f"{parent_clause}{remove_clause} && "
+                    f"cp -a /workspace/host/{quoted} /workspace/source/{quoted}"
+                )
+            else:
+                copy_cmds.append(remove_clause)
         script = " && ".join(copy_cmds)
 
         argv = [
@@ -4307,7 +4969,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         run_root: Path,
         cwd: Path,
         command: list[str],
-        env: dict[str, str],
+        worker_env: dict[str, str],
         state: dict[str, Any],
         agent: bool = False,
     ) -> list[str]:
@@ -4324,19 +4986,6 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         path_value = CONTAINER_BOOTSTRAP_PATH if agent else CONTAINER_NON_AGENT_PATH
         container_cwd = self._container_cwd(run_root, cwd)
         path_mappings = self._container_path_mappings(run_root)
-        worker_env = {
-            key: self._translate_container_paths(value, path_mappings)
-            for key, value in self._filter_container_worker_env(env).items()
-        }
-        home_value = env.get("HOME")
-        if home_value:
-            translated_home = self._translate_container_paths(home_value, path_mappings)
-            if translated_home == CONTAINER_RUNTIME_SOURCE or translated_home.startswith(
-                f"{CONTAINER_RUNTIME_SOURCE}/"
-            ):
-                worker_env["HOME"] = translated_home
-        for key, value in state.get("service_env", {}).items():
-            worker_env.setdefault(str(key), str(value))
         translated_command = [self._translate_container_paths(value, path_mappings) for value in command]
         translated_command = self._relax_codex_sandbox_for_container(translated_command)
         if state.get("worker_container"):
@@ -4355,8 +5004,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 "-e",
                 f"NODE_PATH={CONTAINER_BOOTSTRAP_SOURCE}/node_modules",
             ]
-            for key, value in sorted(worker_env.items()):
-                argv.extend(["-e", self._container_worker_env_arg(key, value)])
+            for key in sorted(worker_env):
+                argv.extend(["-e", self._container_worker_env_arg(key)])
             if not agent and "HOME" not in worker_env:
                 argv.extend(["-e", f"HOME={CONTAINER_RUNTIME_SOURCE}/.spec-claude-home"])
             argv.extend([container_id, *translated_command])
@@ -4394,6 +5043,13 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             argv.extend(["-v", f"{workspace_volumes[0]}:/workspace/source"])
         else:
             argv.extend(["-v", f"{run_root / 'source'}:/workspace/source"])
+        if agent:
+            argv.extend(
+                [
+                    "-v",
+                    f"{run_root / 'provider-homes' / 'codex' / '.spec-codex-home'}:{CONTAINER_CODEX_HOME}",
+                ]
+            )
         attached_networks = list(
             dict.fromkeys(
                 [
@@ -4404,8 +5060,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         )
         for network in attached_networks:
             argv.extend(["--network", network])
-        for key, value in sorted(worker_env.items()):
-            argv.extend(["-e", self._container_worker_env_arg(key, value)])
+        for key in sorted(worker_env):
+            argv.extend(["-e", self._container_worker_env_arg(key)])
         if not agent and "HOME" not in worker_env:
             argv.extend(["-e", f"HOME={CONTAINER_RUNTIME_SOURCE}/.spec-claude-home"])
         argv.extend([state["image"], *translated_command])
@@ -4429,10 +5085,44 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         return relaxed
 
     @staticmethod
-    def _container_worker_env_arg(key: str, value: str) -> str:
-        if key in CONTAINER_WORKER_ENV_SECRET_ALLOWLIST:
-            return key
-        return f"{key}={value}"
+    def _container_worker_env_arg(key: str) -> str:
+        if not _is_valid_container_env_name(key):
+            raise ValueError(f"Invalid container environment variable name: {key!r}")
+        return key
+
+    def _container_worker_environment(
+        self,
+        *,
+        run_root: Path,
+        env: dict[str, str],
+        state: dict[str, Any],
+        declared_env_keys: frozenset[str] = frozenset(),
+    ) -> dict[str, str]:
+        """Return the sole validated environment exported into the worker."""
+        path_mappings = self._container_path_mappings(run_root)
+        worker_env = {
+            key: self._translate_container_paths(value, path_mappings)
+            for key, value in self._filter_container_worker_env(
+                env,
+                declared_env_keys=declared_env_keys,
+            ).items()
+        }
+        home_value = env.get("HOME")
+        if isinstance(home_value, str) and home_value:
+            translated_home = self._translate_container_paths(home_value, path_mappings)
+            if translated_home == CONTAINER_RUNTIME_SOURCE or translated_home.startswith(
+                f"{CONTAINER_RUNTIME_SOURCE}/"
+            ):
+                worker_env["HOME"] = translated_home
+
+        service_env = state.get("service_env", {})
+        if not isinstance(service_env, dict):
+            raise RuntimeError("Container backend service environment is invalid.")
+        for raw_key, raw_value in service_env.items():
+            if not _is_valid_container_env_name(raw_key) or not isinstance(raw_value, str):
+                raise RuntimeError("Container backend service environment is invalid.")
+            worker_env.setdefault(raw_key, raw_value)
+        return worker_env
 
     @staticmethod
     def _playwright_sidecar_networks(state: dict[str, Any]) -> list[str]:
@@ -4442,11 +5132,26 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         return [str(network) for network in playwright_mcp.get("sidecar_networks", [])]
 
     @staticmethod
-    def _filter_container_worker_env(env: dict[str, str]) -> dict[str, str]:
+    def _filter_container_worker_env(
+        env: dict[str, str],
+        *,
+        declared_env_keys: frozenset[str] = frozenset(),
+    ) -> dict[str, str]:
         return {
             key: value
             for key, value in env.items()
-            if _is_container_worker_env_allowed(key) or key in CONTAINER_WORKER_ENV_SECRET_ALLOWLIST
+            if isinstance(value, str)
+            and _is_valid_container_env_name(key)
+            and (
+                _is_container_worker_env_allowed(key)
+                or key in CONTAINER_WORKER_ENV_SECRET_ALLOWLIST
+                or _is_claude_mcp_runtime_env_key(key)
+                or (
+                    key in declared_env_keys
+                    and key.upper() not in CONTAINER_WORKER_ENV_DENYLIST
+                    and not is_provider_process_startup_control_env_name(key)
+                )
+            )
         }
 
     @staticmethod
@@ -4459,6 +5164,10 @@ class ContainerExecutionBackend(CloneExecutionBackend):
     def _container_path_mappings(run_root: Path) -> list[tuple[str, str]]:
         mappings: list[tuple[str, str]] = []
         for host_path, container_path in (
+            (
+                run_root / "provider-homes" / "codex" / ".spec-codex-home",
+                CONTAINER_CODEX_HOME,
+            ),
             (run_root / "source", CONTAINER_RUNTIME_SOURCE),
             (run_root / "outbox", "/workspace/outbox"),
             (run_root / "logs", "/workspace/logs"),
@@ -4469,6 +5178,15 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     mappings.append((host_text, container_path))
         mappings.sort(key=lambda item: len(item[0]), reverse=True)
         return mappings
+
+    def codex_provider_home_root(self, workspace_cwd: Path) -> Path:
+        """Return the host-only root bind-mounted as the worker's CODEX_HOME."""
+        run_root = self._workspace_run_root(workspace_cwd)
+        if run_root is None:
+            raise RuntimeError(
+                f"Container backend cwd is not inside a prepared workspace: {workspace_cwd}"
+            )
+        return run_root / "provider-homes" / "codex"
 
     def _container_user_mapping(self) -> str:
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):

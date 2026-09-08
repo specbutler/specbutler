@@ -6,18 +6,22 @@ helpers and CLI dispatch work even when the ``[web]`` extras are not installed.
 
 from __future__ import annotations
 
+import hashlib
+import ipaddress
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 from .auth import (
     cookie_name_for_port,
-    extract_token_from_request,
     load_or_create_token,
     parse_cookies,
     read_token,
@@ -37,7 +41,7 @@ _LOGIN_HTML = """\
   form { background: #1e293b; padding: 2rem; border-radius: 0.75rem; max-width: 360px; width: 100%; }
   h1 { font-size: 1.25rem; margin: 0 0 1rem; }
   label { display: block; margin-bottom: 0.5rem; font-size: 0.875rem; }
-  input[type=text] { width: 100%; padding: 0.75rem; border: 1px solid #334155;
+  input[type=password] { width: 100%; padding: 0.75rem; border: 1px solid #334155;
                      border-radius: 0.375rem; background: #0f172a; color: #e2e8f0;
                      font-size: 1rem; box-sizing: border-box; }
   button { margin-top: 1rem; width: 100%; padding: 0.75rem; border: none;
@@ -47,10 +51,10 @@ _LOGIN_HTML = """\
 </style>
 </head>
 <body>
-<form method="get" action="/">
+<form method="post" action="/auth/login">
   <h1>spec web</h1>
   <label for="token">Token</label>
-  <input type="text" id="token" name="token" autocomplete="off" autofocus required>
+  <input type="password" id="token" name="token" autocomplete="off" autofocus required>
   <button type="submit">Authenticate</button>
 </form>
 </body>
@@ -67,8 +71,64 @@ def _native_windows_host() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Auth middleware (uses starlette types but defined as plain ASGI callable)
+# Security/auth middleware (plain ASGI callables; no eager web dependency)
 # ---------------------------------------------------------------------------
+
+
+_SECURITY_RESPONSE_HEADERS = (
+    (b"cache-control", b"no-store, private"),
+    (b"content-security-policy", b"frame-ancestors 'none'"),
+    (b"x-frame-options", b"DENY"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+)
+_SECURITY_RESPONSE_HEADER_NAMES = {
+    name for name, _value in _SECURITY_RESPONSE_HEADERS
+}
+
+_BROWSER_SESSION_TTL_SECONDS = 60 * 60
+_BOOTSTRAP_NONCE_TTL_SECONDS = 60
+_CSRF_HEADER = "x-spec-csrf"
+
+
+@dataclass(frozen=True)
+class _BrowserSession:
+    """A launch-local browser credential, intentionally distinct from bearer auth."""
+
+    csrf_digest: bytes
+    operator_token_digest: bytes
+    expires_at: float
+
+
+class SecurityHeadersMiddleware:
+    """Apply browser security policy to every HTTP response, including errors."""
+
+    def __init__(self, app: object) -> None:
+        self.app = app
+
+    def __getattr__(self, name: str) -> object:
+        # Preserve Starlette's public surface (notably ``state``) for embedded
+        # callers and tests while keeping this middleware outside Starlette's
+        # own ServerErrorMiddleware so generated 500 responses are covered.
+        return getattr(self.app, name)
+
+    async def __call__(self, scope: dict, receive: object, send: object) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_security_headers(message: dict) -> None:
+            if message.get("type") == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() not in _SECURITY_RESPONSE_HEADER_NAMES
+                ]
+                headers.extend(_SECURITY_RESPONSE_HEADERS)
+                message = {**message, "headers": headers}
+            await send(message)  # type: ignore[arg-type]
+
+        await self.app(scope, receive, send_with_security_headers)
 
 
 class AuthMiddleware:
@@ -85,21 +145,30 @@ class AuthMiddleware:
         token: str,
         repo_root: object = None,
         port: int | None = None,
+        bootstrap_nonce: str | None = None,
     ) -> None:
         self.app = app
         self._static_token = token
         self._repo_root = repo_root
         self._cookie_name = cookie_name_for_port(port)
+        self._browser_sessions: dict[str, _BrowserSession] = {}
+        self._bootstrap_nonces: dict[bytes, float] = {}
+        if bootstrap_nonce:
+            digest = hashlib.sha256(bootstrap_nonce.encode("utf-8")).digest()
+            self._bootstrap_nonces[digest] = (
+                time.monotonic() + _BOOTSTRAP_NONCE_TTL_SECONDS
+            )
 
-    def _current_token(self) -> str:
-        """Return the live token, re-reading from disk when possible."""
+    def _current_token(self) -> str | None:
+        """Return the live token, failing closed when durable state is unreadable."""
         if self._repo_root is not None:
             try:
                 file_token = read_token(self._repo_root)
                 if file_token:
                     return file_token
             except Exception:
-                pass
+                return None
+            return None
         return self._static_token
 
     async def __call__(self, scope: dict, receive: object, send: object) -> None:
@@ -113,72 +182,169 @@ class AuthMiddleware:
             (k.decode("latin-1"), v.decode("latin-1")) for k, v in scope.get("headers", [])
         )
         cookies = parse_cookies(headers.get("cookie", ""))
-        request_token = extract_token_from_request(
-            scope, headers, cookies, self._cookie_name
+        query_params = _query_params(scope)
+        bootstrap_nonce = _single_query_value(query_params, "bootstrap")
+        bearer_token = _bearer_token(headers)
+        method = str(scope.get("method", "GET")).upper()
+        path = str(scope.get("path", "/"))
+
+        # `--open` carries only a short-lived, single-use nonce in its URL.
+        # The durable bearer and the browser request proof never appear in a
+        # navigation URL, including redirect history retained by browsers.
+        if bootstrap_nonce is not None:
+            if (
+                method not in {"GET", "HEAD"}
+                or path != "/"
+                or current_token is None
+                or not self._consume_bootstrap_nonce(bootstrap_nonce)
+            ):
+                await self._unauthenticated(scope, receive, send)
+                return
+            session_id, csrf_token = self._new_browser_session(current_token)
+            await self._send_browser_bootstrap(
+                scope,
+                receive,
+                send,
+                session_id=session_id,
+                csrf_token=csrf_token,
+            )
+            return
+
+        if method == "POST" and path == "/auth/login":
+            submitted_token = await _read_login_token(receive, headers)
+            if (
+                current_token is None
+                or submitted_token is None
+                or not secrets.compare_digest(submitted_token, current_token)
+            ):
+                await self._unauthenticated(scope, receive, send)
+                return
+            session_id, csrf_token = self._new_browser_session(current_token)
+            await self._send_browser_bootstrap(
+                scope,
+                receive,
+                send,
+                session_id=session_id,
+                csrf_token=csrf_token,
+            )
+            return
+
+        if bearer_token is not None:
+            if (
+                current_token is not None
+                and secrets.compare_digest(bearer_token, current_token)
+            ):
+                await self.app(scope, receive, send)
+                return
+            await self._unauthenticated(scope, receive, send)
+            return
+
+        browser_session = self._valid_browser_session(
+            cookies.get(self._cookie_name), current_token
         )
+        if browser_session is not None:
+            if path.startswith("/api/"):
+                csrf_token = headers.get(_CSRF_HEADER, "")
+                if not csrf_token or not secrets.compare_digest(
+                    hashlib.sha256(csrf_token.encode("utf-8")).digest(),
+                    browser_session.csrf_digest,
+                ):
+                    from starlette.responses import JSONResponse
 
-        if request_token == current_token:
-            # If token was in query string, set cookie and redirect to strip it.
-            # Only redirect safe methods (GET/HEAD); for POST and others, set
-            # the cookie via a wrapper and let the request proceed so the action
-            # actually executes (a 302 would convert POST to GET).
-            qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
-            if f"token={current_token}" in qs:
-                method = scope.get("method", "GET").upper()
-                path = scope.get("path", "/")
-                if method in ("GET", "HEAD"):
-                    params = []
-                    for pair in qs.split("&"):
-                        if "=" in pair:
-                            key, _, value = pair.partition("=")
-                            if key != "token":
-                                params.append(f"{key}={value}")
-                    redirect_path = path
-                    if params:
-                        redirect_path += "?" + "&".join(params)
-
-                    from starlette.responses import RedirectResponse
-
-                    is_https = scope.get("scheme") == "https"
-                    response = RedirectResponse(url=redirect_path, status_code=302)
-                    response.set_cookie(
-                        self._cookie_name,
-                        current_token,
-                        httponly=True,
-                        samesite="lax",
-                        secure=is_https,
-                        path="/",
+                    response = JSONResponse(
+                        {"error": "Browser session proof required"}, status_code=403
                     )
                     await response(scope, receive, send)
                     return
+                if not _is_safe_http_method(method) and not _has_same_origin_browser_context(
+                    scope, headers
+                ):
+                    from starlette.responses import JSONResponse
 
-                # Non-redirect path: set cookie via Set-Cookie header on the
-                # response produced by the downstream app, without redirecting.
-                # Covers non-safe methods (POST etc.) where a redirect would
-                # convert the request to GET and lose the request body.
-                is_https = scope.get("scheme") == "https"
-                secure_part = "; Secure" if is_https else ""
-                cookie_header = (
-                    f"{self._cookie_name}={current_token}; HttpOnly; "
-                    f"SameSite=Lax; Path=/{secure_part}"
-                )
-
-                async def send_with_cookie(message: dict) -> None:
-                    if message.get("type") == "http.response.start":
-                        headers = list(message.get("headers", []))
-                        headers.append(
-                            (b"set-cookie", cookie_header.encode("latin-1"))
-                        )
-                        message = {**message, "headers": headers}
-                    await send(message)  # type: ignore[arg-type]
-
-                await self.app(scope, receive, send_with_cookie)
-                return
-
+                    response = JSONResponse(
+                        {"error": "Cross-origin browser request rejected"},
+                        status_code=403,
+                    )
+                    await response(scope, receive, send)
+                    return
             await self.app(scope, receive, send)
             return
 
         # Unauthenticated — return JSON for API routes, HTML login form otherwise
+        await self._unauthenticated(scope, receive, send)
+
+    def _new_browser_session(self, current_token: str) -> tuple[str, str]:
+        now = time.monotonic()
+        self._browser_sessions = {
+            session_id: session
+            for session_id, session in self._browser_sessions.items()
+            if session.expires_at > now
+        }
+        session_id = secrets.token_urlsafe(32)
+        csrf_token = secrets.token_urlsafe(32)
+        self._browser_sessions[session_id] = _BrowserSession(
+            csrf_digest=hashlib.sha256(csrf_token.encode("utf-8")).digest(),
+            operator_token_digest=hashlib.sha256(current_token.encode("utf-8")).digest(),
+            expires_at=now + _BROWSER_SESSION_TTL_SECONDS,
+        )
+        return session_id, csrf_token
+
+    def _consume_bootstrap_nonce(self, nonce: str) -> bool:
+        digest = hashlib.sha256(nonce.encode("utf-8")).digest()
+        expires_at = self._bootstrap_nonces.pop(digest, None)
+        return expires_at is not None and expires_at > time.monotonic()
+
+    def _valid_browser_session(
+        self, session_id: str | None, current_token: str | None
+    ) -> _BrowserSession | None:
+        if not session_id or current_token is None:
+            return None
+        session = self._browser_sessions.get(session_id)
+        if session is None:
+            return None
+        if session.expires_at <= time.monotonic():
+            self._browser_sessions.pop(session_id, None)
+            return None
+        current_digest = hashlib.sha256(current_token.encode("utf-8")).digest()
+        if not secrets.compare_digest(session.operator_token_digest, current_digest):
+            self._browser_sessions.pop(session_id, None)
+            return None
+        return session
+
+    async def _send_browser_bootstrap(
+        self,
+        scope: dict,
+        receive: object,
+        send: object,
+        *,
+        session_id: str,
+        csrf_token: str,
+    ) -> None:
+        from starlette.responses import HTMLResponse
+
+        rendered_proof = json.dumps(csrf_token).replace("<", "\\u003c")
+        response = HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>Signing in</title>"
+            "<script>(function(){"
+            f'localStorage.setItem("spec-web-csrf",{rendered_proof});'
+            'window.location.replace("/#/");'
+            "})();</script>",
+            status_code=200,
+        )
+        response.set_cookie(
+            self._cookie_name,
+            session_id,
+            httponly=True,
+            samesite="strict",
+            secure=scope.get("scheme") == "https",
+            max_age=_BROWSER_SESSION_TTL_SECONDS,
+            path="/",
+        )
+        await response(scope, receive, send)
+
+    async def _unauthenticated(
+        self, scope: dict, receive: object, send: object
+    ) -> None:
         path = scope.get("path", "")
         if path.startswith("/api/"):
             from starlette.responses import JSONResponse
@@ -189,6 +355,104 @@ class AuthMiddleware:
 
             response = HTMLResponse(_LOGIN_HTML, status_code=401)
         await response(scope, receive, send)
+
+
+def _query_params(scope: dict) -> list[tuple[str, str]]:
+    raw_query = scope.get("query_string", b"")
+    query = raw_query.decode("utf-8", errors="replace")
+    return parse_qsl(query, keep_blank_values=True)
+
+
+def _single_query_value(params: list[tuple[str, str]], name: str) -> str | None:
+    values = [value for key, value in params if key == name]
+    return values[0] if len(values) == 1 and values[0] else None
+
+
+def _bearer_token(headers: dict[str, str]) -> str | None:
+    authorization = headers.get("authorization", "")
+    if authorization.lower().startswith("bearer "):
+        return authorization[7:].strip()
+    return None
+
+
+async def _read_login_token(receive: object, headers: dict[str, str]) -> str | None:
+    """Read a bounded URL-encoded login form without an optional parser dependency."""
+    content_type = headers.get("content-type", "").partition(";")[0].strip().lower()
+    if content_type != "application/x-www-form-urlencoded":
+        return None
+    body = bytearray()
+    while True:
+        message = await receive()  # type: ignore[operator]
+        if message.get("type") != "http.request":
+            return None
+        chunk = message.get("body", b"")
+        if not isinstance(chunk, bytes) or len(body) + len(chunk) > 8192:
+            return None
+        body.extend(chunk)
+        if not message.get("more_body", False):
+            break
+    try:
+        params = parse_qsl(body.decode("utf-8"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        return None
+    values = [value for key, value in params if key == "token"]
+    return values[0] if len(values) == 1 and values[0] else None
+
+
+def _is_safe_http_method(method: object) -> bool:
+    return str(method).upper() in {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+
+def _normalized_origin(value: str, *, allow_path: bool) -> tuple[str, str, int] | None:
+    """Parse an HTTP origin into a stable comparison tuple."""
+    try:
+        parsed = urlsplit(value.strip())
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or (not allow_path and (parsed.path not in {"", "/"} or parsed.query))
+        ):
+            return None
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if parsed.scheme.lower() == "https" else 80
+    return parsed.scheme.lower(), parsed.hostname.rstrip(".").lower(), port
+
+
+def _request_origin(scope: dict, headers: dict[str, str]) -> tuple[str, str, int] | None:
+    scheme = str(scope.get("scheme", "http")).lower()
+    host = headers.get("host", "").strip()
+    if host:
+        return _normalized_origin(f"{scheme}://{host}", allow_path=False)
+    server = scope.get("server")
+    if isinstance(server, (tuple, list)) and len(server) == 2:
+        server_host, server_port = server
+        rendered_host = str(server_host)
+        if ":" in rendered_host and not rendered_host.startswith("["):
+            rendered_host = f"[{rendered_host}]"
+        return _normalized_origin(
+            f"{scheme}://{rendered_host}:{int(server_port)}",
+            allow_path=False,
+        )
+    return None
+
+
+def _has_same_origin_browser_context(scope: dict, headers: dict[str, str]) -> bool:
+    expected = _request_origin(scope, headers)
+    if expected is None:
+        return False
+    supplied_origin = headers.get("origin", "").strip()
+    if supplied_origin:
+        return _normalized_origin(supplied_origin, allow_path=False) == expected
+    supplied_referer = headers.get("referer", "").strip()
+    if supplied_referer:
+        return _normalized_origin(supplied_referer, allow_path=True) == expected
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +909,9 @@ def create_app(
     token: str,
     lifespan: object = None,
     port: int | None = None,
+    *,
+    reload_token: bool = True,
+    bootstrap_nonce: str | None = None,
 ) -> object:
     from starlette.applications import Starlette
     from starlette.responses import HTMLResponse
@@ -696,9 +963,18 @@ def create_app(
     app.state.repo_root = repo_root
     app.state.chat_owner_id = uuid.uuid4().hex
     app.state.web_started_procs = {}
-    app.add_middleware(AuthMiddleware, token=token, repo_root=repo_root, port=port)
+    app.add_middleware(
+        AuthMiddleware,
+        token=token,
+        repo_root=repo_root if reload_token else None,
+        port=port,
+        bootstrap_nonce=bootstrap_nonce,
+    )
 
-    return app
+    # Keep security headers outside Starlette's generated error middleware so
+    # even authentication failures and unhandled-error responses cannot be
+    # framed by another localhost origin.
+    return SecurityHeadersMiddleware(app)
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +995,34 @@ def _connectable_host(host: str) -> str:
     if host == "::":
         return "::1"
     return host
+
+
+def is_loopback_bind(host: str) -> bool:
+    """Return whether *host* unambiguously names a loopback interface."""
+    candidate = host.strip().lower().rstrip(".")
+    if candidate == "localhost":
+        return True
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    try:
+        return ipaddress.ip_address(candidate).is_loopback
+    except ValueError:
+        # Do not resolve arbitrary hostnames here: their address can change
+        # between this check and bind, and a wildcard DNS result is ambiguous.
+        return False
+
+
+def _validated_trusted_proxies(proxies: tuple[str, ...]) -> tuple[str, ...]:
+    validated: list[str] = []
+    for raw_proxy in proxies:
+        proxy = raw_proxy.strip()
+        if not proxy or proxy == "*":
+            raise ValueError("trusted proxy entries must be explicit IP addresses")
+        try:
+            validated.append(str(ipaddress.ip_address(proxy)))
+        except ValueError as exc:
+            raise ValueError(f"invalid trusted proxy IP: {raw_proxy!r}") from exc
+    return tuple(validated)
 
 
 def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
@@ -745,7 +1049,22 @@ def run_server(
     background: bool = False,
     open_browser: bool = False,
     verbose: bool = False,
+    allow_remote: bool = False,
+    trusted_proxies: tuple[str, ...] = (),
 ) -> int:
+    if not is_loopback_bind(host) and not allow_remote:
+        print(
+            "Refusing to expose the web operator control plane on a non-loopback "
+            "interface without --allow-remote.",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        trusted_proxies = _validated_trusted_proxies(trusted_proxies)
+    except ValueError as exc:
+        print(f"spec web cannot start: {exc}", file=sys.stderr)
+        return 2
+
     # Refuse to start if a server is already running — prevents orphaning
     # the existing process by overwriting its PID file.
     try:
@@ -765,7 +1084,11 @@ def run_server(
 
     token = load_or_create_token(repo_root)
     probe_host = _connectable_host(host)
-    auth_url = f"http://{probe_host}:{port}/?token={token}"
+    bootstrap_nonce = (
+        os.environ.get("SPEC_WEB_BOOTSTRAP_NONCE", "").strip()
+        or secrets.token_urlsafe(32)
+    )
+    auth_url = f"http://{probe_host}:{port}/?bootstrap={bootstrap_nonce}"
 
     # Configure Python logging for spec_runtime.web.* loggers so that
     # INFO-level diagnostics (e.g. log_backend_availability, codex stderr)
@@ -858,8 +1181,13 @@ def run_server(
             ]
             if verbose:
                 command.append("--verbose")
+            if allow_remote:
+                command.append("--allow-remote")
+            for trusted_proxy in trusted_proxies:
+                command.extend(["--trusted-proxy", trusted_proxy])
             child_env = os.environ.copy()
             child_env["SPEC_WEB_READY_NONCE"] = ready_nonce
+            child_env["SPEC_WEB_BOOTSTRAP_NONCE"] = bootstrap_nonce
             managed = ProcessSupervisor(
                 LifetimeMode.DETACHED,
                 supervision_id=supervision_id,
@@ -923,7 +1251,7 @@ def run_server(
         _launch_path(repo_root).unlink(missing_ok=True)
         helper_path.unlink(missing_ok=True)
         print(f"spec web running on http://{probe_host}:{port}", file=sys.stderr)
-        print(f"Authenticated URL: {auth_url}", file=sys.stderr)
+        print(f"One-time browser URL: {auth_url}", file=sys.stderr)
         if open_browser:
             import webbrowser
 
@@ -955,12 +1283,28 @@ def run_server(
     try:
         import uvicorn
 
-        app = create_app(repo_root, token, port=port)
+        app = create_app(
+            repo_root,
+            token,
+            port=port,
+            bootstrap_nonce=bootstrap_nonce,
+        )
 
         # Use uvicorn.Server directly so we can hook into startup() and publish
         # authenticated readiness only after the socket binds. A supervised
         # background child executes this same foreground path.
-        config = uvicorn.Config(app, host=host, port=port, log_level=uvi_log_level, proxy_headers=True, forwarded_allow_ips="*")
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level=uvi_log_level,
+            # The browser bootstrap nonce is single-use, short-lived, and not
+            # the durable operator bearer. Keep request-target logging off so
+            # even that consumed nonce is not retained in terminal/server logs.
+            access_log=False,
+            proxy_headers=bool(trusted_proxies),
+            forwarded_allow_ips=",".join(trusted_proxies),
+        )
         server = uvicorn.Server(config)
         _orig_startup = server.startup
 
@@ -981,7 +1325,12 @@ def run_server(
                     f"spec web running on http://{probe_host}:{port}",
                     file=sys.stderr,
                 )
-                print(f"Authenticated URL: {auth_url}", file=sys.stderr)
+                # A supervised background child writes stdout/stderr to the
+                # repository-local server.log.  Its parent already prints the
+                # authenticated URL to the invoking terminal, so never copy
+                # the bearer token into the durable child log.
+                if not background_payload:
+                    print(f"One-time browser URL: {auth_url}", file=sys.stderr)
                 if open_browser:
                     import webbrowser
 

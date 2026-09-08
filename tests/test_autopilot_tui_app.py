@@ -21,6 +21,7 @@ from spec_runtime.autopilot_tui import dashboard as tui_dashboard  # noqa: E402
 class _CompletedChatProcess:
     def __init__(self, stdout: str) -> None:
         self.stdout = io.StringIO(stdout)
+        self.stdin = _RecordingInput()
         self.pid = 0
         self.returncode = 0
 
@@ -37,20 +38,53 @@ class _CompletedChatProcess:
         self.returncode = -9
 
 
+class _ExitedLeaderWithDescendant(_CompletedChatProcess):
+    def __init__(self, stdout: str = "", *, kill_reaps: bool) -> None:
+        super().__init__(stdout)
+        self.descendant_active = True
+        self.kill_reaps = kill_reaps
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def owned_tree_active(self) -> bool:
+        return self.descendant_active
+
+    def terminate(self, grace_seconds: float = 5.0) -> bool:
+        del grace_seconds
+        self.terminate_calls += 1
+        return False
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        if self.kill_reaps:
+            self.descendant_active = False
+
+
+class _RecordingInput(io.StringIO):
+    snapshot = ""
+
+    def close(self) -> None:
+        self.snapshot = self.getvalue()
+        super().close()
+
+
 def test_claude_chat_provider_uses_oauth_compatible_safe_argv(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     calls: list[list[str]] = []
     spawn_kwargs: list[dict[str, object]] = []
+    processes: list[_CompletedChatProcess] = []
 
     def fake_spawn(_supervisor, command, **kwargs):
         calls.append(command)
         spawn_kwargs.append(kwargs)
-        return _CompletedChatProcess(
+        process = _CompletedChatProcess(
             '{"type":"assistant","message":{"content":'
             '[{"type":"text","text":"claude-ok"}]}}\n'
         )
+        processes.append(process)
+        return process
 
     monkeypatch.setattr(tui_app.ProcessSupervisor, "spawn", fake_spawn)
     monkeypatch.setattr(tui_app, "require_host_agent_available", lambda _agent: None)
@@ -60,7 +94,10 @@ def test_claude_chat_provider_uses_oauth_compatible_safe_argv(
     assert calls[0][0] == "claude"
     assert "--safe-mode" in calls[0]
     assert "--bare" not in calls[0]
-    assert calls[0][-2:] == ["--", "provider prompt"]
+    assert calls[0][-1:] == ["--"]
+    assert "provider prompt" not in calls[0]
+    assert processes[0].stdin.snapshot == "provider prompt"
+    assert spawn_kwargs[0]["stdin"] == subprocess.PIPE
     tools_index = calls[0].index("--tools")
     assert calls[0][tools_index + 1] == ""
     assert spawn_kwargs[0]["encoding"] == "utf-8"
@@ -112,15 +149,28 @@ def test_codex_chat_provider_uses_read_only_ephemeral_argv(
 ) -> None:
     calls: list[list[str]] = []
     spawn_kwargs: list[dict[str, object]] = []
+    processes: list[_CompletedChatProcess] = []
 
     def fake_spawn(_supervisor, command, **kwargs):
         calls.append(command)
         spawn_kwargs.append(kwargs)
-        return _CompletedChatProcess(
+        child_env = kwargs["env"]
+        assert isinstance(child_env, dict)
+        assert "OPENAI_API_KEY" not in child_env
+        auth_path = Path(str(child_env["CODEX_HOME"])) / "auth.json"
+        assert json.loads(auth_path.read_text(encoding="utf-8")) == {
+            "auth_mode": "apikey",
+            "OPENAI_API_KEY": "provider-secret",
+        }
+        process = _CompletedChatProcess(
             '{"type":"item.completed","item":{"type":"agent_message",'
             '"id":"assistant-1","text":"codex-ok"}}\n'
         )
+        processes.append(process)
+        return process
 
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex-home"))
     monkeypatch.setattr(tui_app.ProcessSupervisor, "spawn", fake_spawn)
     provider = tui_app.CliChatProvider(agent="codex", repo_root=tmp_path)
 
@@ -128,9 +178,34 @@ def test_codex_chat_provider_uses_read_only_ephemeral_argv(
     assert calls[0][:4] == ["codex", "-a", "never", "exec"]
     assert "--ephemeral" in calls[0]
     assert calls[0][calls[0].index("-s") + 1] == "read-only"
-    assert calls[0][-1] == "provider prompt"
+    assert "features.shell_tool=false" in calls[0]
+    assert "features.unified_exec=false" in calls[0]
+    for override in tui_app.CODEX_AMBIENT_CAPABILITY_OVERRIDES:
+        assert override in calls[0]
+    assert "--ignore-user-config" in calls[0]
+    assert "--ignore-rules" in calls[0]
+    assert calls[0][-1] == "-"
+    assert "provider prompt" not in calls[0]
+    assert processes[0].stdin.snapshot == "provider prompt"
+    assert spawn_kwargs[0]["stdin"] == subprocess.PIPE
     assert spawn_kwargs[0]["encoding"] == "utf-8"
     assert spawn_kwargs[0]["errors"] == "replace"
+
+
+def test_chat_provider_environment_does_not_inherit_ambient_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "provider-secret")
+    monkeypatch.setenv("GH_TOKEN", "forge-secret")
+    monkeypatch.setenv("DATABASE_URL", "database-secret")
+    provider = tui_app.CliChatProvider(agent="codex", repo_root=tmp_path)
+
+    env = provider._provider_env()
+
+    assert env["OPENAI_API_KEY"] == "provider-secret"
+    assert "GH_TOKEN" not in env
+    assert "DATABASE_URL" not in env
 
 
 def _stream_synthetic_chat_provider(tmp_path: Path, script: str):
@@ -225,6 +300,124 @@ def test_chat_provider_generator_cancel_terminates_and_reaps_process(
     assert len(started) == 1
     assert started[0].poll() is not None
     assert started[0].wait(timeout=0.1) == started[0].returncode
+
+
+def test_chat_provider_escalates_when_leader_exited_but_descendant_remains(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = _ExitedLeaderWithDescendant(kill_reaps=True)
+    monkeypatch.setattr(tui_app, "CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(tui_app, "CHAT_PROVIDER_POLL_SECONDS", 0.001)
+
+    assert tui_app._terminate_chat_provider_process(process)
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert not process.descendant_active
+
+
+def test_unconfirmed_chat_tree_retains_process_and_cleanup_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = _ExitedLeaderWithDescendant(kill_reaps=False)
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        tui_app.ProcessSupervisor,
+        "spawn",
+        lambda _supervisor, _command, **_kwargs: process,
+    )
+    monkeypatch.setattr(tui_app, "CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(tui_app, "_start_retained_chat_provider_reaper", lambda _owner: None)
+
+    try:
+        with pytest.raises(tui_app.ChatProviderError, match="ownership.*retained"):
+            list(
+                tui_app._stream_chat_provider_process(
+                    ["synthetic-provider"],
+                    cwd=tmp_path,
+                    env={},
+                    provider_name="Synthetic",
+                    parse_line=lambda line: line,
+                    cleanup_after_reap=cleanup,
+                )
+            )
+
+        ownership = tui_app._RETAINED_CHAT_PROVIDER_OWNERSHIP[id(process)]
+        assert ownership.process is process
+        cleanup.assert_not_called()
+        assert process.terminate_calls == 1
+        assert process.kill_calls == 1
+    finally:
+        tui_app._RETAINED_CHAT_PROVIDER_OWNERSHIP.pop(id(process), None)
+
+
+def test_codex_chat_keeps_credential_home_until_tree_exit_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = _ExitedLeaderWithDescendant(kill_reaps=False)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    codex_home_context = MagicMock()
+    spawn_cwds: list[Path] = []
+
+    def fake_spawn(_supervisor, _command, **kwargs):
+        spawn_cwds.append(Path(kwargs["cwd"]))
+        return process
+
+    monkeypatch.setattr(tui_app.ProcessSupervisor, "spawn", fake_spawn)
+    monkeypatch.setattr(
+        tui_app,
+        "create_ephemeral_codex_home",
+        lambda _env: (codex_home_context, codex_home),
+    )
+    monkeypatch.setattr(tui_app, "CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(tui_app, "_start_retained_chat_provider_reaper", lambda _owner: None)
+    provider = tui_app.CliChatProvider(agent="codex", repo_root=tmp_path)
+
+    try:
+        with pytest.raises(tui_app.ChatProviderError, match="ownership.*retained"):
+            list(provider._stream_codex_output("provider prompt"))
+
+        ownership = tui_app._RETAINED_CHAT_PROVIDER_OWNERSHIP[id(process)]
+        codex_home_context.cleanup.assert_not_called()
+        assert spawn_cwds[0].is_dir()
+        process.descendant_active = False
+        ownership.cleanup()
+        codex_home_context.cleanup.assert_called_once_with()
+        assert not spawn_cwds[0].exists()
+    finally:
+        tui_app._RETAINED_CHAT_PROVIDER_OWNERSHIP.pop(id(process), None)
+
+
+def test_claude_chat_keeps_workspace_until_tree_exit_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    process = _ExitedLeaderWithDescendant(kill_reaps=False)
+    spawn_cwds: list[Path] = []
+
+    def fake_spawn(_supervisor, _command, **kwargs):
+        spawn_cwds.append(Path(kwargs["cwd"]))
+        return process
+
+    monkeypatch.setattr(tui_app.ProcessSupervisor, "spawn", fake_spawn)
+    monkeypatch.setattr(tui_app, "require_host_agent_available", lambda _agent: None)
+    monkeypatch.setattr(tui_app, "CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS", 0.0)
+    monkeypatch.setattr(tui_app, "_start_retained_chat_provider_reaper", lambda _owner: None)
+    provider = tui_app.CliChatProvider(agent="claude", repo_root=tmp_path)
+
+    try:
+        with pytest.raises(tui_app.ChatProviderError, match="ownership.*retained"):
+            list(provider._stream_claude_output("provider prompt"))
+
+        ownership = tui_app._RETAINED_CHAT_PROVIDER_OWNERSHIP[id(process)]
+        assert spawn_cwds[0].is_dir()
+        process.descendant_active = False
+        ownership.cleanup()
+        assert not spawn_cwds[0].exists()
+    finally:
+        tui_app._RETAINED_CHAT_PROVIDER_OWNERSHIP.pop(id(process), None)
 
 
 def test_provider_command_parser_preserves_steering_guidance() -> None:

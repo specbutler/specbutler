@@ -383,6 +383,53 @@ def test_clean_missing_container_state_preserves_workspace_and_recommends_gc(
     assert "Container state is missing" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    ("run_id", "spec_id"),
+    [
+        ("../../outside", "my-feature"),
+        ("other-feature-20260814T120000000000", "my-feature"),
+        ("my-feature/../../outside", "my-feature"),
+    ],
+)
+def test_clean_refuses_forged_run_identity_before_backend_cleanup(
+    tmp_path: Path,
+    capsys,
+    run_id: str,
+    spec_id: str,
+) -> None:
+    repo = tmp_path / "repo"
+    workspace_root = repo / ".spec-workspaces"
+    workspace_root.mkdir(parents=True)
+    forged_source = (workspace_root / run_id / "source").resolve(strict=False)
+    forged_source.mkdir(parents=True, exist_ok=True)
+    marker = forged_source.parent / "must-survive"
+    marker.write_text("operator data\n")
+    run = SimpleNamespace(
+        run_id=run_id,
+        spec_id=spec_id,
+        branch=f"code/{spec_id}--forged",
+        backend="clone",
+        safety_mode="safe",
+        worktree_path=str(forged_source),
+    )
+    backend_factory = MagicMock()
+
+    with patch(
+        "spec_runtime.execution_backend.get_execution_backend",
+        backend_factory,
+    ):
+        removed, failures = cli._cleanup_run_owned_workspaces(
+            common_root=repo,
+            config=_config(backend="clone"),
+            runs=[run],
+        )
+
+    assert (removed, failures) == (0, 1)
+    assert marker.read_text() == "operator data\n"
+    backend_factory.assert_not_called()
+    assert "invalid run identity" in capsys.readouterr().err
+
+
 def test_clean_refuses_live_registered_agent_with_pid_start_identity(
     tmp_path: Path,
     capsys,

@@ -38,6 +38,7 @@ from spec_runtime.process_supervisor import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_PROVIDER_ENV = "SPEC_LINUX_CLAUDE_REAL_PROVIDER"
+CODEX_REAL_PROVIDER_ENV = "SPEC_LINUX_CODEX_REAL_PROVIDER"
 RECEIPT_PATH_ENV = "SPEC_LINUX_CLAUDE_PROOF_RECEIPT"
 EXPECTED_REVISION_ENV = "SPEC_LINUX_CLAUDE_EXPECTED_REVISION"
 CHALLENGE_ENV = "SPEC_LINUX_CLAUDE_PROOF_CHALLENGE"
@@ -230,6 +231,21 @@ def _assert_contains(text: str, *markers: str, turn: int) -> None:
         )
 
 
+def _event_shape(events: list[dict[str, Any]]) -> str:
+    """Describe provider activity without embedding prompts or model output."""
+    counts: dict[str, int] = {}
+    command_exit_codes: list[object] = []
+    for event in events:
+        kind = str(event.get("kind", "unknown"))
+        counts[kind] = counts.get(kind, 0) + 1
+        if kind == "command":
+            command_exit_codes.append(event.get("exit_code"))
+    return json.dumps(
+        {"counts": counts, "command_exit_codes": command_exit_codes},
+        sort_keys=True,
+    )
+
+
 def _free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -249,18 +265,26 @@ def _run_git(repo: Path, *args: str) -> None:
         raise _ProofFailure(f"git {args[0]} failed with exit code {completed.returncode}")
 
 
-def _create_repo(repo: Path) -> None:
+def _create_repo(repo: Path, *, agent: str = "claude") -> None:
+    # Keep both the checkout and plain local-path origin whitespace-bearing.
+    # Private Git accepts internal spaces in this shell-free representation,
+    # while still rejecting raw whitespace in URL and SCP-like transports.
+    remote = repo.parent / f"{repo.name}.git"
+    _run_git(repo.parent, "init", "--bare", str(remote))
     repo.mkdir()
     _run_git(repo, "init", "-b", "main")
     (repo / ".gitignore").write_text(".spec-state/\n.worktrees/\n", encoding="utf-8")
-    (repo / "README.md").write_text("# Real Claude web regression fixture\n", encoding="utf-8")
+    (repo / "README.md").write_text(
+        f"# Real {agent.title()} web regression fixture\n",
+        encoding="utf-8",
+    )
     (repo / ".spec.toml").write_text(
-        """base_ref = "HEAD"
+        f"""base_ref = "HEAD"
 
 [agents]
-default = "claude"
-review_default = "claude"
-allowed = ["claude"]
+default = "{agent}"
+review_default = "{agent}"
+allowed = ["{agent}"]
 """,
         encoding="utf-8",
     )
@@ -273,8 +297,39 @@ allowed = ["claude"]
         "user.email=real-provider@example.invalid",
         "commit",
         "-m",
-        "Create real Claude web regression fixture",
+        f"Create real {agent.title()} web regression fixture",
     )
+    _run_git(repo, "remote", "add", "origin", str(remote))
+
+
+def test_real_provider_fixture_uses_a_sanitizable_origin_url(tmp_path: Path) -> None:
+    repo = tmp_path / "real provider repo with spaces"
+    _create_repo(repo)
+
+    completed = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+
+    origin_url = completed.stdout.rstrip("\n")
+    assert " " in origin_url
+
+    from spec_runtime.agent_git_isolation import (
+        cleanup_agent_git_isolation,
+        prepare_agent_git_isolation,
+    )
+
+    worktree = tmp_path / "linked provider worktree"
+    _run_git(repo, "worktree", "add", "-b", "provider-test", str(worktree))
+    isolation = prepare_agent_git_isolation(worktree)
+    try:
+        assert isolation.origin_url == origin_url
+    finally:
+        cleanup_agent_git_isolation(isolation)
 
 
 def _server_env(repo: Path, control_root: Path) -> dict[str, str]:
@@ -326,6 +381,26 @@ def _new_provider_identities(
         identity = inspect_process(pid)
         if identity is not None:
             identities.append(identity)
+    return identities
+
+
+def _new_codex_app_server_identities(
+    baseline: set[tuple[int, str]],
+) -> list[ProcessIdentity]:
+    """Find exact new Codex app-server identities across detached process groups."""
+    identities: list[ProcessIdentity] = []
+    for process_dir in Path("/proc").glob("[0-9]*"):
+        try:
+            cmdline = (process_dir / "cmdline").read_bytes().replace(b"\0", b" ")
+            pid = int(process_dir.name)
+        except (OSError, ValueError):
+            continue
+        if b"codex" not in cmdline or b"app-server" not in cmdline:
+            continue
+        identity = inspect_process(pid)
+        if identity is None or (identity.pid, identity.started_at) in baseline:
+            continue
+        identities.append(identity)
     return identities
 
 
@@ -424,15 +499,18 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
     repo = tmp_path / "real Claude web repo"
     control_root = tmp_path / "process-controls"
     _create_repo(repo)
-    token = secrets.token_urlsafe(32)
-    token_path = repo / ".spec-state" / "web" / "auth-token"
-    token_path.parent.mkdir(parents=True)
-    token_path.write_text(token, encoding="utf-8")
-    token_path.chmod(0o600)
+    user_state_root = tmp_path / "user-state"
+    env = _server_env(repo, control_root)
+    env["XDG_STATE_HOME"] = str(user_state_root)
+    from spec_runtime.web.auth import _token_path, load_or_create_token
+
+    with pytest.MonkeyPatch.context() as token_env:
+        token_env.setenv("XDG_STATE_HOME", str(user_state_root))
+        token = load_or_create_token(repo)
+        token_path = _token_path(repo)
 
     port = _free_port()
     base_url = f"http://127.0.0.1:{port}"
-    env = _server_env(repo, control_root)
     sessions: list[str] = []
     managed = None
     stopped_cleanly = False
@@ -622,3 +700,227 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
             "credential_files_copied": len(list(repo.rglob(".credentials.json"))),
         }
     )
+
+
+@pytest.mark.linux_codex_real_provider
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="credentialed Codex web proof requires the supported Linux sandbox",
+)
+@pytest.mark.skipif(
+    os.environ.get(CODEX_REAL_PROVIDER_ENV) != "1",
+    reason=f"set {CODEX_REAL_PROVIDER_ENV}=1 to opt into the credentialed real-Codex web proof",
+)
+def test_linux_real_codex_web_chat_edits_and_preserves_context(
+    tmp_path: Path,
+) -> None:
+    """Exercise the real server, auth middleware, SSE, and persistent Codex thread."""
+    repo = tmp_path / "real Codex web repo"
+    control_root = tmp_path / "process-controls"
+    _create_repo(repo, agent="codex")
+    user_state_root = tmp_path / "user-state"
+    env = _server_env(repo, control_root)
+    env["XDG_STATE_HOME"] = str(user_state_root)
+
+    from spec_runtime.web.auth import _token_path, load_or_create_token
+
+    with pytest.MonkeyPatch.context() as token_env:
+        token_env.setenv("XDG_STATE_HOME", str(user_state_root))
+        token = load_or_create_token(repo)
+        token_path = _token_path(repo)
+
+    port = _free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    sessions: list[str] = []
+    managed = None
+    stopped_cleanly = False
+    provider_identities: list[ProcessIdentity] = []
+    provider_homes_root = (
+        Path(env.get("HOME", str(Path.home())))
+        / ".local"
+        / "state"
+        / "specbutler"
+        / "provider-homes"
+    )
+    codex_homes_before = set(provider_homes_root.glob("spec-codex-home-*"))
+
+    with open(os.devnull, "w", encoding="utf-8") as discarded:
+        try:
+            managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+                [
+                    sys.executable,
+                    "-m",
+                    "spec_runtime.cli",
+                    "web",
+                    "start",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                ],
+                cwd=repo,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=discarded,
+                stderr=discarded,
+            )
+        except BaseException:
+            token_path.unlink(missing_ok=True)
+            raise
+
+        pgid = managed.token.pgid
+        try:
+            backends = _wait_for_server(base_url, token, managed)
+            if not backends.get("backends", {}).get("codex"):
+                raise _ProofFailure(
+                    "real server did not expose Codex; verify Codex login and CLI version"
+                )
+            baseline_codex = {
+                (identity.pid, identity.started_at)
+                for identity in _new_codex_app_server_identities(set())
+            }
+            context_marker = f"CODEX-CONTEXT-ONLY-{secrets.token_hex(8).upper()}"
+            edit_marker = f"CODEX-WORKSPACE-EDIT-{secrets.token_hex(8).upper()}"
+            first_prompt = (
+                "Do not use tools or edit files. Memorize this exact context-only marker: "
+                f"{context_marker}. Reply with the exact marker."
+            )
+            created = _json_request(
+                base_url,
+                "/api/v1/chat/sessions",
+                token=token,
+                method="POST",
+                payload={"mode": "create", "agent": "codex", "prompt": first_prompt},
+                timeout=120,
+            )
+            session_id = str(created.get("session_id", ""))
+            if not session_id:
+                raise _ProofFailure("Codex session creation returned no session id")
+            sessions.append(session_id)
+
+            turn_events = [_send_turn(base_url, token, session_id, first_prompt)]
+            codex_texts = [_assistant_text(base_url, token, session_id)]
+            _assert_contains(
+                codex_texts[-1],
+                context_marker,
+                turn=1,
+            )
+            second_prompt = (
+                "Recall the context-only marker from our prior turn without asking me to "
+                f"repeat it. Create notes.txt containing exactly {edit_marker} followed by "
+                "a newline. Reply with both markers. Never write the context-only marker "
+                "to a file."
+            )
+            turn_events.append(_send_turn(base_url, token, session_id, second_prompt))
+            codex_texts.append(_assistant_text(base_url, token, session_id))
+            _assert_contains(
+                codex_texts[-1],
+                context_marker,
+                edit_marker,
+                turn=2,
+            )
+            third_prompt = (
+                "Read notes.txt for the workspace marker and recall the context-only marker "
+                "from our conversation. Reply with both markers in context-then-workspace "
+                "order. Do not write the context-only marker to disk."
+            )
+            turn_events.append(_send_turn(base_url, token, session_id, third_prompt))
+            codex_texts.append(_assistant_text(base_url, token, session_id))
+            _assert_contains(
+                codex_texts[-1],
+                context_marker,
+                edit_marker,
+                turn=3,
+            )
+
+            provider_identities = _new_codex_app_server_identities(baseline_codex)
+            if not provider_identities:
+                raise _ProofFailure("no live Codex provider child was observed")
+            stopped_session = _json_request(
+                base_url,
+                f"/api/v1/chat/sessions/{session_id}/stop",
+                token=token,
+                method="POST",
+                payload={},
+            )
+            sessions.remove(session_id)
+            worktree = Path(str(stopped_session.get("worktree", "")))
+            if not worktree.is_dir():
+                raise _ProofFailure("Codex stop response omitted the session worktree")
+            notes_path = worktree / "notes.txt"
+            if not notes_path.is_file():
+                raise _ProofFailure(
+                    "Codex session created no notes.txt; provider event shapes="
+                    + json.dumps([_event_shape(events) for events in turn_events])
+                )
+            content = notes_path.read_text(encoding="utf-8")
+            if edit_marker not in content:
+                raise _ProofFailure("Codex session did not preserve its workspace edit")
+            if context_marker in content:
+                raise _ProofFailure(
+                    "Codex wrote the context-only marker to disk, invalidating the context proof"
+                )
+            _wait_for_identities_exit(provider_identities)
+
+            stopped = subprocess.run(
+                [sys.executable, "-m", "spec_runtime.cli", "web", "stop"],
+                cwd=repo,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if stopped.returncode != 0:
+                raise _ProofFailure(
+                    f"spec web stop failed with exit code {stopped.returncode}"
+                )
+            returncode = managed.wait(timeout=20)
+            if returncode not in {0, -signal.SIGTERM}:
+                raise _ProofFailure(f"web server exited with status {returncode}")
+            _wait_for_group_exit(pgid)
+            stopped_cleanly = True
+        finally:
+            for session_id in reversed(sessions):
+                try:
+                    _json_request(
+                        base_url,
+                        f"/api/v1/chat/sessions/{session_id}/stop",
+                        token=token,
+                        method="POST",
+                        payload={},
+                    )
+                except Exception:
+                    pass
+            if managed.poll() is None:
+                try:
+                    subprocess.run(
+                        [sys.executable, "-m", "spec_runtime.cli", "web", "stop"],
+                        cwd=repo,
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if managed.poll() is None:
+                managed.terminate(grace_seconds=0.1)
+                try:
+                    managed.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    managed.kill()
+                    try:
+                        managed.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+            token_path.unlink(missing_ok=True)
+
+    assert stopped_cleanly
+    assert not token_path.exists()
+    assert not list(repo.rglob("auth.json"))
+    assert not list(repo.rglob(".credentials.json"))
+    assert set(provider_homes_root.glob("spec-codex-home-*")) == codex_homes_before
+    assert all(not identity_matches(identity) for identity in provider_identities)
+    assert not is_process_group_alive(pgid)

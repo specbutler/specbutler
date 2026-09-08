@@ -45,16 +45,10 @@ gh variable set SPEC_BUTLER_AUTOMATED_RELEASES \
   --body true
 ```
 
-Do not reuse a broad personal login token for this secret. The initial root
-commit has no parent version for the tag job to compare, so bootstrap the first
-release explicitly after CI passes:
-
-```bash
-git tag -a v0.3.0 -m v0.3.0
-git push origin v0.3.0
-gh release create v0.3.0 --repo specbutler/specbutler \
-  --verify-tag --generate-notes --title v0.3.0
-```
+Do not reuse a broad personal login token for this secret. This repository's
+bootstrap releases already exist; do not recreate or move an existing tag.
+Once automation is enabled, the version workflow owns the next version PR,
+tag, and GitHub Release.
 
 The generated container worker installs the tag matching the host package
 version. `spec container smoke` rejects a version mismatch and, when host

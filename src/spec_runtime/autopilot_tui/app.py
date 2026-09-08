@@ -30,6 +30,7 @@ from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, St
 from spec_runtime import autopilot
 from spec_runtime import orchestrator as orch
 from spec_runtime.agent_adapter import (
+    CODEX_AMBIENT_CAPABILITY_OVERRIDES,
     HostAgentUnavailableError,
     host_agent_unavailability_reason,
     require_host_agent_available,
@@ -53,6 +54,11 @@ from spec_runtime.config import load_repo_spec_runtime_config
 from spec_runtime.container import container_image_source
 from spec_runtime.platform_fs import remove_tree
 from spec_runtime.process_supervisor import LifetimeMode, ProcessSupervisor
+from spec_runtime.provider_env import (
+    CODEX_SECRET_ENV_KEYS,
+    create_ephemeral_codex_home,
+    minimal_provider_environment,
+)
 from spec_runtime.spec_identity import SPEC_ID_RE
 from spec_runtime.spec_metadata import iter_spec_metadata
 
@@ -628,6 +634,19 @@ class ChatProviderError(RuntimeError):
         self.retryable = retryable
 
 
+@dataclass(frozen=True)
+class _RetainedChatProviderOwnership:
+    """Keep an unconfirmed provider tree and its cleanup resources reachable."""
+
+    process: Any
+    cleanup: Callable[[], None]
+    provider_name: str
+
+
+_RETAINED_CHAT_PROVIDER_OWNERSHIP: dict[int, _RetainedChatProviderOwnership] = {}
+_RETAINED_CHAT_PROVIDER_OWNERSHIP_LOCK = threading.Lock()
+
+
 def _read_chat_provider_stderr(stderr_file: Any) -> str:
     """Return bounded stderr while retaining both the beginning and end."""
     try:
@@ -652,7 +671,7 @@ def _read_chat_provider_stderr(stderr_file: Any) -> str:
 
 
 def _wait_chat_provider_process(
-    proc: subprocess.Popen[str],
+    proc: Any,
     *,
     timeout: float,
 ) -> int | None:
@@ -663,36 +682,135 @@ def _wait_chat_provider_process(
         return proc.wait()
 
 
-def _terminate_chat_provider_process(proc: subprocess.Popen[str]) -> None:
-    """Terminate a provider group, escalate to kill, and reap its leader."""
+def _chat_provider_tree_exit_confirmed(proc: Any) -> bool:
+    """Return true only when the retained ownership boundary is empty."""
+    tree_active = getattr(proc, "owned_tree_active", None)
+    if callable(tree_active):
+        try:
+            return not bool(tree_active())
+        except (OSError, ProcessLookupError, RuntimeError):
+            return False
     try:
-        running = proc.poll() is None
+        return proc.poll() is not None
     except (OSError, ProcessLookupError):
-        running = False
+        return False
 
-    if running:
+
+def _wait_chat_provider_tree_exit(proc: Any, *, timeout: float) -> bool:
+    """Reap the leader and positively confirm that no owned member remains."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    leader_reaped = False
+    try:
+        _wait_chat_provider_process(proc, timeout=max(0.0, timeout))
+        leader_reaped = True
+    except (
+        OSError,
+        ProcessLookupError,
+        RuntimeError,
+        subprocess.TimeoutExpired,
+    ):
+        try:
+            leader_reaped = proc.poll() is not None
+        except (OSError, ProcessLookupError):
+            leader_reaped = False
+    if not leader_reaped:
+        return False
+
+    while not _chat_provider_tree_exit_confirmed(proc):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(CHAT_PROVIDER_POLL_SECONDS, remaining))
+    return True
+
+
+def _terminate_chat_provider_process(proc: Any) -> bool:
+    """Stop the complete provider tree and report only positively confirmed exit."""
+    if _chat_provider_tree_exit_confirmed(proc):
+        return _wait_chat_provider_tree_exit(
+            proc,
+            timeout=CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS,
+        )
+
+    try:
         try:
             proc.terminate(grace_seconds=CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS)
         except TypeError:  # minimal Popen test doubles
             proc.terminate()
-        try:
-            _wait_chat_provider_process(
-                proc,
-                timeout=CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS,
-            )
-            return
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-    # Even an already-exited process needs wait() to release its process table
-    # entry. After SIGKILL this second bounded wait normally returns at once.
-    try:
-        _wait_chat_provider_process(
-            proc,
-            timeout=CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS,
-        )
-    except (OSError, ProcessLookupError, subprocess.TimeoutExpired):
+    except (OSError, ProcessLookupError):
         pass
+    if _wait_chat_provider_tree_exit(
+        proc,
+        timeout=CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS,
+    ):
+        return True
+
+    try:
+        proc.kill()
+    except (OSError, ProcessLookupError):
+        pass
+    return _wait_chat_provider_tree_exit(
+        proc,
+        timeout=CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS,
+    )
+
+
+def _finish_retained_chat_provider_ownership(
+    ownership: _RetainedChatProviderOwnership,
+) -> None:
+    """Retry cleanup without relinquishing process or credential ownership."""
+    while True:
+        if _terminate_chat_provider_process(ownership.process):
+            try:
+                ownership.cleanup()
+            except Exception:
+                # This callback owns private provider state. Keep it reachable
+                # and retry instead of abandoning the credential lifecycle.
+                time.sleep(CHAT_PROVIDER_POLL_SECONDS)
+                continue
+            with _RETAINED_CHAT_PROVIDER_OWNERSHIP_LOCK:
+                current = _RETAINED_CHAT_PROVIDER_OWNERSHIP.get(
+                    id(ownership.process)
+                )
+                if current is ownership:
+                    _RETAINED_CHAT_PROVIDER_OWNERSHIP.pop(
+                        id(ownership.process),
+                        None,
+                    )
+            return
+        time.sleep(CHAT_PROVIDER_POLL_SECONDS)
+
+
+def _start_retained_chat_provider_reaper(
+    ownership: _RetainedChatProviderOwnership,
+) -> None:
+    threading.Thread(
+        target=_finish_retained_chat_provider_ownership,
+        args=(ownership,),
+        name=f"spec-chat-{ownership.provider_name.lower()}-cleanup",
+        daemon=True,
+    ).start()
+
+
+def _retain_chat_provider_ownership(
+    proc: Any,
+    *,
+    cleanup: Callable[[], None],
+    provider_name: str,
+) -> None:
+    """Retain resources until a reaper confirms complete provider-tree exit."""
+    ownership = _RetainedChatProviderOwnership(
+        process=proc,
+        cleanup=cleanup,
+        provider_name=provider_name,
+    )
+    with _RETAINED_CHAT_PROVIDER_OWNERSHIP_LOCK:
+        existing = _RETAINED_CHAT_PROVIDER_OWNERSHIP.setdefault(
+            id(proc),
+            ownership,
+        )
+    if existing is ownership:
+        _start_retained_chat_provider_reaper(ownership)
 
 
 def _stream_chat_provider_process(
@@ -702,27 +820,39 @@ def _stream_chat_provider_process(
     env: dict[str, str],
     provider_name: str,
     parse_line: Callable[[str], str],
+    input_text: str | None = None,
+    cleanup_after_reap: Callable[[], None] | None = None,
 ):
     """Yield parsed stdout without allowing either provider pipe to deadlock.
 
     Stderr goes to a temporary file, so an arbitrarily chatty provider cannot
     fill a pipe while stdout is being streamed. A dedicated reader thread puts
     stdout lines onto a queue, allowing the consumer to enforce inactivity and
-    react to generator cancellation. Every exit path terminates a still-live
-    process group and waits for the leader.
+    react to generator cancellation. Every exit path retains ownership until
+    the complete process tree is positively reaped. Credential-bearing
+    resources are cleaned only after that confirmation.
     """
     with tempfile.TemporaryFile(mode="w+b") as stderr_file:
-        proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=stderr_file,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        try:
+            proc = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=(
+                    subprocess.PIPE
+                    if input_text is not None
+                    else subprocess.DEVNULL
+                ),
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except BaseException:
+            if cleanup_after_reap is not None:
+                cleanup_after_reap()
+            raise
         assert proc.stdout is not None
         stdout = proc.stdout
         events: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -747,6 +877,10 @@ def _stream_chat_provider_process(
         last_activity = time.monotonic()
 
         try:
+            if input_text is not None:
+                assert proc.stdin is not None
+                proc.stdin.write(input_text)
+                proc.stdin.close()
             while True:
                 if stdout_eof and events.empty():
                     return_code = proc.poll()
@@ -782,10 +916,29 @@ def _stream_chat_provider_process(
                         f"{provider_name} chat provider stdout failed: {payload}",
                         retryable=True,
                     )
+        except (BrokenPipeError, OSError) as exc:
+            raise ChatProviderError(
+                f"{provider_name} chat provider refused its input: {exc}",
+                retryable=True,
+            ) from exc
         finally:
-            _terminate_chat_provider_process(proc)
+            exit_confirmed = _terminate_chat_provider_process(proc)
             reader.join(timeout=CHAT_PROVIDER_TERMINATE_TIMEOUT_SECONDS)
             stdout.close()
+            if exit_confirmed:
+                if cleanup_after_reap is not None:
+                    cleanup_after_reap()
+            else:
+                _retain_chat_provider_ownership(
+                    proc,
+                    cleanup=cleanup_after_reap or (lambda: None),
+                    provider_name=provider_name,
+                )
+                raise ChatProviderError(
+                    f"{provider_name} chat provider process tree did not exit; "
+                    "process ownership and provider credentials were retained "
+                    "for cleanup.",
+                )
 
         if return_code != 0:
             stderr_output = _read_chat_provider_stderr(stderr_file)
@@ -982,9 +1135,7 @@ class CliChatProvider:
         raise RuntimeError(f"Unsupported chat agent '{self.agent}'.")
 
     def _provider_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        for name in ("GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK"):
-            env.pop(name, None)
+        env = minimal_provider_environment(self.agent)
         env["GIT_TERMINAL_PROMPT"] = "0"
         return env
 
@@ -995,31 +1146,64 @@ class CliChatProvider:
             "never",
             "exec",
             "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--strict-config",
             "--skip-git-repo-check",
             "-s",
             "read-only",
             "-c",
             "shell_environment_policy.inherit=none",
+            "-c",
+            "features.shell_tool=false",
+            "-c",
+            "features.unified_exec=false",
+            "-c",
+            "features.code_mode_host=false",
+            *[
+                item
+                for override in CODEX_AMBIENT_CAPABILITY_OVERRIDES
+                for item in ("-c", override)
+            ],
             "--json",
-            prompt,
+            "-",
         ]
-        with tempfile.TemporaryDirectory(prefix="autopilot-tui-chat-") as workspace:
-            message_offsets: dict[str, int] = {}
-            visible_order: list[str] = []
+        workspace_context = tempfile.TemporaryDirectory(
+            prefix="autopilot-tui-chat-"
+        )
+        env = self._provider_env()
+        try:
+            codex_home_context, codex_home = create_ephemeral_codex_home(env)
+        except BaseException:
+            workspace_context.cleanup()
+            raise
+        for key in CODEX_SECRET_ENV_KEYS:
+            env.pop(key, None)
+        env["CODEX_HOME"] = str(codex_home)
+        message_offsets: dict[str, int] = {}
+        visible_order: list[str] = []
 
-            def _parse_line(line: str) -> str:
-                return _extract_codex_chat_text(line, message_offsets, visible_order)
+        def _parse_line(line: str) -> str:
+            return _extract_codex_chat_text(line, message_offsets, visible_order)
 
+        def _cleanup_provider_resources() -> None:
             try:
-                yield from _stream_chat_provider_process(
-                    command,
-                    cwd=Path(workspace),
-                    env=self._provider_env(),
-                    provider_name="Codex",
-                    parse_line=_parse_line,
-                )
-            except FileNotFoundError as exc:
-                raise RuntimeError(f"Codex CLI is not installed: {exc}") from exc
+                codex_home_context.cleanup()
+            finally:
+                workspace_context.cleanup()
+
+        try:
+            yield from _stream_chat_provider_process(
+                command,
+                cwd=Path(workspace_context.name),
+                env=env,
+                provider_name="Codex",
+                parse_line=_parse_line,
+                input_text=prompt,
+                cleanup_after_reap=_cleanup_provider_resources,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Codex CLI is not installed: {exc}") from exc
 
     def _stream_claude_output(self, prompt: str):
         try:
@@ -1038,19 +1222,22 @@ class CliChatProvider:
             "--tools",
             "",
             "--",
-            prompt,
         ]
-        with tempfile.TemporaryDirectory(prefix="autopilot-tui-chat-") as workspace:
-            try:
-                yield from _stream_chat_provider_process(
-                    command,
-                    cwd=Path(workspace),
-                    env=self._provider_env(),
-                    provider_name="Claude",
-                    parse_line=_extract_claude_chat_text,
-                )
-            except FileNotFoundError as exc:
-                raise RuntimeError(f"Claude CLI is not installed: {exc}") from exc
+        workspace_context = tempfile.TemporaryDirectory(
+            prefix="autopilot-tui-chat-"
+        )
+        try:
+            yield from _stream_chat_provider_process(
+                command,
+                cwd=Path(workspace_context.name),
+                env=self._provider_env(),
+                provider_name="Claude",
+                parse_line=_extract_claude_chat_text,
+                input_text=prompt,
+                cleanup_after_reap=workspace_context.cleanup,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Claude CLI is not installed: {exc}") from exc
 
 
 def _chat_session_key(spec_id: str = "") -> str:

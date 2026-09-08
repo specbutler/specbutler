@@ -93,22 +93,42 @@ parallel = true
 
 The Windows-specific command and shell are required for a PowerShell script;
 the portable `install_command` remains the POSIX fallback. The implementation
-bootstrap may download dependencies. The same selected command is also
-attempted before local review inside Codex's model-free sandbox, where
-network access and operator-profile reads are deliberately denied. If the
-command requires a package download, Spec Butler records a review-environment
-warning and continues with a diff-only review. To let the reviewer run tests,
-make the bootstrap satisfiable from already installed packages or a trusted
-local wheel/cache; do not enable network access for the review sandbox.
+bootstrap may download dependencies. Built-in local reviewers do not rerun the
+install or verification commands: Spec Butler passes them the canonical spec,
+an exact host-materialized diff, and the gate results already produced by the
+orchestrator. This avoids executing pull-request package hooks inside the
+reviewer boundary.
 
 Run a small spec manually before enabling unattended dispatch:
 
 ```powershell
 spec doctor
 spec create --spec windows-smoke --agent codex
+# From the printed authoring worktree:
+Set-Location -LiteralPath .worktrees\spec-windows-smoke
+git status --short
+git log -1 --stat
+git push --set-upstream origin spec/windows-smoke
+gh pr create --head spec/windows-smoke --base main
+# Review and merge the spec PR, then return to the orchestration checkout.
+Set-Location -LiteralPath ..\..
+git pull --ff-only
 spec implement --spec windows-smoke --agent codex --review-agent codex
 spec status --spec windows-smoke
 ```
+
+The authoring agent can edit and commit in its isolated worktree. Ordinary
+GitHub environment credentials are omitted and Git publication is guarded;
+network commands prompt for approval. Explicitly trusted user MCP servers
+retain their own service authority and provider approval behavior. Push and
+merge the spec branch from your normal PowerShell session before running
+`spec implement` from the orchestration checkout.
+
+Native Windows Codex runs copy OAuth state into a launch-scoped provider home.
+Only one such OAuth-backed session per canonical Codex auth file can be active,
+because Codex may rotate its refresh token. A concurrent launch fails promptly
+rather than freezing another session or the web server. Configure
+`OPENAI_API_KEY` or `CODEX_API_KEY` when parallel native Codex runs are needed.
 
 ## Troubleshooting
 

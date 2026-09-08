@@ -53,8 +53,12 @@ When launched by the orchestrator for `implement`, follow this contract:
    (see step 6).
 6. **Report completion before exit**:
    ```bash
-   spec report --status ok|blocked|error|needs-input --summary "..."
+   spec report --status ok|blocked|error|needs-input --summary 'plain text summary'
    ```
+   Keep the summary shell-safe: single-quote the complete value, avoid
+   apostrophes, and do not include backticks or `$()`. Describe commands without
+   Markdown code delimiters because the shell evaluates substitutions before
+   `spec report` starts.
    Use `needs-input` when the spec is genuinely ambiguous and a wrong guess
    would waste retry cycles. Describe the ambiguity and include specific
    options when possible.

@@ -58,7 +58,13 @@ All fields are optional:
 
 The orchestrator applies the manifest like this:
 
-- `env`: merged into the implement agent environment.
+- `env`: project values are merged into the implement agent environment.
+  Provider authentication/routing namespaces, process essentials such as
+  `PATH` and `HOME`, TLS/proxy settings, Spec Butler's `SPEC_*` controls, and
+  runtime loader/startup injection variables are reserved and ignored with a
+  warning. Configure those at the operator/provider layer instead. Explicit
+  project secrets such as `DATABASE_URL` or `DB_PASSWORD` remain supported;
+  container launches keep their values out of Docker arguments and logs.
 - `prompt`: appended to the implement prompt for all agents.
 - `mcp_prompt`: appended only for agents that support MCP.
 - `mcp_servers`: merged into the generated MCP config only for agents that

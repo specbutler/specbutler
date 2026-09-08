@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -29,17 +33,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 def _repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str, dict[str, str]]:
-    token = "linux-web-service-token"
-    (tmp_path / ".spec-state" / "web").mkdir(parents=True)
-    (tmp_path / ".spec-state" / "web" / "auth-token").write_text(
-        token,
-        encoding="utf-8",
-    )
     config_path = tmp_path / ".spec.toml"
     config_path.write_text('base_ref = "HEAD"\n', encoding="utf-8")
     control_root = tmp_path / "process-controls"
+    user_state_root = tmp_path / "user-state"
     monkeypatch.setenv("SPEC_CONFIG", str(config_path))
     monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(control_root))
+    monkeypatch.setenv("XDG_STATE_HOME", str(user_state_root))
+    from spec_runtime.web.auth import load_or_create_token
+
+    token = load_or_create_token(tmp_path)
     env = os.environ.copy()
     env.pop("SPEC_WEB_READY_NONCE", None)
     env["SPEC_NO_UPDATE_CHECK"] = "1"
@@ -176,6 +179,185 @@ def test_linux_foreground_bind_auth_status_and_legacy_stop(
             managed.wait(timeout=10)
             _assert_port_closed(port)
             assert not (repo / ".spec-state" / "web" / "server.pid").exists()
+        except Exception as exc:
+            raise AssertionError(f"{exc}\n{_logs(stdout_path, stderr_path)}") from exc
+        finally:
+            if managed.poll() is None:
+                managed.terminate(grace_seconds=0.1)
+
+
+def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    chrome = shutil.which("google-chrome") or shutil.which("chromium")
+    if chrome is None:
+        pytest.skip("Chrome/Chromium is not installed")
+
+    repo, token, env = _repo(tmp_path, monkeypatch)
+    port = _free_port()
+    stdout_path = tmp_path / "chrome-server.stdout.log"
+    stderr_path = tmp_path / "chrome-server.stderr.log"
+    browser_stdout_path = tmp_path / "chrome.stdout.log"
+    browser_stderr_path = tmp_path / "chrome.stderr.log"
+    profile = tmp_path / "chrome-profile"
+    with (
+        stdout_path.open("w", encoding="utf-8") as stdout,
+        stderr_path.open("w", encoding="utf-8") as stderr,
+    ):
+        managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+            _start_command(port),
+            cwd=repo,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        try:
+            _wait_for_authenticated_http(port, token, process=managed)
+            deadline = time.monotonic() + 5
+            opening_url = ""
+            while time.monotonic() < deadline:
+                match = re.search(
+                    r"One-time browser URL: (\S+)",
+                    stderr_path.read_text(errors="replace"),
+                )
+                if match:
+                    opening_url = match.group(1)
+                    break
+                time.sleep(0.05)
+            assert opening_url
+            assert token not in opening_url
+            assert "bootstrap=" in opening_url
+
+            with (
+                browser_stdout_path.open("w", encoding="utf-8") as browser_stdout,
+                browser_stderr_path.open("w", encoding="utf-8") as browser_stderr,
+            ):
+                browser = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+                    [
+                        chrome,
+                        "--headless=new",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--disable-dev-shm-usage",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        f"--user-data-dir={profile}",
+                        "--remote-debugging-address=127.0.0.1",
+                        "--remote-debugging-port=0",
+                        opening_url,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=browser_stdout,
+                    stderr=browser_stderr,
+                )
+                try:
+                    deadline = time.monotonic() + 30
+                    page_target: dict[str, object] | None = None
+                    last_browser_error: Exception | None = None
+                    debug_port: int | None = None
+                    while time.monotonic() < deadline:
+                        try:
+                            if debug_port is None:
+                                active_port = profile / "DevToolsActivePort"
+                                debug_port = int(
+                                    active_port.read_text(encoding="utf-8")
+                                    .splitlines()[0]
+                                    .strip()
+                                )
+                            with urllib.request.urlopen(
+                                f"http://127.0.0.1:{debug_port}/json/list",
+                                timeout=1,
+                            ) as response:
+                                targets = json.load(response)
+                            page_target = next(
+                                (
+                                    target
+                                    for target in targets
+                                    if target.get("type") == "page"
+                                    and target.get("title") == "spec web"
+                                    and str(target.get("url", "")).startswith(
+                                        f"http://127.0.0.1:{port}/"
+                                    )
+                                    and "bootstrap="
+                                    not in str(target.get("url", ""))
+                                ),
+                                None,
+                            )
+                            if page_target is not None:
+                                break
+                        except (
+                            IndexError,
+                            OSError,
+                            ValueError,
+                            urllib.error.URLError,
+                        ) as exc:
+                            last_browser_error = exc
+                        if browser.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                    assert page_target is not None, (
+                        "Chrome did not load the authenticated clean URL: "
+                        f"debug_port={debug_port}, error={last_browser_error}\n"
+                        f"{browser_stderr_path.read_text(errors='replace')[-2000:]}"
+                    )
+                    current_url = str(page_target["url"])
+                    assert token not in current_url
+                    assert "bootstrap=" not in current_url
+                    assert "spec-csrf" not in current_url
+                    target_id = str(page_target["id"])
+                    close_request = urllib.request.Request(
+                        (
+                            f"http://127.0.0.1:{debug_port}"
+                            f"/json/close/{target_id}"
+                        ),
+                        method="PUT",
+                    )
+                    with urllib.request.urlopen(close_request, timeout=2) as response:
+                        assert response.read().decode() == "Target is closing"
+
+                    # Closing the page through the browser protocol gives
+                    # Chrome a deterministic history-commit boundary without
+                    # depending on --dump-dom to exit while the app has live
+                    # timers and streams.
+                    close_deadline = time.monotonic() + 5
+                    while time.monotonic() < close_deadline:
+                        if browser.poll() is not None:
+                            break
+                        with urllib.request.urlopen(
+                            f"http://127.0.0.1:{debug_port}/json/list",
+                            timeout=1,
+                        ) as response:
+                            targets = json.load(response)
+                        if all(target.get("id") != target_id for target in targets):
+                            break
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError("Chrome did not close the audited page")
+                finally:
+                    if browser.owned_tree_active():
+                        browser.send_signal(signal.SIGINT)
+                    try:
+                        browser.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        assert browser.terminate(grace_seconds=1)
+                        browser.wait(timeout=5)
+
+            history_path = profile / "Default" / "History"
+            assert history_path.is_file()
+            database = sqlite3.connect(f"file:{history_path}?mode=ro", uri=True)
+            try:
+                urls = [row[0] for row in database.execute("select url from urls")]
+            finally:
+                database.close()
+            assert urls
+            assert all(token not in url for url in urls)
+            assert all("spec-csrf" not in url for url in urls)
+
+            with pytest.raises(urllib.error.HTTPError) as replay:
+                urllib.request.urlopen(opening_url, timeout=2)
+            assert replay.value.code == 401
         except Exception as exc:
             raise AssertionError(f"{exc}\n{_logs(stdout_path, stderr_path)}") from exc
         finally:
