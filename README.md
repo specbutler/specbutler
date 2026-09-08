@@ -208,7 +208,14 @@ spec container init                    # generate a baseline worker image
 # Then enable backend = "container" in .spec.toml.
 spec container doctor                  # validate container backend readiness
 spec container smoke --verify-gates    # exercise the configured worker
+spec container gc                      # preview crash leftovers for this checkout
+spec container gc --apply              # revalidate and remove that preview
 ```
+
+Docker inventories are host-global, so GC requires exact labels tying every
+resource to the current checkout's configured workspace root. It ignores
+resources from other checkouts and ambiguous unlabeled legacy resources. See
+[Container operations and recovery](docs/execution-backends.md#operations-and-recovery).
 
 ### Coordinator Service
 

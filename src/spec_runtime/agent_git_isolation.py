@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 
 _PRIVATE_GIT_DIR_NAME = "specbutler-private-git"
 _MAX_POINTER_BYTES = 16 * 1024
+_MAX_PRIVATE_GIT_ENTRIES = 200_000
 _OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SCP_REMOTE_RE = re.compile(
     r"(?:(?P<user>[A-Za-z0-9._-]+)@)?(?P<host>[^/\\:@\s]+):(?P<path>[^\s]+)\Z"
@@ -293,48 +294,50 @@ def _assert_private_tree_is_plain(root: Path) -> None:
     while pending:
         directory = pending.pop()
         try:
-            entries = list(os.scandir(directory))
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen > _MAX_PRIVATE_GIT_ENTRIES:
+                        raise UnsafeAgentGitIsolationError(
+                            "Private Git metadata contains too many filesystem entries"
+                        )
+                    try:
+                        metadata = os.lstat(entry.path)
+                        if stat.S_ISLNK(metadata.st_mode):
+                            raise UnsafeAgentGitIsolationError(
+                                f"Private Git metadata contains a symlink: {entry.path}"
+                            )
+                        if _is_windows_reparse_stat(metadata):
+                            raise UnsafeAgentGitIsolationError(
+                                f"Private Git metadata contains a reparse point: {entry.path}"
+                            )
+                        if stat.S_ISDIR(metadata.st_mode):
+                            pending.append(Path(entry.path))
+                        elif stat.S_ISREG(metadata.st_mode):
+                            # Windows' directory-enumeration metadata does not include
+                            # a reliable link count.  In particular, Python 3.11 may
+                            # expose ``st_nlink == 0`` from this DirEntry cache for an
+                            # ordinary single-link file.  ``os.lstat`` asks the
+                            # filesystem for the real count while retaining the
+                            # no-follow behavior required by this boundary.
+                            if metadata.st_nlink != 1:
+                                raise UnsafeAgentGitIsolationError(
+                                    f"Private Git metadata contains a hardlink: {entry.path}"
+                                )
+                        else:
+                            raise UnsafeAgentGitIsolationError(
+                                f"Private Git metadata contains a special file: {entry.path}"
+                            )
+                    except OSError as exc:
+                        raise UnsafeAgentGitIsolationError(
+                            "Unable to inspect private Git metadata"
+                        ) from exc
+        except UnsafeAgentGitIsolationError:
+            raise
         except OSError as exc:
             raise UnsafeAgentGitIsolationError(
                 "Unable to inspect private Git metadata"
             ) from exc
-        for entry in entries:
-            entries_seen += 1
-            if entries_seen > 200_000:
-                raise UnsafeAgentGitIsolationError(
-                    "Private Git metadata contains too many filesystem entries"
-                )
-            try:
-                metadata = os.lstat(entry.path)
-                if stat.S_ISLNK(metadata.st_mode):
-                    raise UnsafeAgentGitIsolationError(
-                        f"Private Git metadata contains a symlink: {entry.path}"
-                    )
-                if _is_windows_reparse_stat(metadata):
-                    raise UnsafeAgentGitIsolationError(
-                        f"Private Git metadata contains a reparse point: {entry.path}"
-                    )
-                if stat.S_ISDIR(metadata.st_mode):
-                    pending.append(Path(entry.path))
-                elif stat.S_ISREG(metadata.st_mode):
-                    # Windows' directory-enumeration metadata does not include
-                    # a reliable link count.  In particular, Python 3.11 may
-                    # expose ``st_nlink == 0`` from this DirEntry cache for an
-                    # ordinary single-link file.  ``os.lstat`` asks the
-                    # filesystem for the real count while retaining the
-                    # no-follow behavior required by this boundary.
-                    if metadata.st_nlink != 1:
-                        raise UnsafeAgentGitIsolationError(
-                            f"Private Git metadata contains a hardlink: {entry.path}"
-                        )
-                else:
-                    raise UnsafeAgentGitIsolationError(
-                        f"Private Git metadata contains a special file: {entry.path}"
-                    )
-            except OSError as exc:
-                raise UnsafeAgentGitIsolationError(
-                    "Unable to inspect private Git metadata"
-                ) from exc
 
 
 def _file_snapshot(path: Path, *, required: bool = False) -> _FileSnapshot:

@@ -10,13 +10,22 @@ distinguishes a timeout from a generic failure and survives across resumes so
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..platform_fs import atomic_write_text
+from ..platform_fs import atomic_write_text, read_bounded_regular_text
+
+_GATE_RECORDS_MAX_BYTES = 8 * 1024 * 1024
+_GATE_DIAGNOSTIC_MAX_BYTES = 256 * 1024
+_DIAGNOSTIC_TRUNCATION_MARKER = "\n...[diagnostic truncated in durable gate record]"
+
+
+class GateRecordPersistenceError(OSError):
+    """A gate-record update would discard or create unreadable state."""
 
 
 class GateStatus(str, Enum):
@@ -110,23 +119,104 @@ class GateRecordStore:
         return self._path
 
     def load(self) -> list[GateRecord]:
-        if not self._path.exists():
+        return self._load(for_update=False)
+
+    def _load(self, *, for_update: bool) -> list[GateRecord]:
+        try:
+            self._path.lstat()
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            if for_update:
+                raise GateRecordPersistenceError(
+                    f"refusing to overwrite unreadable gate records: {self._path}"
+                ) from exc
             return []
         try:
-            payload = json.loads(self._path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
+            payload = json.loads(
+                read_bounded_regular_text(
+                    self._path,
+                    max_bytes=_GATE_RECORDS_MAX_BYTES,
+                )
+            )
+        except (ValueError, RecursionError, OSError, UnicodeError) as exc:
+            if for_update:
+                raise GateRecordPersistenceError(
+                    f"refusing to overwrite unreadable gate records: {self._path}"
+                ) from exc
             return []
+        if for_update and (
+            not isinstance(payload, dict) or payload.get("version") != 1
+        ):
+            raise GateRecordPersistenceError(
+                f"refusing to overwrite malformed gate records: {self._path}"
+            )
         items = payload.get("records") if isinstance(payload, dict) else None
         if not isinstance(items, list):
+            if for_update:
+                raise GateRecordPersistenceError(
+                    f"refusing to overwrite malformed gate records: {self._path}"
+                )
             return []
         records: list[GateRecord] = []
         for item in items:
-            if isinstance(item, dict):
-                records.append(GateRecord.from_dict(item))
+            if not isinstance(item, dict) or (
+                for_update and not self._record_payload_is_strict(item)
+            ):
+                if for_update:
+                    raise GateRecordPersistenceError(
+                        f"refusing to overwrite malformed gate records: {self._path}"
+                    )
+                continue
+            records.append(GateRecord.from_dict(item))
         return records
 
+    @staticmethod
+    def _record_payload_is_strict(payload: dict[str, Any]) -> bool:
+        """Validate persisted records before any append can rewrite them."""
+        name = payload.get("name")
+        status = payload.get("status")
+        if not isinstance(name, str) or not name.strip():
+            return False
+        if not isinstance(status, str) or status.strip() not in {
+            item.value for item in GateStatus
+        }:
+            return False
+        if "command" in payload and (
+            not isinstance(payload["command"], (list, tuple))
+            or any(not isinstance(item, str) for item in payload["command"])
+        ):
+            return False
+        for field_name in (
+            "cwd",
+            "started_at",
+            "completed_at",
+            "log_path",
+            "diagnostic",
+        ):
+            if field_name in payload and not isinstance(payload[field_name], str):
+                return False
+        if "timeout_seconds" in payload:
+            timeout = payload["timeout_seconds"]
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(float(timeout))
+                or float(timeout) < 0
+            ):
+                return False
+        if "exit_status" in payload:
+            exit_status = payload["exit_status"]
+            if exit_status is not None and (
+                isinstance(exit_status, bool) or not isinstance(exit_status, int)
+            ):
+                return False
+        if "metadata" in payload and not isinstance(payload["metadata"], dict):
+            return False
+        return True
+
     def append(self, record: GateRecord) -> GateRecord:
-        records = self.load()
+        records = self._load(for_update=True)
         records.append(record)
         self._write(records)
         return record
@@ -138,7 +228,7 @@ class GateRecordStore:
         the gate completes. If no started record exists, behaves like append.
         """
 
-        records = self.load()
+        records = self._load(for_update=True)
         for index in range(len(records) - 1, -1, -1):
             existing = records[index]
             if existing.name == record.name and existing.status is GateStatus.STARTED:
@@ -162,15 +252,46 @@ class GateRecordStore:
         return tuple(name for name, status in seen.items() if status is GateStatus.STARTED)
 
     def _write(self, records: Iterable[GateRecord]) -> None:
+        record_payloads = [record.to_dict() for record in records]
+        if any(
+            not self._record_payload_is_strict(record)
+            for record in record_payloads
+        ):
+            raise GateRecordPersistenceError(
+                f"refusing malformed gate records update: {self._path}"
+            )
         payload = {
             "version": 1,
             "updated_at": _now_iso(),
-            "records": [record.to_dict() for record in records],
+            "records": record_payloads,
         }
-        atomic_write_text(
-            self._path,
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        )
+        try:
+            serialized = (
+                json.dumps(payload, indent=2, sort_keys=True, allow_nan=False)
+                + "\n"
+            )
+        except (TypeError, ValueError) as exc:
+            raise GateRecordPersistenceError(
+                f"refusing non-JSON gate records update: {self._path}"
+            ) from exc
+        if len(serialized.encode("utf-8")) > _GATE_RECORDS_MAX_BYTES:
+            raise GateRecordPersistenceError(
+                f"refusing oversized gate records update: {self._path}"
+            )
+        atomic_write_text(self._path, serialized)
+
+
+def _bounded_diagnostic(value: str) -> str:
+    diagnostic = str(value or "")
+    encoded = diagnostic.encode("utf-8", errors="replace")
+    if len(encoded) <= _GATE_DIAGNOSTIC_MAX_BYTES:
+        return diagnostic
+    marker = _DIAGNOSTIC_TRUNCATION_MARKER.encode("utf-8")
+    prefix = encoded[: _GATE_DIAGNOSTIC_MAX_BYTES - len(marker)].decode(
+        "utf-8",
+        errors="ignore",
+    )
+    return prefix + _DIAGNOSTIC_TRUNCATION_MARKER
 
 
 def record_gate_started(
@@ -223,7 +344,7 @@ def record_gate_completed(
         completed_at=_now_iso(now),
         exit_status=int(exit_status),
         log_path=log_target,
-        diagnostic=diagnostic,
+        diagnostic=_bounded_diagnostic(diagnostic),
     )
     store.replace_pending(record)
     return record
@@ -254,7 +375,9 @@ def record_gate_timeout(
         completed_at=_now_iso(now),
         exit_status=None,
         log_path=log_target,
-        diagnostic=diagnostic or f"gate '{name}' exceeded timeout",
+        diagnostic=_bounded_diagnostic(
+            diagnostic or f"gate '{name}' exceeded timeout"
+        ),
     )
     store.replace_pending(record)
     return record

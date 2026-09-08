@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from spec_runtime.config import (
     SpecRuntimeConfig,
     load_spec_runtime_config,
 )
+from spec_runtime.git_publish_guard import apply_host_owned_publication_guard
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -1701,7 +1703,7 @@ class TestCloneBackend:
             backend.cleanup(handle)
         assert (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
-        # The explicit post-merge / spec-clean opt-out still deletes it.
+        # The explicit operator spec-clean opt-out still deletes it.
         backend.cleanup(handle, allow_unpushed_work=True)
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
@@ -1724,6 +1726,76 @@ class TestCloneBackend:
 
         backend.cleanup(handle)
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
+
+    def test_snapshot_copy_failure_never_publishes_partial_restore_point(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        snapshot_path = handle.outbox_path.parent / "snapshots" / "pre-implement"
+
+        with patch.object(eb.shutil, "copytree", side_effect=OSError("mid-copy failure")):
+            with pytest.raises(OSError, match="mid-copy failure"):
+                backend.snapshot(handle, "pre-implement")
+
+        assert not snapshot_path.exists()
+        assert not list(snapshot_path.parent.glob(".pre-implement.staging-*"))
+
+        snapshot = backend.snapshot(handle, "pre-implement")
+        (handle.path / "README.md").write_text("mutated after snapshot\n")
+        restored = backend.restore(handle, snapshot)
+
+        assert (restored.path / "README.md").read_text() == "hello\n"
+
+    def test_restore_copy_and_fresh_clone_failure_preserve_current_workspace(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        snapshot = backend.snapshot(handle, "pre-implement")
+        exclude = handle.path / ".git" / "info" / "exclude"
+        with exclude.open("a", encoding="utf-8") as stream:
+            stream.write("\n.local/\n")
+        sentinel = handle.path / ".local" / "postgres" / "data" / "current"
+        sentinel.parent.mkdir(parents=True)
+        sentinel.write_text("only current copy\n")
+
+        with (
+            patch.object(
+                eb.shutil,
+                "copytree",
+                side_effect=OSError("snapshot copy failed"),
+            ),
+            patch.object(
+                backend,
+                "_clone_source_checkout",
+                side_effect=RuntimeError("fresh clone failed"),
+            ),
+            pytest.raises(RuntimeError, match="fresh clone failed"),
+        ):
+            backend.restore(handle, snapshot)
+
+        assert sentinel.read_text() == "only current copy\n"
+        assert (handle.path / ".git").is_dir()
+        assert not list(handle.path.parent.glob(".source.*-staging-*"))
 
     def test_forced_restore_rescues_unpushed_work_and_records_index(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -1957,6 +2029,97 @@ class TestCloneBackend:
         backend.cleanup(handle, allow_unpushed_work=True)
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
+    def test_restore_and_cleanup_fail_closed_when_git_metadata_is_missing(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        snapshot = backend.snapshot(handle, "pre-implement")
+        (handle.path / ".git").rename(handle.path / ".git-removed")
+        sentinel = handle.path / "agent-work.txt"
+        sentinel.write_text("must survive\n")
+
+        with pytest.raises(eb.WorkspaceInspectionFailedError, match=r"\.git is missing"):
+            backend.restore(handle, snapshot)
+        with pytest.raises(eb.WorkspaceInspectionFailedError, match=r"\.git is missing"):
+            backend.cleanup(handle)
+
+        assert sentinel.read_text() == "must survive\n"
+
+    def test_cleanup_fails_closed_when_git_probe_returns_nonzero(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        original_run_git = backend._run_git
+
+        def failing_run_git(argv, *, cwd):
+            if argv[:1] == ["rev-list"]:
+                return subprocess.CompletedProcess(
+                    argv, 128, "", "simulated corrupt ref"
+                )
+            return original_run_git(argv, cwd=cwd)
+
+        backend._run_git = failing_run_git
+        try:
+            with pytest.raises(
+                eb.WorkspaceInspectionFailedError,
+                match="inspect unpublished commits",
+            ):
+                backend.cleanup(handle)
+        finally:
+            del backend._run_git
+
+        assert handle.path.is_dir()
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires directory symlinks")
+    def test_restore_refuses_symlinked_source_without_touching_target(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        outside_root = tmp_path / "outside-root"
+        outside_root.mkdir()
+        outside = outside_root / "outside"
+        _init_clone_source(repo)
+        _init_clone_source(outside)
+        sentinel = outside / "outside-sentinel.txt"
+        sentinel.write_text("preserve me\n")
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        snapshot = backend.snapshot(handle, "pre-implement")
+        shutil.rmtree(handle.path)
+        handle.path.symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(OSError, match="symlink or junction"):
+            backend.restore(handle, snapshot)
+
+        assert sentinel.read_text() == "preserve me\n"
+
     def test_cleanup_allowed_when_only_orchestrator_secrets_are_untracked(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -1978,6 +2141,159 @@ class TestCloneBackend:
         backend.cleanup(handle)
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
+    def test_uninitialized_submodule_directory_does_not_block_cleanup(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        child_repo = tmp_path / "child" / "child-repo"
+        _init_clone_source(repo)
+        child_repo.parent.mkdir()
+        _init_clone_source(child_repo)
+        added = subprocess.run(
+            [
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(child_repo),
+                "child",
+            ],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert added.returncode == 0, added.stderr
+        _git_ok("commit", "-am", "add child", cwd=repo)
+        _git_ok("push", cwd=repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+
+        assert handle.path.joinpath("child").is_dir()
+        assert list(handle.path.joinpath("child").iterdir()) == []
+        backend.cleanup(handle)
+
+        assert not handle.outbox_path.parent.exists()
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX FIFO support")
+    def test_checked_out_submodule_fifo_cannot_block_clone_cleanup(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        child_repo = tmp_path / "child-source"
+        _init_clone_source(repo)
+        _init_clone_source(child_repo)
+        added = subprocess.run(
+            [
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(child_repo),
+                "child",
+            ],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert added.returncode == 0, added.stderr
+        _git_ok("commit", "-am", "add child", cwd=repo)
+        _git_ok("push", cwd=repo)
+        backend = self._make()
+        handle = backend.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        initialized = subprocess.run(
+            [
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "child",
+            ],
+            cwd=handle.path,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert initialized.returncode == 0, initialized.stderr
+        fifo = tmp_path / "nested-config-include"
+        os.mkfifo(fifo)
+        nested_config = handle.path / ".git" / "modules" / "child" / "config"
+        nested_config.write_text(
+            nested_config.read_text(encoding="utf-8")
+            + f"\n[include]\n\tpath = {fifo}\n",
+            encoding="utf-8",
+        )
+        sentinel = handle.path / "child" / "README.md"
+        sentinel.write_text("nested work must survive\n", encoding="utf-8")
+
+        probe = """
+import sys
+from pathlib import Path
+from spec_runtime.config import ExecutionConfig
+from spec_runtime.execution_backend import CloneExecutionBackend, WorkspaceHandle
+
+source = Path(sys.argv[1])
+run_root = source.parent
+backend = CloneExecutionBackend(
+    ExecutionConfig(
+        backend="clone",
+        workspace_root=str(run_root.parent),
+        backend_explicit=True,
+    )
+)
+workspace = WorkspaceHandle(
+    path=source,
+    outbox_path=run_root / "outbox",
+    branch="code/my-feature--abc",
+    backend="clone",
+    metadata={
+        "run_id": "my-feature-abc",
+        "spec_id": "my-feature",
+        "repo_root": sys.argv[2],
+        "workspace_root": str(run_root.parent),
+    },
+)
+try:
+    backend.cleanup(workspace)
+except Exception as exc:
+    print(type(exc).__name__)
+    print(str(exc))
+    raise SystemExit(0)
+raise SystemExit(3)
+"""
+        completed = subprocess.run(
+            [sys.executable, "-c", probe, str(handle.path), str(repo)],
+            cwd=PROJECT_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert "WorkspaceHasUnpushedWorkError" in completed.stdout
+        assert "checked-out submodule" in completed.stdout
+        assert sentinel.read_text(encoding="utf-8") == "nested work must survive\n"
+
 
 # A sample pid recorded on line 1 of a stale postmaster.pid file. Teardown does
 # not (and must not) probe its host-side liveness — the pid is written by a
@@ -1992,46 +2308,75 @@ class _FakeContainerRunner:
         self,
         *,
         fail_volume_import: bool = False,
+        inject_volume_import_state: bool = False,
+        successful_empty_volume_import: bool = False,
         fail_compose_up: bool = False,
         fail_compose_stop: bool = False,
+        fail_compose_stop_verification: bool = False,
+        fail_pause_inspect: bool = False,
         fail_in_worker_run: bool = False,
         playwright_version: str = "",
         image_passwd: str | None = None,
         image_group: str | None = None,
         fail_cp: bool = False,
+        fail_create: bool = False,
         ps_container_ids: Sequence[str] = (),
         fail_ps: bool = False,
+        fail_volume_ls: bool = False,
         fail_rm_ids: Sequence[str] = (),
         inspect_present_ids: Sequence[str] = (),
         cache_built_images: bool = False,
         build_delay_seconds: float = 0.0,
         exec_stdout: str = "exec ok\n",
+        lowercase_network_inspect: bool = False,
+        compose_service_exit_code_after_up: int | None = None,
     ):
         self.calls: list[list[str]] = []
         self.cwd_calls: list[Path] = []
         self.envs: list[dict[str, str] | None] = []
         self.fail_volume_import = fail_volume_import
+        self.inject_volume_import_state = inject_volume_import_state
+        self.successful_empty_volume_import = successful_empty_volume_import
         self.fail_compose_up = fail_compose_up
         self.fail_compose_stop = fail_compose_stop
+        self.fail_compose_stop_verification = fail_compose_stop_verification
+        self.fail_pause_inspect = fail_pause_inspect
+        self.compose_stop_seen = False
         self.fail_in_worker_run = fail_in_worker_run
         self.playwright_version = playwright_version
         self.image_passwd = image_passwd
         self.image_group = image_group
         self.fail_cp = fail_cp
+        self.fail_create = fail_create
         # These sets model resources returned by an engine-side ownership-label
         # query.  Cleanup must discover them from Docker, never trust names or
         # ids copied out of the persisted backend state.
         self.ps_container_ids = set(ps_container_ids)
+        self.container_statuses: dict[str, str] = {
+            container_id: "running" for container_id in ps_container_ids
+        }
+        self.container_exit_codes: dict[str, int] = {
+            container_id: 0 for container_id in ps_container_ids
+        }
         self.owned_volume_ids: set[str] = set()
         self.owned_network_ids: set[str] = set()
         self.fail_ps = fail_ps
+        self.fail_volume_ls = fail_volume_ls
+        self.fail_volume_ls_count = 0
         self.fail_rm_ids = set(fail_rm_ids)
         # Ids that ``docker inspect`` should report as still present (returncode
         # 0). Any other id inspects as not-found, modelling a confirmed removal.
         self.inspect_present_ids = set(inspect_present_ids)
+        self.resource_labels: dict[tuple[str, str], dict[str, str]] = {}
+        self.container_volumes: dict[str, set[str]] = {}
+        self.network_containers: dict[str, set[str]] = {}
+        self.paused_container_ids: set[str] = set()
+        self._extract_sequence = 0
         self.cache_built_images = cache_built_images
         self.build_delay_seconds = build_delay_seconds
         self.exec_stdout = exec_stdout
+        self.lowercase_network_inspect = lowercase_network_inspect
+        self.compose_service_exit_code_after_up = compose_service_exit_code_after_up
         self.built_images: set[str] = set()
         self.image_state_lock = threading.Lock()
 
@@ -2070,17 +2415,77 @@ class _FakeContainerRunner:
                 return subprocess.CompletedProcess(argv, 1, "", "postgres still running\n")
             if "up" in argv:
                 project = argv[3]
-                override = Path(argv[argv.index("-f", 5) + 1])
+                override_indexes = [
+                    index for index, item in enumerate(argv[:-1]) if item == "-f"
+                ]
+                override = Path(argv[override_indexes[-1] + 1])
                 if override.is_file():
                     payload = json.loads(override.read_text())
+                    labels = next(
+                        (
+                            dict(value.get("labels", {}))
+                            for section in ("services", "volumes", "networks")
+                            for value in payload.get(section, {}).values()
+                            if isinstance(value, dict) and value.get("labels")
+                        ),
+                        {},
+                    )
+                    compose_labels = labels | {
+                        "com.docker.compose.project": project,
+                    }
                     for service in payload.get("services", {}):
-                        self.ps_container_ids.add(f"{project}-{service}-1")
+                        name = f"{project}-{service}-1"
+                        self.ps_container_ids.add(name)
+                        self.container_statuses[name] = "running"
+                        self.container_exit_codes[name] = 0
+                        self.resource_labels[("container", name)] = compose_labels
+                        if self.compose_service_exit_code_after_up is not None:
+                            self.container_statuses[name] = "exited"
+                            self.container_exit_codes[name] = (
+                                self.compose_service_exit_code_after_up
+                            )
                     for volume in payload.get("volumes", {}):
-                        self.owned_volume_ids.add(f"{project}_{volume}")
+                        name = f"{project}_{volume}"
+                        self.owned_volume_ids.add(name)
+                        self.resource_labels[("volume", name)] = compose_labels
+                    if not payload.get("volumes"):
+                        # Preserve the historical fixture's representative
+                        # compose-managed service volume.
+                        name = f"{project}_postgres-data"
+                        self.owned_volume_ids.add(name)
+                        self.resource_labels[("volume", name)] = compose_labels
                     for network in payload.get("networks", {}):
-                        self.owned_network_ids.add(f"{project}_{network}")
+                        name = f"{project}_{network}"
+                        self.owned_network_ids.add(name)
+                        self.resource_labels[("network", name)] = compose_labels
+                        self.network_containers[name] = {
+                            container_id
+                            for container_id in self.ps_container_ids
+                            if self.resource_labels.get(("container", container_id), {}).get(
+                                "com.docker.compose.project"
+                            )
+                            == project
+                        }
+            if "stop" in argv:
+                project = argv[3]
+                self.compose_stop_seen = True
+                for container_id in list(self.ps_container_ids):
+                    if self.resource_labels.get(("container", container_id), {}).get(
+                        "com.docker.compose.project"
+                    ) == project:
+                        self.container_statuses[container_id] = "exited"
+                        self.container_exit_codes[container_id] = 0
             return subprocess.CompletedProcess(argv, 0, "compose ok\n", "")
         if argv[:2] == ["docker", "volume"] and "ls" in argv:
+            if self.fail_volume_ls or self.fail_volume_ls_count > 0:
+                if self.fail_volume_ls_count > 0:
+                    self.fail_volume_ls_count -= 1
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "",
+                    "volume inventory unavailable\n",
+                )
             compose_filter = next(
                 (
                     item
@@ -2094,16 +2499,21 @@ class _FakeContainerRunner:
                 names = {
                     name
                     for name in self.owned_volume_ids
-                    if name.startswith(f"{project}_")
+                    if self.resource_labels.get(("volume", name), {}).get(
+                        "com.docker.compose.project"
+                    )
+                    == project
                 }
-                # Historical fake behavior exposed one compose-managed volume
-                # even for the minimal fixture. Keep that behavior while also
-                # recording it as engine-owned for the hardened cleanup query.
-                if not names:
-                    names = {f"{project}_postgres-data"}
-                    self.owned_volume_ids.update(names)
             else:
-                names = self.owned_volume_ids
+                names = {
+                    name
+                    for name in self.owned_volume_ids
+                    if _docker_label_filters_match(
+                        self.resource_labels.get(("volume", name), {}),
+                        argv,
+                        default_when_unlabeled=True,
+                    )
+                }
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -2111,26 +2521,86 @@ class _FakeContainerRunner:
                 "",
             )
         if argv[:3] == ["docker", "volume", "create"]:
-            self.owned_volume_ids.add(argv[-1])
+            name = argv[-1]
+            if name not in self.owned_volume_ids:
+                self.owned_volume_ids.add(name)
+                self.resource_labels[("volume", name)] = _docker_labels(argv)
             return subprocess.CompletedProcess(argv, 0, f"{argv[-1]}\n", "")
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            name = argv[-1]
+            if name not in self.owned_volume_ids:
+                return subprocess.CompletedProcess(argv, 1, "", "missing volume\n")
+            payload = [{"Name": name, "Labels": self.resource_labels.get(("volume", name), {})}]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
         if argv[:3] == ["docker", "volume", "rm"]:
             self.owned_volume_ids.discard(argv[-1])
+            self.resource_labels.pop(("volume", argv[-1]), None)
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:3] == ["docker", "network", "create"]:
-            self.owned_network_ids.add(argv[-1])
+            name = argv[-1]
+            if name in self.owned_network_ids:
+                return subprocess.CompletedProcess(argv, 1, "", "already exists\n")
+            self.owned_network_ids.add(name)
+            self.resource_labels[("network", name)] = _docker_labels(argv)
             return subprocess.CompletedProcess(argv, 0, f"{argv[-1]}\n", "")
         if argv[:3] == ["docker", "network", "ls"]:
+            names = {
+                name
+                for name in self.owned_network_ids
+                if _docker_label_filters_match(
+                    self.resource_labels.get(("network", name), {}),
+                    argv,
+                    default_when_unlabeled="com.docker.compose.project" not in " ".join(argv),
+                )
+            }
             return subprocess.CompletedProcess(
                 argv,
                 0,
-                "".join(f"{name}\n" for name in sorted(self.owned_network_ids)),
+                "".join(f"{name}\n" for name in sorted(names)),
                 "",
             )
+        if argv[:3] == ["docker", "network", "inspect"]:
+            name = argv[-1]
+            if name not in self.owned_network_ids:
+                return subprocess.CompletedProcess(argv, 1, "", "missing network\n")
+            endpoints = {
+                container_id: {}
+                for container_id in self.network_containers.get(name, set())
+            }
+            payload = [
+                (
+                    {
+                        "id": name,
+                        "name": name,
+                        "labels": self.resource_labels.get(("network", name), {}),
+                        "containers": [
+                            {"id": container_id}
+                            for container_id in endpoints
+                        ],
+                    }
+                    if self.lowercase_network_inspect
+                    else {
+                        "Id": name,
+                        "Name": name,
+                        "Labels": self.resource_labels.get(("network", name), {}),
+                        "Containers": endpoints,
+                    }
+                )
+            ]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
         if argv[:3] == ["docker", "network", "rm"]:
             self.owned_network_ids.discard(argv[-1])
+            self.resource_labels.pop(("network", argv[-1]), None)
+            self.network_containers.pop(argv[-1], None)
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:2] == ["docker", "create"]:
-            return subprocess.CompletedProcess(argv, 0, "created\n", "")
+            if self.fail_create:
+                return subprocess.CompletedProcess(argv, 1, "", "create failed\n")
+            self._extract_sequence += 1
+            container_id = f"extract-{self._extract_sequence}"
+            self.ps_container_ids.add(container_id)
+            self.resource_labels[("container", container_id)] = _docker_labels(argv)
+            return subprocess.CompletedProcess(argv, 0, f"{container_id}\n", "")
         if argv[:2] == ["docker", "cp"]:
             if self.fail_cp:
                 return subprocess.CompletedProcess(argv, 1, "", "no such file\n")
@@ -2151,10 +2621,68 @@ class _FakeContainerRunner:
         if argv[:2] == ["docker", "ps"]:
             if self.fail_ps:
                 return subprocess.CompletedProcess(argv, 1, "", "ps failed\n")
+            if (
+                self.fail_compose_stop_verification
+                and self.compose_stop_seen
+                and any(
+                item.startswith("label=com.docker.compose.project=")
+                for item in argv
+                )
+            ):
+                self.fail_compose_stop_verification = False
+                return subprocess.CompletedProcess(
+                    argv, 1, "", "could not verify stopped services\n"
+                )
+            volume_filter = next(
+                (
+                    item.removeprefix("volume=")
+                    for item in argv
+                    if item.startswith("volume=")
+                ),
+                "",
+            )
+            if volume_filter:
+                ids = {
+                    container_id
+                    for container_id in self.ps_container_ids
+                    if volume_filter in self.container_volumes.get(container_id, set())
+                }
+            else:
+                # ``ps_container_ids`` models ids returned by this exact
+                # engine-side label query.  A real Docker/Podman daemon cannot
+                # return an unlabeled container for a positive label filter,
+                # so materialize those queried labels for the later mandatory
+                # inspect/revalidation step.  Tests for replaced or foreign
+                # resources install explicit mismatched labels instead.
+                query_labels = _docker_label_filter_values(argv)
+                if query_labels:
+                    for container_id in self.ps_container_ids:
+                        self.resource_labels.setdefault(
+                            ("container", container_id),
+                            dict(query_labels),
+                        )
+                ids = {
+                    container_id
+                    for container_id in self.ps_container_ids
+                    if _docker_label_filters_match(
+                        self.resource_labels.get(("container", container_id), {}),
+                        argv,
+                        default_when_unlabeled=(
+                            "com.docker.compose.project" not in " ".join(argv)
+                        ),
+                    )
+                }
+            if "-a" not in argv:
+                ids = {
+                    container_id
+                    for container_id in ids
+                    if self.container_statuses.get(container_id, "running")
+                    == "running"
+                }
             return subprocess.CompletedProcess(
                 argv,
                 0,
-                "".join(f"{cid}\n" for cid in sorted(self.ps_container_ids)),
+                "".join(f"{cid}\n" for cid in sorted(ids)),
                 "",
             )
         if argv[:3] == ["docker", "rm", "-f"]:
@@ -2162,11 +2690,60 @@ class _FakeContainerRunner:
             if target in self.fail_rm_ids:
                 return subprocess.CompletedProcess(argv, 1, "", f"cannot remove {target}\n")
             self.ps_container_ids.discard(target)
+            self.container_statuses.pop(target, None)
+            self.container_exit_codes.pop(target, None)
+            self.resource_labels.pop(("container", target), None)
+            self.container_volumes.pop(target, None)
+            for endpoints in self.network_containers.values():
+                endpoints.discard(target)
+            self.paused_container_ids.discard(target)
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:2] == ["docker", "pause"]:
+            target = argv[-1]
+            if target not in self.ps_container_ids:
+                return subprocess.CompletedProcess(argv, 1, "", "missing container\n")
+            self.paused_container_ids.add(target)
+            return subprocess.CompletedProcess(argv, 0, target + "\n", "")
+        if argv[:2] == ["docker", "unpause"]:
+            target = argv[-1]
+            if target not in self.ps_container_ids:
+                return subprocess.CompletedProcess(argv, 1, "", "missing container\n")
+            self.paused_container_ids.discard(target)
+            return subprocess.CompletedProcess(argv, 0, target + "\n", "")
         if argv[:2] == ["docker", "inspect"]:
             target = argv[-1]
-            if target in self.inspect_present_ids:
-                return subprocess.CompletedProcess(argv, 0, "[{}]\n", "")
+            if target in self.inspect_present_ids or target in self.ps_container_ids:
+                if "{{.State.Paused}}" in argv:
+                    if self.fail_pause_inspect:
+                        return subprocess.CompletedProcess(
+                            argv, 1, "", "pause state unavailable\n"
+                        )
+                    value = "true" if target in self.paused_container_ids else "false"
+                    return subprocess.CompletedProcess(argv, 0, value + "\n", "")
+                if "{{.State.Status}}" in argv:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        self.container_statuses.get(target, "running") + "\n",
+                        "",
+                    )
+                if "{{.State.ExitCode}}" in argv:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        str(self.container_exit_codes.get(target, 0)) + "\n",
+                        "",
+                    )
+                payload = [
+                    {
+                        "Id": target,
+                        "Name": f"/{target}",
+                        "Config": {
+                            "Labels": self.resource_labels.get(("container", target), {})
+                        },
+                    }
+                ]
+                return subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
             return subprocess.CompletedProcess(
                 argv, 1, "", f"Error: No such object: {target}\n"
             )
@@ -2195,6 +2772,21 @@ class _FakeContainerRunner:
                 )
                 if container_id:
                     self.ps_container_ids.add(container_id)
+                    self.container_statuses[container_id] = "running"
+                    self.container_exit_codes[container_id] = 0
+                    self.resource_labels[("container", container_id)] = _docker_labels(argv)
+                    self.container_volumes[container_id] = {
+                        item.split(":", 1)[0]
+                        for index, item in enumerate(argv)
+                        if index > 0
+                        and argv[index - 1] == "-v"
+                        and item.split(":", 1)[0] in self.owned_volume_ids
+                    }
+                    network = _value_after(argv, "--network")
+                    if network:
+                        self.network_containers.setdefault(network, set()).add(
+                            container_id
+                        )
             snapshot_mount = next(
                 (
                     item
@@ -2215,8 +2807,42 @@ class _FakeContainerRunner:
                 if marker in command:
                     archive_name = command.split(marker, 1)[1].split()[0]
                     (snapshot_dir / archive_name).write_text("volume archive\n")
-            if self.fail_volume_import and any("/workspace/host" in item for item in argv):
-                return subprocess.CompletedProcess(argv, 1, "", "copy failed\n")
+            import_mount = next(
+                (
+                    item
+                    for item in argv
+                    if item.endswith(":/workspace/host")
+                    and any(
+                        candidate.endswith(":/workspace/source:ro")
+                        for candidate in argv
+                    )
+                ),
+                "",
+            )
+            if import_mount:
+                if self.fail_volume_import:
+                    return subprocess.CompletedProcess(argv, 1, "", "copy failed\n")
+                # Model an unchanged workspace volume by materializing the
+                # current host mirror into the backend's import staging mount.
+                # Individual tests patch the sync helper when they need
+                # volume-only content.
+                import_target = Path(import_mount.removesuffix(":/workspace/host"))
+                host_source = cwd / "source"
+                if (
+                    not self.successful_empty_volume_import
+                    and import_target != host_source
+                    and host_source.is_dir()
+                ):
+                    shutil.copytree(
+                        host_source,
+                        import_target,
+                        dirs_exist_ok=True,
+                        symlinks=True,
+                    )
+                if self.inject_volume_import_state:
+                    leaked = import_target / ".spec-state" / "runs"
+                    leaked.mkdir(parents=True, exist_ok=True)
+                    (leaked / "old-worker-secret.json").write_text("secret\n")
             return subprocess.CompletedProcess(argv, 0, "container ok\n", "")
         if argv[:2] == ["docker", "exec"]:
             return subprocess.CompletedProcess(argv, 0, self.exec_stdout, "")
@@ -2228,6 +2854,55 @@ def _value_after(argv: list[str], flag: str) -> str:
         return argv[argv.index(flag) + 1]
     except (ValueError, IndexError):
         return ""
+
+
+def _docker_labels(argv: Sequence[str]) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for index, value in enumerate(argv[:-1]):
+        if value != "--label":
+            continue
+        key, separator, label_value = argv[index + 1].partition("=")
+        if separator:
+            labels[key] = label_value
+    return labels
+
+
+def _docker_label_filters_match(
+    labels: dict[str, str],
+    argv: Sequence[str],
+    *,
+    default_when_unlabeled: bool,
+) -> bool:
+    filters = [
+        argv[index + 1].removeprefix("label=")
+        for index, value in enumerate(argv[:-1])
+        if value == "--filter" and argv[index + 1].startswith("label=")
+    ]
+    if not filters:
+        return True
+    if not labels:
+        return default_when_unlabeled
+    for item in filters:
+        key, separator, expected = item.partition("=")
+        if separator and labels.get(key) != expected:
+            return False
+        if not separator and key not in labels:
+            return False
+    return True
+
+
+def _docker_label_filter_values(argv: Sequence[str]) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for index, value in enumerate(argv[:-1]):
+        if value != "--filter":
+            continue
+        item = argv[index + 1]
+        if not item.startswith("label="):
+            continue
+        key, separator, label_value = item.removeprefix("label=").partition("=")
+        if separator:
+            labels[key] = label_value
+    return labels
 
 
 class TestContainerBackend:
@@ -2245,8 +2920,10 @@ class TestContainerBackend:
         compose_file: str = "",
         playwright_mcp: object | None = None,
         build_ssh: str = "",
+        engine: str = "docker",
     ) -> eb.ContainerExecutionBackend:
         container_config = ContainerExecutionConfig(
+            engine=engine,
             image=image,
             dockerfile=dockerfile,
             workspace_mode=workspace_mode,
@@ -2268,6 +2945,618 @@ class TestContainerBackend:
             runner=runner,
             system_name=system_name,
         )
+
+    def test_deterministic_resource_names_are_scoped_to_checkout(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        backend = self._make(_FakeContainerRunner())
+        first = tmp_path / "first" / ".spec-workspaces" / "same-run" / "source"
+        second = tmp_path / "second" / ".spec-workspaces" / "same-run" / "source"
+
+        first_playwright = backend._playwright_sidecar_names("same-run", first)
+        second_playwright = backend._playwright_sidecar_names("same-run", second)
+
+        assert backend._volume_names("same-run", "volume", first) != (
+            backend._volume_names("same-run", "volume", second)
+        )
+        assert backend._service_network_names("same-run", "sidecar", first) != (
+            backend._service_network_names("same-run", "sidecar", second)
+        )
+        assert backend._compose_project_name("same-run", first) != (
+            backend._compose_project_name("same-run", second)
+        )
+        assert first_playwright != second_playwright
+
+    @pytest.mark.parametrize("payload", ["[]", "{}", "null", "1"])
+    @pytest.mark.parametrize("source_present", [True, False])
+    def test_retry_refuses_invalid_existing_state_before_engine_or_mutation(
+        self,
+        tmp_path: Path,
+        payload: str,
+        source_present: bool,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        state_path.write_text(payload, encoding="utf-8")
+        preserved_source = handle.path
+        if not source_present:
+            preserved_source = handle.path.with_name("source-preserved")
+            handle.path.rename(preserved_source)
+        source_sentinel = preserved_source / "preserve-me.txt"
+        source_sentinel.write_text("operator data\n", encoding="utf-8")
+        resources_before = (
+            set(runner.ps_container_ids),
+            set(runner.owned_volume_ids),
+            set(runner.owned_network_ids),
+        )
+        runner.calls.clear()
+
+        with (
+            patch(
+                "shutil.which",
+                side_effect=AssertionError("engine availability was consulted"),
+            ),
+            pytest.raises(RuntimeError, match="backend state is invalid"),
+        ):
+            backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert runner.calls == []
+        assert resources_before == (
+            runner.ps_container_ids,
+            runner.owned_volume_ids,
+            runner.owned_network_ids,
+        )
+        assert source_sentinel.read_text(encoding="utf-8") == "operator data\n"
+        assert state_path.read_text(encoding="utf-8") == payload
+
+    @pytest.mark.parametrize(
+        "corruption",
+        [
+            "missing-backend",
+            "missing-engine",
+            "missing-topology",
+            "list-topology",
+            "unknown-topology",
+            "missing-mode",
+            "list-mode",
+            "missing-playwright",
+            "list-playwright",
+            "unknown-playwright",
+            "list-seed-state",
+            "bad-labels",
+            "nonfinite",
+            "overflow-float",
+        ],
+    )
+    def test_retry_refuses_invalid_state_semantics_before_engine_or_mutation(
+        self,
+        tmp_path: Path,
+        corruption: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(
+            runner,
+            workspace_mode="volume" if corruption == "list-seed-state" else "bind",
+        )
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if corruption == "missing-backend":
+            state.pop("backend")
+        elif corruption == "missing-engine":
+            state.pop("engine")
+        elif corruption == "missing-topology":
+            state.pop("service_topology")
+        elif corruption == "list-topology":
+            state["service_topology"] = []
+        elif corruption == "unknown-topology":
+            state["service_topology"] = "surprise"
+        elif corruption == "missing-mode":
+            state.pop("workspace_mode")
+        elif corruption == "list-mode":
+            state["workspace_mode"] = []
+        elif corruption == "missing-playwright":
+            state.pop("playwright_mcp")
+        elif corruption == "list-playwright":
+            state["playwright_mcp"]["topology"] = []
+        elif corruption == "unknown-playwright":
+            state["playwright_mcp"]["topology"] = "surprise"
+        elif corruption == "list-seed-state":
+            state["workspace_volume_seed_state"] = []
+        elif corruption == "bad-labels":
+            state["resource_labels"]["spec.run_id"] = "another-run-xyz"
+        elif corruption == "nonfinite":
+            state["invalid_number"] = float("nan")
+        else:
+            state["invalid_number"] = 0.0
+        rendered_state = json.dumps(state)
+        if corruption == "overflow-float":
+            rendered_state = rendered_state.replace(
+                '"invalid_number": 0.0',
+                '"invalid_number": 1e9999',
+            )
+        state_path.write_text(rendered_state, encoding="utf-8")
+        resources_before = set(runner.ps_container_ids)
+        runner.calls.clear()
+
+        with (
+            patch(
+                "shutil.which",
+                side_effect=AssertionError("engine availability was consulted"),
+            ),
+            pytest.raises(
+                RuntimeError,
+                match=(
+                    "backend state|service topology|workspace mode|Playwright "
+                    "topology|resource labels|engine identity"
+                    "|seed marker"
+                ),
+            ),
+        ):
+            backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert runner.calls == []
+        assert runner.ps_container_ids == resources_before
+        assert state_path.is_file()
+
+    @pytest.mark.parametrize("drift", ["service", "workspace", "playwright"])
+    def test_retry_refuses_runtime_topology_drift_before_engine_or_mutation(
+        self,
+        tmp_path: Path,
+        drift: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+            "    volumes:\n      - data:/var/lib/postgresql/data\n"
+            "volumes:\n  data: {}\n",
+            encoding="utf-8",
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        sidecar_playwright = replace(
+            ContainerExecutionConfig().playwright_mcp,
+            topology="sidecar",
+            app_url="http://localhost:5173",
+            command="node",
+            args=("cli.js", "--headless"),
+        )
+        initial_options: dict[str, object] = {}
+        resumed_options: dict[str, object] = {}
+        if drift == "service":
+            initial_options["compose_file"] = "compose.yaml"
+        elif drift == "workspace":
+            initial_options["workspace_mode"] = "volume"
+            resumed_options["workspace_mode"] = "bind"
+        else:
+            initial_options["playwright_mcp"] = sidecar_playwright
+
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, **initial_options)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        state_before = state_path.read_bytes()
+        pinned_path = handle.outbox_path.parent / "backend-state" / "operator-compose.yaml"
+        pinned_before = pinned_path.read_bytes() if pinned_path.exists() else None
+        resources_before = (
+            set(runner.ps_container_ids),
+            set(runner.owned_volume_ids),
+            set(runner.owned_network_ids),
+        )
+        runner.calls.clear()
+        resumed = self._make(runner, **resumed_options)
+
+        with (
+            patch(
+                "shutil.which",
+                side_effect=AssertionError("engine availability was consulted"),
+            ),
+            pytest.raises(RuntimeError, match="cannot change .* topology|workspace mode"),
+        ):
+            resumed.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert runner.calls == []
+        assert resources_before == (
+            runner.ps_container_ids,
+            runner.owned_volume_ids,
+            runner.owned_network_ids,
+        )
+        assert state_path.read_bytes() == state_before
+        if pinned_before is not None:
+            assert pinned_path.read_bytes() == pinned_before
+
+    def test_retry_refuses_engine_drift_before_contacting_either_engine(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        docker_runner = _FakeContainerRunner()
+        docker_backend = self._make(docker_runner, engine="docker")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = docker_backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        state_before = state_path.read_bytes()
+        docker_containers_before = set(docker_runner.ps_container_ids)
+        docker_runner.calls.clear()
+        podman_runner = _FakeContainerRunner()
+        podman_backend = self._make(podman_runner, engine="podman")
+
+        with (
+            patch(
+                "shutil.which",
+                side_effect=AssertionError("engine availability was consulted"),
+            ),
+            pytest.raises(RuntimeError, match="cannot change container engines"),
+        ):
+            podman_backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert podman_runner.calls == []
+        assert docker_runner.calls == []
+        assert docker_runner.ps_container_ids == docker_containers_before
+        assert state_path.read_bytes() == state_before
+
+    def test_retry_accepts_persisted_disabled_playwright_topology(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        disabled_playwright = replace(
+            ContainerExecutionConfig().playwright_mcp,
+            topology="disabled",
+        )
+        backend = self._make(runner, playwright_mcp=disabled_playwright)
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            first = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+            resumed = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert resumed.path == first.path
+        state = json.loads(Path(resumed.metadata["container_state_path"]).read_text())
+        assert state["playwright_mcp"]["topology"] == "disabled"
+        assert state["runtime_generation_status"] == "running"
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX FIFO support")
+    def test_retry_refuses_special_existing_state_before_engine_or_mutation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        state_path.unlink()
+        os.mkfifo(state_path)
+        resources_before = set(runner.ps_container_ids)
+        runner.calls.clear()
+
+        with (
+            patch(
+                "shutil.which",
+                side_effect=AssertionError("engine availability was consulted"),
+            ),
+            pytest.raises(RuntimeError, match="backend state is invalid"),
+        ):
+            backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert runner.calls == []
+        assert runner.ps_container_ids == resources_before
+        assert state_path.is_fifo()
+
+    @pytest.mark.parametrize(
+        ("replacement", "message"),
+        [
+            ({}, "non-empty JSON object"),
+            (
+                {"payload": "x" * (eb._CONTAINER_BACKEND_STATE_MAX_BYTES + 1)},
+                "size limit",
+            ),
+            ({"value": float("nan")}, "not JSON-serializable"),
+        ],
+    )
+    def test_state_writer_rejects_unreadable_output_without_replacing_prior_bytes(
+        self,
+        tmp_path: Path,
+        replacement: dict[str, object],
+        message: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        run_root = handle.outbox_path.parent
+        state_path = Path(handle.metadata["container_state_path"])
+        original = state_path.read_bytes()
+
+        with pytest.raises(RuntimeError, match=message):
+            backend._write_container_state(run_root, replacement)
+
+        assert state_path.read_bytes() == original
+        assert backend._read_container_state(run_root)
+
+    def test_retry_adopts_saved_development_compose_and_playwright_names(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+            "    volumes:\n      - data:/var/lib/postgresql/data\n"
+            "volumes:\n  data: {}\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        playwright_mcp = replace(
+            ContainerExecutionConfig().playwright_mcp,
+            topology="sidecar",
+            app_url="http://localhost:5173",
+            command="node",
+            args=("cli.js", "--headless"),
+        )
+        runner = _FakeContainerRunner()
+        backend = self._make(
+            runner,
+            compose_file="compose.yaml",
+            playwright_mcp=playwright_mcp,
+        )
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.materialize_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state_path = Path(handle.metadata["container_state_path"])
+        state = json.loads(state_path.read_text())
+        labels = state["resource_labels"]
+        legacy = backend._legacy_resource_digest("my-feature-abc")
+        legacy_project = f"spec-{legacy}"
+        legacy_service_volume = f"{legacy_project}_data"
+        legacy_service_network = f"{legacy_project}_default"
+        legacy_playwright = (
+            "spec-"
+            + backend._legacy_resource_digest(
+                "my-feature-abc",
+                purpose="playwright-mcp",
+            )
+            + "-playwright-mcp"
+        )
+        state["compose_project"] = legacy_project
+        state["service_volumes"] = [legacy_service_volume]
+        state["service_networks"] = [legacy_service_network]
+        state["volumes"] = [legacy_service_volume]
+        state["networks"] = [legacy_service_network, legacy_playwright]
+        state["playwright_mcp"]["sidecar_container"] = legacy_playwright
+        state["playwright_mcp"]["sidecar_networks"] = [legacy_playwright]
+        state_path.write_text(json.dumps(state))
+        compose_labels = labels | {"com.docker.compose.project": legacy_project}
+        runner.owned_volume_ids.add(legacy_service_volume)
+        runner.resource_labels[("volume", legacy_service_volume)] = compose_labels
+        runner.owned_network_ids.update(
+            {legacy_service_network, legacy_playwright}
+        )
+        runner.resource_labels[("network", legacy_service_network)] = compose_labels
+        runner.resource_labels[("network", legacy_playwright)] = labels
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            resumed = backend.materialize_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        resumed_state = json.loads(
+            Path(resumed.metadata["container_state_path"]).read_text()
+        )
+        assert resumed_state["compose_project"] == legacy_project
+        assert resumed_state["service_volumes"] == [legacy_service_volume]
+        assert resumed_state["service_networks"] == [legacy_service_network]
+        assert resumed_state["playwright_mcp"]["sidecar_container"] == (
+            legacy_playwright
+        )
+        assert resumed_state["playwright_mcp"]["sidecar_networks"] == [
+            legacy_playwright
+        ]
+
+    @pytest.mark.parametrize(
+        ("retry_compose_file", "expected_error"),
+        [
+            ("compose.yaml", "Compose baseline is missing"),
+            ("", "cannot change service topology"),
+        ],
+    )
+    def test_pre_0_5_sidecar_retry_refuses_before_engine_or_workspace_mutation(
+        self,
+        tmp_path: Path,
+        retry_compose_file: str,
+        expected_error: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        clone = eb.CloneExecutionBackend(
+            ExecutionConfig(
+                backend="clone",
+                workspace_root=".spec-workspaces",
+                backend_explicit=True,
+            )
+        )
+        handle = clone.prepare_workspace(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            repo_root=repo,
+            base_ref="master",
+        )
+        run_root = handle.outbox_path.parent
+        state_path = run_root / "backend-state" / "container-backend-state.json"
+        state_path.parent.mkdir(parents=True)
+        runner = _FakeContainerRunner(ps_container_ids=("v040-worker", "v040-db"))
+        backend = self._make(runner, compose_file=retry_compose_file)
+        labels = backend._resource_labels(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            workspace_root=handle.path,
+        )
+        compose_labels = labels | {
+            "com.docker.compose.project": "spec-v040-project"
+        }
+        runner.owned_volume_ids.add("spec-v040-project_data")
+        runner.owned_network_ids.add("spec-v040-project_default")
+        for container_id in ("v040-worker", "v040-db"):
+            runner.resource_labels[("container", container_id)] = compose_labels
+        runner.resource_labels[("volume", "spec-v040-project_data")] = (
+            compose_labels
+        )
+        runner.resource_labels[("network", "spec-v040-project_default")] = (
+            compose_labels
+        )
+        old_state = {
+            "backend": "container",
+            "engine": "docker",
+            "workspace_mode": "bind",
+            "service_topology": "sidecar",
+            "playwright_mcp": {"topology": "in-worker"},
+            "compose_project": "spec-v040-project",
+            "worker_container": "v040-worker",
+            "containers": ["v040-worker", "v040-db"],
+            "service_volumes": ["spec-v040-project_data"],
+            "service_networks": ["spec-v040-project_default"],
+            "resource_labels": labels,
+        }
+        state_path.write_text(json.dumps(old_state, sort_keys=True))
+        sentinel = handle.path / "v040-work.txt"
+        sentinel.write_text("preserve me\n")
+        original_state = state_path.read_bytes()
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            pytest.raises(RuntimeError, match=expected_error),
+        ):
+            backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert runner.calls == []
+        assert state_path.read_bytes() == original_state
+        assert sentinel.read_text() == "preserve me\n"
+        assert runner.ps_container_ids == {"v040-worker", "v040-db"}
+        assert runner.owned_volume_ids == {"spec-v040-project_data"}
+        assert runner.owned_network_ids == {"spec-v040-project_default"}
 
     def test_codex_provider_home_is_external_and_mounted_after_source(
         self,
@@ -2316,10 +3605,45 @@ class TestContainerBackend:
             )
         )
 
-        assert runner.calls[-1][:2] == ["docker", "exec"]
-        assert str(provider_home) not in " ".join(runner.calls[-1])
-        assert "/workspace/source/.spec-codex-home" in " ".join(runner.calls[-1])
-        assert runner.envs[-1]["CODEX_HOME"] == "/workspace/source/.spec-codex-home"
+        exec_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:2] == ["docker", "exec"]
+        )
+        exec_call = runner.calls[exec_index]
+        assert str(provider_home) not in " ".join(exec_call)
+        assert "/workspace/source/.spec-codex-home" in " ".join(exec_call)
+        assert runner.envs[exec_index]["CODEX_HOME"] == "/workspace/source/.spec-codex-home"
+
+    def test_prepare_rejects_credential_bearing_origin_before_worker_start(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        _git_ok(
+            "remote",
+            "set-url",
+            "origin",
+            "https://operator:secret@example.invalid/repo.git",
+            cwd=repo,
+        )
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="credential|user information"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert not any(
+            call[:3] == ["docker", "run", "-d"] for call in runner.calls
+        )
 
     def test_prepare_workspace_requires_docker_compatible_cli(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -2441,9 +3765,271 @@ class TestContainerBackend:
         ps_call = next(call for call in runner.calls if call[:2] == ["docker", "ps"])
         assert "label=spec.owner=spec-runtime" in ps_call
         assert "label=spec.run_id=my-feature-abc" in ps_call
+        assert "label=spec.spec_id=my-feature" in ps_call
+        assert (
+            f"label=spec.workspace_root={(repo / '.spec-workspaces' / 'my-feature-abc' / 'source').resolve()}"
+            in ps_call
+        )
+        assert not any("spec.workspace_scope" in item for item in ps_call)
         rm_targets = [call[3] for call in runner.calls if call[:3] == ["docker", "rm", "-f"] and len(call) > 3]
         assert "old-worker-1" in rm_targets
         assert "old-sidecar-2" in rm_targets
+
+    def test_retry_imports_preexisting_workspace_volume_before_reseed(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner(inject_volume_import_state=True)
+        backend = self._make(runner, compose_file="", workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            first = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+            runner.calls.clear()
+            retried = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        import_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if any(item.endswith(":/workspace/source:ro") for item in call)
+            and any(item.endswith(":/workspace/host") for item in call)
+        )
+        seed_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if any(item.endswith(":/workspace/seed:ro") for item in call)
+        )
+        worker_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:3] == ["docker", "run", "-d"]
+            and "sleep infinity" in call[-1]
+        )
+        assert import_index < seed_index < worker_index
+        assert first.path == retried.path
+        assert not (retried.path / ".spec-state").exists()
+
+    def test_retry_import_failure_preserves_host_and_skips_reseed(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="", workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+            marker = handle.path / "current-host-tree.txt"
+            marker.write_text("preserve current host mirror\n")
+            runner.fail_volume_import = True
+            runner.calls.clear()
+            with pytest.raises(eb.ExecutionBackendImportError):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert marker.read_text() == "preserve current host mirror\n"
+        assert not any(
+            any(item.endswith(":/workspace/seed:ro") for item in call)
+            for call in runner.calls
+        )
+        assert not any(
+            call[:3] == ["docker", "run", "-d"]
+            and "sleep infinity" in call[-1]
+            for call in runner.calls
+        )
+
+    def test_retry_rejects_successful_empty_volume_import_before_swap(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="", workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+            marker = handle.path / "current-valid-checkout.txt"
+            marker.write_text("preserve valid host checkout\n")
+            runner.successful_empty_volume_import = True
+            runner.calls.clear()
+            with pytest.raises(
+                eb.ExecutionBackendImportError,
+                match="could not install source volume",
+            ):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert marker.read_text() == "preserve valid host checkout\n"
+        assert (handle.path / ".git").is_dir()
+        assert not any(
+            any(item.endswith(":/workspace/seed:ro") for item in call)
+            for call in runner.calls
+        )
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        assert state["workspace_volume_seed_state"] == "ready"
+
+    def test_retry_reseeds_interrupted_volume_without_importing_it(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="", workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+            state_path = Path(handle.metadata["container_state_path"])
+            state = json.loads(state_path.read_text())
+            state["workspace_volume_seed_state"] = "seeding"
+            state_path.write_text(json.dumps(state))
+            runner.fail_volume_import = True
+            runner.calls.clear()
+            backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert not any(
+            any(item.endswith(":/workspace/source:ro") for item in call)
+            and any(item.endswith(":/workspace/host") for item in call)
+            for call in runner.calls
+        )
+        assert any(
+            any(item.endswith(":/workspace/seed:ro") for item in call)
+            for call in runner.calls
+        )
+        state = json.loads(state_path.read_text())
+        assert state["workspace_volume_seed_state"] == "ready"
+
+    def test_retry_refuses_legacy_volume_without_crash_safe_seed_marker(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="", workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+            marker = handle.path / "preserve-host-mirror.txt"
+            marker.write_text("operator data\n")
+            state_path = Path(handle.metadata["container_state_path"])
+            state = json.loads(state_path.read_text())
+            state.pop("workspace_volume_seed_state")
+            state_path.write_text(json.dumps(state))
+            state_before = state_path.read_bytes()
+            resources_before = (
+                set(runner.ps_container_ids),
+                set(runner.owned_volume_ids),
+                set(runner.owned_network_ids),
+            )
+            runner.calls.clear()
+
+            with (
+                patch(
+                    "shutil.which",
+                    side_effect=AssertionError("engine availability was consulted"),
+                ),
+                pytest.raises(RuntimeError, match="legacy workspace volume"),
+            ):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert marker.read_text() == "operator data\n"
+        assert runner.calls == []
+        assert resources_before == (
+            runner.ps_container_ids,
+            runner.owned_volume_ids,
+            runner.owned_network_ids,
+        )
+        assert state_path.read_bytes() == state_before
+        assert not any(
+            any(item.endswith(":/workspace/source:ro") for item in call)
+            and any(item.endswith(":/workspace/host") for item in call)
+            for call in runner.calls
+        )
+        assert not any(
+            any(item.endswith(":/workspace/seed:ro") for item in call)
+            for call in runner.calls
+        )
+
+    def test_teardown_without_canonical_workspace_label_fails_closed(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner(ps_container_ids=("foreign-worker",))
+        backend = self._make(runner, compose_file="")
+        run_root = (repo / ".spec-workspaces" / "my-feature-abc").resolve()
+        data_dir = run_root / "source" / ".local" / "postgres" / "data"
+        data_dir.mkdir(parents=True)
+        pid_file = data_dir / "postmaster.pid"
+        pid_file.write_text("123\n")
+        state = {
+            "resource_labels": {
+                "spec.owner": "spec-runtime",
+                "spec.run_id": "my-feature-abc",
+                "spec.spec_id": "my-feature",
+                "spec.phase": "execution",
+            },
+            "workspace_mode": "bind",
+            "service_topology": "in-worker",
+            "containers": [],
+            "service_data_dirs": [str(data_dir)],
+        }
+
+        assert backend._teardown_previous_attempt_containers(run_root, state) is False
+        assert pid_file.is_file()
+        assert not any(call[:2] == ["docker", "ps"] for call in runner.calls)
+        assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
 
     def test_current_attempt_worker_created_after_teardown(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -2484,7 +4070,11 @@ class TestContainerBackend:
         run_root = (repo / ".spec-workspaces" / "my-feature-abc").resolve()
         run_root.mkdir(parents=True, exist_ok=True)
         state = {
-            "resource_labels": {"spec.owner": "spec-runtime", "spec.run_id": "my-feature-abc"},
+            "resource_labels": backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=run_root / "source",
+            ),
             "containers": ["container-123"],
             "service_data_dirs": [],
         }
@@ -2516,12 +4106,15 @@ class TestContainerBackend:
         ps_call = next(call for call in runner.calls if call[:2] == ["docker", "ps"])
         assert "label=spec.owner=spec-runtime" in ps_call
         assert "label=spec.run_id=my-feature-abc" in ps_call
-        # No stale ids returned -> teardown removes nothing (the only rm -f
-        # calls are the unrelated one-shot passwd/group shim extractions).
+        # No stale ids returned -> teardown removes nothing. Password/group
+        # shim extraction uses separately tracked ``extract-*`` containers and
+        # can occur on either side of an ownership inventory.
+        ps_index = runner.calls.index(ps_call)
         teardown_rm = [
             call
-            for call in runner.calls
-            if call[:3] == ["docker", "rm", "-f"] and len(call) > 3 and not call[3].startswith("spec-extract-")
+            for call in runner.calls[ps_index + 1 :]
+            if call[:3] == ["docker", "rm", "-f"] and len(call) > 3
+            and not call[3].startswith("extract-")
         ]
         assert teardown_rm == []
 
@@ -2540,8 +4133,13 @@ class TestContainerBackend:
         pid_file = data_dir / "postmaster.pid"
         pid_file.write_text(f"{_RECORDED_PID}\n/workspace/source/.local/postgres/data\n")
         state = {
-            "resource_labels": {"spec.owner": "spec-runtime", "spec.run_id": "my-feature-abc"},
+            "resource_labels": backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=run_root / "source",
+            ),
             "workspace_mode": "bind",
+            "service_topology": "in-worker",
             "containers": [],
             "service_data_dirs": [str(data_dir)],
         }
@@ -2572,8 +4170,13 @@ class TestContainerBackend:
         pid_file = data_dir / "postmaster.pid"
         pid_file.write_text(f"{_RECORDED_PID}\n/workspace/source/.local/postgres/data\n")
         state = {
-            "resource_labels": {"spec.owner": "spec-runtime", "spec.run_id": "my-feature-abc"},
+            "resource_labels": backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=run_root / "source",
+            ),
             "workspace_mode": "bind",
+            "service_topology": "in-worker",
             "containers": [],
             "service_data_dirs": [str(data_dir)],
         }
@@ -2600,8 +4203,13 @@ class TestContainerBackend:
         pid_file = data_dir / "postmaster.pid"
         pid_file.write_text(f"{_RECORDED_PID}\n/workspace/source/.local/postgres/data\n")
         state = {
-            "resource_labels": {"spec.owner": "spec-runtime", "spec.run_id": "my-feature-abc"},
+            "resource_labels": backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=run_root / "source",
+            ),
             "workspace_mode": "bind",
+            "service_topology": "in-worker",
             "containers": [],
             "service_data_dirs": [str(data_dir)],
         }
@@ -2635,8 +4243,13 @@ class TestContainerBackend:
         pid_file = data_dir / "postmaster.pid"
         pid_file.write_text(f"{os.getpid()}\n/workspace/source/.local/postgres/data\n")
         state = {
-            "resource_labels": {"spec.owner": "spec-runtime", "spec.run_id": "my-feature-abc"},
+            "resource_labels": backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=run_root / "source",
+            ),
             "workspace_mode": "bind",
+            "service_topology": "in-worker",
             "containers": [],
             "service_data_dirs": [str(data_dir)],
         }
@@ -2661,7 +4274,11 @@ class TestContainerBackend:
         run_root = (repo / ".spec-workspaces" / "my-feature-abc").resolve()
         run_root.mkdir(parents=True, exist_ok=True)
         state = {
-            "resource_labels": {"spec.owner": "spec-runtime", "spec.run_id": "my-feature-abc"},
+            "resource_labels": backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=run_root / "source",
+            ),
             "workspace_mode": "volume",
             "image": "example/spec-worker:latest",
             "workspace_volumes": ["spec-deadbeef-source"],
@@ -2758,55 +4375,69 @@ class TestContainerBackend:
         )
         assert seed_index < clear_index < worker_index
 
-    def test_teardown_failure_is_non_fatal_and_logged(self, tmp_path: Path):
+    def test_teardown_failure_aborts_before_volume_seed_and_new_worker(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         runner = _FakeContainerRunner(
             ps_container_ids=("old-worker-1",),
             fail_rm_ids=("old-worker-1",),
         )
-        backend = self._make(runner, compose_file="")
+        backend = self._make(runner, compose_file="", workspace_mode="volume")
+        run_root = repo / ".spec-workspaces" / "my-feature-abc"
+        labels = backend._resource_labels(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            workspace_root=run_root / "source",
+        )
+        volume = backend._volume_names(
+            "my-feature-abc", "volume", run_root / "source"
+        )[0]
+        runner.resource_labels[("container", "old-worker-1")] = labels
+        runner.owned_volume_ids.add(volume)
+        runner.resource_labels[("volume", volume)] = labels
+        runner.container_volumes["old-worker-1"] = {volume}
 
         with patch("shutil.which", return_value="/usr/bin/docker"):
-            handle = backend.prepare_workspace(
-                run_id="my-feature-abc",
-                spec_id="my-feature",
-                branch="code/my-feature--abc",
-                repo_root=repo,
-                base_ref="master",
-            )
+            with pytest.raises(RuntimeError, match="without trustworthy matching state"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
 
-        # The attempt still prepares its own worker despite the teardown failure.
-        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
-        assert state["worker_container"] == "container-123"
-        failure_log = handle.outbox_path.parent / "logs" / "previous-attempt-teardown-failures.log"
-        assert failure_log.is_file()
-        assert "old-worker-1" in failure_log.read_text()
+        # Quiescence cannot depend on attacker-writable diagnostic paths.  The
+        # raised engine detail is the diagnostic; no log write precedes or
+        # masks it.
+        assert not (run_root / "logs" / "previous-attempt-teardown-failures.log").exists()
+        assert volume in runner.owned_volume_ids
+        assert not any("/workspace/seed:ro" in " ".join(call) for call in runner.calls)
+        assert not any(
+            call[:3] == ["docker", "run", "-d"] and "sleep infinity" in call[-1]
+            for call in runner.calls
+        )
 
-    def test_teardown_discovery_failure_is_non_fatal(self, tmp_path: Path):
+    def test_teardown_discovery_failure_aborts_before_new_worker(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         runner = _FakeContainerRunner(fail_ps=True)
         backend = self._make(runner, compose_file="")
 
         with patch("shutil.which", return_value="/usr/bin/docker"):
-            handle = backend.prepare_workspace(
-                run_id="my-feature-abc",
-                spec_id="my-feature",
-                branch="code/my-feature--abc",
-                repo_root=repo,
-                base_ref="master",
-            )
+            with pytest.raises(RuntimeError, match="could not discover its exact-owned"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
 
-        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
-        assert state["worker_container"] == "container-123"
-        # A failed discovery removes nothing (only unrelated shim extractions).
-        teardown_rm = [
-            call
+        assert not any(
+            call[:3] == ["docker", "run", "-d"] and "sleep infinity" in call[-1]
             for call in runner.calls
-            if call[:3] == ["docker", "rm", "-f"] and len(call) > 3 and not call[3].startswith("spec-extract-")
-        ]
-        assert teardown_rm == []
+        )
 
     def test_compose_file_opts_into_host_managed_sidecars(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -2831,18 +4462,553 @@ class TestContainerBackend:
         state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
         compose_call = next(call for call in runner.calls if call[:3] == ["docker", "compose", "-p"])
         assert state["service_topology"] == "sidecar"
-        assert state["compose_file"] == str((handle.path / "compose.yaml").resolve())
+        pinned_compose = (
+            handle.outbox_path.parent / "backend-state" / "operator-compose.yaml"
+        )
+        assert state["compose_file"] == str(pinned_compose)
+        assert pinned_compose.read_text() == (repo / "compose.yaml").read_text()
         assert state["compose_project"].startswith("spec-")
         assert state["service_networks"][0].startswith("spec-")
         assert state["service_volumes"] == [f"{state['compose_project']}_postgres-data"]
         assert "up" in compose_call
         assert "-d" in compose_call
-        assert str((handle.path / "compose.yaml").resolve()) in compose_call
+        assert str(pinned_compose) in compose_call
+        assert str((handle.path / "compose.yaml").resolve()) not in compose_call
+        assert str(
+            handle.outbox_path.parent / "backend-state" / "compose-project"
+        ) in compose_call
         assert "/var/run/docker.sock" not in " ".join(compose_call)
         override = json.loads((handle.outbox_path.parent / "container-compose-labels.json").read_text())
         assert override["services"]["postgres"]["labels"]["spec.owner"] == "spec-runtime"
         assert override["volumes"]["postgres-data"]["labels"]["spec.run_id"] == "my-feature-abc"
         assert override["networks"]["default"]["labels"]["spec.spec_id"] == "my-feature"
+
+    @pytest.mark.parametrize(
+        "compose_text",
+        [
+            "services:\n  db:\n    image: postgres:16\n    volumes:\n      - ./data:/var/lib/postgresql/data\n",
+            "services:\n  db:\n    build: .\n",
+            "services:\n  db:\n    image: postgres:16\n    env_file: .env\n",
+            "services:\n  db:\n    image: postgres:16\n    develop:\n      watch: []\n",
+            "services:\n  db:\n    image: postgres:16\nconfigs:\n  app:\n    file: ./app.conf\n",
+        ],
+    )
+    def test_compose_rejects_agent_mutable_host_inputs(
+        self,
+        tmp_path: Path,
+        compose_text: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(compose_text)
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add unsafe compose input", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="must be self-contained"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] for call in runner.calls
+        )
+
+    def test_compose_retry_ignores_agent_modified_source_file(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        original = "services:\n  db:\n    image: postgres:16\n"
+        (repo / "compose.yaml").write_text(original)
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+            outside = tmp_path / "operator-data"
+            outside.mkdir()
+            (handle.path / "compose.yaml").write_text(
+                "services:\n  escape:\n    image: busybox\n"
+                f"    volumes:\n      - {outside}:/host\n"
+            )
+            runner.calls.clear()
+            backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        pinned = handle.outbox_path.parent / "backend-state" / "operator-compose.yaml"
+        assert pinned.read_text() == original
+        compose_calls = [
+            call for call in runner.calls if call[:3] == ["docker", "compose", "-p"]
+        ]
+        assert compose_calls
+        assert str(outside) not in " ".join(" ".join(call) for call in compose_calls)
+
+    def test_compose_retry_with_missing_source_preserves_operator_baseline(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        original = "services:\n  db:\n    image: postgres:16\n"
+        (repo / "compose.yaml").write_text(original, encoding="utf-8")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        run_root = handle.outbox_path.parent
+        pinned = run_root / "backend-state" / "operator-compose.yaml"
+        pinned_before = pinned.read_bytes()
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:17\n",
+            encoding="utf-8",
+        )
+        shutil.rmtree(handle.path)
+        runner.calls.clear()
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            resumed = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert resumed.path.is_dir()
+        assert pinned.read_bytes() == pinned_before
+        assert pinned.read_text(encoding="utf-8") == original
+        compose_calls = [
+            call for call in runner.calls if call[:3] == ["docker", "compose", "-p"]
+        ]
+        assert compose_calls
+        assert all(str(pinned) in call for call in compose_calls)
+        assert "postgres:17" not in pinned.read_text(encoding="utf-8")
+
+    def test_compose_preflight_refuses_foreign_same_project_resource(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        other_repo = tmp_path / "other-repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        _git_ok("push", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            backend.materialize_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        project = backend._compose_project_name(
+            "my-feature-abc",
+            repo / ".spec-workspaces" / "my-feature-abc" / "source",
+        )
+        volume = f"{project}_foreign-data"
+        runner.owned_volume_ids.add(volume)
+        runner.resource_labels[("volume", volume)] = (
+            backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=(
+                    other_repo
+                    / ".spec-workspaces"
+                    / "my-feature-abc"
+                    / "source"
+                ),
+            )
+            | {"com.docker.compose.project": project}
+        )
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="not owned by this checkout"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert volume in runner.owned_volume_ids
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+        assert not any(
+            call[:3] == ["docker", "volume", "rm"] and volume in call
+            for call in runner.calls
+        )
+
+    def test_compose_preflight_refuses_locally_labeled_volume_with_foreign_consumer(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        other_repo = tmp_path / "other-repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        _git_ok("push", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            backend.materialize_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        project = backend._compose_project_name(
+            "my-feature-abc",
+            repo / ".spec-workspaces" / "my-feature-abc" / "source",
+        )
+        volume = f"{project}_shared-data"
+        local_labels = backend._resource_labels(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            workspace_root=(
+                repo / ".spec-workspaces" / "my-feature-abc" / "source"
+            ),
+        )
+        runner.owned_volume_ids.add(volume)
+        runner.resource_labels[("volume", volume)] = local_labels | {
+            "com.docker.compose.project": project
+        }
+        runner.ps_container_ids.add("foreign-consumer")
+        runner.container_volumes["foreign-consumer"] = {volume}
+        runner.resource_labels[("container", "foreign-consumer")] = (
+            backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=(
+                    other_repo
+                    / ".spec-workspaces"
+                    / "my-feature-abc"
+                    / "source"
+                ),
+            )
+        )
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="not owned by this checkout"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert volume in runner.owned_volume_ids
+        assert "foreign-consumer" in runner.ps_container_ids
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+
+    def test_cleanup_preserves_state_when_compose_project_has_foreign_resource(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        _git_ok("push", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        foreign = f"{state['compose_project']}-foreign-1"
+        runner.ps_container_ids.add(foreign)
+        runner.resource_labels[("container", foreign)] = {
+            "com.docker.compose.project": state["compose_project"]
+        }
+        calls_before_cleanup = len(runner.calls)
+
+        with pytest.raises(OSError, match="not owned by this checkout"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert handle.outbox_path.parent.exists()
+        assert foreign in runner.ps_container_ids
+        assert not any(
+            call[:3] in (["docker", "rm", "-f"], ["docker", "volume", "rm"])
+            for call in runner.calls[calls_before_cleanup:]
+        )
+
+    def test_compose_refuses_unlabeled_deterministic_volume_collision(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+            "    volumes:\n      - data:/var/lib/postgresql/data\n"
+            "volumes:\n  data: {}\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        collision = (
+            f"{backend._compose_project_name('my-feature-abc', repo / '.spec-workspaces' / 'my-feature-abc' / 'source')}_data"
+        )
+        runner.owned_volume_ids.add(collision)
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="not owned by this checkout"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert collision in runner.owned_volume_ids
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+
+    @pytest.mark.parametrize("resource_kind", ["volume", "network"])
+    def test_compose_refuses_unlabeled_custom_resource_name_collision(
+        self,
+        tmp_path: Path,
+        resource_kind: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        custom_name = f"operator-owned-{resource_kind}"
+        if resource_kind == "volume":
+            compose = (
+                "services:\n  db:\n    image: postgres:16\n"
+                "    volumes:\n      - data:/var/lib/postgresql/data\n"
+                f"volumes:\n  data:\n    name: {custom_name}\n"
+            )
+        else:
+            compose = (
+                "services:\n  db:\n    image: postgres:16\n"
+                "    networks:\n      - default\n"
+                f"networks:\n  default:\n    name: {custom_name}\n"
+            )
+        (repo / "compose.yaml").write_text(compose)
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        owned_set = (
+            runner.owned_volume_ids
+            if resource_kind == "volume"
+            else runner.owned_network_ids
+        )
+        owned_set.add(custom_name)
+        runner.resource_labels[(resource_kind, custom_name)] = {}
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="not owned by this checkout"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert custom_name in owned_set
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+
+    @pytest.mark.parametrize(
+        "compose_text, expected",
+        [
+            (
+                "services:\n  db:\n    image: postgres:16\n    container_name: shared-db\n",
+                "must not set container_name",
+            ),
+            (
+                "services: {}\nvolumes:\n  data:\n    name: shared-data\n",
+                "must not assign global names",
+            ),
+            (
+                "services: {}\nnetworks:\n  app:\n    name: shared-network\n",
+                "must not assign global names",
+            ),
+            (
+                "services: {}\nvolumes:\n  data:\n    name: shared-data\n"
+                "    external: '${EXTERNAL:-false}'\n",
+                "must be self-contained",
+            ),
+        ],
+    )
+    def test_compose_rejects_global_managed_resource_names(
+        self,
+        tmp_path: Path,
+        compose_text: str,
+        expected: str,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(compose_text)
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        _git_ok("push", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match=expected):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+
+    @pytest.mark.parametrize(
+        "compose_text, expected",
+        [
+            ("include:\n  - child.yaml\nservices: {}\n", "does not support Compose include"),
+            (
+                "services:\n  base:\n    image: postgres:16\n"
+                "  db:\n    extends:\n      service: base\n",
+                "does not support Compose extends",
+            ),
+            (
+                "services: {}\nnetworks:\n  default:\n"
+                "    name: shared-default\n    external: true\n",
+                "requires the Compose default network to be managed",
+            ),
+            (
+                "services:\n  db:\n    image: postgres:16\n"
+                "    volumes:\n      - /var/lib/postgresql/data\n",
+                "must be self-contained",
+            ),
+            (
+                "services:\n  db:\n    image: postgres:16\n"
+                "    volumes:\n      - type: volume\n"
+                "        target: /var/lib/postgresql/data\n",
+                "must be self-contained",
+            ),
+            ("services: [\n", "could not safely parse the Compose file"),
+        ],
+    )
+    def test_compose_refuses_models_it_cannot_fully_safety_label(
+        self,
+        tmp_path: Path,
+        compose_text: str,
+        expected: str,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(compose_text)
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        _git_ok("push", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match=expected):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+
+    def test_compose_literal_external_resource_is_not_safety_labeled(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services: {}\nvolumes:\n  shared:\n"
+            "    name: shared-data\n    external: true\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add external volume", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        override = json.loads(
+            (handle.outbox_path.parent / "container-compose-labels.json").read_text()
+        )
+        assert "shared" not in override.get("volumes", {})
 
     def test_playwright_mcp_sidecar_requires_explicit_reachable_target(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -2930,10 +5096,165 @@ class TestContainerBackend:
             call[:3] == ["docker", "rm", "-f"] and mcp_state["sidecar_container"] in call for call in runner.calls
         )
 
+    def test_playwright_sidecar_collision_preserves_foreign_network(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        other_repo = tmp_path / "other-repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        playwright_mcp = replace(
+            ContainerExecutionConfig().playwright_mcp,
+            topology="sidecar",
+            app_url="http://localhost:5173",
+            command="node",
+            args=("cli.js", "--headless"),
+        )
+        backend = self._make(runner, playwright_mcp=playwright_mcp)
+        _container, networks = backend._playwright_sidecar_names(
+            "my-feature-abc",
+            repo / ".spec-workspaces" / "my-feature-abc" / "source",
+        )
+        network = networks[0]
+        runner.owned_network_ids.add(network)
+        runner.resource_labels[("network", network)] = backend._resource_labels(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            workspace_root=(
+                other_repo
+                / ".spec-workspaces"
+                / "my-feature-abc"
+                / "source"
+            ),
+        )
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="could not create.*network"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert network in runner.owned_network_ids
+        assert not any(
+            call[:3] == ["docker", "network", "rm"] and network in call
+            for call in runner.calls
+        )
+
+    def test_playwright_sidecar_reuses_exact_owned_network_on_retry(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        playwright_mcp = replace(
+            ContainerExecutionConfig().playwright_mcp,
+            topology="sidecar",
+            app_url="http://localhost:5173",
+            command="node",
+            args=("cli.js", "--headless"),
+        )
+        backend = self._make(runner, playwright_mcp=playwright_mcp)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            backend.materialize_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        _container, networks = backend._playwright_sidecar_names(
+            "my-feature-abc",
+            repo / ".spec-workspaces" / "my-feature-abc" / "source",
+        )
+        network = networks[0]
+        runner.owned_network_ids.add(network)
+        runner.resource_labels[("network", network)] = backend._resource_labels(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            workspace_root=(
+                repo / ".spec-workspaces" / "my-feature-abc" / "source"
+            ),
+        )
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        assert state["playwright_mcp"]["sidecar_networks"] == [network]
+        assert network in runner.owned_network_ids
+        assert any(call[:3] == ["docker", "network", "create"] for call in runner.calls)
+
+    def test_resource_label_inspection_accepts_podman_lowercase_network_json(
+        self,
+        tmp_path: Path,
+    ):
+        labels = {"spec.owner": "spec-runtime", "spec.run_id": "feature-run"}
+
+        class LowercaseNetworkRunner(_FakeContainerRunner):
+            def run(self, argv: list[str], **kwargs):  # noqa: ANN003
+                if argv[:3] == ["docker", "network", "inspect"]:
+                    return subprocess.CompletedProcess(
+                        argv,
+                        0,
+                        json.dumps(
+                            [{"id": argv[-1], "name": argv[-1], "labels": labels}]
+                        ),
+                        "",
+                    )
+                return super().run(argv, **kwargs)
+
+        backend = self._make(LowercaseNetworkRunner())
+
+        assert backend._inspect_resource_labels(
+            tmp_path,
+            "network",
+            "podman-network",
+        ) == labels
+
+    @pytest.mark.parametrize("lowercase", [False, True])
+    def test_network_reuse_refuses_foreign_attached_container(
+        self,
+        tmp_path: Path,
+        lowercase: bool,
+    ) -> None:
+        runner = _FakeContainerRunner(lowercase_network_inspect=lowercase)
+        backend = self._make(runner)
+        source = tmp_path / "repo" / ".spec-workspaces" / "same-run" / "source"
+        labels = backend._resource_labels(
+            run_id="same-run",
+            spec_id="same",
+            workspace_root=source,
+        )
+        network = backend._service_network_names("same-run", "sidecar", source)[0]
+        runner.owned_network_ids.add(network)
+        runner.resource_labels[("network", network)] = labels
+        runner.ps_container_ids.add("foreign-container")
+        runner.network_containers[network] = {"foreign-container"}
+        runner.resource_labels[("container", "foreign-container")] = labels | {
+            "spec.workspace_root": str(tmp_path / "foreign" / "source")
+        }
+
+        with pytest.raises(RuntimeError, match="not owned by this checkout"):
+            backend._require_network_safe_to_use(tmp_path, network, labels)
+
     def test_playwright_mcp_sidecar_connects_to_service_network(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
         runner = _FakeContainerRunner()
         playwright_mcp = replace(
             ContainerExecutionConfig().playwright_mcp,
@@ -3021,6 +5342,15 @@ class TestContainerBackend:
         assert any(
             call[:2] == ["docker", "run"] and "@playwright/test/package.json" in call[-1] for call in runner.calls
         )
+        detection_call = next(
+            call
+            for call in runner.calls
+            if call[:2] == ["docker", "run"]
+            and "@playwright/test/package.json" in call[-1]
+        )
+        assert "spec.owner=spec-runtime" in detection_call
+        assert "spec.run_id=my-feature-abc" in detection_call
+        assert any(item.startswith("spec.workspace_root=") for item in detection_call)
 
     def test_playwright_mcp_version_detection_normalizes_semver_range(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -3056,6 +5386,8 @@ class TestContainerBackend:
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
         runner = _FakeContainerRunner(fail_compose_up=True)
         backend = self._make(runner, compose_file="compose.yaml")
 
@@ -3116,6 +5448,48 @@ class TestContainerBackend:
         assert failure["container_id"] == "container-123"
         assert run_root.exists()
 
+    def test_worker_start_log_failure_still_quiesces_created_container(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.materialize_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        original_log = backend._write_image_log
+
+        def fail_worker_log(logs, name, result, **kwargs):
+            if name == "in-worker-services.log":
+                raise OSError("log path became unwritable")
+            return original_log(logs, name, result, **kwargs)
+
+        runner.calls.clear()
+        with (
+            patch.object(backend, "_write_image_log", side_effect=fail_worker_log),
+            pytest.raises(OSError, match="unwritable"),
+        ):
+            backend.run_command(
+                eb.CommandRequest(argv=["true"], cwd=handle.path)
+            )
+
+        assert any(
+            call[:3] == ["docker", "rm", "-f"] and call[-1] == "container-123"
+            for call in runner.calls
+        )
+        assert "container-123" not in runner.ps_container_ids
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        assert not state.get("worker_container")
+        assert state.get("containers") == []
+
     def test_prepare_workspace_failure_tears_down_resources_but_keeps_logs(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -3137,7 +5511,8 @@ class TestContainerBackend:
 
         run_root = repo / ".spec-workspaces" / "my-feature-abc"
         # The workspace volume created earlier in prepare_workspace is removed.
-        assert any(call[:4] == ["docker", "volume", "rm", "-f"] for call in runner.calls), runner.calls
+        assert any(call[:3] == ["docker", "volume", "rm"] for call in runner.calls), runner.calls
+        assert not any(call[:4] == ["docker", "volume", "rm", "-f"] for call in runner.calls)
         # The worker container is removed too.
         assert any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
         # But the run root / diagnostic survive (teardown is not a full rmtree).
@@ -3562,6 +5937,8 @@ class TestContainerBackend:
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
         runner = _FakeContainerRunner()
         backend = self._make(
             runner,
@@ -3714,14 +6091,18 @@ class TestContainerBackend:
             )
         )
 
-        agent_call = runner.calls[-1]
+        agent_call, agent_env = next(
+            (call, env)
+            for call, env in reversed(list(zip(runner.calls, runner.envs, strict=True)))
+            if call[:2] == ["docker", "exec"]
+        )
         assert result.returncode == 0
         assert agent_call[:2] == ["docker", "exec"]
         # Agents report completion through the outbox, so they keep the real
         # path — and their HOME comes from the launch env, never the pin.
         assert "SPEC_COMPLETION_OUTBOX=/workspace/outbox/completion-report.json" in agent_call
         assert "HOME=/workspace/source/.spec-claude-home" not in agent_call
-        assert runner.envs[-1] is not None
+        assert agent_env is not None
         for key, value in {
             "APP_FEATURE_FLAG": "agent-feature-enabled",
             "DATABASE_URL": "postgres://agent:credential@db/spec",
@@ -3730,7 +6111,345 @@ class TestContainerBackend:
         }.items():
             assert key in agent_call
             assert f"{key}={value}" not in agent_call
-            assert runner.envs[-1][key] == value
+            assert agent_env[key] == value
+
+    def test_agent_log_failure_happens_only_after_runtime_is_quiesced(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        runner.calls.clear()
+
+        with (
+            patch.object(
+                backend,
+                "_write_command_log",
+                side_effect=OSError("agent log is unwritable"),
+            ),
+            pytest.raises(OSError, match="agent log is unwritable"),
+        ):
+            backend.launch_agent(
+                eb.AgentRequest(
+                    argv=["claude", "-p", "implement"],
+                    cwd=handle.path,
+                )
+            )
+
+        assert any(
+            call[:3] == ["docker", "rm", "-f"] and call[-1] == "container-123"
+            for call in runner.calls
+        )
+        assert "container-123" not in runner.ps_container_ids
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        assert not state.get("worker_container")
+        assert state.get("containers") == []
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX FIFO support")
+    @pytest.mark.parametrize(
+        "poison",
+        [
+            "head-fifo",
+            "objects-symlink",
+            "alternates",
+            "commondir-fifo",
+            "gitdir-pointer",
+        ],
+    )
+    def test_agent_completion_rejects_unsafe_git_metadata_without_running_git(
+        self,
+        tmp_path: Path,
+        poison: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        git_dir = handle.path / ".git"
+        if poison == "head-fifo":
+            (git_dir / "HEAD").unlink()
+            os.mkfifo(git_dir / "HEAD")
+        elif poison == "objects-symlink":
+            outside_objects = tmp_path / "outside-objects"
+            (git_dir / "objects").rename(outside_objects)
+            os.symlink(outside_objects, git_dir / "objects")
+        elif poison == "alternates":
+            alternates = git_dir / "objects" / "info" / "alternates"
+            alternates.parent.mkdir(parents=True, exist_ok=True)
+            alternates.write_text(str(tmp_path / "outside-objects") + "\n")
+        elif poison == "commondir-fifo":
+            common = handle.outbox_path / "common"
+            (common / "objects").mkdir(parents=True)
+            (common / "refs").mkdir()
+            os.mkfifo(common / "packed-refs")
+            (git_dir / "commondir").write_text("../../outbox/common\n")
+        else:
+            (git_dir / "gitdir").write_text("../../outbox/redirected-gitdir\n")
+
+        started = time.monotonic()
+        with pytest.raises(
+            RuntimeError,
+            match=(
+                "Git metadata|Git HEAD|alternates|special files|symbolic links|"
+                "linked-worktree control files"
+            ),
+        ):
+            backend.launch_agent(
+                eb.AgentRequest(
+                    argv=["claude", "-p", "implement"],
+                    cwd=handle.path,
+                )
+            )
+        assert time.monotonic() - started < 5
+        assert any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
+
+    def test_git_metadata_entry_limit_streams_instead_of_materializing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        original_scandir = os.scandir
+        yielded = 0
+        closed = False
+
+        class CountingScandir:
+            def __init__(self, path):  # noqa: ANN001
+                self._entries = original_scandir(path)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                nonlocal closed
+                closed = True
+                self._entries.close()
+
+            def __iter__(self):
+                nonlocal yielded
+                for entry in self._entries:
+                    yielded += 1
+                    yield entry
+
+        monkeypatch.setattr(eb, "_CONTAINER_GIT_METADATA_MAX_ENTRIES", 2)
+        monkeypatch.setattr(eb.os, "scandir", CountingScandir)
+
+        with pytest.raises(RuntimeError, match="structural safety limit"):
+            eb.ContainerExecutionBackend._validate_container_git_metadata_for_host(repo)
+
+        assert yielded == 3
+        assert closed is True
+
+    def test_git_metadata_rejects_directory_reparse_point_without_recursing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        git_dir = repo / ".git"
+        outside = tmp_path / "outside-git-metadata"
+        outside.mkdir()
+        scandir_calls: list[Path] = []
+
+        class ReparseEntry:
+            path = str(outside)
+
+            @staticmethod
+            def stat(*, follow_symlinks: bool) -> SimpleNamespace:
+                assert follow_symlinks is False
+                return SimpleNamespace(
+                    st_mode=outside.stat().st_mode,
+                    st_file_attributes=0x400,
+                )
+
+        class Entries:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def __iter__(self):
+                return iter([ReparseEntry()])
+
+        def fake_scandir(path: Path) -> Entries:
+            scandir_calls.append(Path(path))
+            if Path(path) != git_dir:
+                raise AssertionError(f"validator followed reparse point to {path}")
+            return Entries()
+
+        monkeypatch.setattr(eb.os, "scandir", fake_scandir)
+
+        with pytest.raises(RuntimeError, match="reparse points"):
+            eb.ContainerExecutionBackend._validate_container_git_metadata_for_host(repo)
+
+        assert scandir_calls == [git_dir]
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink support")
+    def test_agent_completion_replaces_linked_config_without_touching_target(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        external = tmp_path / "operator-config"
+        external.write_text("operator-owned\n")
+        config = handle.path / ".git" / "config"
+        config.unlink()
+        os.symlink(external, config)
+
+        result = backend.launch_agent(
+            eb.AgentRequest(
+                argv=["claude", "-p", "implement"],
+                cwd=handle.path,
+            )
+        )
+
+        assert result.returncode == 0
+        assert external.read_text() == "operator-owned\n"
+        assert config.is_file() and not config.is_symlink()
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires executable POSIX script")
+    def test_agent_completion_disables_agent_configured_fsmonitor(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        marker = tmp_path / "fsmonitor-ran"
+        monitor = tmp_path / "fsmonitor.sh"
+        monitor.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        monitor.chmod(0o755)
+        _git_ok("config", "core.fsmonitor", str(monitor), cwd=handle.path)
+
+        result = backend.launch_agent(
+            eb.AgentRequest(
+                argv=["claude", "-p", "implement"],
+                cwd=handle.path,
+            )
+        )
+
+        assert result.returncode == 0
+        assert not marker.exists()
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX FIFO and script support")
+    def test_host_git_does_not_enter_agent_controlled_submodule_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        submodule_source = tmp_path / "submodule-source"
+        _init_clone_source(repo)
+        _init_clone_source(submodule_source)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        added = subprocess.run(
+            [
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                str(submodule_source),
+                "child",
+            ],
+            cwd=handle.path,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert added.returncode == 0, added.stderr
+        _git_ok("commit", "-am", "add child", cwd=handle.path)
+
+        marker = tmp_path / "nested-fsmonitor-ran"
+        monitor = tmp_path / "nested-fsmonitor.sh"
+        monitor.write_text(f"#!/bin/sh\ntouch {marker}\nexit 0\n")
+        monitor.chmod(0o755)
+        _git_ok("config", "core.fsmonitor", str(monitor), cwd=handle.path / "child")
+        fifo = tmp_path / "nested-config-include"
+        os.mkfifo(fifo)
+        nested_config = handle.path / ".git" / "modules" / "child" / "config"
+        nested_config.write_text(
+            nested_config.read_text()
+            + f"\n[include]\n\tpath = {fifo}\n",
+            encoding="utf-8",
+        )
+        (handle.path / "child" / "README.md").write_text("dirty submodule\n")
+
+        backend.prepare_host_access(handle)
+        started = time.monotonic()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=handle.path,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+
+        assert status.returncode == 0, status.stderr
+        assert time.monotonic() - started < 5
+        assert not marker.exists()
+
+        with pytest.raises(
+            eb.WorkspaceHasUnpushedWorkError,
+            match="checked-out submodule",
+        ):
+            backend.cleanup(handle)
+
+        assert (handle.path / "child" / "README.md").read_text() == (
+            "dirty submodule\n"
+        )
+        assert not marker.exists()
 
     def test_agent_launch_does_not_export_undeclared_ambient_secret(
         self,
@@ -3761,7 +6480,11 @@ class TestContainerBackend:
                 )
             )
 
-        agent_call = runner.calls[-1]
+        agent_call = next(
+            call
+            for call in reversed(runner.calls)
+            if call[:2] == ["docker", "exec"]
+        )
         exported_names = {
             agent_call[index + 1]
             for index, value in enumerate(agent_call[:-1])
@@ -3824,7 +6547,11 @@ class TestContainerBackend:
             eb.AgentRequest(argv=["claude", "-p", "implement"], cwd=handle.path)
         )
 
-        agent_call = runner.calls[-1]
+        agent_call = next(
+            call
+            for call in reversed(runner.calls)
+            if call[:2] == ["docker", "exec"]
+        )
         assert f"PATH={eb.CONTAINER_BOOTSTRAP_PATH}" in agent_call
         assert "/workspace/source/.venv/bin" not in " ".join(
             arg for arg in agent_call if arg.startswith("PATH=")
@@ -3859,7 +6586,11 @@ class TestContainerBackend:
             )
         )
 
-        agent_call = runner.calls[-1]
+        agent_call = next(
+            call
+            for call in reversed(runner.calls)
+            if call[:2] == ["docker", "exec"]
+        )
         assert result.returncode == 0
         assert agent_call[:2] == ["docker", "exec"]
         sandbox_index = agent_call.index("-s")
@@ -4013,6 +6744,8 @@ class TestContainerBackend:
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
         runner = _FakeContainerRunner()
         backend = self._make(runner, compose_file="compose.yaml")
         with patch("shutil.which", return_value="/usr/bin/docker"):
@@ -4324,6 +7057,204 @@ class TestContainerBackend:
         assert "spec.run_id=my-feature-abc" in seed_calls[-1]
         assert "find /workspace/source -mindepth 1 -maxdepth 1 -exec rm -rf {} +" in " ".join(seed_calls[-1])
 
+    def test_volume_seed_refuses_same_named_foreign_volume(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        other_repo = tmp_path / "other-repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(
+            runner,
+            workspace_mode="volume",
+            system_name="Darwin",
+        )
+        volume = backend._volume_names(
+            "my-feature-abc",
+            "volume",
+            repo / ".spec-workspaces" / "my-feature-abc" / "source",
+        )[0]
+        runner.owned_volume_ids.add(volume)
+        runner.resource_labels[("volume", volume)] = backend._resource_labels(
+            run_id="my-feature-abc",
+            spec_id="my-feature",
+            workspace_root=(
+                other_repo
+                / ".spec-workspaces"
+                / "my-feature-abc"
+                / "source"
+            ),
+        )
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="not owned by this checkout"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert volume in runner.owned_volume_ids
+        assert not any(
+            call[:3] == ["docker", "volume", "rm"] and volume in call
+            for call in runner.calls
+        )
+        assert not any("/workspace/seed:ro" in " ".join(call) for call in runner.calls)
+
+    def test_volume_seed_refuses_locally_labeled_volume_with_foreign_consumer(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        other_repo = tmp_path / "other-repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(
+            runner,
+            workspace_mode="volume",
+            system_name="Darwin",
+        )
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        volume = state["workspace_volumes"][0]
+        runner.ps_container_ids.add("foreign-consumer")
+        runner.container_volumes["foreign-consumer"] = {volume}
+        runner.resource_labels[("container", "foreign-consumer")] = (
+            backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=(
+                    other_repo
+                    / ".spec-workspaces"
+                    / "my-feature-abc"
+                    / "source"
+                ),
+            )
+        )
+        runner.calls.clear()
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="not owned by this checkout"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert volume in runner.owned_volume_ids
+        assert "foreign-consumer" in runner.ps_container_ids
+        assert not any("/workspace/seed:ro" in " ".join(call) for call in runner.calls)
+        assert not any(
+            call[:3] == ["docker", "volume", "rm"] and volume in call
+            for call in runner.calls
+        )
+
+    def test_worker_start_rechecks_workspace_volume_after_seed(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        other_repo = tmp_path / "other-repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, workspace_mode="volume", system_name="Darwin")
+        volume = backend._volume_names(
+            "my-feature-abc",
+            "volume",
+            repo / ".spec-workspaces" / "my-feature-abc" / "source",
+        )[0]
+        original_seed = backend._seed_volume_workspace
+
+        def seed_then_replace(workspace, state):
+            original_seed(workspace, state)
+            runner.resource_labels[("volume", volume)] = backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=(
+                    other_repo
+                    / ".spec-workspaces"
+                    / "my-feature-abc"
+                    / "source"
+                ),
+            )
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch.object(
+                backend,
+                "_seed_volume_workspace",
+                side_effect=seed_then_replace,
+            ),
+            pytest.raises(RuntimeError, match="not owned by this checkout"),
+        ):
+            backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert not any(
+            call[:3] == ["docker", "run", "-d"]
+            and "sleep infinity" in call[-1]
+            for call in runner.calls
+        )
+
+    def test_startup_failure_preserves_preexisting_owned_workspace_volume(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(
+            runner,
+            workspace_mode="volume",
+            system_name="Darwin",
+        )
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        volume = state["workspace_volumes"][0]
+        runner.fail_in_worker_run = True
+        runner.calls.clear()
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            with pytest.raises(RuntimeError, match="in-worker service startup failed"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc",
+                    spec_id="my-feature",
+                    branch="code/my-feature--abc",
+                    repo_root=repo,
+                    base_ref="master",
+                )
+
+        assert volume in runner.owned_volume_ids
+        assert not any(
+            call[:3] == ["docker", "volume", "rm"] and volume in call
+            for call in runner.calls
+        )
+        assert any(
+            call[:3] == ["docker", "rm", "-f"] and "container-123" in call
+            for call in runner.calls
+        )
+
     def test_ignores_worker_writable_container_state_for_mounts_and_cleanup(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -4361,8 +7292,8 @@ class TestContainerBackend:
 
         backend.cleanup(handle)
         cleanup_text = "\n".join(" ".join(call) for call in runner.calls)
-        assert f"volume rm -f {expected_volume}" in cleanup_text
-        assert "volume rm -f /:/workspace/source" not in cleanup_text
+        assert f"volume rm {expected_volume}" in cleanup_text
+        assert "volume rm /:/workspace/source" not in cleanup_text
         assert "network rm attacker-network" not in cleanup_text
 
     def test_volume_mode_imports_worker_changes_back_to_host(self, tmp_path: Path):
@@ -4381,6 +7312,10 @@ class TestContainerBackend:
             )
 
         backend.run_command(eb.CommandRequest(argv=["sh", "-lc", "touch file"], cwd=handle.path))
+        # Volume work remains authoritative while the worker is live.  The
+        # explicit host-access boundary removes every writer and only then
+        # imports it into the host mirror.
+        backend.prepare_host_access(handle)
 
         import_calls = [
             call
@@ -4388,13 +7323,20 @@ class TestContainerBackend:
             if "/workspace/source:ro" in " ".join(call) and "/workspace/host" in " ".join(call)
         ]
         assert import_calls
-        assert f"{handle.path}:/workspace/host" in import_calls[-1]
+        import_mount = next(
+            item for item in import_calls[-1] if item.endswith(":/workspace/host")
+        )
+        assert import_mount.startswith(
+            f"{handle.outbox_path.parent}/.spec-volume-import-"
+        )
+        assert not any(
+            child.name.startswith(".spec-volume-import-")
+            for child in handle.outbox_path.parent.iterdir()
+        )
 
-    def test_volume_mode_import_uses_bounded_find_cleanup(self, tmp_path: Path):
-        """The import cleanup must bound find to the
-        top-level entries (-maxdepth 1) so find never descends into a directory
-        that rm -rf has already deleted (notably under .git/objects), which made
-        find exit nonzero and skip the cp -a import."""
+    def test_volume_mode_import_stages_before_replacing_host_tree(self, tmp_path: Path):
+        """Import into a fresh sibling so copy failure cannot partially wipe the
+        current host mirror; the bounded source walk still handles dotfiles."""
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         runner = _FakeContainerRunner()
@@ -4410,6 +7352,7 @@ class TestContainerBackend:
             )
 
         backend.run_command(eb.CommandRequest(argv=["sh", "-lc", "touch file"], cwd=handle.path))
+        backend.prepare_host_access(handle)
 
         import_calls = [
             call
@@ -4418,8 +7361,7 @@ class TestContainerBackend:
         ]
         assert import_calls
         joined = " ".join(import_calls[-1])
-        assert "find /workspace/host -mindepth 1 -maxdepth 1 -exec rm -rf {} +" in joined
-        assert "find /workspace/host -mindepth 1 -exec rm -rf {} +" not in joined
+        assert "find /workspace/host" not in joined
         assert "find /workspace/source -mindepth 1 -maxdepth 1 -exec sh -c" in joined
         assert 'cp -a "$@" /workspace/host/' in joined
         assert "cp -a -t /workspace/host" not in joined
@@ -4440,8 +7382,9 @@ class TestContainerBackend:
                 base_ref="master",
             )
 
+        backend.run_command(eb.CommandRequest(argv=["sh", "-lc", "touch file"], cwd=handle.path))
         with pytest.raises(eb.ExecutionBackendImportError) as exc_info:
-            backend.run_command(eb.CommandRequest(argv=["sh", "-lc", "touch file"], cwd=handle.path))
+            backend.prepare_host_access(handle)
 
         log_path = handle.outbox_path.parent / "logs" / "volume-import.log"
         failure_path = handle.outbox_path.parent / "logs" / "volume-import-failure.json"
@@ -4453,13 +7396,43 @@ class TestContainerBackend:
         assert failure["log_path"] == str(log_path)
         assert "copy failed" in log_path.read_text()
 
+    def test_volume_import_failure_preserves_current_host_tree(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner(fail_volume_import=True)
+        backend = self._make(runner, workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        marker = handle.path / "host-mirror-marker.txt"
+        marker.write_text("preserve me\n")
+
+        backend.run_command(
+            eb.CommandRequest(argv=["sh", "-lc", "touch file"], cwd=handle.path)
+        )
+        with pytest.raises(eb.ExecutionBackendImportError):
+            backend.prepare_host_access(handle)
+
+        assert marker.read_text() == "preserve me\n"
+        assert not any(
+            child.name.startswith(".spec-volume-import-")
+            for child in handle.outbox_path.parent.iterdir()
+        )
+
     def test_volume_cleanup_syncs_volume_before_deletability_guard(self, tmp_path: Path):
         """Regression: in volume mode the authoritative git state lives inside
         the Docker volume. If a crash (or a cleanup/resume before the post-run
         sync) leaves work only in the volume, the host mirror can read clean.
         ``cleanup`` must sync the volume back to the host and re-check
         deletability *before* removing any docker resources, so unsynced agent
-        work is never destroyed by ``volume rm -f``."""
+        work is never destroyed by ``volume rm``."""
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         runner = _FakeContainerRunner()
@@ -4490,10 +7463,10 @@ class TestContainerBackend:
 
         synced.assert_called_once()
         # The guard fired before any docker resource was torn down.
-        assert not any("volume rm -f" in " ".join(call) for call in runner.calls)
+        assert not any(call[:3] == ["docker", "volume", "rm"] for call in runner.calls)
         assert source.exists()
 
-        # The explicit post-merge / spec-clean opt-out skips the guard (and the
+        # The explicit operator spec-clean opt-out skips the guard (and the
         # extra sync) and still deletes the workspace.
         with patch.object(
             backend, "_sync_volume_workspace_to_host", side_effect=_fake_sync
@@ -4501,6 +7474,138 @@ class TestContainerBackend:
             backend.cleanup(handle, allow_unpushed_work=True)
         synced_allowed.assert_not_called()
         assert not source.exists()
+
+    def test_volume_cleanup_refuses_foreign_consumer_before_import_or_removal(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        other_repo = tmp_path / "other-repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        volume = state["workspace_volumes"][0]
+        runner.ps_container_ids.add("foreign-consumer")
+        runner.container_volumes["foreign-consumer"] = {volume}
+        runner.resource_labels[("container", "foreign-consumer")] = (
+            backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=(
+                    other_repo
+                    / ".spec-workspaces"
+                    / "my-feature-abc"
+                    / "source"
+                ),
+            )
+        )
+        runner.calls.clear()
+
+        with pytest.raises(OSError, match="not owned by this checkout"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert handle.outbox_path.parent.exists()
+        assert "foreign-consumer" in runner.ps_container_ids
+        assert volume in runner.owned_volume_ids
+        assert not any(
+            "/workspace/source:ro" in " ".join(call)
+            and "/workspace/host" in " ".join(call)
+            for call in runner.calls
+        )
+        assert not any(
+            call[:3] in (["docker", "rm", "-f"], ["docker", "volume", "rm"])
+            for call in runner.calls
+        )
+
+    @pytest.mark.parametrize("request_kind", ["command", "agent"])
+    def test_volume_execution_refuses_foreign_consumer_before_command(
+        self,
+        tmp_path: Path,
+        request_kind: str,
+    ):
+        repo = tmp_path / "repo"
+        other_repo = tmp_path / "other-repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        volume = state["workspace_volumes"][0]
+        runner.ps_container_ids.add("foreign-consumer")
+        runner.container_volumes["foreign-consumer"] = {volume}
+        runner.resource_labels[("container", "foreign-consumer")] = (
+            backend._resource_labels(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                workspace_root=(
+                    other_repo
+                    / ".spec-workspaces"
+                    / "my-feature-abc"
+                    / "source"
+                ),
+            )
+        )
+        runner.calls.clear()
+
+        with pytest.raises(RuntimeError, match="not owned by this checkout"):
+            if request_kind == "command":
+                backend.run_command(
+                    eb.CommandRequest(argv=["unsafe-command"], cwd=handle.path)
+                )
+            else:
+                backend.launch_agent(
+                    eb.AgentRequest(argv=["unsafe-agent"], cwd=handle.path)
+                )
+
+        assert not any(call[:2] in (["docker", "exec"], ["docker", "run"]) for call in runner.calls)
+
+    def test_volume_execution_refuses_runtime_inventory_failure_before_command(
+        self,
+        tmp_path: Path,
+    ):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        runner.calls.clear()
+        runner.fail_ps = True
+
+        with pytest.raises(OSError, match="runtime health discovery failed"):
+            backend.run_command(
+                eb.CommandRequest(argv=["unsafe-command"], cwd=handle.path)
+            )
+
+        assert not any(call[:2] in (["docker", "exec"], ["docker", "run"]) for call in runner.calls)
 
     def test_volume_restore_syncs_volume_before_rescuing_unpushed_work(self, tmp_path: Path):
         """Regression: in volume mode the authoritative git state lives inside the
@@ -4656,6 +7761,18 @@ class TestContainerBackend:
         before_head = _git("rev-parse", "HEAD", cwd=handle.path).stdout.strip()
 
         snapshot = backend.snapshot(handle, "pre-implement")
+        pause_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:2] == ["docker", "pause"]
+        )
+        unpause_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:2] == ["docker", "unpause"]
+        )
+        assert pause_index < unpause_index
+        assert runner.paused_container_ids == set()
         (handle.path / "file.txt").write_text("after\n")
         (handle.path / "link.txt").unlink()
         (handle.path / "link.txt").write_text("dereferenced\n")
@@ -4680,7 +7797,7 @@ class TestContainerBackend:
         rescue_index = json.loads((restored.outbox_path.parent / "rescue" / "index.json").read_text())
         assert rescue_index and rescue_index[-1]["unpushed_commits"]
         # The branch still carries unpushed commits, so cleanup is only allowed
-        # with the explicit post-merge opt-out.
+        # with the explicit operator spec-clean opt-out.
         backend.cleanup(restored, allow_unpushed_work=True)
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
@@ -4688,6 +7805,8 @@ class TestContainerBackend:
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
         runner = _FakeContainerRunner()
         backend = self._make(runner, compose_file="compose.yaml")
         with patch("shutil.which", return_value="/usr/bin/docker"):
@@ -4715,10 +7834,132 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    def test_volume_snapshot_copies_only_while_worker_is_paused(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="", workspace_mode="volume")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        runner.calls.clear()
+
+        backend.snapshot(handle, "pre-implement")
+
+        pause_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:2] == ["docker", "pause"]
+        )
+        import_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if any(item.endswith(":/workspace/source:ro") for item in call)
+            and any(item.endswith(":/workspace/host") for item in call)
+        )
+        unpause_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:2] == ["docker", "unpause"]
+        )
+        assert pause_index < import_index < unpause_index
+
+    def test_snapshot_rolls_back_pause_when_pause_inspection_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        original_run = runner.run
+        failed_once = False
+
+        def fail_first_post_pause_inspect(argv, **kwargs):
+            nonlocal failed_once
+            if (
+                not failed_once
+                and argv[:2] == ["docker", "inspect"]
+                and "{{.State.Paused}}" in argv
+                and any(call[:2] == ["docker", "pause"] for call in runner.calls)
+            ):
+                failed_once = True
+                runner.calls.append(list(argv))
+                runner.cwd_calls.append(kwargs["cwd"])
+                runner.envs.append(kwargs.get("env"))
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "",
+                    "pause state unavailable\n",
+                )
+            return original_run(argv, **kwargs)
+
+        with (
+            patch.object(runner, "run", side_effect=fail_first_post_pause_inspect),
+            pytest.raises(RuntimeError, match="inspect worker pause state"),
+        ):
+            backend.snapshot(handle, "pre-implement")
+
+        assert any(call[:2] == ["docker", "unpause"] for call in runner.calls)
+        assert runner.paused_container_ids == set()
+
+    def test_snapshot_restarts_sidecars_when_stop_verification_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        runner.fail_compose_stop_verification = True
+        runner.calls.clear()
+
+        with pytest.raises(RuntimeError, match="positively verify every sidecar"):
+            backend.snapshot(handle, "pre-implement")
+
+        compose_calls = [
+            call for call in runner.calls if call[:3] == ["docker", "compose", "-p"]
+        ]
+        assert any("stop" in call for call in compose_calls)
+        assert any("up" in call for call in compose_calls)
+        assert any(call[:2] == ["docker", "unpause"] for call in runner.calls)
+
     def test_sidecar_snapshot_aborts_when_services_do_not_stop_cleanly(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
         runner = _FakeContainerRunner(fail_compose_stop=True)
         backend = self._make(runner, compose_file="compose.yaml")
         with patch("shutil.which", return_value="/usr/bin/docker"):
@@ -4738,12 +7979,459 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    def test_snapshot_restart_failure_quiesces_before_next_runtime_generation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text("services:\n  db:\n    image: postgres:16\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state_path = Path(handle.metadata["container_state_path"])
+        old_worker = json.loads(state_path.read_text())["worker_container"]
+        runner.fail_compose_up = True
+
+        with pytest.raises(
+            eb.ExecutionBackendRuntimeResetError,
+            match="setup phase must be retried",
+        ):
+            backend.snapshot(handle, "pre-implement")
+
+        failed_state = json.loads(state_path.read_text())
+        assert failed_state["worker_container"] == ""
+        assert old_worker not in runner.ps_container_ids
+
+        runner.fail_compose_up = False
+        runner.calls.clear()
+        result = backend.run_command(
+            eb.CommandRequest(argv=["true"], cwd=handle.path)
+        )
+
+        assert result.returncode == 0
+        compose_up = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:3] == ["docker", "compose", "-p"] and "up" in call
+        )
+        worker_start = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:3] == ["docker", "run", "-d"]
+            and "sleep infinity" in call[-1]
+        )
+        agent_exec = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:2] == ["docker", "exec"]
+        )
+        assert compose_up < worker_start < agent_exec
+
+    def test_sidecar_snapshot_fails_closed_when_volume_inventory_fails(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+            "    volumes:\n      - data:/var/lib/postgresql/data\n"
+            "volumes:\n  data: {}\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        runner.calls.clear()
+        original_run = runner.run
+        volume_inventory_calls = 0
+
+        def fail_refresh_inventory(argv, **kwargs):
+            nonlocal volume_inventory_calls
+            if argv[:2] == ["docker", "volume"] and "ls" in argv:
+                volume_inventory_calls += 1
+                if volume_inventory_calls == 2:
+                    runner.calls.append(list(argv))
+                    runner.cwd_calls.append(kwargs["cwd"])
+                    runner.envs.append(kwargs.get("env"))
+                    return subprocess.CompletedProcess(
+                        argv,
+                        1,
+                        "",
+                        "volume inventory unavailable\n",
+                    )
+            return original_run(argv, **kwargs)
+
+        with (
+            patch.object(runner, "run", side_effect=fail_refresh_inventory),
+            pytest.raises(RuntimeError, match="consistent snapshot"),
+        ):
+            backend.snapshot(handle, "pre-implement")
+
+        snapshot_path = handle.outbox_path.parent / "snapshots" / "pre-implement"
+        assert not snapshot_path.exists()
+        assert any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+
+    def test_completed_sidecar_snapshot_is_immutable_on_setup_retry(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+            "    volumes:\n      - data:/var/lib/postgresql/data\n"
+            "volumes:\n  data: {}\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        first = backend.snapshot(handle, "pre-implement")
+        runner.calls.clear()
+
+        second = backend.snapshot(handle, "pre-implement")
+
+        assert second.path == first.path
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "stop" in call
+            for call in runner.calls
+        )
+        assert not any(
+            call[:2] == ["docker", "run"]
+            and any("/workspace/service-volume:ro" in item for item in call)
+            for call in runner.calls
+        )
+
+    def test_runtime_generation_accepts_successful_one_shot_compose_job(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  migrate:\n    image: busybox\n",
+            encoding="utf-8",
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add one-shot service", cwd=repo)
+        runner = _FakeContainerRunner(compose_service_exit_code_after_up=0)
+        backend = self._make(runner, compose_file="compose.yaml")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        completed = next(
+            container_id
+            for container_id, status in runner.container_statuses.items()
+            if status == "exited"
+        )
+        assert completed not in state["runtime_generation_containers"]
+        runner.calls.clear()
+
+        result = backend.run_command(eb.CommandRequest(argv=["true"], cwd=handle.path))
+
+        assert result.returncode == 0
+        assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+
+    def test_runtime_generation_rejects_failed_compose_job_and_quiesces(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n",
+            encoding="utf-8",
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add service", cwd=repo)
+        runner = _FakeContainerRunner(compose_service_exit_code_after_up=1)
+        backend = self._make(runner, compose_file="compose.yaml")
+
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            pytest.raises(RuntimeError, match="unhealthy exact-owned container"),
+        ):
+            backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        run_root = repo / ".spec-workspaces" / "my-feature-abc"
+        state = json.loads(
+            (run_root / "backend-state" / "container-backend-state.json").read_text()
+        )
+        assert state["runtime_generation_status"] == "quiesced"
+        assert state["runtime_generation_containers"] == []
+        assert state["worker_container"] == ""
+        assert runner.ps_container_ids == set()
+
+    @pytest.mark.parametrize(
+        ("status", "exit_code"),
+        [("created", 0), ("dead", 0), ("exited", 1)],
+    )
+    def test_runtime_health_rebuilds_for_unhealthy_omitted_member(
+        self,
+        tmp_path: Path,
+        status: str,
+        exit_code: int,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        original = json.loads(state_path.read_text())
+        unhealthy = "unhealthy-generation-member"
+        runner.ps_container_ids.add(unhealthy)
+        runner.container_statuses[unhealthy] = status
+        runner.container_exit_codes[unhealthy] = exit_code
+        runner.resource_labels[("container", unhealthy)] = original[
+            "resource_labels"
+        ]
+        runner.calls.clear()
+
+        result = backend.run_command(eb.CommandRequest(argv=["true"], cwd=handle.path))
+
+        assert result.returncode == 0
+        assert any(
+            call[:3] == ["docker", "rm", "-f"] and call[-1] == unhealthy
+            for call in runner.calls
+        )
+        refreshed = json.loads(state_path.read_text())
+        assert unhealthy not in refreshed["runtime_generation_containers"]
+        assert refreshed["runtime_generation_status"] == "running"
+
+    def test_host_suspend_skips_exact_owned_exited_compose_job(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        completed = "completed-migration"
+        runner.ps_container_ids.add(completed)
+        runner.container_statuses[completed] = "exited"
+        runner.container_exit_codes[completed] = 0
+        runner.resource_labels[("container", completed)] = state["resource_labels"]
+        runner.calls.clear()
+
+        backend.suspend_for_host_access(handle)
+
+        assert not any(
+            call[:2] == ["docker", "pause"] and call[-1] == completed
+            for call in runner.calls
+        )
+        persisted = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        assert completed not in persisted["host_access_paused_containers"]
+        assert "container-123" in persisted["host_access_paused_containers"]
+
+    def test_volume_suspend_resume_preserves_the_same_runtime_generation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="", workspace_mode="volume")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state_path = Path(handle.metadata["container_state_path"])
+        original = json.loads(state_path.read_text())
+        original_generation = original["runtime_generation_containers"]
+        runner.calls.clear()
+
+        backend.suspend_for_host_access(handle)
+        backend.resume_after_host_access(handle)
+
+        resumed = json.loads(state_path.read_text())
+        assert resumed["runtime_generation_containers"] == original_generation
+        assert resumed["host_access_paused_containers"] == []
+        assert not any(
+            call[:2] == ["docker", "run"]
+            and any(item.endswith(":/workspace/seed:ro") for item in call)
+            for call in runner.calls
+        )
+        assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
+        assert not any(
+            call[:3] == ["docker", "run", "-d"]
+            and "sleep infinity" in call[-1]
+            for call in runner.calls
+        )
+
+    def test_paused_runtime_death_quiesces_and_requires_setup_retry(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="", workspace_mode="volume")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        backend.suspend_for_host_access(handle)
+        runner.ps_container_ids.discard("container-123")
+        runner.container_statuses.pop("container-123", None)
+        runner.paused_container_ids.discard("container-123")
+        runner.calls.clear()
+
+        with pytest.raises(
+            eb.ExecutionBackendRuntimeResetError,
+            match="setup phase must be retried",
+        ):
+            backend.resume_after_host_access(handle)
+
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        assert state["worker_container"] == ""
+        assert state["runtime_generation_containers"] == []
+        assert state["host_access_paused_containers"] == []
+        assert not any(
+            call[:2] == ["docker", "run"]
+            and any(item.endswith(":/workspace/seed:ro") for item in call)
+            for call in runner.calls
+        )
+
+    @pytest.mark.parametrize("failed_member", ["worker", "sidecar"])
+    def test_command_replaces_incomplete_recorded_runtime_generation(
+        self,
+        tmp_path: Path,
+        failed_member: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        worker = state["worker_container"]
+        sidecar = next(
+            item
+            for item in state["runtime_generation_containers"]
+            if item != worker
+        )
+        failed = worker if failed_member == "worker" else sidecar
+        runner.container_statuses[failed] = "exited"
+        runner.calls.clear()
+
+        result = backend.run_command(eb.CommandRequest(argv=["true"], cwd=handle.path))
+
+        assert result.returncode == 0
+        removal_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:3] == ["docker", "rm", "-f"] and call[-1] == failed
+        )
+        compose_start = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:3] == ["docker", "compose", "-p"] and "up" in call
+        )
+        worker_start = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:3] == ["docker", "run", "-d"]
+            and "sleep infinity" in call[-1]
+        )
+        assert removal_index < compose_start < worker_start
+        refreshed = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        assert worker in refreshed["runtime_generation_containers"]
+        assert sidecar in refreshed["runtime_generation_containers"]
+
     def test_sidecar_restore_stops_services_before_importing_volume_snapshot(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
         runner = _FakeContainerRunner()
-        backend = self._make(runner, compose_file="compose.yaml")
+        backend = self._make(
+            runner,
+            compose_file="compose.yaml",
+            bootstrap_install_command="make install",
+        )
         with patch("shutil.which", return_value="/usr/bin/docker"):
             handle = backend.prepare_workspace(
                 run_id="my-feature-abc",
@@ -4757,10 +8445,10 @@ class TestContainerBackend:
 
         backend.restore(handle, snapshot)
 
-        compose_stop_index = next(
+        quiesce_index = next(
             index
             for index, call in enumerate(runner.calls)
-            if call[:3] == ["docker", "compose", "-p"] and "stop" in call
+            if call[:3] == ["docker", "rm", "-f"]
         )
         import_index = next(
             index
@@ -4769,11 +8457,220 @@ class TestContainerBackend:
             and any(":/workspace/service-volume" in item for item in call)
             and any(":/workspace/service-volume-snapshot:ro" in item for item in call)
         )
+        # Restore itself stays quiesced: no service, worker, or bootstrap may
+        # race the host tree/service-volume replacement.
+        assert quiesce_index < import_index
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+        assert not any(
+            call[:2] == ["docker", "exec"] and "make install" in call[-1]
+            for call in runner.calls
+        )
+
+        backend.resume_after_host_access(handle)
         compose_up_index = next(
             index for index, call in enumerate(runner.calls) if call[:3] == ["docker", "compose", "-p"] and "up" in call
         )
-        assert compose_stop_index < import_index
+        bootstrap_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:2] == ["docker", "exec"] and "make install" in call[-1]
+        )
         assert import_index < compose_up_index
+        assert compose_up_index < bootstrap_index
+
+    def test_sidecar_restore_stop_failure_preserves_current_workspace(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        snapshot = backend.snapshot(handle, "pre-implement")
+        marker = handle.path / "restore-must-not-run.txt"
+        marker.write_text("preserve current workspace\n")
+        runner.calls.clear()
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        sidecar = f"{state['compose_project']}-db-1"
+        runner.fail_rm_ids.add(sidecar)
+
+        with pytest.raises(RuntimeError, match="could not remove an exact-owned"):
+            backend.restore(handle, snapshot)
+
+        assert marker.read_text() == "preserve current workspace\n"
+        assert sidecar in runner.ps_container_ids
+        assert not any(
+            any(item.endswith(":/workspace/seed:ro") for item in call)
+            for call in runner.calls
+        )
+        assert not any(
+            call[:3] == ["docker", "run", "-d"]
+            and "sleep infinity" in call[-1]
+            for call in runner.calls
+        )
+        assert not any(
+            call[:3] == ["docker", "compose", "-p"] and "up" in call
+            for call in runner.calls
+        )
+
+    def test_sidecar_restore_preflights_all_archives_before_any_mutation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+            "    volumes:\n"
+            "      - first:/var/lib/postgresql/data\n"
+            "      - second:/var/lib/postgresql/extra\n"
+            "volumes:\n  first: {}\n  second: {}\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        snapshot = backend.snapshot(handle, "pre-implement")
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        archives = state["service_volume_snapshots"]["pre-implement"]
+        archive_record = archives[sorted(archives)[-1]]
+        Path(archive_record["path"]).unlink()
+        marker = handle.path / "restore-must-not-run.txt"
+        marker.write_text("preserve current source\n")
+        runner.calls.clear()
+
+        with pytest.raises(RuntimeError, match="archive is missing"):
+            backend.restore(handle, snapshot)
+
+        assert marker.read_text() == "preserve current source\n"
+        assert not any(
+            call[:2] == ["docker", "run"]
+            and any(item.endswith(":/workspace/service-volume") for item in call)
+            and any(
+                item.endswith(":/workspace/service-volume-snapshot:ro")
+                for item in call
+            )
+            for call in runner.calls
+        )
+
+    @pytest.mark.parametrize("archive_index", [0, -1])
+    def test_sidecar_restore_rejects_corrupt_archive_before_any_volume_wipe(
+        self,
+        tmp_path: Path,
+        archive_index: int,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+            "    volumes:\n"
+            "      - first:/var/lib/postgresql/data\n"
+            "      - second:/var/lib/postgresql/extra\n"
+            "volumes:\n  first: {}\n  second: {}\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        snapshot = backend.snapshot(handle, "pre-implement")
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        archives = state["service_volume_snapshots"]["pre-implement"]
+        selected_volume = sorted(archives)[archive_index]
+        Path(archives[selected_volume]["path"]).write_bytes(b"truncated")
+        runner.calls.clear()
+
+        with pytest.raises(RuntimeError, match="failed its integrity check"):
+            backend.restore(handle, snapshot)
+
+        assert not any(
+            call[:2] == ["docker", "run"]
+            and "find /workspace/service-volume -mindepth 1" in call[-1]
+            for call in runner.calls
+        )
+
+    def test_sidecar_restore_rechecks_volume_consumers_immediately_before_wipe(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        (repo / "compose.yaml").write_text(
+            "services:\n  db:\n    image: postgres:16\n"
+            "    volumes:\n      - data:/var/lib/postgresql/data\n"
+            "volumes:\n  data: {}\n"
+        )
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, compose_file="compose.yaml")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        backend.snapshot(handle, "pre-implement")
+        run_root = handle.outbox_path.parent
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        prepared = backend._validated_sidecar_service_volume_restore(
+            run_root,
+            state,
+            "pre-implement",
+        )
+        volume = prepared[0][0]
+        foreign = "foreign-consumer"
+        runner.ps_container_ids.add(foreign)
+        runner.container_statuses[foreign] = "running"
+        runner.container_volumes[foreign] = {volume}
+        runner.resource_labels[("container", foreign)] = {
+            "spec.owner": "someone-else"
+        }
+        runner.calls.clear()
+
+        with pytest.raises(RuntimeError, match="not owned by this checkout"):
+            backend._restore_sidecar_service_volumes(
+                run_root,
+                state,
+                "pre-implement",
+                prepared=prepared,
+            )
+
+        assert not any(
+            call[:2] == ["docker", "run"]
+            and "find /workspace/service-volume -mindepth 1" in call[-1]
+            for call in runner.calls
+        )
 
     def test_in_worker_restore_recreates_persistent_worker_container(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -4803,6 +8700,16 @@ class TestContainerBackend:
             for index, call in enumerate(runner.calls)
             if call[:3] == ["docker", "rm", "-f"] and "container-123" in call
         )
+        assert not any(
+            call[:2] == ["docker", "run"] and "sleep infinity" in call[-1]
+            for call in runner.calls
+        )
+        quiesced_state = json.loads(
+            (restored.outbox_path.parent / "backend-state" / "container-backend-state.json").read_text()
+        )
+        assert quiesced_state["worker_container"] == ""
+
+        backend.resume_after_host_access(restored)
         restart_index = next(
             index
             for index, call in enumerate(runner.calls)
@@ -4813,6 +8720,37 @@ class TestContainerBackend:
         assert (restored.path / ".local" / "postgres" / "data" / "seeded.txt").read_text() == "seeded\n"
         assert state["worker_container"] == "container-123"
         assert state["service_processes"][0]["container_id"] == "container-123"
+
+    def test_restore_aborts_when_worker_removal_is_not_verified(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, workspace_mode="volume")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        snapshot = backend.snapshot(handle, "pre-implement")
+        marker = handle.path / "restore-must-not-run.txt"
+        marker.write_text("preserve current workspace\n")
+        runner.fail_rm_ids.add("container-123")
+        runner.calls.clear()
+
+        with pytest.raises(RuntimeError, match="could not remove an exact-owned"):
+            backend.restore(handle, snapshot)
+
+        assert marker.read_text() == "preserve current workspace\n"
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        assert state["worker_container"] == "container-123"
+        assert not any("/workspace/seed:ro" in " ".join(call) for call in runner.calls)
+        assert not any(
+            call[:3] == ["docker", "run", "-d"] and "sleep infinity" in call[-1]
+            for call in runner.calls
+        )
 
     def test_restore_reruns_bootstrap_install_after_worker_reset(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -4830,7 +8768,12 @@ class TestContainerBackend:
         snapshot = backend.snapshot(handle, "pre-implement")
         runner.calls.clear()
 
-        backend.restore(handle, snapshot)
+        restored = backend.restore(handle, snapshot)
+        assert not any(
+            call[:2] == ["docker", "exec"] and call[-3:] == ["sh", "-lc", "make install"]
+            for call in runner.calls
+        )
+        backend.resume_after_host_access(restored)
 
         rm_index = next(
             index
@@ -4850,7 +8793,7 @@ class TestContainerBackend:
         assert rm_index < restart_index
         assert restart_index < install_index
 
-    def test_reseed_workspace_volume_reinstalls_dependencies_after_seed(self, tmp_path: Path):
+    def test_reseed_workspace_volume_defers_single_bootstrap_until_resume(self, tmp_path: Path):
         """Re-seeding the worker volume after repositioning the
         host source wipes /workspace/source (including bootstrap-installed
         dependencies). The reseed must rerun the bootstrap install so the volume
@@ -4871,6 +8814,7 @@ class TestContainerBackend:
                 repo_root=repo,
                 base_ref="master",
             )
+        backend.prepare_host_access(handle)
         runner.calls.clear()
 
         backend.reseed_workspace_volume(handle)
@@ -4882,6 +8826,12 @@ class TestContainerBackend:
             and any(item.endswith(":/workspace/seed:ro") for item in call)
             and "cp -a /workspace/seed/. /workspace/source/" in call[-1]
         )
+        assert not any(
+            call[:2] == ["docker", "exec"] and call[-3:] == ["sh", "-lc", "make install"]
+            for call in runner.calls
+        )
+
+        backend.resume_after_host_access(handle)
         install_index = next(
             index
             for index, call in enumerate(runner.calls)
@@ -4890,6 +8840,11 @@ class TestContainerBackend:
         # Bootstrap install must run *after* the reseed, so the freshly copied
         # tree gets its dependencies reinstalled rather than being left bare.
         assert seed_index < install_index
+        assert sum(
+            call[:2] == ["docker", "exec"]
+            and call[-3:] == ["sh", "-lc", "make install"]
+            for call in runner.calls
+        ) == 1
 
     def test_reseed_workspace_volume_is_noop_in_bind_mode(self, tmp_path: Path):
         """The reseed step only applies to volume mode; a bind-mode workspace
@@ -4924,6 +8879,9 @@ class TestContainerBackend:
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         (repo / "compose.yaml").write_text("services: {}\n")
+        _git_ok("add", "compose.yaml", cwd=repo)
+        _git_ok("commit", "-m", "add compose", cwd=repo)
+        _git_ok("push", cwd=repo)
         runner = _FakeContainerRunner()
         backend = self._make(runner, compose_file="compose.yaml")
         with patch("shutil.which", return_value="/usr/bin/docker"):
@@ -5010,6 +8968,54 @@ class TestContainerBackend:
         assert sentinel.read_text() == "keep\n"
         assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
 
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink support")
+    def test_cleanup_revalidates_service_data_after_stopping_runtime(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner)
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        data_dir = Path(state["service_data_dirs"][0])
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "local.txt").write_text("local\n")
+        outside = tmp_path / "outside-data"
+        outside.mkdir()
+        sentinel = outside / "keep.txt"
+        sentinel.write_text("keep\n")
+        original_run = runner.run
+        swapped = False
+
+        def swap_after_stop(argv, **kwargs):
+            nonlocal swapped
+            result = original_run(argv, **kwargs)
+            if not swapped and argv[:3] == ["docker", "rm", "-f"]:
+                data_dir.rename(data_dir.with_name(data_dir.name + "-old"))
+                data_dir.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return result
+
+        runner.calls.clear()
+        with (
+            patch.object(runner, "run", side_effect=swap_after_stop),
+            pytest.raises(OSError, match="linked container service data"),
+        ):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert swapped is True
+        assert sentinel.read_text() == "keep\n"
+        assert outside.is_dir()
+
     @pytest.mark.parametrize(
         "relative_path",
         ["src", "nested/../.local/postgres/data"],
@@ -5070,6 +9076,220 @@ class TestContainerBackend:
 
         assert handle.path.is_dir()
         assert runner.calls == []
+
+    def test_cleanup_refuses_changed_engine_without_losing_original_run_state(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        docker_runner = _FakeContainerRunner()
+        docker_backend = self._make(docker_runner, engine="docker")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = docker_backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        state_before = state_path.read_bytes()
+        containers_before = set(docker_runner.ps_container_ids)
+        docker_runner.calls.clear()
+        podman_runner = _FakeContainerRunner()
+        podman_backend = self._make(podman_runner, engine="podman")
+
+        with pytest.raises(OSError, match="cannot change container engines"):
+            podman_backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert podman_runner.calls == []
+        assert docker_runner.calls == []
+        assert docker_runner.ps_container_ids == containers_before
+        assert handle.outbox_path.parent.is_dir()
+        assert state_path.read_bytes() == state_before
+
+    @pytest.mark.parametrize(
+        "corruption",
+        [
+            "missing-backend",
+            "missing-engine",
+            "invalid-mode",
+            "list-mode",
+            "invalid-topology",
+            "list-topology",
+            "missing-workspace-volumes",
+            "empty-workspace-volumes",
+            "integer-workspace-volumes",
+            "object-workspace-volume",
+            "integer-service-processes",
+        ],
+    )
+    def test_cleanup_refuses_invalid_state_discriminators_before_engine(
+        self,
+        tmp_path: Path,
+        corruption: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        volume_corruptions = {
+            "missing-workspace-volumes",
+            "empty-workspace-volumes",
+            "integer-workspace-volumes",
+            "object-workspace-volume",
+        }
+        backend = self._make(
+            runner,
+            workspace_mode="volume" if corruption in volume_corruptions else "bind",
+        )
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        state = json.loads(state_path.read_text())
+        if corruption == "missing-backend":
+            state.pop("backend")
+        elif corruption == "missing-engine":
+            state.pop("engine")
+        elif corruption == "invalid-mode":
+            state["workspace_mode"] = "surprise"
+        elif corruption == "list-mode":
+            state["workspace_mode"] = []
+        elif corruption == "invalid-topology":
+            state["service_topology"] = "surprise"
+        elif corruption == "list-topology":
+            state["service_topology"] = []
+        elif corruption == "missing-workspace-volumes":
+            state.pop("workspace_volumes")
+        elif corruption == "empty-workspace-volumes":
+            state["workspace_volumes"] = []
+        elif corruption == "integer-workspace-volumes":
+            state["workspace_volumes"] = 7
+        elif corruption == "object-workspace-volume":
+            state["workspace_volumes"] = [{}]
+        else:
+            state["service_processes"] = 7
+        state_path.write_text(json.dumps(state))
+        runner.calls.clear()
+
+        with pytest.raises(OSError, match="invalid|malformed"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert runner.calls == []
+        assert handle.outbox_path.parent.is_dir()
+        assert state_path.is_file()
+
+    def test_cleanup_refuses_undiscovered_workspace_volume_before_stopping_runtime(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, workspace_mode="volume")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        state = json.loads(state_path.read_text())
+        state["workspace_volumes"] = ["missing-workspace-volume"]
+        state_path.write_text(json.dumps(state))
+        state_before = state_path.read_bytes()
+        containers_before = set(runner.ps_container_ids)
+        volumes_before = set(runner.owned_volume_ids)
+        runner.calls.clear()
+
+        with pytest.raises(OSError, match="not present on the selected engine"):
+            backend.cleanup(handle, allow_unpushed_work=True)
+
+        assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
+        assert runner.ps_container_ids == containers_before
+        assert runner.owned_volume_ids == volumes_before
+        assert state_path.read_bytes() == state_before
+
+    @pytest.mark.parametrize(
+        "operation",
+        [
+            "prepare-host-access",
+            "run-command",
+            "snapshot",
+            "restore",
+            "suspend",
+            "resume",
+            "reseed",
+            "sync-host-paths",
+        ],
+    )
+    def test_existing_phase_entrypoints_refuse_changed_engine_before_contact(
+        self,
+        tmp_path: Path,
+        operation: str,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        docker_runner = _FakeContainerRunner()
+        docker_backend = self._make(docker_runner, engine="docker")
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = docker_backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        state_path = Path(handle.metadata["container_state_path"])
+        state_before = state_path.read_bytes()
+        containers_before = set(docker_runner.ps_container_ids)
+        docker_runner.calls.clear()
+        podman_runner = _FakeContainerRunner()
+        podman_backend = self._make(podman_runner, engine="podman")
+        actions = {
+            "prepare-host-access": lambda: podman_backend.prepare_host_access(handle),
+            "run-command": lambda: podman_backend.run_command(
+                eb.CommandRequest(argv=["true"], cwd=handle.path)
+            ),
+            "snapshot": lambda: podman_backend.snapshot(handle, "drifted"),
+            "restore": lambda: podman_backend.restore(
+                handle,
+                eb.SnapshotRef(
+                    label="drifted",
+                    path=handle.outbox_path.parent / "snapshots" / "drifted",
+                ),
+            ),
+            "suspend": lambda: podman_backend.suspend_for_host_access(handle),
+            "resume": lambda: podman_backend.resume_after_host_access(handle),
+            "reseed": lambda: podman_backend.reseed_workspace_volume(handle),
+            "sync-host-paths": lambda: podman_backend.sync_host_paths_into_workspace(
+                handle.path,
+                ["README.md"],
+            ),
+        }
+
+        with pytest.raises(
+            (OSError, RuntimeError),
+            match="cannot change container engines",
+        ):
+            actions[operation]()
+
+        assert podman_runner.calls == []
+        assert docker_runner.calls == []
+        assert docker_runner.ps_container_ids == containers_before
+        assert state_path.read_bytes() == state_before
 
     def test_cleanup_refuses_unauthenticated_service_pid(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -5171,9 +9391,21 @@ class TestContainerBackend:
         runner.ps_container_ids.add("owned-container")
         runner.owned_volume_ids.add("owned-volume")
         runner.owned_network_ids.add("owned-network")
+        for kind, resource in (
+            ("container", "owned-container"),
+            ("volume", "owned-volume"),
+            ("network", "owned-network"),
+        ):
+            runner.resource_labels[(kind, resource)] = labels | {
+                "com.docker.compose.project": "spec-stale"
+            }
         state_path.write_text(
             json.dumps(
                 {
+                    "backend": "container",
+                    "engine": "docker",
+                    "workspace_mode": "bind",
+                    "workspace_volumes": [],
                     "service_topology": "sidecar",
                     "compose_file": str(repo / "compose.yaml"),
                     "compose_project": "spec-stale",
@@ -5201,26 +9433,40 @@ class TestContainerBackend:
                     "repo_root": str(repo.resolve()),
                     "workspace_root": str((repo / ".spec-workspaces").resolve()),
                 },
-            )
+            ),
+            allow_unpushed_work=True,
         )
 
         cleanup_text = "\n".join(" ".join(call) for call in runner.calls)
         assert "docker rm -f owned-container" in cleanup_text
-        assert "docker volume rm -f owned-volume" in cleanup_text
+        assert "docker volume rm owned-volume" in cleanup_text
         assert "docker network rm owned-network" in cleanup_text
         assert "state-attacker" not in cleanup_text
         expected_filters = {
             f"label={key}={value}" for key, value in labels.items()
         }
-        discovery_calls = [
+        inventory_calls = [
             call
             for call in runner.calls
-            if call[:2] == ["docker", "ps"]
+            if (
+                call[:2] == ["docker", "ps"]
+                and not any(item.startswith("volume=") for item in call)
+            )
             or call[:3] == ["docker", "volume", "ls"]
             or call[:3] == ["docker", "network", "ls"]
         ]
-        assert len(discovery_calls) == 3
-        assert all(expected_filters.issubset(set(call)) for call in discovery_calls)
+        owned_discovery_calls = [
+            call for call in inventory_calls if expected_filters.issubset(set(call))
+        ]
+        assert len(inventory_calls) == 6
+        assert len(owned_discovery_calls) == 3
+        volume_consumer_checks = [
+            call
+            for call in runner.calls
+            if call[:2] == ["docker", "ps"]
+            and "volume=owned-volume" in call
+        ]
+        assert len(volume_consumer_checks) == 3
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
     def test_missing_snapshot_restore_recreates_fresh_workspace(self, tmp_path: Path):
@@ -5245,6 +9491,7 @@ class TestContainerBackend:
             label="pre-implement",
             path=handle.outbox_path.parent / "snapshots" / "pre-implement",
         )
+        runner.calls.clear()
         with patch("shutil.which", return_value="/usr/bin/docker"):
             restored = backend.restore(handle, missing)
 
@@ -5256,6 +9503,21 @@ class TestContainerBackend:
         assert _git("status", "--short", cwd=restored.path).stdout.strip() == ""
         assert "snapshot path is missing" in fallback_log.read_text()
         assert "prepared fresh workspace" in fallback_log.read_text()
+        worker_starts = [
+            call
+            for call in runner.calls
+            if call[:3] == ["docker", "run", "-d"]
+            and "sleep infinity" in call[-1]
+        ]
+        assert worker_starts == []
+        backend.resume_after_host_access(restored)
+        worker_starts = [
+            call
+            for call in runner.calls
+            if call[:3] == ["docker", "run", "-d"]
+            and "sleep infinity" in call[-1]
+        ]
+        assert len(worker_starts) == 1
 
     def test_passwd_shim_files_are_created_with_runtime_uid(self, tmp_path: Path):
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
@@ -5290,6 +9552,52 @@ class TestContainerBackend:
         assert f"spec:x:{uid}:{gid}:spec runtime user:/workspace/source:/bin/sh" in passwd_text
         assert "root:x:0:" in group_text
         assert f"spec:x:{gid}:" in group_text
+        create_calls = [
+            call for call in runner.calls if call[:2] == ["docker", "create"]
+        ]
+        assert create_calls
+        assert all("--name" not in call for call in create_calls)
+        assert all("spec.owner=spec-runtime" in call for call in create_calls)
+        removed_ids = {
+            call[3]
+            for call in runner.calls
+            if call[:3] == ["docker", "rm", "-f"]
+            and call[3].startswith("extract-")
+        }
+        assert removed_ids == {"extract-1", "extract-2"}
+
+    def test_passwd_shim_create_failure_never_copies_or_removes_by_name(
+        self,
+        tmp_path: Path,
+    ):
+        if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
+            pytest.skip("requires POSIX uid/gid")
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner(fail_create=True)
+        backend = self._make(runner)
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+
+        assert (handle.outbox_path.parent / "passwd-shim" / "passwd").is_file()
+        create_calls = [
+            call for call in runner.calls if call[:2] == ["docker", "create"]
+        ]
+        assert len(create_calls) == 2
+        assert all("--name" not in call for call in create_calls)
+        assert not any(call[:2] == ["docker", "cp"] for call in runner.calls)
+        assert not any(
+            call[:3] == ["docker", "rm", "-f"]
+            and call[3].startswith("extract-")
+            for call in runner.calls
+        )
 
     def test_passwd_shim_does_not_duplicate_existing_uid(self, tmp_path: Path):
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
@@ -5389,7 +9697,7 @@ class TestContainerBackend:
         assert worker_call.index(passwd_mount) > user_idx
         assert worker_call.index(group_mount) > user_idx
 
-    def test_run_command_run_branch_mounts_passwd_shim(self, tmp_path: Path):
+    def test_run_command_replaces_unrecorded_worker_before_exec(self, tmp_path: Path):
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
             pytest.skip("requires POSIX uid/gid")
         repo = tmp_path / "repo"
@@ -5407,7 +9715,9 @@ class TestContainerBackend:
             )
 
         run_root = handle.outbox_path.parent
-        # Force the no-worker-container fallback path.
+        # Simulate state lost after the old worker started. The next command
+        # must discover/remove that exact-owned worker, start one clean runtime
+        # generation with the passwd shim, and execute inside it.
         state_path = run_root / "backend-state" / "container-backend-state.json"
         state = json.loads(state_path.read_text())
         state["worker_container"] = ""
@@ -5425,26 +9735,38 @@ class TestContainerBackend:
                 },
             )
         )
-        run_index = next(
+        removal_index = next(
             index
             for index, call in enumerate(runner.calls)
-            if call[:3] == ["docker", "run", "--rm"] and call[-2:] == ["echo", "hello"]
+            if call[:3] == ["docker", "rm", "-f"] and call[-1] == "container-123"
         )
-        run_call = runner.calls[run_index]
-        client_env = runner.envs[run_index]
+        worker_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:3] == ["docker", "run", "-d"] and "sleep infinity" in call[-1]
+        )
+        exec_index = next(
+            index
+            for index, call in enumerate(runner.calls)
+            if call[:2] == ["docker", "exec"] and call[-2:] == ["echo", "hello"]
+        )
+        assert removal_index < worker_index < exec_index
+        worker_call = runner.calls[worker_index]
+        exec_call = runner.calls[exec_index]
+        client_env = runner.envs[exec_index]
         assert client_env is not None
         for key, value in {
             "APP_FEATURE_FLAG": "fallback-feature-enabled",
             "DATABASE_URL": "postgres://fallback:credential@db/spec",
         }.items():
-            assert key in run_call
-            assert f"{key}={value}" not in run_call
+            assert key in exec_call
+            assert f"{key}={value}" not in exec_call
             assert client_env[key] == value
         passwd_mount = f"{run_root / 'passwd-shim' / 'passwd'}:/etc/passwd:ro"
         group_mount = f"{run_root / 'passwd-shim' / 'group'}:/etc/group:ro"
-        assert "--user" in run_call
-        assert passwd_mount in run_call
-        assert group_mount in run_call
+        assert "--user" in worker_call
+        assert passwd_mount in worker_call
+        assert group_mount in worker_call
 
     def test_passwd_shim_is_skipped_on_windows(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -5497,8 +9819,8 @@ class TestContainerBackend:
                 cwd=handle.path,
             )
         )
-        # Volume import path runs after each command; locate the import
-        # docker run that mounts /workspace/host.
+        backend.prepare_host_access(handle)
+        # The host-access boundary imports only after all writers are gone.
         import_call = next(
             call
             for call in runner.calls
@@ -5634,6 +9956,47 @@ class TestOrchestratorBackendSeam:
         assert fake.prepare_calls[0]["run_id"] == "my-feature-20260101T000000"
         assert fake.prepare_calls[0]["spec_id"] == "my-feature"
         assert fake.prepare_calls[0]["branch"] == "spec/my-feature"
+
+    def test_builtin_container_resolution_materializes_without_eager_prepare(
+        self,
+        tmp_path: Path,
+        reset_execution_backend,
+    ) -> None:
+        workspace = tmp_path / ".spec-workspaces" / "my-feature-run" / "source"
+        outbox = workspace.parent / "outbox"
+
+        @dataclass
+        class LazyContainerBackend(_FakeBackend):
+            materialize_calls: list[dict] = field(default_factory=list)
+
+            def materialize_workspace(self, **kwargs):
+                self.materialize_calls.append(kwargs)
+                return eb.WorkspaceHandle(
+                    path=self.workspace_path,
+                    outbox_path=self.outbox_path,
+                    branch=kwargs.get("branch", ""),
+                    backend="container",
+                    metadata={"run_id": kwargs.get("run_id", "")},
+                )
+
+        backend = LazyContainerBackend(
+            workspace_path=workspace,
+            outbox_path=outbox,
+            backend_name="container",
+        )
+        orch.set_execution_backend(backend)
+        run = orch.RunState(
+            run_id="my-feature-run",
+            spec_id="my-feature",
+            branch="code/my-feature--abc",
+            backend="container",
+        )
+
+        handle = orch._resolve_workspace_handle(run, tmp_path)
+
+        assert handle.path == workspace
+        assert len(backend.materialize_calls) == 1
+        assert backend.prepare_calls == []
 
     def test_publish_workspace_reuses_prepared_container_checkout(
         self,
@@ -5868,8 +10231,9 @@ class TestOrchestratorBackendSeam:
         cleanup_workspace, allow_unpushed_work = fake.cleanup_calls[0]
         assert cleanup_workspace.path == expected_run_root / "source"
         assert cleanup_workspace.outbox_path == expected_run_root / "outbox"
-        # The post-merge cleanup phase opts out of the resume-safety guard.
-        assert allow_unpushed_work is True
+        # Automatic post-merge cleanup keeps the final recoverability guard;
+        # only an explicit operator `spec clean` waives it.
+        assert allow_unpushed_work is False
 
     def test_container_bootstrap_skips_host_install_command(self, tmp_path: Path, monkeypatch, reset_execution_backend):
         repo = tmp_path / "repo"
@@ -6025,6 +10389,38 @@ class TestVerifyGateRoutesThroughBackend:
 
 
 class TestImplementSetupRoutesThroughBackend:
+    def test_container_runtime_reset_during_snapshot_is_not_swallowed(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        worktree = tmp_path / ".spec-workspaces" / "run-1" / "source"
+        worktree.mkdir(parents=True)
+        fake = _FakeBackend(
+            workspace_path=worktree,
+            outbox_path=worktree.parent / "outbox",
+            backend_name="container",
+        )
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--20260101T000000",
+            agent="claude",
+        )
+
+        with (
+            patch.object(
+                fake,
+                "snapshot",
+                side_effect=eb.ExecutionBackendRuntimeResetError("runtime reset"),
+            ),
+            pytest.raises(eb.ExecutionBackendRuntimeResetError, match="runtime reset"),
+        ):
+            orch._snapshot_container_workspace_after_setup(run, worktree, fake)
+
+        assert not (
+            worktree.parent / "logs" / "snapshot-restore-fallback.log"
+        ).exists()
+
     def test_setup_command_invokes_backend_run_command(self, tmp_path: Path, reset_execution_backend):
         worktree = tmp_path / "wt"
         worktree.mkdir()
@@ -6097,7 +10493,7 @@ class TestImplementSetupRoutesThroughBackend:
         assert snapshot_workspace.outbox_path == worktree.parent / "outbox"
         assert snapshot_workspace.branch == "spec/my-feature"
 
-    def test_container_setup_preserves_existing_pre_implement_snapshot(self, tmp_path: Path, reset_execution_backend):
+    def test_container_setup_retries_incomplete_pre_implement_snapshot(self, tmp_path: Path, reset_execution_backend):
         worktree = tmp_path / ".spec-workspaces" / "run-1" / "source"
         worktree.mkdir(parents=True)
         existing_snapshot = worktree.parent / "snapshots" / "pre-implement"
@@ -6130,7 +10526,11 @@ class TestImplementSetupRoutesThroughBackend:
             manifest = orch._run_implement_setup_command(run, worktree)
 
         assert manifest == orch.ImplementSetupManifest()
-        assert fake.snapshot_calls == []
+        # A directory without the backend's completion manifest may be a
+        # crash-partial copy.  The orchestrator must delegate to the backend so
+        # it can reject/replace it instead of treating mere existence as proof.
+        assert len(fake.snapshot_calls) == 1
+        assert fake.snapshot_calls[0][1] == "pre-implement"
         assert (existing_snapshot / "clean.txt").read_text() == "clean baseline\n"
 
     def test_container_import_failure_classifies_as_import(self):
@@ -6430,6 +10830,90 @@ class TestContainerWorkerEnvHostPathDenylist:
             "DB_PASSWORD": "database-secret",
             "STRIPE_API_KEY": "stripe-secret",
         }
+
+    def test_filter_preserves_complete_host_owned_git_no_push_guard(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        env: dict[str, str] = {}
+        apply_host_owned_publication_guard(env, repo)
+
+        filtered = eb.ContainerExecutionBackend._filter_container_worker_env(env)
+
+        assert filtered["GIT_CONFIG_COUNT"] == env["GIT_CONFIG_COUNT"]
+        status = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=repo,
+            env={"PATH": os.environ.get("PATH", os.defpath), **filtered},
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert status.returncode == 0, status.stderr
+        push = subprocess.run(
+            ["git", "push", "origin", "HEAD:refs/heads/guard-must-not-publish"],
+            cwd=repo,
+            env={"PATH": os.environ.get("PATH", os.defpath), **filtered},
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert push.returncode != 0
+        assert not (
+            repo.parent / "remote.git" / "refs" / "heads" / "guard-must-not-publish"
+        ).exists()
+
+    def test_filter_rejects_partial_or_tampered_git_no_push_guard(self) -> None:
+        with pytest.raises(RuntimeError, match="incomplete"):
+            eb.ContainerExecutionBackend._filter_container_worker_env(
+                {
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "credential.helper",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                }
+            )
+        with pytest.raises(RuntimeError, match="unexpected entry"):
+            eb.ContainerExecutionBackend._filter_container_worker_env(
+                {
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "alias.pwn",
+                    "GIT_CONFIG_VALUE_0": "!touch /tmp/pwned",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                }
+            )
+
+    def test_windows_host_git_global_null_is_translated_for_linux_worker(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        env: dict[str, str] = {}
+        apply_host_owned_publication_guard(env, repo)
+        env["GIT_CONFIG_GLOBAL"] = "nul"
+        (repo / "nul").write_text("[alias]\n\tpwn = !echo escaped\n")
+
+        with patch.object(eb.os, "devnull", "nul"):
+            filtered = eb.ContainerExecutionBackend._filter_container_worker_env(env)
+
+        assert filtered["GIT_CONFIG_GLOBAL"] == "/dev/null"
+        probe = subprocess.run(
+            ["git", "config", "--global", "--get", "alias.pwn"],
+            cwd=repo,
+            env={"PATH": os.environ.get("PATH", os.defpath), **filtered},
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        assert probe.returncode != 0
+        assert "escaped" not in probe.stdout
 
     @pytest.mark.parametrize(
         "key",

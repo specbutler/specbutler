@@ -32,7 +32,7 @@
   var messages = []; // {role: "user"|"assistant"|"card", content: ..., event?: AgentEvent}
   var isStreaming = false;
   var inReviewMode = false; // true while spec review UI is showing
-  var isSessionCompleted = false; // true once session.status becomes "completed"
+  var isSessionCompleted = false; // true once the session is no longer active
   var availableBackends = null; // {claude: bool, codex: bool}
   var selectedAgent = null;
   var activeAbortController = null; // cancels in-flight SSE readers on route change
@@ -105,6 +105,11 @@
       html += "</select>";
     }
 
+    // The first successful send promotes this view into a durable session
+    // without re-rendering the route. Keep its session control in the mounted
+    // DOM and reveal it once currentSessionId exists.
+    html += '<button class="btn btn-danger btn-sm" id="chat-stop" hidden>Stop</button>';
+
     html += "</div>";
     html += '<div class="chat-messages" id="chat-messages">';
     if (selectedAgent) {
@@ -127,6 +132,7 @@
     var input = document.getElementById("chat-input");
     var sendBtn = document.getElementById("chat-send");
     var agentSelect = document.getElementById("agent-select");
+    var stopBtn = document.getElementById("chat-stop");
 
     if (agentSelect) {
       agentSelect.addEventListener("change", function () {
@@ -150,6 +156,10 @@
 
     sendBtn.addEventListener("click", function () {
       sendMessage(mode);
+    });
+
+    stopBtn.addEventListener("click", function () {
+      stopSession();
     });
   }
 
@@ -213,7 +223,7 @@
           return;
         }
         var sessionMeta = data;
-        if (data.status === "completed") {
+        if (data.status !== "active") {
           isSessionCompleted = true;
           updateSendButton();
         }
@@ -326,13 +336,16 @@
           return;
         }
         currentSessionId = data.session_id;
+        var stopBtn = document.getElementById("chat-stop");
+        if (stopBtn) stopBtn.hidden = false;
 
         // Update URL hash without triggering full re-render
         history.replaceState(null, "", "#/chat/" + currentSessionId);
 
         // The create endpoint already forwarded the initial prompt to the
-        // bridge, so send the same text to /messages to get the stream.
-        streamMessage(text);
+        // bridge. Attach to that turn through its dedicated replay endpoint;
+        // POST /messages always starts a genuinely new provider turn.
+        reattachToStream(currentSessionId, 0);
       })
       .catch(function (err) {
         addErrorMessage("Failed to create session: " + err.message);
@@ -466,6 +479,11 @@
               addSpecReview(event.spec_id, event.spec_content);
             } else if (event.kind === "error") {
               addErrorMessage(event.text);
+              // Provider error events are terminal server-side. Mirror that
+              // state immediately so the UI does not invite a follow-up that
+              // can only receive HTTP 409.
+              isSessionCompleted = true;
+              updateSendButton();
             }
             scrollToBottom();
           } catch (e) {

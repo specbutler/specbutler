@@ -707,6 +707,68 @@ class TestRunState:
 
         assert orch._active_spec_path(repo, run, prefer_worktree=True) is None
 
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink support")
+    def test_restore_pinned_spec_replaces_leaf_symlink_without_following_it(
+        self,
+        repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        worktree = repo / ".worktrees" / "code-my-feature--token123"
+        worktree.mkdir(parents=True)
+        run = orch.RunState(
+            run_id="my-feature-20260101T000005",
+            spec_id="my-feature",
+            branch="code/my-feature--token123",
+            worktree_path=str(worktree),
+            spec_path="specs/my-feature.md",
+            spec_revision=orch._spec_revision_for_text("pinned spec\n"),
+        )
+        snapshot = orch._run_spec_snapshot_path(repo, run.run_id)
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text("pinned spec\n")
+        external = tmp_path / "external-spec.md"
+        external.write_text("external data\n")
+        target = worktree / "specs" / "my-feature.md"
+        target.parent.mkdir()
+        target.symlink_to(external)
+
+        restored = orch._restore_pinned_spec_into_worktree(repo, run, worktree)
+
+        assert restored == target
+        assert target.is_file() and not target.is_symlink()
+        assert target.read_text() == "pinned spec\n"
+        assert external.read_text() == "external data\n"
+
+    @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink support")
+    def test_restore_pinned_spec_refuses_linked_parent(
+        self,
+        repo: Path,
+        tmp_path: Path,
+    ) -> None:
+        worktree = repo / ".worktrees" / "code-my-feature--token123"
+        worktree.mkdir(parents=True)
+        run = orch.RunState(
+            run_id="my-feature-20260101T000006",
+            spec_id="my-feature",
+            branch="code/my-feature--token123",
+            worktree_path=str(worktree),
+            spec_path="specs/my-feature.md",
+            spec_revision=orch._spec_revision_for_text("pinned spec\n"),
+        )
+        snapshot = orch._run_spec_snapshot_path(repo, run.run_id)
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text("pinned spec\n")
+        external = tmp_path / "external-specs"
+        external.mkdir()
+        sentinel = external / "my-feature.md"
+        sentinel.write_text("external data\n")
+        (worktree / "specs").symlink_to(external, target_is_directory=True)
+
+        with pytest.raises(OSError, match="linked or non-directory parent"):
+            orch._restore_pinned_spec_into_worktree(repo, run, worktree)
+
+        assert sentinel.read_text() == "external data\n"
+
 
 # ---------------------------------------------------------------------------
 # SpecLock
@@ -5480,6 +5542,9 @@ class TestBootstrapGuards:
                 run.branch,
                 "origin/master",
             ]:
+                # Model the filesystem effect needed by the pinned-spec path
+                # validation that follows a successful worktree creation.
+                worktree.mkdir(parents=True)
                 return subprocess.CompletedProcess(cmd, 0, "", "")
             if cmd == ["git", "status", "--porcelain", "--", "specs/my-feature.md"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -11605,6 +11670,130 @@ class TestSpecAuthoringPolicy:
         assert "src/unsafe.py" in error
 
 
+class TestSubmodulePublicationBoundary:
+    def test_one_launch_legacy_run_migrates_pre_agent_head_before_publication(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        trusted_base = "a" * 40
+        run = orch.RunState(
+            run_id="run",
+            spec_id="spec",
+            branch="code/spec--token",
+            implement_launches=1,
+            implement_head_sha_before=trusted_base,
+        )
+
+        with (
+            patch.object(orch, "_capture_or_validate_run_publication_baseline"),
+            patch.object(orch, "_assert_no_submodule_pointer_changes") as guard,
+        ):
+            orch._assert_publication_transition_safe(run, tmp_path)
+
+        assert run.publication_base_sha == trusted_base
+        guard.assert_called_once_with(run, tmp_path)
+
+    def test_multi_launch_legacy_run_cannot_guess_publication_base(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        run = orch.RunState(
+            run_id="run",
+            spec_id="spec",
+            branch="code/spec--token",
+            implement_launches=2,
+            implement_head_sha_before="a" * 40,
+        )
+
+        with patch.object(orch, "_capture_or_validate_run_publication_baseline"):
+            with pytest.raises(
+                orch.UnsafeRepositoryGitConfigError,
+                match="base is missing or invalid",
+            ):
+                orch._assert_publication_transition_safe(run, tmp_path)
+
+        assert run.publication_base_sha == ""
+
+    def test_moved_local_base_ref_cannot_hide_gitlink_addition(self, repo: Path):
+        trusted_base = _run_git_stdout("rev-parse", "HEAD", cwd=repo).strip()
+        _run_git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{trusted_base},child",
+            cwd=repo,
+        )
+        _run_git("commit", "-m", "point at unpublished child", cwd=repo)
+        # This was the bypass against a name-based comparison: the mutable
+        # local base now resolves to HEAD and reports no delta.
+        _run_git("update-ref", "refs/heads/master", "HEAD", cwd=repo)
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="code/my-feature--token123",
+            implement_launches=1,
+            publication_base_sha=trusted_base,
+        )
+
+        with pytest.raises(
+            orch.UnsafeRepositoryGitConfigError,
+            match="changes submodule pointer",
+        ):
+            orch._assert_no_submodule_pointer_changes(run, repo)
+
+    @pytest.mark.parametrize(
+        "raw_delta",
+        [
+            ":000000 160000 0000000 aaaaaaa A\tchild\n",
+            ":160000 160000 aaaaaaa bbbbbbb M\tchild\n",
+            ":160000 000000 aaaaaaa 0000000 D\tchild\n",
+        ],
+    )
+    def test_add_change_and_remove_gitlinks_are_rejected(
+        self,
+        tmp_path: Path,
+        raw_delta: str,
+    ) -> None:
+        base_sha = "a" * 40
+        run = orch.RunState(
+            run_id="run",
+            spec_id="spec",
+            branch="code/spec--token",
+            implement_launches=1,
+            publication_base_sha=base_sha,
+        )
+        responses = [
+            subprocess.CompletedProcess([], 0, base_sha + "\n", ""),
+            subprocess.CompletedProcess([], 0, raw_delta, ""),
+        ]
+        with patch.object(orch, "run_subprocess", side_effect=responses):
+            with pytest.raises(
+                orch.UnsafeRepositoryGitConfigError,
+                match="changes submodule pointer",
+            ):
+                orch._assert_no_submodule_pointer_changes(run, tmp_path)
+
+    def test_malformed_diff_tree_output_fails_closed(self, tmp_path: Path):
+        base_sha = "a" * 40
+        run = orch.RunState(
+            run_id="run",
+            spec_id="spec",
+            branch="code/spec--token",
+            implement_launches=1,
+            publication_base_sha=base_sha,
+        )
+        responses = [
+            subprocess.CompletedProcess([], 0, base_sha + "\n", ""),
+            subprocess.CompletedProcess([], 0, "malformed\n", ""),
+        ]
+        with patch.object(orch, "run_subprocess", side_effect=responses):
+            with pytest.raises(
+                orch.UnsafeRepositoryGitConfigError,
+                match="malformed",
+            ):
+                orch._assert_no_submodule_pointer_changes(run, tmp_path)
+
+
 class TestPublishPhase:
     @staticmethod
     def _prepare_checked_no_diff_branch(repo: Path, branch: str) -> str:
@@ -15244,6 +15433,80 @@ class TestImplementSetupTeardownHelpers:
         prompt = orch._build_setup_failure_prompt(manifest)
         assert "scripts/implement-setup.sh" in prompt
         assert manifest.failure.message
+
+    def test_nonzero_container_setup_still_creates_retry_snapshot(
+        self,
+        repo: Path,
+    ) -> None:
+        run = self._run()
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            implement=replace(
+                orch.SPEC_RUNTIME_CONFIG.implement,
+                setup_command="scripts/implement-setup.sh",
+            ),
+        )
+        backend = MagicMock()
+        backend.identity.backend = "container"
+        backend.run_command.return_value = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="setup failed",
+            ownership_token=None,
+        )
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+        ):
+            manifest = orch._run_implement_setup_command(run, repo)
+
+        assert manifest.failure is not None
+        backend.snapshot.assert_called_once()
+        workspace, label = backend.snapshot.call_args.args
+        assert workspace.path == repo
+        assert label == "pre-implement"
+
+    @pytest.mark.parametrize("failure_mode", ["parse", "launch"])
+    def test_container_setup_prelaunch_failure_still_creates_retry_snapshot(
+        self,
+        repo: Path,
+        failure_mode: str,
+    ) -> None:
+        run = self._run()
+        setup_command = (
+            "scripts/implement-setup.sh '"
+            if failure_mode == "parse"
+            else "scripts/implement-setup.sh"
+        )
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            implement=replace(
+                orch.SPEC_RUNTIME_CONFIG.implement,
+                setup_command=setup_command,
+            ),
+        )
+        backend = MagicMock()
+        backend.identity.backend = "container"
+        if failure_mode == "launch":
+            backend.run_command.side_effect = OSError("executable missing")
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+        ):
+            manifest = orch._run_implement_setup_command(run, repo)
+
+        assert manifest.failure is not None
+        assert manifest.failure.launch_error is True
+        if failure_mode == "parse":
+            backend.run_command.assert_not_called()
+        else:
+            backend.run_command.assert_called_once()
+        backend.snapshot.assert_called_once()
+        workspace, label = backend.snapshot.call_args.args
+        assert workspace.path == repo
+        assert label == "pre-implement"
 
     def test_run_setup_command_malformed_quoting_redacts_argv_secrets(
         self, repo: Path
@@ -27579,6 +27842,72 @@ class TestCleanupPhase:
         assert not worktree.exists()
         assert run.branch not in _run_git_stdout("branch", "--format=%(refname:short)", cwd=repo).splitlines()
 
+    def test_container_cleanup_runtime_error_is_recorded_as_nonfatal_warning(
+        self,
+        repo: Path,
+    ) -> None:
+        run = self._make_run()
+        backend = MagicMock()
+        backend.identity = eb.BackendIdentity(
+            backend="container",
+            safety_mode="container",
+            workspace_root=".spec-workspaces",
+            backend_explicit=True,
+        )
+        backend.cleanup.side_effect = RuntimeError("persisted state is malformed")
+
+        with patch.object(
+            orch,
+            "_resolve_execution_backend",
+            return_value=backend,
+        ):
+            result = orch.phase_cleanup(run, repo)
+
+        assert result == "passed"
+        backend.cleanup.assert_called_once()
+        assert len(run.nonfatal_warnings) == 1
+        warning = run.nonfatal_warnings[0]
+        assert warning["phase"] == "cleanup"
+        assert warning["failure_subtype"] == "backend_workspace_cleanup_failed"
+        assert "persisted state is malformed" in warning["detail"]
+
+    @pytest.mark.parametrize(
+        ("current_backend", "current_root", "expected"),
+        [
+            ("clone", ".spec-workspaces", "current config selects 'clone'"),
+            ("container", ".other-workspaces", "current config selects"),
+        ],
+    )
+    def test_phase_refuses_recorded_backend_or_workspace_root_drift(
+        self,
+        repo: Path,
+        current_backend: str,
+        current_root: str,
+        expected: str,
+    ) -> None:
+        run = self._make_run()
+        run.backend = "container"
+        run.backend_workspace_root = ".spec-workspaces"
+        backend = MagicMock()
+        backend.identity = eb.BackendIdentity(
+            backend=current_backend,
+            safety_mode="safe",
+            workspace_root=current_root,
+            backend_explicit=True,
+        )
+        handler = MagicMock(return_value="passed")
+
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+            patch.dict(orch.PHASE_HANDLERS, {"verify": handler}),
+        ):
+            result = orch.run_single_phase(run, "verify", repo)
+
+        assert result == "failed"
+        assert expected in run.last_error
+        handler.assert_not_called()
+        backend.prepare_workspace.assert_not_called()
+
     def test_phase_cleanup_fails_when_worktree_metadata_remains(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -32441,6 +32770,35 @@ class TestCmdTask:
         assert run.run_mode == "task"
         assert run.agent == "claude"
         assert run.branch.startswith("task/")
+
+    def test_cmd_task_holds_spec_lock_for_full_workflow(self, repo: Path):
+        observed: dict[str, bool] = {}
+
+        def fake_workflow(
+            run: orch.RunState,
+            _root: Path,
+            *,
+            retry_cap: int = 20,
+        ) -> str:
+            with pytest.raises(RuntimeError, match="Lock contention"):
+                with orch.SpecLock(repo, run.spec_id):
+                    pass
+            observed["locked"] = True
+            return "passed"
+
+        args = argparse.Namespace(
+            agent="claude",
+            base="origin/master",
+            retry_cap=None,
+        )
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch, "run_full_workflow", side_effect=fake_workflow),
+        ):
+            code = orch.cmd_task(args)
+
+        assert code == 0
+        assert observed == {"locked": True}
 
     def test_cmd_task_always_creates_fresh_run(
         self,

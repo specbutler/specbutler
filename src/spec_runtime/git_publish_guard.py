@@ -394,11 +394,21 @@ def host_publication_git_environment() -> dict[str, str]:
         # Python's Windows os.devnull is ``nul``; treating that device name as
         # a hooks directory can make commit fail while probing ``nul/<hook>``.
         ("core.hooksPath", "/dev/null"),
+        ("core.fsmonitor", "false"),
         ("credential.interactive", "false"),
         # Ignore a repository-selected config.worktree during every host Git
         # publication command. The baseline still fingerprints that file so
         # any post-launch change fails closed before publication.
         ("extensions.worktreeConfig", "false"),
+        # Host publication never needs to enter a submodule checkout. A
+        # container agent controls nested .git/modules/* configs, whose
+        # fsmonitor/include directives would otherwise execute or block when a
+        # superproject status/diff probes submodule dirtiness.
+        ("diff.ignoreSubmodules", "all"),
+        ("status.submoduleSummary", "false"),
+        ("submodule.recurse", "false"),
+        ("fetch.recurseSubmodules", "false"),
+        ("push.recurseSubmodules", "no"),
     )
     env["GIT_CONFIG_COUNT"] = str(len(entries))
     for index, (key, value) in enumerate(entries):

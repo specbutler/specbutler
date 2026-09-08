@@ -1900,6 +1900,7 @@ class TestAuthMiddleware:
         assert 'fetch("/api/' not in app_source
         assert 'fetch("/api/' not in chat_source
         assert 'window.specFetch("/api/' in chat_source
+        assert 'if (data.status !== "active")' in chat_source
 
 
 # ---------------------------------------------------------------------------

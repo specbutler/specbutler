@@ -9,6 +9,7 @@ adopting or waiting on active work.
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 from dataclasses import asdict, dataclass, field, replace
@@ -17,7 +18,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from ..platform_fs import atomic_write_text
+from ..platform_fs import atomic_write_text, read_bounded_regular_text
 
 DEFAULT_LEASE_HEARTBEAT_TIMEOUT_SECONDS = 600.0
 
@@ -118,7 +119,16 @@ def classify_lease(
         return LeaseStatus.UNKNOWN
 
     current = (now or datetime.now(UTC)).astimezone(UTC)
-    timeout = max(float(lease.timeout_seconds), 1.0)
+    try:
+        timeout = float(lease.timeout_seconds)
+    except (TypeError, ValueError):
+        return LeaseStatus.UNKNOWN
+    if (
+        not math.isfinite(timeout)
+        or timeout <= 0
+        or timeout > timedelta.max.total_seconds()
+    ):
+        return LeaseStatus.UNKNOWN
     if current - heartbeat > timedelta(seconds=timeout):
         return LeaseStatus.EXPIRED
 
@@ -139,8 +149,10 @@ def load_run_lease(state_runs_dir: Path, run_id: str) -> RunLease | None:
     if not path.exists():
         return None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        payload = json.loads(
+            read_bounded_regular_text(path, max_bytes=1024 * 1024)
+        )
+    except (ValueError, RecursionError, OSError):
         return None
     if not isinstance(payload, dict):
         return None

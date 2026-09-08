@@ -254,7 +254,13 @@ jobs:
           tag_name="v${version}"
 
           if git rev-parse "$tag_name" >/dev/null 2>&1; then
-            echo "Tag $tag_name already exists"
+            tag_commit="$(git rev-list -n 1 "$tag_name")"
+            head_commit="$(git rev-parse HEAD)"
+            if [ "$tag_commit" != "$head_commit" ]; then
+              echo "::error::Tag $tag_name already points to $tag_commit, not version commit $head_commit"
+              exit 1
+            fi
+            echo "Tag $tag_name already exists at the version commit"
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"

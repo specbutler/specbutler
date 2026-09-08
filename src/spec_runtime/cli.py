@@ -1479,11 +1479,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Also run configured verify gates inside the worker",
     )
     p_container_smoke.add_argument("--timeout", type=float, default=300, help="Per-command timeout in seconds")
-    p_container_gc = container_sub.add_parser("gc", help="Discover and remove stale spec-owned Docker resources")
+    p_container_gc = container_sub.add_parser(
+        "gc",
+        help="Discover and remove stale Docker resources owned by this checkout",
+    )
     p_container_gc.add_argument("--repo-root", default=None, help="Repository root")
     gc_mode = p_container_gc.add_mutually_exclusive_group()
-    gc_mode.add_argument("--dry-run", action="store_true", help="List stale resources (default)")
-    gc_mode.add_argument("--apply", action="store_true", help="Remove stale resources")
+    gc_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List stale resources scoped to this checkout (default)",
+    )
+    gc_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Remove the checkout-scoped stale resources after revalidation",
+    )
 
     # ----- Advanced / debug commands -----
 

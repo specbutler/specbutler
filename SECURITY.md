@@ -67,6 +67,36 @@ TLS/proxy settings, Spec Butler control variables, or runtime loader/startup
 controls. Container launches pass admitted values through the Docker client
 environment rather than command arguments and redact them from command logs.
 
+Container-engine inventory is shared across every checkout using the same
+daemon. Spec Butler therefore treats `spec.owner` as necessary but not
+sufficient for deletion: cleanup and `spec container gc --apply` also require
+the exact canonical run, spec, and current-checkout workspace labels. GC reads
+structured engine labels, acquires the run's local lock, and revalidates both
+labels and liveness before removal. Ambiguous unlabeled resources fail closed.
+Named volumes are ownership-checked before workspace seeding, and managed
+volumes are also checked for foreign attached containers before mounting or
+mutation. Volume removal is never forced because Podman may interpret force as
+permission to remove attached containers. Managed Compose projects are checked
+before mutation; globally named managed Compose resources are rejected unless
+explicitly declared external.
+
+An active container run is bound to the configured engine command and to the
+daemon endpoint/context that command addressed when the run started. Restore
+that original engine and endpoint before resuming or cleaning the run. Spec
+Butler rejects a changed engine command, but Docker/Podman context selection and
+daemon replacement happen outside the run state and cannot always be detected
+when the command name stays the same. Switching `DOCKER_HOST`, `DOCKER_CONTEXT`,
+Podman connections, or the backing daemon while a run exists can leave the old
+generation invisible; do not do so until the run is clean.
+
+Disposable clone and container workspaces are inspected only through the
+superproject Git boundary. Automatic restore and cleanup refuse a checked-out
+submodule because nested Git configuration is agent-controlled and could make
+a cleanliness probe unsafe or incomplete. Publication also rejects any changed
+gitlink: Spec Butler cannot prove that the referenced child commit was published
+by the operator. `spec clean` remains the explicit operator-authorized discard
+path after manual inspection.
+
 Run-owned provider and verification commands retain an operating-system
 ownership boundary. A successful leader exit is not sufficient: Spec Butler
 terminates and confirms that boundary before a command can release ownership or

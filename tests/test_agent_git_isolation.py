@@ -570,15 +570,84 @@ def test_private_tree_ignores_incomplete_windows_direntry_link_count(
             cached_stat_calls.append(self.path)
             return type("IncompleteStat", (), {"st_nlink": 0})()
 
-    def incomplete_scandir(path: str | os.PathLike[str]) -> list[IncompleteDirEntry]:
+    class IncompleteScandir:
+        def __init__(self, entries: list[IncompleteDirEntry]) -> None:
+            self._entries = entries
+
+        def __enter__(self) -> IncompleteScandir:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def __iter__(self):
+            return iter(self._entries)
+
+    def incomplete_scandir(path: str | os.PathLike[str]) -> IncompleteScandir:
         with real_scandir(path) as entries:
-            return [IncompleteDirEntry(entry) for entry in entries]
+            return IncompleteScandir([IncompleteDirEntry(entry) for entry in entries])
 
     monkeypatch.setattr(git_isolation.os, "scandir", incomplete_scandir)
 
     assert os.lstat(isolation.private_git_dir / "config").st_nlink == 1
     assert agent_git_head(isolation) == isolation.initial_head
     assert cached_stat_calls == []
+
+
+def test_private_tree_entry_limit_is_enforced_while_streaming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "private-git"
+    root.mkdir()
+    real_lstat = os.lstat
+    yielded = 0
+    exhausted = False
+    closed = False
+
+    class Entry:
+        def __init__(self, index: int) -> None:
+            self.path = str(root / f"entry-{index}")
+
+    class StreamingScandir:
+        def __enter__(self) -> StreamingScandir:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            nonlocal closed
+            del args
+            closed = True
+
+        def __iter__(self):
+            nonlocal yielded, exhausted
+            for index in range(100):
+                yielded += 1
+                yield Entry(index)
+            exhausted = True
+
+    def fake_lstat(path: str | os.PathLike[str]) -> object:
+        if Path(path) == root:
+            return real_lstat(path)
+        return type(
+            "PlainFileStat",
+            (),
+            {
+                "st_mode": stat.S_IFREG | 0o600,
+                "st_nlink": 1,
+                "st_file_attributes": 0,
+            },
+        )()
+
+    monkeypatch.setattr(git_isolation, "_MAX_PRIVATE_GIT_ENTRIES", 3)
+    monkeypatch.setattr(git_isolation.os, "scandir", lambda _path: StreamingScandir())
+    monkeypatch.setattr(git_isolation.os, "lstat", fake_lstat)
+
+    with pytest.raises(UnsafeAgentGitIsolationError, match="too many"):
+        git_isolation._assert_private_tree_is_plain(root)
+
+    assert yielded == 4
+    assert not exhausted
+    assert closed
 
 
 def test_git_metadata_kind_rejects_windows_reparse_attribute() -> None:

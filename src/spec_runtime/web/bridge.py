@@ -81,7 +81,6 @@ class ChatSession:
     status: str = "active"  # active / stopping / completed / error
     history: list = field(default_factory=list)
     initial_prompt: str = ""
-    initial_turn_dispatched: bool = False  # True once the create-time turn starts
     live_turn: list = field(default_factory=list)
     worktree_path: str = ""  # dedicated worktree for the session
     branch: str = ""  # branch name for the session

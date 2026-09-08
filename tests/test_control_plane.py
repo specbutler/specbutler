@@ -139,6 +139,22 @@ def test_lease_unknown_without_heartbeat() -> None:
     assert classify_lease(None) is LeaseStatus.UNKNOWN
 
 
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), 1e308, 0, -1])
+def test_lease_unknown_with_invalid_timeout(timeout: float) -> None:
+    lease = build_lease(
+        run_id="run-1",
+        spec_id="spec-a",
+        phase="implement",
+        timeout_seconds=timeout,
+        now=_utc("2026-01-01T00:00:00"),
+    )
+
+    assert classify_lease(
+        lease,
+        now=_utc("2026-01-01T00:00:01"),
+    ) is LeaseStatus.UNKNOWN
+
+
 def test_lease_with_heartbeat_advances_timestamp() -> None:
     lease = build_lease(
         run_id="run-1",
@@ -160,6 +176,25 @@ def test_lease_load_returns_none_on_invalid_json(tmp_path: Path) -> None:
     run_dir = runs_dir / "run-1"
     run_dir.mkdir(parents=True)
     (run_dir / "lease.json").write_text("not-json")
+    assert load_run_lease(runs_dir, "run-1") is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"timeout_seconds":' + "9" * 5000 + "}",
+        "[" * 10000 + "]" * 10000,
+    ],
+)
+def test_lease_load_returns_none_on_pathological_bounded_json(
+    tmp_path: Path,
+    raw: str,
+) -> None:
+    runs_dir = tmp_path / "runs"
+    run_dir = runs_dir / "run-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "lease.json").write_text(raw)
+
     assert load_run_lease(runs_dir, "run-1") is None
 
 
@@ -391,6 +426,190 @@ def test_gate_record_persistence_survives_reload(tmp_path: Path) -> None:
     assert history[0].status is GateStatus.PASSED
     assert fresh_store.latest_for_gate("pytest").status is GateStatus.PASSED
     assert fresh_store.pending_gates() == ()
+
+
+def test_gate_record_store_never_overwrites_oversized_existing_state(
+    tmp_path: Path,
+) -> None:
+    from spec_runtime.control_plane import gate_records
+
+    path = tmp_path / "gate-records.json"
+    with path.open("wb") as stream:
+        stream.write(b"preserve-existing\n")
+        stream.truncate(gate_records._GATE_RECORDS_MAX_BYTES + 1)
+    original_size = path.stat().st_size
+
+    with pytest.raises(OSError, match="refusing to overwrite unreadable"):
+        record_gate_started(
+            tmp_path,
+            name="second",
+            command=["pytest"],
+            cwd=str(tmp_path),
+            timeout_seconds=60.0,
+        )
+
+    assert path.stat().st_size == original_size
+    assert path.read_bytes()[:18] == b"preserve-existing\n"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX symlink support")
+def test_gate_record_update_preserves_dangling_state_symlink(
+    tmp_path: Path,
+) -> None:
+    from spec_runtime.control_plane import gate_records
+
+    path = tmp_path / "gate-records.json"
+    target = "missing-gate-records.json"
+    path.symlink_to(target)
+
+    assert GateRecordStore(tmp_path).load() == []
+    with pytest.raises(
+        gate_records.GateRecordPersistenceError,
+        match="refusing to overwrite unreadable",
+    ):
+        record_gate_started(
+            tmp_path,
+            name="next",
+            command=["pytest"],
+            cwd=str(tmp_path),
+            timeout_seconds=60.0,
+        )
+
+    assert path.is_symlink()
+    assert str(path.readlink()) == target
+    assert not (tmp_path / target).exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"version": 999, "records": []},
+        {"version": 1, "records": [{}]},
+        {
+            "version": 1,
+            "records": [{"name": "test", "status": "invented"}],
+        },
+        {
+            "version": 1,
+            "records": [
+                {"name": "test", "status": "passed", "metadata": "wrong"}
+            ],
+        },
+        {
+            "version": 1,
+            "records": [
+                {"name": "test", "status": "passed", "command": ["ok", 7]}
+            ],
+        },
+        {
+            "version": 1,
+            "records": [
+                {
+                    "name": "test",
+                    "status": "passed",
+                    "timeout_seconds": "sixty",
+                }
+            ],
+        },
+    ],
+)
+def test_gate_record_update_preserves_semantically_malformed_state(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    from spec_runtime.control_plane import gate_records
+
+    path = tmp_path / "gate-records.json"
+    original = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(original)
+
+    with pytest.raises(
+        gate_records.GateRecordPersistenceError,
+        match="refusing to overwrite malformed",
+    ):
+        record_gate_started(
+            tmp_path,
+            name="next",
+            command=["pytest"],
+            cwd=str(tmp_path),
+            timeout_seconds=60.0,
+        )
+
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"version":1,"records":[],"number":' + "9" * 5000 + "}",
+        "[" * 10000 + "]" * 10000,
+    ],
+)
+def test_gate_record_update_preserves_pathological_bounded_json(
+    tmp_path: Path,
+    raw: str,
+) -> None:
+    from spec_runtime.control_plane import gate_records
+
+    path = tmp_path / "gate-records.json"
+    path.write_text(raw)
+
+    assert GateRecordStore(tmp_path).load() == []
+    with pytest.raises(gate_records.GateRecordPersistenceError):
+        record_gate_started(
+            tmp_path,
+            name="next",
+            command=["pytest"],
+            cwd=str(tmp_path),
+            timeout_seconds=60.0,
+        )
+
+    assert path.read_text() == raw
+
+
+def test_gate_record_writer_bounds_diagnostic_and_remains_loadable(
+    tmp_path: Path,
+) -> None:
+    from spec_runtime.control_plane import gate_records
+
+    completed = record_gate_completed(
+        tmp_path,
+        name="pytest",
+        exit_status=1,
+        diagnostic="\N{PILE OF POO}" * gate_records._GATE_DIAGNOSTIC_MAX_BYTES,
+    )
+
+    assert completed.diagnostic.endswith(gate_records._DIAGNOSTIC_TRUNCATION_MARKER)
+    assert (
+        len(completed.diagnostic.encode("utf-8"))
+        <= gate_records._GATE_DIAGNOSTIC_MAX_BYTES
+    )
+    assert (tmp_path / "gate-records.json").stat().st_size <= (
+        gate_records._GATE_RECORDS_MAX_BYTES
+    )
+    assert GateRecordStore(tmp_path).load() == [completed]
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf")])
+def test_gate_record_writer_rejects_state_its_updater_cannot_read(
+    tmp_path: Path,
+    timeout: float,
+) -> None:
+    from spec_runtime.control_plane import gate_records
+
+    with pytest.raises(
+        gate_records.GateRecordPersistenceError,
+        match="refusing malformed",
+    ):
+        record_gate_started(
+            tmp_path,
+            name="pytest",
+            command=["pytest"],
+            cwd=str(tmp_path),
+            timeout_seconds=timeout,
+        )
+
+    assert not (tmp_path / "gate-records.json").exists()
 
 
 def test_orchestrator_verify_subprocess_timeout_marks_completed_process(

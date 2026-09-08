@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import locale
+import math
 import os
 import platform
 import re
@@ -44,7 +45,16 @@ from .config import (
     SpecRuntimeConfig,
 )
 from .git_common import run_git, subprocess_text_kwargs
-from .platform_fs import FileLock, atomic_write_text, remove_tree
+from .git_publish_guard import (
+    capture_repository_publication_baseline,
+    host_publication_git_environment,
+)
+from .platform_fs import (
+    FileLock,
+    atomic_write_text,
+    read_bounded_regular_text,
+    remove_tree,
+)
 from .process_supervisor import (
     LifetimeMode,
     ManagedProcess,
@@ -62,6 +72,7 @@ from .spec_identity import SPEC_ID_RE, implementation_branch_identity
 
 _WORKSPACE_RUN_COMPONENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{1,191}$")
 _WORKSPACE_OWNER_FILENAME = ".specbutler-workspace-owner.json"
+_CONTAINER_BACKEND_STATE_MAX_BYTES = 8 * 1024 * 1024
 
 
 def validate_workspace_run_identity(run_id: str, spec_id: str) -> str:
@@ -164,6 +175,8 @@ CONTAINER_WORKER_ENV_DENYLIST = frozenset(
         "XDG_CREDENTIAL_HOME",
     }
 )
+
+_CONTAINER_GIT_METADATA_MAX_ENTRIES = 2_000_000
 CONTAINER_WORKER_ENV_SENSITIVE_MARKERS = (
     "AUTH",
     "CREDENTIAL",
@@ -627,6 +640,18 @@ class ExecutionBackend(Protocol):
         """
         ...
 
+    def prepare_host_access(self, workspace: WorkspaceHandle) -> None:
+        """Establish a stable workspace boundary before host reads or Git."""
+        ...
+
+    def suspend_for_host_access(self, workspace: WorkspaceHandle) -> None:
+        """Freeze backend writers while preserving resumable runtime state."""
+        ...
+
+    def resume_after_host_access(self, workspace: WorkspaceHandle) -> None:
+        """Resume backend services after a host-only workspace transition."""
+        ...
+
     def snapshot(self, workspace: WorkspaceHandle, label: str) -> SnapshotRef:
         """Create a backend snapshot when supported."""
         ...
@@ -647,7 +672,8 @@ class ExecutionBackend(Protocol):
 
         Backends that own the checkout must refuse deletion when the branch
         holds commits not reachable from any ``origin`` ref, unless
-        ``allow_unpushed_work`` is set (post-merge cleanup / ``spec clean``).
+        ``allow_unpushed_work`` is set for an explicit operator discard such as
+        ``spec clean``.
         """
         ...
 
@@ -684,6 +710,19 @@ class ExecutionBackendImportError(RuntimeError):
         super().__init__(message)
 
 
+class ExecutionBackendQuiescenceError(RuntimeError):
+    """Raised when a failed runtime transition cannot be made safely idle."""
+
+
+class ExecutionBackendRuntimeResetError(RuntimeError):
+    """Raised when safety recovery discarded a container runtime generation.
+
+    The workspace is safely quiesced, but setup-created processes no longer
+    exist.  Callers must retry from setup instead of silently continuing with
+    a newly created runtime generation.
+    """
+
+
 class UnknownExecutionBackendError(ValueError):
     """Raised when an unknown backend value reaches the factory."""
 
@@ -696,16 +735,18 @@ class WorkspaceHasUnpushedWorkError(OSError):
     """Raised when a workspace deletion is refused because the worktree still
     holds work that is not durable in ``origin``.
 
-    "Unpushed work" spans three states, any of which blocks deletion:
+    "Unpushed work" spans four states, any of which blocks deletion:
 
     - commits on ``HEAD`` not reachable from any ``origin`` ref,
     - uncommitted modifications to tracked files, and
     - untracked, non-ignored files (excluding orchestrator secrets).
+    - checked-out submodules, whose nested working trees cannot safely be
+      inspected by host Git after an agent has controlled their Git config.
 
     Subclasses :class:`OSError` so existing ``cleanup`` callers that catch
     ``OSError`` degrade to a recorded warning rather than crashing. Deletion is
-    only permitted with ``allow_unpushed_work=True`` (the post-merge cleanup
-    phase and ``spec clean``).
+    only permitted with ``allow_unpushed_work=True`` (an explicit operator
+    discard such as ``spec clean``).
     """
 
     def __init__(
@@ -715,11 +756,13 @@ class WorkspaceHasUnpushedWorkError(OSError):
         *,
         dirty: bool = False,
         untracked: Sequence[str] = (),
+        submodules: Sequence[str] = (),
     ):
         self.source = source
         self.unpushed = tuple(unpushed)
         self.dirty = bool(dirty)
         self.untracked = tuple(untracked)
+        self.submodules = tuple(submodules)
         reasons: list[str] = []
         if self.unpushed:
             preview = ", ".join(sha[:12] for sha in self.unpushed[:5])
@@ -732,10 +775,35 @@ class WorkspaceHasUnpushedWorkError(OSError):
         if self.untracked:
             preview = ", ".join(self.untracked[:5])
             reasons.append(f"{len(self.untracked)} untracked file(s) ({preview})")
+        if self.submodules:
+            preview = ", ".join(self.submodules[:5])
+            reasons.append(
+                f"{len(self.submodules)} checked-out submodule(s) whose nested "
+                f"work was not inspected ({preview})"
+            )
         detail = "; ".join(reasons) if reasons else "unpushed work"
         super().__init__(
             f"refusing to delete workspace {source}: worktree has {detail}. "
             "Push the branch or run `spec clean` to force removal."
+        )
+
+
+class WorkspaceInspectionFailedError(OSError):
+    """Raised when Git cannot prove that a workspace is safe to replace.
+
+    Destructive cleanup and retry restore must distinguish "clean" from
+    "inspection failed". Treating a nonzero Git probe as an empty result can
+    silently discard work when an index, ref, or protected configuration is
+    malformed.
+    """
+
+    def __init__(self, source: Path, operation: str, detail: str):
+        self.source = source
+        self.operation = operation
+        self.detail = detail
+        super().__init__(
+            f"refusing to replace workspace {source}: Git could not {operation}: "
+            f"{detail or 'unknown error'}"
         )
 
 
@@ -775,11 +843,11 @@ _OUTBOX_METADATA_FILENAME = "pr-metadata.json"
 
 def _read_outbox_metadata(outbox_path: Path) -> OutboxMetadata | None:
     candidate = outbox_path / _OUTBOX_METADATA_FILENAME
-    if not candidate.is_file():
-        return None
     try:
-        payload = json.loads(candidate.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+        payload = json.loads(
+            read_bounded_regular_text(candidate, max_bytes=1024 * 1024)
+        )
+    except (ValueError, RecursionError, OSError, UnicodeError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -818,7 +886,7 @@ def _wait_for_posix_setup_status(
             payload = json.loads(status_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             payload = None
-        except (OSError, json.JSONDecodeError, TypeError) as exc:
+        except (OSError, ValueError, RecursionError, TypeError) as exc:
             raise RuntimeError("POSIX setup keeper published invalid status") from exc
         if isinstance(payload, dict):
             if payload.get("schema") != 1:
@@ -1202,6 +1270,15 @@ class WorktreeExecutionBackend:
     def collect_outbox_metadata(self, workspace: WorkspaceHandle) -> OutboxMetadata | None:
         return _read_outbox_metadata(workspace.outbox_path)
 
+    def prepare_host_access(self, workspace: WorkspaceHandle) -> None:
+        del workspace
+
+    def suspend_for_host_access(self, workspace: WorkspaceHandle) -> None:
+        del workspace
+
+    def resume_after_host_access(self, workspace: WorkspaceHandle) -> None:
+        del workspace
+
     def snapshot(self, workspace: WorkspaceHandle, label: str) -> SnapshotRef:
         raise NotImplementedError("worktree backend snapshots are not supported")
 
@@ -1278,16 +1355,27 @@ class CloneExecutionBackend:
         outbox.mkdir(parents=True, exist_ok=True)
         logs.mkdir(parents=True, exist_ok=True)
 
-        if not source.exists():
+        source_created = not source.exists()
+        if source_created:
             source.parent.mkdir(parents=True, exist_ok=True)
             self._clone_source_checkout(repo_root, source)
             self._copy_user_git_config(repo_root, source)
-            self._write_git_state(source, logs, "clone")
         elif not (source / ".git").is_dir():
             raise RuntimeError(
                 f"Clone backend source path exists but is not a full checkout: {source}. "
                 "Remove the workspace directory and retry."
             )
+
+        self._prepare_workspace_git_boundary(
+            repo_root=repo_root,
+            run_root=run_root,
+            source=source,
+            run_id=run_id,
+            spec_id=spec_id,
+            source_created=source_created,
+        )
+        if source_created:
+            self._write_git_state(source, logs, "clone")
 
         base_ref = base_ref or "origin/master"
         # The disposable clone's ``origin`` is rewritten to the forge URL for
@@ -1416,33 +1504,115 @@ class CloneExecutionBackend:
     def collect_outbox_metadata(self, workspace: WorkspaceHandle) -> OutboxMetadata | None:
         return _read_outbox_metadata(workspace.outbox_path)
 
+    def prepare_host_access(self, workspace: WorkspaceHandle) -> None:
+        del workspace
+
+    def suspend_for_host_access(self, workspace: WorkspaceHandle) -> None:
+        del workspace
+
+    def resume_after_host_access(self, workspace: WorkspaceHandle) -> None:
+        del workspace
+
     def snapshot(self, workspace: WorkspaceHandle, label: str) -> SnapshotRef:
         run_root = workspace.outbox_path.parent.resolve()
         snapshots = run_root / "snapshots"
         snapshots.mkdir(parents=True, exist_ok=True)
         target = snapshots / _safe_artifact_name(label)
-        if target.exists():
+        existing = self._completed_snapshot(target, label)
+        if existing is not None:
+            return existing
+        manifest_path = self._snapshot_manifest_path(target)
+        if path_is_link_or_junction(target):
+            target.unlink()
+        elif target.exists():
             remove_tree(target)
-        shutil.copytree(workspace.path, target, symlinks=True)
+        manifest_path.unlink(missing_ok=True)
+
+        staging_parent = Path(
+            tempfile.mkdtemp(
+                dir=snapshots,
+                prefix=f".{target.name}.staging-",
+            )
+        )
+        staging_tree = staging_parent / "tree"
+        published = False
+        try:
+            shutil.copytree(workspace.path, staging_tree, symlinks=True)
+            # The final snapshot name appears only after copytree completed.
+            # A crash or OSError during the copy leaves a private staging path,
+            # never a directory the retry path can mistake for a recovery point.
+            os.replace(staging_tree, target)
+            published = True
+        except BaseException:
+            if published and target.exists():
+                remove_tree(target, ignore_errors=True)
+            raise
+        finally:
+            if staging_parent.exists():
+                remove_tree(staging_parent, ignore_errors=True)
         ref = SnapshotRef(
             label=label,
             path=target,
             metadata={
                 "backend": self.identity.backend,
                 "created_at": datetime.now(timezone.utc).isoformat(),
+                "complete": True,
             },
         )
-        (snapshots / f"{target.name}.json").write_text(
-            json.dumps(ref.metadata | {"label": label, "path": str(target)}, indent=2, sort_keys=True),
-            encoding="utf-8",
+        atomic_write_text(
+            manifest_path,
+            json.dumps(
+                ref.metadata | {"label": label, "path": str(target)},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
         )
         return ref
+
+    @staticmethod
+    def _snapshot_manifest_path(target: Path) -> Path:
+        return target.parent / f"{target.name}.json"
+
+    def _completed_snapshot(self, target: Path, label: str) -> SnapshotRef | None:
+        manifest_path = self._snapshot_manifest_path(target)
+        if (
+            not target.is_dir()
+            or path_is_link_or_junction(target)
+            or not manifest_path.is_file()
+            or path_is_link_or_junction(manifest_path)
+        ):
+            return None
+        try:
+            payload = json.loads(
+                read_bounded_regular_text(manifest_path, max_bytes=1024 * 1024)
+            )
+        except (OSError, UnicodeError, ValueError, RecursionError):
+            return None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("label") != label
+            or payload.get("path") != str(target)
+        ):
+            return None
+        # Older snapshots wrote their manifest only after copytree returned,
+        # so a well-formed legacy manifest is also a valid completion marker.
+        metadata = {
+            str(key): value
+            for key, value in payload.items()
+            if key not in {"label", "path"}
+        }
+        return SnapshotRef(label=label, path=target, metadata=metadata)
 
     def restore(
         self,
         workspace: WorkspaceHandle,
         snapshot: SnapshotRef,
     ) -> WorkspaceHandle:
+        self._validated_cleanup_layout(
+            workspace,
+            migrate_legacy_owner=False,
+        )
         # A restore replaces the workspace tree (including ``.git``) with the
         # snapshot, so any commits or uncommitted changes the agent produced
         # since the snapshot are about to be discarded. Preserve them first.
@@ -1476,18 +1646,28 @@ class CloneExecutionBackend:
                 snapshot,
                 f"rescued unpushed work before restore: {rescue.get('manifest_path')}",
             )
-        if not snapshot.path.is_dir():
-            self._record_snapshot_fallback(workspace, snapshot, "snapshot path is missing")
-            return self._restore_fresh_workspace_fallback(workspace, snapshot)
-        try:
-            self._replace_workspace_tree(workspace.path, snapshot.path)
-        except OSError as exc:
-            self._record_snapshot_fallback(
+        completed_snapshot = self._completed_snapshot(snapshot.path, snapshot.label)
+        if completed_snapshot is None:
+            return self._restore_fresh_workspace_fallback(
                 workspace,
                 snapshot,
-                f"snapshot restore failed: {exc}",
+                reason="snapshot path is missing or completion manifest is invalid",
             )
-            return self._restore_fresh_workspace_fallback(workspace, snapshot)
+        try:
+            # Recheck the link-sensitive boundary immediately before deleting
+            # any child. A replaced source directory must never redirect this
+            # restore into an external tree.
+            self._validated_cleanup_layout(
+                workspace,
+                migrate_legacy_owner=False,
+            )
+            self._replace_workspace_tree(workspace.path, completed_snapshot.path)
+        except OSError as exc:
+            return self._restore_fresh_workspace_fallback(
+                workspace,
+                snapshot,
+                reason=f"snapshot restore failed: {exc}",
+            )
         return workspace
 
     def cleanup(self, workspace: WorkspaceHandle, *, allow_unpushed_work: bool = False) -> None:
@@ -1508,6 +1688,8 @@ class CloneExecutionBackend:
     def _validated_cleanup_layout(
         self,
         workspace: WorkspaceHandle,
+        *,
+        migrate_legacy_owner: bool = True,
     ) -> tuple[Path, Path, Path]:
         """Resolve an owned cleanup target without trusting handle paths."""
         outbox = _lexical_absolute(workspace.outbox_path)
@@ -1580,6 +1762,7 @@ class CloneExecutionBackend:
         repo_root = self._workspace_owner_repo_root(
             workspace_root,
             workspace=workspace,
+            migrate_legacy_owner=migrate_legacy_owner,
         )
         configured_root = self._resolve_workspace_root(repo_root)
         if configured_root != workspace_root:
@@ -1628,19 +1811,19 @@ class CloneExecutionBackend:
                 f"reason: {reason}",
             ]
         )
-        with path.open("a", encoding="utf-8") as handle:
-            if path.stat().st_size:
-                handle.write("\n---\n")
-            handle.write(entry)
+        # Container workspaces expose logs to the worker. Atomic replacement
+        # cannot follow an attacker-planted leaf symlink; preserving older
+        # fallback entries is less important than retaining that boundary.
+        atomic_write_text(path, entry, encoding="utf-8")
 
     def _restore_fresh_workspace_fallback(
         self,
         workspace: WorkspaceHandle,
         snapshot: SnapshotRef,
+        *,
+        reason: str,
     ) -> WorkspaceHandle:
         repo_root_raw = workspace.metadata.get("repo_root")
-        run_id = str(workspace.metadata.get("run_id") or workspace.outbox_path.parent.name)
-        spec_id = str(workspace.metadata.get("spec_id") or "")
         if not repo_root_raw or not workspace.branch:
             raise RuntimeError(
                 "Snapshot restore fallback requires workspace metadata with "
@@ -1649,38 +1832,102 @@ class CloneExecutionBackend:
         repo_root = Path(str(repo_root_raw)).expanduser()
         if not repo_root.is_absolute():
             repo_root = repo_root.resolve()
-        if workspace.path.exists():
-            remove_tree(workspace.path)
-        refreshed = self.prepare_workspace(
-            run_id=run_id,
-            spec_id=spec_id,
-            branch=workspace.branch,
-            repo_root=repo_root,
-            base_ref=str(workspace.metadata.get("base_ref") or ""),
+        self._validated_cleanup_layout(
+            workspace,
+            migrate_legacy_owner=False,
         )
+        run_root = workspace.outbox_path.parent.resolve()
+        logs = run_root / "logs"
+        base_ref = str(workspace.metadata.get("base_ref") or "") or "origin/master"
+        publish_remote_url = self._resolve_publish_remote_url(repo_root)
+        staging_parent = Path(
+            tempfile.mkdtemp(dir=run_root, prefix=".source.fresh-staging-")
+        )
+        staging_tree = staging_parent / "tree"
+        try:
+            # Build and validate the complete replacement beside the current
+            # checkout. A clone/fetch/checkout failure leaves the only known
+            # good source tree untouched.
+            self._clone_source_checkout(repo_root, staging_tree)
+            self._copy_user_git_config(repo_root, staging_tree)
+            self._prepare_restored_checkout_git_boundary(
+                run_root=run_root,
+                source=staging_tree,
+            )
+            self._copy_local_refs(repo_root, staging_tree)
+            self._configure_publish_remote(staging_tree, publish_remote_url)
+            self._ensure_ref_available(staging_tree, base_ref)
+            self._checkout_branch(staging_tree, workspace.branch, base_ref)
+            self._write_git_state(staging_tree, logs, "prepared")
+            self._swap_workspace_tree(workspace.path, staging_tree, staging_parent)
+        finally:
+            if staging_parent.exists():
+                remove_tree(staging_parent, ignore_errors=True)
+        self._persist_base_ref(run_root, workspace.path, base_ref)
+        refreshed = workspace
         self._record_snapshot_fallback(
             refreshed,
             snapshot,
-            "prepared fresh workspace after snapshot restore fallback",
+            f"{reason}; prepared fresh workspace after snapshot restore fallback",
         )
         return refreshed
 
+    def _replace_workspace_tree(self, workspace_path: Path, snapshot_path: Path) -> None:
+        staging_parent = Path(
+            tempfile.mkdtemp(
+                dir=workspace_path.parent,
+                prefix=".source.snapshot-staging-",
+            )
+        )
+        staging_tree = staging_parent / "tree"
+        try:
+            shutil.copytree(snapshot_path, staging_tree, symlinks=True)
+            self._prepare_restored_checkout_git_boundary(
+                run_root=workspace_path.parent,
+                source=staging_tree,
+            )
+            self._swap_workspace_tree(workspace_path, staging_tree, staging_parent)
+        finally:
+            if staging_parent.exists():
+                remove_tree(staging_parent, ignore_errors=True)
+
     @staticmethod
-    def _replace_workspace_tree(workspace_path: Path, snapshot_path: Path) -> None:
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        for child in workspace_path.iterdir():
-            if child.is_dir() and not child.is_symlink():
-                remove_tree(child)
-            else:
-                child.unlink()
-        for child in snapshot_path.iterdir():
-            target = workspace_path / child.name
-            if child.is_symlink():
-                os.symlink(os.readlink(child), target)
-            elif child.is_dir():
-                shutil.copytree(child, target, symlinks=True)
-            else:
-                shutil.copy2(child, target, follow_symlinks=False)
+    def _prepare_restored_checkout_git_boundary(
+        *,
+        run_root: Path,
+        source: Path,
+    ) -> None:
+        del run_root
+        git_dir = source / ".git"
+        if not git_dir.is_dir() or path_is_link_or_junction(git_dir):
+            raise OSError(
+                "replacement workspace is not a regular full Git checkout"
+            )
+
+    @staticmethod
+    def _swap_workspace_tree(
+        workspace_path: Path,
+        staging_tree: Path,
+        staging_parent: Path,
+    ) -> None:
+        """Install a complete sibling tree while retaining rollback authority."""
+        backup = staging_parent / "previous"
+        os.replace(workspace_path, backup)
+        try:
+            os.replace(staging_tree, workspace_path)
+        except BaseException:
+            try:
+                os.replace(backup, workspace_path)
+            except BaseException as rollback_error:
+                raise OSError(
+                    "workspace replacement failed and the original checkout "
+                    f"could not be restored from {backup}"
+                ) from rollback_error
+            raise
+        # The replacement is now installed atomically. Cleanup failure may
+        # leave a private backup for manual recovery, but must not trigger a
+        # second fallback that would replace the successful tree again.
+        remove_tree(backup, ignore_errors=True)
 
     def _resolve_workspace_root(self, repo_root: Path) -> Path:
         configured = Path(self._identity.workspace_root).expanduser()
@@ -1740,6 +1987,7 @@ class CloneExecutionBackend:
         workspace_root: Path,
         *,
         workspace: WorkspaceHandle | None = None,
+        migrate_legacy_owner: bool = True,
     ) -> Path:
         marker = workspace_root / _WORKSPACE_OWNER_FILENAME
         if path_is_link_or_junction(marker):
@@ -1754,7 +2002,8 @@ class CloneExecutionBackend:
             # Released workspaces predate the marker. Migrate only after the
             # caller paths, run identity, branch/spec relationship, root
             # containment, and link checks have all passed.
-            self._ensure_workspace_root_owner(repo_path, workspace_root)
+            if migrate_legacy_owner:
+                self._ensure_workspace_root_owner(repo_path, workspace_root)
             return repo_path
         try:
             payload = json.loads(marker.read_text(encoding="utf-8"))
@@ -1951,6 +2200,19 @@ class CloneExecutionBackend:
             f"git clone --local failed while preparing clone backend workspace at {source}: {self._git_detail(clone)}"
         )
 
+    def _prepare_workspace_git_boundary(
+        self,
+        *,
+        repo_root: Path,
+        run_root: Path,
+        source: Path,
+        run_id: str,
+        spec_id: str,
+        source_created: bool,
+    ) -> None:
+        """Hook for backends with a stronger Git trust boundary."""
+        del repo_root, run_root, source, run_id, spec_id, source_created
+
     def _configure_publish_remote(self, source: Path, remote_url: str) -> None:
         current = self._run_git(["remote", "get-url", "origin"], cwd=source)
         action = "set-url" if current.returncode == 0 else "add"
@@ -2025,9 +2287,13 @@ class CloneExecutionBackend:
                 )
 
     def _write_git_state(self, source: Path, logs: Path, label: str) -> None:
-        status = self._run_git(["status", "--short", "--branch"], cwd=source)
+        status = self._run_git(
+            ["status", "--short", "--branch", "--ignore-submodules=all"],
+            cwd=source,
+        )
         rev = self._run_git(["rev-parse", "HEAD"], cwd=source)
-        (logs / f"git-state-{label}.txt").write_text(
+        atomic_write_text(
+            logs / f"git-state-{label}.txt",
             "\n".join(
                 [
                     f"$ git status --short --branch\n{status.stdout}{status.stderr}",
@@ -2081,7 +2347,7 @@ class CloneExecutionBackend:
             "stderr:",
             _redact_log_text(stderr, redactions),
         ]
-        path.write_text("\n".join(payload), encoding="utf-8")
+        atomic_write_text(path, "\n".join(payload), encoding="utf-8")
 
     def _write_agent_result(
         self,
@@ -2105,8 +2371,10 @@ class CloneExecutionBackend:
             "stdout": stdout,
             "stderr": stderr,
         }
-        (outbox / "agent-result.json").write_text(
-            json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+        atomic_write_text(
+            outbox / "agent-result.json",
+            json.dumps(payload, indent=2, sort_keys=True),
+            encoding="utf-8",
         )
         self._write_completion_artifacts(source=run_root / "source", outbox=outbox)
 
@@ -2115,7 +2383,10 @@ class CloneExecutionBackend:
             return
         branch = self._run_git(["branch", "--show-current"], cwd=source)
         head = self._run_git(["rev-parse", "HEAD"], cwd=source)
-        status = self._run_git(["status", "--short", "--branch"], cwd=source)
+        status = self._run_git(
+            ["status", "--short", "--branch", "--ignore-submodules=all"],
+            cwd=source,
+        )
         recent = self._run_git(
             ["log", "--oneline", "--decorate", "-20"],
             cwd=source,
@@ -2128,7 +2399,10 @@ class CloneExecutionBackend:
         # Regression: committed work must not be lost during container export.
         base_sha = self._read_persisted_base_sha(outbox.parent, source)
         diff_target = base_sha or "HEAD"
-        diff = self._run_git(["diff", diff_target, "--binary"], cwd=source)
+        diff = self._run_git(
+            ["diff", diff_target, "--binary", "--ignore-submodules=all"],
+            cwd=source,
+        )
         metadata = {
             "collected_at": datetime.now(timezone.utc).isoformat(),
             "branch": branch.stdout.strip() if branch.returncode == 0 else "",
@@ -2145,11 +2419,13 @@ class CloneExecutionBackend:
                 "final_patch": diff.stderr if diff.returncode != 0 else "",
             },
         }
-        (outbox / "commit-metadata.json").write_text(
-            json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8"
+        atomic_write_text(
+            outbox / "commit-metadata.json",
+            json.dumps(metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
         )
         if diff.returncode == 0:
-            (outbox / "final.patch").write_text(diff.stdout, encoding="utf-8")
+            atomic_write_text(outbox / "final.patch", diff.stdout, encoding="utf-8")
 
     _BASE_REF_FILENAME = "base-ref"
 
@@ -2207,6 +2483,20 @@ class CloneExecutionBackend:
             f"{cls.SECRET_HOME_DIRNAME}/"
         )
 
+    @staticmethod
+    def _has_inspectable_git_boundary(source: Path) -> bool:
+        """Require Git metadata whenever an existing workspace may be erased."""
+        if not source.exists():
+            return False
+        git_dir = source / ".git"
+        if not git_dir.is_dir() or path_is_link_or_junction(git_dir):
+            raise WorkspaceInspectionFailedError(
+                source,
+                "locate repository metadata",
+                ".git is missing, linked, or not a directory",
+            )
+        return True
+
     def _untracked_files(self, source: Path) -> list[str]:
         """Return untracked, non-ignored file paths (repo-relative) worth saving.
 
@@ -2217,13 +2507,17 @@ class CloneExecutionBackend:
         deletion just as surely as committed work, so both the rescue snapshot
         and the deletion guard must account for them.
         """
-        if not (source / ".git").exists():
+        if not self._has_inspectable_git_boundary(source):
             return []
         result = self._run_git(
             ["ls-files", "--others", "--exclude-standard", "-z"], cwd=source
         )
         if result.returncode != 0:
-            return []
+            raise WorkspaceInspectionFailedError(
+                source,
+                "inspect untracked files",
+                self._git_detail(result),
+            )
         files = [entry for entry in result.stdout.split("\0") if entry]
         return [rel for rel in files if not self._is_secret_path(rel)]
 
@@ -2234,11 +2528,15 @@ class CloneExecutionBackend:
         has no git checkout). Used both to gate destructive deletion and to
         decide whether a rescue snapshot is worth taking.
         """
-        if not (source / ".git").exists():
+        if not self._has_inspectable_git_boundary(source):
             return []
         result = self._run_git(["rev-list", "HEAD", "--not", "--remotes=origin"], cwd=source)
         if result.returncode != 0:
-            return []
+            raise WorkspaceInspectionFailedError(
+                source,
+                "inspect unpublished commits",
+                self._git_detail(result),
+            )
         return [line for line in result.stdout.splitlines() if line.strip()]
 
     def _has_uncommitted_changes(self, source: Path) -> bool:
@@ -2249,12 +2547,101 @@ class CloneExecutionBackend:
         ``--untracked-files=no`` keeps orchestrator-staged, self-gitignored
         credentials under ``.spec-claude-home`` out of this signal.
         """
-        if not (source / ".git").exists():
+        if not self._has_inspectable_git_boundary(source):
             return False
         # ``--untracked-files=no`` keeps orchestrator-staged, self-gitignored
         # secrets out of the "dirty" signal and out of any rescue artifact.
-        result = self._run_git(["status", "--porcelain", "--untracked-files=no"], cwd=source)
-        return result.returncode == 0 and bool(result.stdout.strip())
+        result = self._run_git(
+            [
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+                "--ignore-submodules=all",
+            ],
+            cwd=source,
+        )
+        if result.returncode != 0:
+            raise WorkspaceInspectionFailedError(
+                source,
+                "inspect tracked changes",
+                self._git_detail(result),
+            )
+        return bool(result.stdout.strip())
+
+    def _checked_out_submodules(self, source: Path) -> list[str]:
+        """Return checked-out gitlinks without entering their repositories.
+
+        A container agent controls each nested ``.git/modules/*/config``. Host
+        Git therefore ignores submodule dirtiness to avoid executing a nested
+        fsmonitor or blocking on an included FIFO. At a destructive boundary,
+        the safe conservative choice is to preserve every initialized
+        submodule checkout and require an explicit operator discard instead
+        of pretending its uncommitted state is known to be clean.
+        """
+        if not self._has_inspectable_git_boundary(source):
+            return []
+        result = self._run_git(["ls-files", "--stage", "-z"], cwd=source)
+        if result.returncode != 0:
+            raise WorkspaceInspectionFailedError(
+                source,
+                "inventory submodules",
+                self._git_detail(result),
+            )
+        checked_out: list[str] = []
+        for record in result.stdout.split("\0"):
+            if not record:
+                continue
+            metadata, separator, rel = record.partition("\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 3:
+                raise WorkspaceInspectionFailedError(
+                    source,
+                    "inventory submodules",
+                    "Git returned malformed index data",
+                )
+            mode, _object_id, stage = fields
+            if mode != "160000" or stage != "0":
+                continue
+            relative = PurePosixPath(rel)
+            if (
+                relative.is_absolute()
+                or not rel
+                or ".." in relative.parts
+                or "\\" in rel
+            ):
+                raise WorkspaceInspectionFailedError(
+                    source,
+                    "inventory submodules",
+                    "Git returned an unsafe submodule path",
+                )
+            target = source.joinpath(*relative.parts)
+            try:
+                target_stat = target.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise WorkspaceInspectionFailedError(
+                    source,
+                    "inventory submodules",
+                    f"could not inspect {rel}: {exc}",
+                ) from exc
+            if stat.S_ISDIR(target_stat.st_mode) and not path_is_link_or_junction(
+                target
+            ):
+                try:
+                    if next(target.iterdir(), None) is None:
+                        # Non-recursive clones materialize an empty directory
+                        # for an uninitialized gitlink. It contains no nested
+                        # work and is safe to recreate from the snapshot.
+                        continue
+                except OSError as exc:
+                    raise WorkspaceInspectionFailedError(
+                        source,
+                        "inventory submodules",
+                        f"could not inspect {rel}: {exc}",
+                    ) from exc
+            checked_out.append(rel)
+        return checked_out
 
     def _rescue_unpushed_work(self, source: Path, run_root: Path, *, reason: str) -> dict[str, Any] | None:
         """Preserve unpushed commits and uncommitted tracked changes before a
@@ -2271,12 +2658,11 @@ class CloneExecutionBackend:
         are captured. Self-gitignored orchestrator secrets under
         ``.spec-claude-home`` are excluded from every artifact.
         """
-        if not (source / ".git").exists():
-            return None
         unpushed = self._unpushed_commits(source)
         dirty = self._has_uncommitted_changes(source)
         untracked = self._untracked_files(source)
-        if not unpushed and not dirty and not untracked:
+        submodules = self._checked_out_submodules(source)
+        if not unpushed and not dirty and not untracked and not submodules:
             return None
 
         rescue_root = run_root / self.RESCUE_DIRNAME
@@ -2297,6 +2683,7 @@ class CloneExecutionBackend:
             "branch": self._run_git(["branch", "--show-current"], cwd=source).stdout.strip(),
             "head_sha": head.stdout.strip() if head.returncode == 0 else "",
             "unpushed_commits": list(unpushed),
+            "checked_out_submodules": list(submodules),
             "artifacts": {},
         }
 
@@ -2304,6 +2691,10 @@ class CloneExecutionBackend:
         # Any entry here means the restore must abort rather than replace (and
         # destroy) the tree, since that work is not durable anywhere else.
         unpreserved: list[str] = []
+        if submodules:
+            # Nested work is deliberately not traversed: agent-controlled
+            # submodule Git metadata is outside the trusted host-Git boundary.
+            unpreserved.append("checked-out submodule work")
 
         if unpushed:
             bundle_path = rescue_dir / "unpushed.bundle"
@@ -2319,7 +2710,10 @@ class CloneExecutionBackend:
 
         if dirty:
             patch_path = rescue_dir / "uncommitted.patch"
-            diff = self._run_git(["diff", "HEAD", "--binary"], cwd=source)
+            diff = self._run_git(
+                ["diff", "HEAD", "--binary", "--ignore-submodules=all"],
+                cwd=source,
+            )
             if diff.returncode == 0:
                 try:
                     patch_path.write_text(diff.stdout, encoding="utf-8")
@@ -2402,19 +2796,23 @@ class CloneExecutionBackend:
 
         Deletion is blocked when the worktree has unpushed commits, uncommitted
         edits to tracked files, or untracked non-ignored files — any of which
-        would be permanently lost. The post-merge ``cleanup`` phase and
-        ``spec clean`` pass ``allow_unpushed_work=True`` because the work is
-        merged (or the operator explicitly asked to discard it); every other
-        caller gets the guard.
+        would be permanently lost. Only explicit operator discard paths such
+        as ``spec clean`` pass ``allow_unpushed_work=True``; automatic
+        post-merge cleanup keeps the guard so omitted nested work survives.
         """
         if allow_unpushed_work:
             return
         unpushed = self._unpushed_commits(source)
         dirty = self._has_uncommitted_changes(source)
         untracked = self._untracked_files(source)
-        if unpushed or dirty or untracked:
+        submodules = self._checked_out_submodules(source)
+        if unpushed or dirty or untracked or submodules:
             raise WorkspaceHasUnpushedWorkError(
-                source, unpushed, dirty=dirty, untracked=untracked
+                source,
+                unpushed,
+                dirty=dirty,
+                untracked=untracked,
+                submodules=submodules,
             )
 
     @staticmethod
@@ -2460,6 +2858,69 @@ def _is_valid_container_env_name(key: object) -> bool:
 def _is_claude_mcp_runtime_env_key(key: str) -> bool:
     """Accept only orchestrator-generated MCP alias names for key-only export."""
     return _CLAUDE_MCP_RUNTIME_ENV_RE.fullmatch(key) is not None
+
+
+def _trusted_container_git_guard_environment(env: dict[str, str]) -> dict[str, str]:
+    """Validate and retain the host-generated no-push Git config as one unit."""
+    raw_count = env.get("GIT_CONFIG_COUNT")
+    if raw_count is None:
+        return {}
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Container Git publication guard count is invalid.") from exc
+    if count < 1 or count > 256 or str(count) != raw_count:
+        raise RuntimeError("Container Git publication guard count is invalid.")
+
+    result = {"GIT_CONFIG_COUNT": raw_count}
+    allowed_push_prefixes = {"https://", "http://", "ssh://", "git://", "git@", "file://"}
+    for index in range(count):
+        key_name = f"GIT_CONFIG_KEY_{index}"
+        value_name = f"GIT_CONFIG_VALUE_{index}"
+        key = env.get(key_name)
+        value = env.get(value_name)
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise RuntimeError("Container Git publication guard is incomplete.")
+        valid = (
+            (key == "credential.helper" and value == "")
+            or (key == "credential.interactive" and value == "false")
+            or (
+                key.startswith("url.specbutler-no-push://")
+                and key.endswith("/.pushInsteadOf")
+                and value in allowed_push_prefixes
+            )
+            or (
+                re.fullmatch(r"remote\.[^\s\x00-\x1f]+\.pushurl", key) is not None
+                and value.startswith("specbutler-no-push://remote/")
+                and "\0" not in value
+                and "\n" not in value
+                and "\r" not in value
+            )
+        )
+        if not valid:
+            raise RuntimeError(
+                "Container Git publication guard contains an unexpected entry."
+            )
+        result[key_name] = key
+        result[value_name] = value
+
+    indexed_names = {
+        key
+        for key in env
+        if re.fullmatch(r"GIT_CONFIG_(?:KEY|VALUE)_\d+", key)
+    }
+    if indexed_names != set(result) - {"GIT_CONFIG_COUNT"}:
+        raise RuntimeError("Container Git publication guard has stray entries.")
+    if env.get("GIT_CONFIG_NOSYSTEM") != "1" or env.get("GIT_CONFIG_GLOBAL") != os.devnull:
+        raise RuntimeError("Container Git publication guard isolation is incomplete.")
+    result["GIT_CONFIG_NOSYSTEM"] = "1"
+    # The worker image is Linux even when the host is Windows. Forwarding the
+    # host spelling ``nul`` would make Git read a relative workspace file named
+    # ``nul`` as global config inside the container.
+    result["GIT_CONFIG_GLOBAL"] = "/dev/null"
+    if env.get("GIT_TERMINAL_PROMPT") == "0":
+        result["GIT_TERMINAL_PROMPT"] = "0"
+    return result
 
 
 def _replace_host_path_reference(value: str, *, host_path: str, container_path: str) -> str:
@@ -2593,6 +3054,327 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         self._runner = runner or ContainerCliRunner(self._container.engine)
         self._system_name = system_name or platform.system()
 
+    @staticmethod
+    def _container_safe_git_config_path(run_root: Path) -> Path:
+        return run_root / "backend-state" / "host-git-config"
+
+    @staticmethod
+    def _pinned_compose_file_path(run_root: Path) -> Path:
+        return run_root / "backend-state" / "operator-compose.yaml"
+
+    @staticmethod
+    def _pinned_compose_project_directory(run_root: Path) -> Path:
+        return run_root / "backend-state" / "compose-project"
+
+    @staticmethod
+    def _quote_git_config_value(value: str) -> str:
+        if "\0" in value or "\r" in value or "\n" in value:
+            raise RuntimeError("Container Git configuration contains an unsafe value.")
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+
+    def _create_container_safe_git_config(
+        self,
+        *,
+        repo_root: Path,
+        run_root: Path,
+    ) -> None:
+        def trusted_value(*arguments: str) -> str:
+            result = run_git(arguments, cwd=repo_root, check=False, timeout=10)
+            return result.stdout.strip() if result.returncode == 0 else ""
+
+        # This file is mounted read-only into the worker, so even its fetch URL
+        # must be safe for an untrusted process to read. Reuse the publication
+        # boundary's local-config parser: it disables includes/global config,
+        # rejects credential helpers and URL userinfo, and returns exactly one
+        # credential-free origin URL.
+        remote_url, _ = capture_repository_publication_baseline(repo_root)
+        object_format = trusted_value("rev-parse", "--show-object-format") or "sha1"
+        if object_format not in {"sha1", "sha256"}:
+            raise RuntimeError(
+                f"Container backend does not support Git object format {object_format!r}."
+            )
+        hooks = run_root / "backend-state" / "disabled-git-hooks"
+        if path_is_link_or_junction(hooks) or (hooks.exists() and not hooks.is_dir()):
+            raise RuntimeError(
+                f"Container backend refuses unsafe disabled-hooks path: {hooks}"
+            )
+        hooks.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+        lines = [
+            "[core]",
+            f"\trepositoryFormatVersion = {'1' if object_format == 'sha256' else '0'}",
+            f"\tfileMode = {trusted_value('config', '--bool', 'core.filemode') or ('false' if os.name == 'nt' else 'true')}",
+            "\tbare = false",
+            "\tlogAllRefUpdates = true",
+            "\thooksPath = /dev/null",
+            "\tfsmonitor = false",
+            "[diff]",
+            "\tignoreSubmodules = all",
+            "[status]",
+            "\tsubmoduleSummary = false",
+            "[submodule]",
+            "\trecurse = false",
+            "[fetch]",
+            "\trecurseSubmodules = false",
+            "[push]",
+            "\trecurseSubmodules = no",
+        ]
+        for key, rendered in (
+            ("core.ignorecase", "ignoreCase"),
+            ("core.symlinks", "symlinks"),
+            ("core.precomposeunicode", "precomposeUnicode"),
+        ):
+            value = trusted_value("config", "--bool", key)
+            if value in {"true", "false"}:
+                lines.append(f"\t{rendered} = {value}")
+        if object_format == "sha256":
+            lines.extend(["[extensions]", "\tobjectFormat = sha256"])
+        lines.extend(
+            [
+                '[remote "origin"]',
+                f"\turl = {self._quote_git_config_value(remote_url)}",
+                "\tfetch = +refs/heads/*:refs/remotes/origin/*",
+            ]
+        )
+        user_name = trusted_value("config", "--get", "user.name")
+        user_email = trusted_value("config", "--get", "user.email")
+        if user_name or user_email:
+            lines.append("[user]")
+            if user_name:
+                lines.append(f"\tname = {self._quote_git_config_value(user_name)}")
+            if user_email:
+                lines.append(f"\temail = {self._quote_git_config_value(user_email)}")
+        safe_path = self._container_safe_git_config_path(run_root)
+        atomic_write_text(safe_path, "\n".join(lines) + "\n")
+        if os.name != "nt":
+            safe_path.chmod(0o600)
+
+    def _restore_container_safe_git_config(
+        self,
+        *,
+        run_root: Path,
+        source: Path,
+    ) -> None:
+        safe_path = self._container_safe_git_config_path(run_root)
+        git_dir = source / ".git"
+        if (
+            not safe_path.is_file()
+            or path_is_link_or_junction(safe_path)
+            or safe_path.stat().st_size > 1024 * 1024
+            or not git_dir.is_dir()
+            or path_is_link_or_junction(git_dir)
+        ):
+            raise RuntimeError(
+                "Container backend cannot establish a safe host Git configuration."
+            )
+        payload = safe_path.read_text(encoding="utf-8")
+        if "\0" in payload:
+            raise RuntimeError(
+                "Container backend safe host Git configuration is invalid."
+            )
+        atomic_write_text(git_dir / "config", payload)
+        self._validate_container_git_metadata_for_host(source)
+
+    @staticmethod
+    def _validate_container_git_metadata_for_host(source: Path) -> None:
+        """Reject blocking or redirecting Git metadata before host Git runs.
+
+        Agent output is repository data, but filesystem topology is not a
+        trusted Git transport. A FIFO in HEAD/packed-refs or a symlink under
+        objects can hang Git or redirect it outside the isolated checkout.
+        Validate with lstat/scandir only, without following links or opening
+        arbitrary agent-selected files. The bounded HEAD read happens after
+        the runtime is quiesced (or in a private completed import staging dir).
+        """
+        git_dir = source / ".git"
+        try:
+            git_stat = git_dir.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                "Container backend workspace Git metadata is unavailable."
+            ) from exc
+        if not stat.S_ISDIR(git_stat.st_mode) or path_is_link_or_junction(git_dir):
+            raise RuntimeError(
+                "Container backend refuses linked or non-directory .git metadata."
+            )
+
+        # Container workspaces are standalone clones.  Linked-worktree control
+        # files are therefore never legitimate here, and Git would honor them
+        # before consulting the metadata tree we validate below.  In
+        # particular, ``commondir`` can redirect refs, objects, and packed-refs
+        # outside ``.git`` and reintroduce both path escapes and blocking
+        # special files at the host Git boundary.
+        for control_name in ("commondir", "gitdir"):
+            control_path = git_dir / control_name
+            try:
+                control_path.lstat()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(
+                    "Container backend could not structurally inspect Git metadata."
+                ) from exc
+            raise RuntimeError(
+                "Container backend refuses linked-worktree control files inside "
+                f".git metadata: {control_path}"
+            )
+
+        entries_seen = 0
+        stack = [git_dir]
+        while stack:
+            directory = stack.pop()
+            try:
+                entries = os.scandir(directory)
+            except OSError as exc:
+                raise RuntimeError(
+                    "Container backend could not structurally inspect Git metadata."
+                ) from exc
+            with entries:
+                for entry in entries:
+                    entries_seen += 1
+                    if entries_seen > _CONTAINER_GIT_METADATA_MAX_ENTRIES:
+                        raise RuntimeError(
+                            "Container backend Git metadata exceeds the structural safety limit."
+                        )
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise RuntimeError(
+                            "Container backend could not structurally inspect Git metadata."
+                        ) from exc
+                    is_reparse_point = bool(
+                        getattr(entry_stat, "st_file_attributes", 0)
+                        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                    )
+                    if stat.S_ISLNK(entry_stat.st_mode) or is_reparse_point:
+                        raise RuntimeError(
+                            "Container backend refuses symbolic links or reparse "
+                            "points inside .git metadata: "
+                            f"{entry.path}"
+                        )
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        stack.append(Path(entry.path))
+                    elif not stat.S_ISREG(entry_stat.st_mode):
+                        raise RuntimeError(
+                            "Container backend refuses special files inside .git metadata: "
+                            f"{entry.path}"
+                        )
+
+        for relative in ("objects/info/alternates", "objects/info/http-alternates"):
+            if (git_dir / relative).exists():
+                raise RuntimeError(
+                    "Container backend refuses Git object alternates in agent output."
+                )
+        for required_directory in (git_dir / "objects", git_dir / "refs"):
+            try:
+                required_stat = required_directory.lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    "Container backend workspace Git metadata is incomplete."
+                ) from exc
+            if not stat.S_ISDIR(required_stat.st_mode):
+                raise RuntimeError(
+                    "Container backend workspace Git metadata is incomplete."
+                )
+
+        head_path = git_dir / "HEAD"
+        try:
+            head_stat = head_path.lstat()
+        except OSError as exc:
+            raise RuntimeError(
+                "Container backend workspace Git HEAD is unavailable."
+            ) from exc
+        if not stat.S_ISREG(head_stat.st_mode) or head_stat.st_size > 4096:
+            raise RuntimeError(
+                "Container backend workspace Git HEAD is not a bounded regular file."
+            )
+        try:
+            head = read_bounded_regular_text(
+                head_path,
+                max_bytes=4096,
+                encoding="ascii",
+            ).strip()
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(
+                "Container backend workspace Git HEAD is invalid."
+            ) from exc
+        direct_head = re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", head)
+        symbolic = head.removeprefix("ref: ") if head.startswith("ref: ") else ""
+        safe_symbolic = (
+            re.fullmatch(r"refs/[A-Za-z0-9][A-Za-z0-9._/-]{0,1023}", symbolic)
+            is not None
+            and ".." not in symbolic.split("/")
+            and not symbolic.endswith(("/", ".lock"))
+        )
+        if direct_head is None and not safe_symbolic:
+            raise RuntimeError(
+                "Container backend workspace Git HEAD has an unsafe reference."
+            )
+
+    @staticmethod
+    def _run_git(
+        argv: list[str],
+        *,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]:
+        # Structural validation removes known blocking filesystem primitives;
+        # the timeout is the final fail-closed bound for malformed Git data.
+        return run_git(
+            argv,
+            cwd=cwd,
+            check=False,
+            timeout=30,
+            env=host_publication_git_environment(),
+        )
+
+    def _prepare_workspace_git_boundary(
+        self,
+        *,
+        repo_root: Path,
+        run_root: Path,
+        source: Path,
+        run_id: str,
+        spec_id: str,
+        source_created: bool,
+    ) -> None:
+        previous = self._read_container_state(run_root, missing_ok=True)
+        retrying_existing_run = bool(previous) or not source_created
+        if retrying_existing_run and self._service_topology() == "sidecar":
+            # A pre-0.5 run has no operator-controlled Compose baseline. Check
+            # this migration boundary before removing any existing runtime;
+            # failure must leave the old generation available for inspection.
+            self._validated_pinned_compose_file(run_root)
+        if retrying_existing_run:
+            labels = self._resource_labels(
+                run_id=run_id,
+                spec_id=spec_id,
+                workspace_root=source,
+            )
+            quiesce_state = dict(previous)
+            quiesce_state["resource_labels"] = labels
+            quiesce_state["containers"] = []
+            # This state can be stale or corrupt. Quiescing needs only the
+            # host-derived labels; never let persisted mode/path fields trigger
+            # host-path mutation before the safe Git boundary is restored.
+            quiesce_state["workspace_mode"] = "volume"
+            quiesce_state["service_data_dirs"] = []
+            self._remove_exact_owned_runtime_containers(run_root, quiesce_state)
+        self._create_container_safe_git_config(
+            repo_root=repo_root,
+            run_root=run_root,
+        )
+        self._restore_container_safe_git_config(
+            run_root=run_root,
+            source=source,
+        )
+        if self._service_topology() == "sidecar":
+            self._pin_or_validate_operator_compose(
+                repo_root=repo_root,
+                run_root=run_root,
+                source_created=not retrying_existing_run,
+            )
+
     def prepare_workspace(
         self,
         *,
@@ -2603,6 +3385,156 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         worktree_path: Path | None = None,
         base_ref: str = "",
     ) -> WorkspaceHandle:
+        return self._prepare_workspace(
+            run_id=run_id,
+            spec_id=spec_id,
+            branch=branch,
+            repo_root=repo_root,
+            worktree_path=worktree_path,
+            base_ref=base_ref,
+            start_runtime=True,
+        )
+
+    def materialize_workspace(
+        self,
+        *,
+        run_id: str,
+        spec_id: str,
+        branch: str,
+        repo_root: Path,
+        worktree_path: Path | None = None,
+        base_ref: str = "",
+    ) -> WorkspaceHandle:
+        """Prepare a host-safe checkout without starting project processes."""
+        return self._prepare_workspace(
+            run_id=run_id,
+            spec_id=spec_id,
+            branch=branch,
+            repo_root=repo_root,
+            worktree_path=worktree_path,
+            base_ref=base_ref,
+            start_runtime=False,
+        )
+
+    def _prepare_workspace(
+        self,
+        *,
+        run_id: str,
+        spec_id: str,
+        branch: str,
+        repo_root: Path,
+        worktree_path: Path | None = None,
+        base_ref: str = "",
+        start_runtime: bool,
+    ) -> WorkspaceHandle:
+        # Retry compatibility is a filesystem-only preflight. In particular,
+        # do not contact or mutate the container engine for a pre-0.5 sidecar
+        # run that cannot be resumed without a protected Compose baseline.
+        checked_run_id = validate_workspace_run_identity(run_id, spec_id)
+        checked_repo_root = repo_root.resolve()
+        candidate_root = self._resolve_workspace_root(checked_repo_root)
+        candidate_run_root = candidate_root / checked_run_id
+        candidate_source = candidate_run_root / "source"
+        prior_state = self._read_container_state(
+            candidate_run_root,
+            missing_ok=True,
+        )
+        prior_topology = prior_state.get("service_topology")
+        current_topology = self._service_topology()
+        if prior_state:
+            if prior_state.get("backend") != "container":
+                raise RuntimeError(
+                    "Container backend state has an invalid backend identity; "
+                    "refusing to contact the container engine."
+                )
+            prior_engine = prior_state.get("engine")
+            if not isinstance(prior_engine, str) or not prior_engine:
+                raise RuntimeError(
+                    "Container backend state has an invalid engine identity; "
+                    "refusing to contact the container engine."
+                )
+            if prior_engine != self._container.engine:
+                raise RuntimeError(
+                    "Container backend cannot change container engines while "
+                    "resuming an existing run; restore the original engine before "
+                    "retrying or cleaning that run."
+                )
+            if (
+                not isinstance(prior_topology, str)
+                or prior_topology not in {"in-worker", "sidecar"}
+            ):
+                raise RuntimeError(
+                    "Container backend state has an invalid service topology; "
+                    "refusing to contact the container engine."
+                )
+            if prior_topology != current_topology:
+                raise RuntimeError(
+                    "Container backend cannot change service topology while resuming "
+                    "an existing run; clean or finish that run before changing config."
+                )
+            prior_mode = prior_state.get("workspace_mode")
+            current_mode = self._effective_workspace_mode()
+            if (
+                not isinstance(prior_mode, str)
+                or prior_mode not in {"bind", "volume"}
+            ):
+                raise RuntimeError(
+                    "Container backend state has an invalid workspace mode; "
+                    "refusing to contact the container engine."
+                )
+            if prior_mode != current_mode:
+                raise RuntimeError(
+                    "Container backend cannot change workspace mode while resuming "
+                    "an existing run; clean or finish that run before changing config."
+                )
+            prior_playwright = prior_state.get("playwright_mcp")
+            prior_playwright_topology = (
+                prior_playwright.get("topology")
+                if isinstance(prior_playwright, dict)
+                else None
+            )
+            current_playwright_topology = self._container.playwright_mcp.topology
+            if not isinstance(prior_playwright_topology, str) or (
+                prior_playwright_topology
+                not in {
+                    "disabled",
+                    "in-worker",
+                    "sidecar",
+                }
+            ):
+                raise RuntimeError(
+                    "Container backend state has an invalid Playwright topology; "
+                    "refusing to contact the container engine."
+                )
+            if prior_playwright_topology != current_playwright_topology:
+                raise RuntimeError(
+                    "Container backend cannot change Playwright topology while "
+                    "resuming an existing run; clean or finish that run before "
+                    "changing config."
+                )
+            if self._canonical_state_resource_labels(
+                candidate_run_root,
+                prior_state,
+            ) is None:
+                raise RuntimeError(
+                    "Container backend state has non-canonical resource labels; "
+                    "refusing to contact the container engine."
+                )
+            seed_state = prior_state.get("workspace_volume_seed_state")
+            if prior_mode == "volume" and (
+                not isinstance(seed_state, str)
+                or seed_state not in {"unseeded", "seeding", "ready"}
+            ):
+                raise RuntimeError(
+                    "Container backend found a legacy workspace volume without a "
+                    "valid crash-safe seed marker. It will not contact the container "
+                    "engine or guess whether newer work exists only in the volume."
+                )
+        if prior_topology == "sidecar" or (
+            current_topology == "sidecar"
+            and (candidate_source.exists() or bool(prior_state))
+        ):
+            self._validated_pinned_compose_file(candidate_run_root)
         self._ensure_engine_available()
         handle = super().prepare_workspace(
             run_id=run_id,
@@ -2613,7 +3545,67 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             base_ref=base_ref,
         )
         run_root = handle.outbox_path.parent
+        previous_state = self._read_container_state(run_root, missing_ok=True)
         logs = run_root / "logs"
+        resource_labels = self._resource_labels(
+            run_id=run_id,
+            spec_id=spec_id,
+            workspace_root=handle.path,
+        )
+        previous_labels = self._canonical_state_resource_labels(
+            run_root,
+            previous_state,
+        )
+        preexisting_resources: dict[str, set[str]] | None = None
+        try:
+            preexisting_resources = self._discover_owned_cleanup_resources(
+                run_root,
+                resource_labels,
+            )
+        except OSError:
+            # A prior state may point at data-bearing resources. Without an
+            # authoritative inventory we cannot decide whether to retain its
+            # legacy names or allocate checkout-scoped replacements.
+            if previous_state:
+                raise RuntimeError(
+                    "Container backend could not inventory resources from the "
+                    "previous attempt; refusing to guess whether existing "
+                    "workspace or service data must be resumed."
+                )
+        else:
+            # Treat engine label filters as candidate discovery only. Reinspect
+            # every result before migration/startup preservation so an
+            # unlabeled or foreign same-name resource cannot masquerade as an
+            # exact-owned legacy generation.
+            verified_resources: dict[str, set[str]] = {
+                "container": set(),
+                "volume": set(),
+                "network": set(),
+            }
+            for kind, references in preexisting_resources.items():
+                for reference in references:
+                    actual_labels = self._inspect_resource_labels(
+                        run_root,
+                        kind,
+                        reference,
+                    )
+                    if all(
+                        actual_labels.get(key) == value
+                        for key, value in resource_labels.items()
+                    ):
+                        verified_resources[kind].add(reference)
+            preexisting_resources = verified_resources
+            persistent_resources = (
+                preexisting_resources["volume"]
+                | preexisting_resources["network"]
+            )
+            if persistent_resources and previous_labels != resource_labels:
+                preview = ", ".join(sorted(persistent_resources)[:5])
+                raise RuntimeError(
+                    "Container backend found exact-labeled persistent resources "
+                    "without trustworthy matching state; refusing to orphan or "
+                    f"overwrite ambiguous data ({preview})."
+                )
         codex_provider_home = self.codex_provider_home_root(handle.path) / ".spec-codex-home"
         for candidate in (codex_provider_home.parent, codex_provider_home):
             if path_is_link_or_junction(candidate) or (
@@ -2626,20 +3618,64 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             if os.name != "nt":
                 candidate.chmod(0o700)
         image = self._resolve_worker_image(repo_root=repo_root, run_root=run_root, logs=logs)
-        self._ensure_container_passwd_shim(run_root=run_root, image=image)
+        self._ensure_container_passwd_shim(
+            run_root=run_root,
+            image=image,
+            resource_labels=resource_labels,
+        )
         mode = self._effective_workspace_mode()
         service_topology = self._service_topology()
         service_env = self._service_env(service_topology)
         service_redactions = self._service_env_redactions(service_env)
-        compose_project = self._compose_project_name(run_id) if service_topology == "sidecar" else ""
-        compose_file = self._resolve_compose_file(handle.path) if service_topology == "sidecar" else None
+        compose_project = (
+            self._compose_project_name(run_id, handle.path)
+            if service_topology == "sidecar"
+            else ""
+        )
+        compose_file = (
+            self._validated_pinned_compose_file(run_root)
+            if service_topology == "sidecar"
+            else None
+        )
         playwright_mcp = self._playwright_mcp_state(
             run_id=run_id,
             source=handle.path,
             logs=logs,
             image=image,
             service_topology=service_topology,
+            resource_labels=resource_labels,
         )
+        workspace_volumes = self._volume_names(run_id, mode, handle.path)
+        service_volumes = self._service_volume_names(run_id, service_topology)
+        service_networks = self._service_network_names(
+            run_id,
+            service_topology,
+            handle.path,
+        )
+        service_volume_snapshots: dict[str, Any] = {}
+        if previous_labels == resource_labels and preexisting_resources is not None:
+            (
+                workspace_volumes,
+                compose_project,
+                service_volumes,
+                service_networks,
+                playwright_mcp,
+                service_volume_snapshots,
+            ) = self._adopt_previous_resource_names(
+                run_id=run_id,
+                run_root=run_root,
+                workspace_root=handle.path,
+                mode=mode,
+                service_topology=service_topology,
+                previous_state=previous_state,
+                preexisting_resources=preexisting_resources,
+                expected_labels=resource_labels,
+                workspace_volumes=workspace_volumes,
+                compose_project=compose_project,
+                service_volumes=service_volumes,
+                service_networks=service_networks,
+                playwright_mcp=playwright_mcp,
+            )
         state = {
             "backend": "container",
             "engine": self._container.engine,
@@ -2660,13 +3696,19 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             "outbox_path": str(handle.outbox_path),
             "logs_path": str(logs),
             "containers": [],
-            "volumes": self._volume_names(run_id, mode),
-            "workspace_volumes": self._volume_names(run_id, mode),
-            "service_volumes": self._service_volume_names(run_id, service_topology),
+            "runtime_generation_containers": [],
+            "runtime_generation_status": "quiesced",
+            "volumes": workspace_volumes,
+            "workspace_volumes": workspace_volumes,
+            "service_volumes": service_volumes,
+            "service_volume_snapshots": service_volume_snapshots,
             "networks": [],
-            "service_networks": self._service_network_names(run_id, service_topology),
+            "service_networks": service_networks,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "resource_labels": self._resource_labels(run_id=run_id, spec_id=spec_id, workspace_root=handle.path),
+            "resource_labels": resource_labels,
+            "workspace_volume_seed_state": (
+                "unseeded" if mode == "volume" else "not-applicable"
+            ),
         }
         state["volumes"] = list(dict.fromkeys([*state["workspace_volumes"], *state["service_volumes"]]))
         state["networks"] = list(
@@ -2678,6 +3720,63 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 ]
             )
         )
+        if preexisting_resources is None:
+            # Preparation can still proceed, but a later startup failure must
+            # leak rather than guess which resources predated this attempt.
+            state["startup_cleanup_safe"] = False
+            state["startup_preserved_resources"] = {}
+        else:
+            state["startup_cleanup_safe"] = True
+            state["startup_preserved_resources"] = {
+                kind: sorted(resources)
+                for kind, resources in preexisting_resources.items()
+            }
+        workspace_volume = next(iter(state["workspace_volumes"]), "")
+        workspace_volume_preexisting = bool(
+            workspace_volume
+            and preexisting_resources is not None
+            and workspace_volume in preexisting_resources.get("volume", set())
+        )
+        previous_seed_state = str(
+            previous_state.get("workspace_volume_seed_state") or ""
+        )
+        previous_volumes = previous_state.get("workspace_volumes") or previous_state.get(
+            "volumes", []
+        )
+        previous_volume = (
+            str(previous_volumes[0])
+            if isinstance(previous_volumes, list) and previous_volumes
+            else ""
+        )
+        interrupted_seed = (
+            workspace_volume_preexisting
+            and previous_labels == resource_labels
+            and previous_volume == workspace_volume
+            and previous_seed_state in {"unseeded", "seeding"}
+        )
+        legacy_seed_state_ambiguous = (
+            workspace_volume_preexisting
+            and previous_labels == resource_labels
+            and previous_volume == workspace_volume
+            and "workspace_volume_seed_state" not in previous_state
+        )
+        if legacy_seed_state_ambiguous:
+            raise RuntimeError(
+                "Container backend found a legacy workspace volume without a "
+                "crash-safe seed marker. It may contain either newer agent work "
+                "or a partial interrupted seed, so Spec Butler will not replace "
+                "the host checkout or overwrite the volume automatically. Preserve "
+                f"and inspect volume {workspace_volume!r}, or explicitly clean this "
+                "run before retrying."
+            )
+        if workspace_volume_preexisting:
+            # Preserve "ready" across a transient import failure so the next
+            # retry tries the non-destructive import again. Missing legacy
+            # markers were rejected above because structural Git validation
+            # cannot prove their working tree was completely seeded.
+            state["workspace_volume_seed_state"] = (
+                "seeding" if interrupted_seed else "ready"
+            )
         self._write_container_state(run_root, state)
         self._write_playwright_mcp_diagnostics(logs, playwright_mcp, service_env)
         self._remove_worker_visible_state(handle.path)
@@ -2688,47 +3787,40 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         # verified removed (docker inspect not-found — not merely rm exit 0);
         # postmaster.pid cleanup is gated on it so a live postmaster's lock is
         # never deleted out from under it.
-        containers_verified_gone = self._teardown_previous_attempt_containers(run_root, state)
-        try:
-            if service_topology == "sidecar":
-                assert compose_file is not None
-                self._start_sidecar_services(
+        self._remove_exact_owned_runtime_containers(run_root, state)
+        containers_verified_gone = True
+        self._clear_stale_postmaster_pids(run_root, state)
+        if mode == "volume":
+            if preexisting_resources is None:
+                raise RuntimeError(
+                    "Container backend could not determine whether this run's "
+                    "workspace volume already exists; refusing to seed it."
+                )
+            if (
+                workspace_volume_preexisting
+                and state["workspace_volume_seed_state"] == "ready"
+            ):
+                # A timed-out or interrupted provider can leave its newest git
+                # state only in the authoritative workspace volume. Import it
+                # after every prior worker is positively gone and before the
+                # destructive seed below. The import itself revalidates volume
+                # ownership and every attached consumer.
+                self._sync_volume_workspace_to_host(run_root, state)
+                # Never bring the completion/control state exposed to the old
+                # worker back into the host mirror used for the next attempt.
+                self._remove_worker_visible_state(handle.path)
+                self._restore_container_safe_git_config(
                     run_root=run_root,
-                    logs=logs,
-                    compose_file=compose_file,
-                    compose_project=compose_project,
+                    source=handle.path,
                 )
-                self._refresh_sidecar_service_volumes(run_root, state)
-            if playwright_mcp.get("topology") == "sidecar":
-                self._start_playwright_mcp_sidecar(run_root, logs, state)
-            if mode == "volume":
-                self._seed_volume_workspace(handle, state)
-                # Seeding wipes and repopulates the workspace volume from the
-                # host worktree, which can re-introduce a stale postmaster.pid
-                # into the postgres data dir. Clear it *after* the reseed (and
-                # before the worker starts) so the cleanup is not undone. Gate
-                # it on every prior-attempt container being *verified* removed:
-                # in volume mode postgres only ever runs inside a spec-runtime
-                # container, so once they are all confirmed gone no live
-                # postmaster can own the data dir. If teardown could not confirm
-                # that, leave the pid untouched and let env prep fail loudly
-                # rather than risk deleting a live postmaster's lock.
-                self._clear_stale_volume_postmaster_pids(
-                    run_root, state, containers_verified_gone
-                )
-            self._start_in_worker_container(run_root, state)
-            self._run_container_bootstrap_install(handle)
-        except Exception:
-            # Service/container startup failed partway through. Tear down the
-            # docker resources created so far (sidecars, worker container,
-            # networks, volumes) so a startup failure does not leak them and
-            # saturate the docker bridge. Preserve run_root/logs (including the
-            # service-startup-failure.json diagnostic) for debugging. Best-
-            # effort — never mask the original startup error being re-raised.
-            teardown_state = self._read_container_state(run_root, missing_ok=True) or state
-            self._teardown_container_resources(run_root, teardown_state)
-            raise
-        return WorkspaceHandle(
+        # Preparation intentionally starts no project-controlled process. The
+        # checkout is now safe for bootstrap-phase host writes and Git. The
+        # first backend command (or an explicit resume transition) seeds the
+        # final host tree, starts services/worker, and runs bootstrap exactly
+        # once for that runtime generation.
+        state["prior_containers_verified_gone"] = containers_verified_gone
+        self._write_container_state(run_root, state)
+        prepared = WorkspaceHandle(
             path=handle.path,
             outbox_path=handle.outbox_path,
             branch=handle.branch,
@@ -2743,11 +3835,14 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 "container_state_path": str(self._container_state_path(run_root)),
             },
         )
+        if start_runtime:
+            self._ensure_container_runtime_started(prepared.path)
+        return prepared
 
     def _run_container_bootstrap_install(self, handle: WorkspaceHandle) -> None:
         if not self._bootstrap_install_command:
             return
-        result = self.run_command(
+        result = self._run_command_in_started_runtime(
             CommandRequest(
                 argv=["sh", "-lc", self._bootstrap_install_command],
                 cwd=handle.path,
@@ -2789,11 +3884,136 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             return False
         return result.returncode == 0
 
+    def _workspace_handle_from_run_root(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+    ) -> WorkspaceHandle:
+        return WorkspaceHandle(
+            path=run_root / "source",
+            outbox_path=run_root / "outbox",
+            branch=str(state.get("branch") or ""),
+            backend="container",
+            metadata={
+                "run_id": str(state.get("resource_labels", {}).get("spec.run_id") or run_root.name),
+                "spec_id": str(state.get("resource_labels", {}).get("spec.spec_id") or ""),
+                "workspace_root": str(run_root.parent),
+            },
+        )
+
+    def _ensure_container_runtime_started(self, workspace_cwd: Path) -> None:
+        run_root = self._workspace_run_root(workspace_cwd)
+        if run_root is None:
+            raise RuntimeError(
+                f"Container backend command cwd is not inside a prepared workspace: {workspace_cwd}"
+            )
+        state = self._read_container_state(run_root)
+        paused = [
+            str(item)
+            for item in state.get("host_access_paused_containers", [])
+            if str(item)
+        ]
+        if paused:
+            raise RuntimeError(
+                "Container backend refuses to run a command while host access owns "
+                "the suspended workspace boundary."
+            )
+        if self._recorded_runtime_is_healthy(run_root, state):
+            return
+        # The state can lag a crash or manual edit, and a recorded worker is
+        # not proof that its sidecars are still alive.  Before creating a new
+        # runtime generation, remove every exact-owned container discovered
+        # from the engine so no partial or unrecorded generation can race it.
+        cleanly_quiesced = (
+            state.get("runtime_generation_status") == "quiesced"
+            and not state.get("worker_container")
+            and not state.get("containers")
+            and not state.get("runtime_generation_containers")
+        )
+        if not cleanly_quiesced:
+            self._quiesce_runtime_for_host_access(
+                run_root=run_root,
+                source=workspace_cwd,
+                purpose="runtime health recovery",
+            )
+            state = self._read_container_state(run_root)
+        # Arm recovery before the first resource is started. A crash anywhere
+        # below leaves "starting", so the next command quiesces every
+        # exact-owned partial resource instead of trusting an empty id list.
+        state["runtime_generation_status"] = "starting"
+        self._write_container_state(run_root, state)
+        handle = self._workspace_handle_from_run_root(run_root, state)
+        try:
+            if state.get("workspace_mode") == "volume":
+                if state.pop("workspace_volume_preseeded_for_runtime", False):
+                    # A host reposition explicitly seeded this exact tree while
+                    # quiesced. Consume the one-start token durably before
+                    # starting any writer; a crash after this point safely
+                    # falls back to a fresh seed on retry.
+                    self._write_container_state(run_root, state)
+                else:
+                    self._seed_volume_workspace(handle, state)
+                self._clear_stale_volume_postmaster_pids(
+                    run_root,
+                    state,
+                    bool(state.get("prior_containers_verified_gone", True)),
+                )
+            if state.get("service_topology") == "sidecar":
+                self._start_sidecar_services(
+                    run_root=run_root,
+                    logs=run_root / "logs",
+                    compose_file=self._validated_pinned_compose_file(run_root),
+                    compose_project=str(state.get("compose_project") or ""),
+                )
+                self._refresh_sidecar_service_volumes(run_root, state)
+            playwright = state.get("playwright_mcp", {})
+            if isinstance(playwright, dict) and playwright.get("topology") == "sidecar":
+                self._start_playwright_mcp_sidecar(run_root, run_root / "logs", state)
+            self._start_in_worker_container(run_root, state)
+            self._run_container_bootstrap_install(handle)
+            state = self._read_container_state(run_root)
+            self._record_runtime_generation(run_root, state)
+            if not self._recorded_runtime_is_healthy(run_root, state):
+                raise RuntimeError(
+                    "Container backend could not verify the complete runtime generation."
+                )
+        except BaseException as startup_error:
+            teardown_state = self._read_container_state(run_root, missing_ok=True) or state
+            try:
+                self._remove_exact_owned_runtime_containers(run_root, teardown_state)
+            except BaseException as quiesce_error:
+                raise RuntimeError(
+                    "Container runtime startup failed and its writers could not "
+                    "be positively quiesced. Manual scoped cleanup is required."
+                ) from ExceptionGroup(
+                    "runtime startup and container quiescence both failed",
+                    [startup_error, quiesce_error],
+                )
+            teardown_state["worker_container"] = ""
+            teardown_state["containers"] = []
+            teardown_state["service_processes"] = []
+            teardown_state["host_access_paused_containers"] = []
+            teardown_state["runtime_generation_containers"] = []
+            teardown_state["runtime_generation_status"] = "quiesced"
+            self._write_container_state(run_root, teardown_state)
+            # Containers are now positively gone. Remaining volume/network
+            # cleanup is best-effort and must not mask the startup failure.
+            try:
+                self._teardown_container_resources(run_root, teardown_state)
+            except BaseException:
+                pass
+            raise
+
     def run_command(self, request: CommandRequest) -> CommandResult:
+        self._ensure_container_runtime_started(request.cwd)
+        return self._run_command_in_started_runtime(request)
+
+    def _run_command_in_started_runtime(self, request: CommandRequest) -> CommandResult:
         run_root = self._workspace_run_root(request.cwd)
         if run_root is None:
             raise RuntimeError(f"Container backend command cwd is not inside a prepared workspace: {request.cwd}")
         state = self._read_container_state(run_root)
+        self._require_workspace_volume_safe(run_root, state)
         worker_env = self._container_worker_environment(
             run_root=run_root,
             env=request.env or {},
@@ -2817,8 +4037,6 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             input_text=request.input_text,
             timeout=request.timeout,
         )
-        self._remember_container_id(run_root, state)
-        self._sync_volume_workspace_to_host(run_root, state)
         self._write_command_log(
             kind="container-command",
             cwd=request.cwd,
@@ -2848,7 +4066,9 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         run_root = self._workspace_run_root(request.cwd)
         if run_root is None:
             raise RuntimeError(f"Container backend agent cwd is not inside a prepared workspace: {request.cwd}")
+        self._ensure_container_runtime_started(request.cwd)
         state = self._read_container_state(run_root)
+        self._require_workspace_volume_safe(run_root, state)
         worker_env = self._container_worker_environment(
             run_root=run_root,
             env=request.env or {},
@@ -2864,53 +4084,57 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             agent=True,
         )
         client_env = self._container_client_env(worker_env)
-        if monitor is None:
-            completed = self._runner.run(argv, cwd=run_root, env=client_env)
-            self._remember_container_id(run_root, state)
-            self._sync_volume_workspace_to_host(run_root, state)
-            self._write_command_log(
-                kind="container-agent",
-                cwd=request.cwd,
-                argv=argv,
-                returncode=completed.returncode,
-                stdout=completed.stdout or "",
-                stderr=completed.stderr or "",
-                redactions=(
-                    *self._service_log_redactions(state),
-                    *self._request_env_log_redactions(worker_env),
-                    *request.redactions,
-                ),
-            )
-            self._write_agent_result(
-                cwd=request.cwd,
-                argv=request.argv,
-                returncode=completed.returncode,
-                stdout=completed.stdout or "",
-                stderr=completed.stderr or "",
-            )
-            return AgentResult(
-                returncode=completed.returncode,
-                stdout=completed.stdout or "",
-                stderr=completed.stderr or "",
+        completed: subprocess.CompletedProcess[str] | None = None
+        returncode = 1
+        try:
+            if monitor is None:
+                completed = self._runner.run(argv, cwd=run_root, env=client_env)
+                returncode = completed.returncode
+            else:
+                popen_kwargs = dict(request.popen_kwargs)
+                proc = self._runner.popen(
+                    argv,
+                    cwd=run_root,
+                    env=client_env,
+                    popen_kwargs=popen_kwargs,
+                )
+                returncode = _run_agent_monitor(proc, monitor)
+        except BaseException as agent_error:
+            try:
+                self._quiesce_runtime_for_host_access(
+                    run_root=run_root,
+                    source=request.cwd,
+                    purpose="failed agent return",
+                )
+            except BaseException as quiesce_error:
+                raise RuntimeError(
+                    "Container agent execution failed and its runtime could not "
+                    "be positively quiesced. Manual scoped cleanup is required."
+                ) from ExceptionGroup(
+                    "agent execution and container quiescence both failed",
+                    [agent_error, quiesce_error],
+                )
+            raise
+        else:
+            # This is the liveness boundary, not a diagnostic side effect. It
+            # must run before touching worker-writable logs/outbox paths: an
+            # agent can make those paths unwritable, and a logging exception
+            # must never strand the persistent worker or its descendants.
+            self._quiesce_runtime_for_host_access(
+                run_root=run_root,
+                source=request.cwd,
+                purpose="agent return",
             )
 
-        popen_kwargs = dict(request.popen_kwargs)
-        proc = self._runner.popen(
-            argv,
-            cwd=run_root,
-            env=client_env,
-            popen_kwargs=popen_kwargs,
-        )
-        returncode = _run_agent_monitor(proc, monitor)
-        self._remember_container_id(run_root, state)
-        self._sync_volume_workspace_to_host(run_root, state)
+        stdout = completed.stdout or "" if completed is not None else ""
+        stderr = completed.stderr or "" if completed is not None else ""
         self._write_command_log(
             kind="container-agent",
             cwd=request.cwd,
             argv=argv,
             returncode=returncode,
-            stdout="",
-            stderr="",
+            stdout=stdout,
+            stderr=stderr,
             redactions=(
                 *self._service_log_redactions(state),
                 *self._request_env_log_redactions(worker_env),
@@ -2921,22 +4145,247 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             cwd=request.cwd,
             argv=request.argv,
             returncode=returncode,
-            stdout="",
-            stderr="",
+            stdout=stdout,
+            stderr=stderr,
         )
-        return AgentResult(returncode=returncode)
+        return AgentResult(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def _write_completion_artifacts(self, *, source: Path, outbox: Path) -> None:
+        """Collect evidence after :meth:`launch_agent` closes the runtime."""
+        super()._write_completion_artifacts(source=source, outbox=outbox)
+
+    def prepare_host_access(self, workspace: WorkspaceHandle) -> None:
+        run_root = workspace.outbox_path.parent.resolve()
+        if workspace.path.resolve() != (run_root / "source").resolve():
+            raise RuntimeError(
+                "Container backend refuses host access for a mismatched workspace path."
+            )
+        self._quiesce_runtime_for_host_access(
+            run_root=run_root,
+            source=workspace.path,
+            purpose="host phase transition",
+        )
+
+    def suspend_for_host_access(self, workspace: WorkspaceHandle) -> None:
+        """Pause all exactly-owned containers and stabilize the host mirror."""
+        run_root = workspace.outbox_path.parent.resolve()
+        if workspace.path.resolve() != (run_root / "source").resolve():
+            raise RuntimeError(
+                "Container backend refuses host suspension for a mismatched workspace."
+            )
+        state = self._read_container_state(run_root)
+        existing = [
+            str(item)
+            for item in state.get("host_access_paused_containers", [])
+            if str(item)
+        ]
+        if existing:
+            for container_id in existing:
+                if not self._container_pause_state(run_root, container_id):
+                    raise RuntimeError(
+                        "Container backend lost its suspended runtime boundary."
+                    )
+        else:
+            labels = self._canonical_state_resource_labels(run_root, state)
+            if labels is None:
+                raise RuntimeError(
+                    "Container backend refuses host suspension with non-canonical labels."
+                )
+            owned = self._discover_owned_cleanup_resources(run_root, labels)
+            paused: list[str] = []
+            try:
+                for container_id in sorted(owned["container"]):
+                    status = self._container_runtime_status(
+                        run_root,
+                        state,
+                        container_id,
+                    )
+                    if status in {"created", "exited", "dead"}:
+                        # A completed one-shot Compose job or crashed sidecar is
+                        # not a writer and cannot be paused. It remains covered
+                        # by exact ownership and later cleanup/quiescence.
+                        continue
+                    if status != "running":
+                        raise RuntimeError(
+                            "Container backend cannot establish a stable host "
+                            f"boundary while exact-owned container {container_id} "
+                            f"is in unexpected state {status!r}."
+                        )
+                    self._pause_owned_container(run_root, state, container_id)
+                    paused.append(container_id)
+            except Exception:
+                for container_id in reversed(paused):
+                    try:
+                        self._unpause_owned_container(run_root, state, container_id)
+                    except Exception:
+                        pass
+                raise
+            state["host_access_paused_containers"] = paused
+            self._write_container_state(run_root, state)
+        if state.get("workspace_mode") == "volume":
+            self._sync_volume_workspace_to_host(run_root, state)
+        self._restore_container_safe_git_config(
+            run_root=run_root,
+            source=workspace.path,
+        )
+
+    def resume_after_host_access(self, workspace: WorkspaceHandle) -> None:
+        """Resume a paused generation or recreate a fully quiesced runtime."""
+        run_root = workspace.outbox_path.parent.resolve()
+        if workspace.path.resolve() != (run_root / "source").resolve():
+            raise RuntimeError(
+                "Container backend refuses runtime resume for a mismatched workspace."
+            )
+        state = self._read_container_state(run_root)
+        paused = [
+            str(item)
+            for item in state.get("host_access_paused_containers", [])
+            if str(item)
+        ]
+        if paused:
+            try:
+                healthy = self._recorded_runtime_is_healthy(
+                    run_root,
+                    state,
+                    allow_paused=True,
+                )
+            except Exception as health_error:
+                self._discard_unusable_runtime_generation(
+                    run_root=run_root,
+                    source=workspace.path,
+                    reason="could not validate the paused runtime generation",
+                    cause=health_error,
+                )
+            if not healthy:
+                self._discard_unusable_runtime_generation(
+                    run_root=run_root,
+                    source=workspace.path,
+                    reason="the paused runtime generation changed or exited",
+                )
+            try:
+                remaining = list(paused)
+                for container_id in reversed(paused):
+                    self._unpause_owned_container(run_root, state, container_id)
+                    remaining.remove(container_id)
+                    state["host_access_paused_containers"] = remaining
+                    self._write_container_state(run_root, state)
+                state = self._read_container_state(run_root)
+                if not self._recorded_runtime_is_healthy(run_root, state):
+                    raise RuntimeError(
+                        "the resumed runtime generation could not be verified"
+                    )
+            except Exception as resume_error:
+                self._discard_unusable_runtime_generation(
+                    run_root=run_root,
+                    source=workspace.path,
+                    reason="could not safely resume the paused runtime generation",
+                    cause=resume_error,
+                )
+            return
+        self._ensure_container_runtime_started(workspace.path)
+
+    def _discard_unusable_runtime_generation(
+        self,
+        *,
+        run_root: Path,
+        source: Path,
+        reason: str,
+        cause: BaseException | None = None,
+    ) -> None:
+        """Quiesce an invalid generation and force the caller to rerun setup."""
+        try:
+            self._quiesce_runtime_for_host_access(
+                run_root=run_root,
+                source=source,
+                purpose="runtime generation reset",
+            )
+        except Exception as quiesce_error:
+            errors: list[BaseException] = [quiesce_error]
+            if cause is not None:
+                errors.insert(0, cause)
+            raise ExecutionBackendQuiescenceError(
+                "Container backend could not quiesce an unusable runtime generation."
+            ) from ExceptionGroup("runtime validation and quiescence failed", errors)
+        error = ExecutionBackendRuntimeResetError(
+            f"Container backend discarded its runtime because {reason}; "
+            "the implementation setup phase must be retried."
+        )
+        if cause is None:
+            raise error
+        raise error from cause
+
+    def _quiesce_runtime_for_host_access(
+        self,
+        *,
+        run_root: Path,
+        source: Path,
+        purpose: str,
+    ) -> None:
+        state = self._read_container_state(run_root)
+        self._remove_exact_owned_runtime_containers(run_root, state)
+        state["worker_container"] = ""
+        state["containers"] = []
+        state["service_processes"] = []
+        state["host_access_paused_containers"] = []
+        state["runtime_generation_containers"] = []
+        state["runtime_generation_status"] = "quiesced"
+        self._write_container_state(run_root, state)
+        if (
+            state.get("workspace_mode") == "volume"
+            and state.get("workspace_volume_seed_state") == "ready"
+        ):
+            # The volume is authoritative. Import only after every owned
+            # writer is positively gone so the host receives one consistent,
+            # final image rather than a raced mid-copy view.
+            self._sync_volume_workspace_to_host(run_root, state)
+        self._restore_container_safe_git_config(
+            run_root=run_root,
+            source=source,
+        )
 
     def snapshot(self, workspace: WorkspaceHandle, label: str) -> SnapshotRef:
         run_root = workspace.outbox_path.parent.resolve()
+        target = run_root / "snapshots" / _safe_artifact_name(label)
+        existing = self._completed_snapshot(target, label)
+        if existing is not None:
+            # A recovery point is immutable.  In particular, do not pair an
+            # existing source snapshot with a freshly captured sidecar database
+            # on a resumed setup attempt.  Validate that the original sidecar
+            # archive set is still complete, then return it unchanged.
+            state = self._read_container_state(run_root)
+            if state.get("service_topology") == "sidecar":
+                self._validated_sidecar_service_volume_restore(
+                    run_root,
+                    state,
+                    label,
+                )
+            return existing
+        self._ensure_container_runtime_started(workspace.path)
         state = self._read_container_state(run_root, missing_ok=True)
         sidecars_stopped = False
+        paused_containers: list[str] = []
         try:
+            # setup_command may deliberately leave services running in the
+            # persistent worker. Freeze (rather than remove) those exact-owned
+            # containers so the snapshot is consistent without losing setup
+            # descendants that the implementation agent still needs.
+            for container_id in self._snapshot_pause_container_ids(state):
+                self._pause_owned_container(run_root, state, container_id)
+                paused_containers.append(container_id)
             if state.get("service_topology") == "sidecar":
-                self._stop_sidecar_services(run_root, state)
+                # Once the protected Compose input is known-good, any stop
+                # attempt may have changed service state even if its later
+                # verification fails. Arm the finally restart first.
+                self._validated_pinned_compose_file(run_root)
                 sidecars_stopped = True
+                self._stop_sidecar_services(run_root, state)
                 self._refresh_sidecar_service_volumes(run_root, state)
                 self._snapshot_sidecar_service_volumes(run_root, state, label)
             self._sync_volume_workspace_to_host(run_root, state)
+            self._restore_container_safe_git_config(
+                run_root=run_root,
+                source=workspace.path,
+            )
             ref = super().snapshot(workspace, label)
             metadata = ref.metadata | {
                 "backend": "container",
@@ -2946,72 +4395,125 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 "service_volumes": state.get("service_volumes", []),
                 "service_volume_snapshots": state.get("service_volume_snapshots", {}).get(label, {}),
             }
-            (ref.path.parent / f"{ref.path.name}.json").write_text(
+            atomic_write_text(
+                ref.path.parent / f"{ref.path.name}.json",
                 json.dumps(
                     metadata | {"label": label, "path": str(ref.path)},
                     indent=2,
                     sort_keys=True,
-                ),
-                encoding="utf-8",
+                )
+                + "\n",
             )
             return SnapshotRef(label=ref.label, path=ref.path, metadata=metadata)
         finally:
-            if sidecars_stopped:
-                compose_file = str(state.get("compose_file") or "")
-                compose_project = str(state.get("compose_project") or "")
-                if compose_file and compose_project:
-                    self._start_sidecar_services(
+            restart_error: Exception | None = None
+            try:
+                if sidecars_stopped:
+                    compose_file = str(state.get("compose_file") or "")
+                    compose_project = str(state.get("compose_project") or "")
+                    if compose_file and compose_project:
+                        self._start_sidecar_services(
+                            run_root=run_root,
+                            logs=run_root / "logs",
+                            compose_file=Path(compose_file),
+                            compose_project=compose_project,
+                        )
+            except Exception as exc:
+                restart_error = exc
+            for container_id in reversed(paused_containers):
+                try:
+                    self._unpause_owned_container(run_root, state, container_id)
+                except Exception as exc:
+                    if restart_error is None:
+                        restart_error = exc
+            if restart_error is None:
+                try:
+                    state = self._read_container_state(run_root)
+                    self._record_runtime_generation(run_root, state)
+                except Exception as exc:
+                    restart_error = exc
+            if restart_error is not None:
+                try:
+                    # Never leave a live worker paired with missing/dead
+                    # sidecars. Even successful quiescence invalidates any
+                    # setup-created descendants, so the orchestrator must retry
+                    # setup rather than silently starting an empty generation.
+                    self._quiesce_runtime_for_host_access(
                         run_root=run_root,
-                        logs=run_root / "logs",
-                        compose_file=Path(compose_file),
-                        compose_project=compose_project,
+                        source=workspace.path,
+                        purpose="snapshot recovery",
                     )
+                except Exception as quiesce_error:
+                    raise ExecutionBackendQuiescenceError(
+                        "Container backend could not quiesce the runtime after "
+                        "snapshot restart failed."
+                    ) from quiesce_error
+                raise ExecutionBackendRuntimeResetError(
+                    "Container backend discarded its runtime after snapshot "
+                    "restart failed; the implementation setup phase must be retried."
+                ) from restart_error
 
     def restore(
         self,
         workspace: WorkspaceHandle,
         snapshot: SnapshotRef,
     ) -> WorkspaceHandle:
+        self._validated_cleanup_layout(
+            workspace,
+            migrate_legacy_owner=False,
+        )
         run_root = workspace.outbox_path.parent.resolve()
-        state = self._read_container_state(run_root, missing_ok=True)
-        reset_worker = bool(state.get("worker_container")) or state.get("service_topology") == "in-worker"
-        if reset_worker:
-            self._reset_in_worker_container(run_root, state)
-        # For volume-mode workspaces the authoritative git state lives inside the
-        # Docker volume, not the host ``source`` mirror. ``super().restore``
-        # rescues unpushed work from the host mirror and then reseeds the volume
-        # from the restored tree — so any commits or edits that reached only the
-        # volume (a crash before the post-run sync) would be overwritten before
-        # the rescue ever sees them. Re-sync the volume back to the host first so
-        # the rescue snapshot captures the same content the reseed is about to
-        # discard. Mirrors the deletability-guard sync in :meth:`cleanup`.
-        if state.get("workspace_mode") == "volume":
-            self._sync_volume_workspace_to_host(run_root, state)
+        try:
+            state = self._read_container_state(run_root, missing_ok=True)
+        except RuntimeError as exc:
+            raise OSError(str(exc)) from exc
+        # Restore is a host-owned tree mutation. Stop *every* exactly-owned
+        # writer first, including the Playwright sidecar, rather than managing
+        # worker/Compose subsets independently. The returned workspace remains
+        # quiesced; its next command performs one explicit seed/start/bootstrap.
+        self._quiesce_runtime_for_host_access(
+            run_root=run_root,
+            source=workspace.path,
+            purpose="workspace restore",
+        )
+        prepared_service_volumes: list[tuple[str, Path]] | None = None
+        if state.get("service_topology") == "sidecar":
+            # Validate the complete database/service recovery set before the
+            # source tree is replaced. A missing later archive must not leave
+            # source rolled back while service data remains advanced.
+            prepared_service_volumes = self._validated_sidecar_service_volume_restore(
+                run_root,
+                state,
+                snapshot.label,
+            )
         restored = super().restore(workspace, snapshot)
         run_root = restored.outbox_path.parent.resolve()
-        state = self._read_container_state(run_root, missing_ok=True)
-        if state.get("workspace_mode") == "volume":
-            self._seed_volume_workspace(restored, state)
-        if reset_worker:
-            self._start_in_worker_container(run_root, state)
-            self._run_container_bootstrap_install(restored)
+        state = self._read_container_state(run_root, missing_ok=True) or state
+        self._restore_container_safe_git_config(
+            run_root=run_root,
+            source=restored.path,
+        )
         if state.get("service_topology") == "sidecar":
-            compose_file = str(state.get("compose_file") or "")
-            compose_project = str(state.get("compose_project") or "")
-            sidecars_stopped = False
-            try:
-                self._stop_sidecar_services(run_root, state)
-                sidecars_stopped = True
-                self._restore_sidecar_service_volumes(run_root, state, snapshot.label)
-            finally:
-                if sidecars_stopped and compose_file and compose_project:
-                    self._start_sidecar_services(
-                        run_root=run_root,
-                        logs=run_root / "logs",
-                        compose_file=Path(compose_file),
-                        compose_project=compose_project,
-                    )
+            self._restore_sidecar_service_volumes(
+                run_root,
+                state,
+                snapshot.label,
+                prepared=prepared_service_volumes,
+            )
         return restored
+
+    def _prepare_restored_checkout_git_boundary(
+        self,
+        *,
+        run_root: Path,
+        source: Path,
+    ) -> None:
+        # Restore the operator-generated config and structurally validate the
+        # private staging checkout before it can replace the host-visible tree.
+        self._restore_container_safe_git_config(
+            run_root=run_root,
+            source=source,
+        )
 
     def _teardown_container_resources(self, run_root: Path, state: dict[str, Any]) -> None:
         """Remove docker resources recorded in ``state`` (sidecars, service
@@ -3023,52 +4525,147 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         service-startup-failure diagnostic. Best-effort: every step swallows
         errors so teardown never masks the original startup failure.
         """
-        if state.get("service_topology") == "sidecar":
-            try:
-                self._remove_sidecar_services(run_root, state)
-            except Exception:
-                pass
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None or state.get("startup_cleanup_safe") is not True:
+            return
         try:
-            self._remove_playwright_mcp_sidecar(run_root, state)
+            owned = self._discover_owned_cleanup_resources(run_root, labels)
         except Exception:
-            pass
-        for process in state.get("service_processes", []):
-            pid = process.get("pid") if isinstance(process, dict) else None
-            if pid:
+            # Failure cleanup must never fall back to mutable state names. If
+            # ownership cannot be proven from the engine, leak the resource
+            # for scoped GC rather than risk deleting another checkout's data.
+            return
+        commands = (
+            (
+                "container",
+                [self._container.engine, "rm", "-f"],
+                "startup-failure-container-cleanup",
+            ),
+            (
+                "volume",
+                [self._container.engine, "volume", "rm"],
+                "startup-failure-volume-cleanup",
+            ),
+            (
+                "network",
+                [self._container.engine, "network", "rm"],
+                "startup-failure-network-cleanup",
+            ),
+        )
+        for kind, prefix, log_prefix in commands:
+            preserved_raw = state.get("startup_preserved_resources", {})
+            preserved = (
+                {
+                    str(item)
+                    for item in preserved_raw.get(kind, [])
+                    if str(item)
+                }
+                if isinstance(preserved_raw, dict)
+                and isinstance(preserved_raw.get(kind, []), list)
+                else set()
+            )
+            for reference in sorted(owned[kind] - preserved):
                 try:
-                    self._runner.run(
-                        [self._container.engine, "kill", str(pid)],
+                    self._require_resource_owned(
+                        run_root,
+                        kind,
+                        reference,
+                        labels,
+                        allow_additional_labels=True,
+                    )
+                    result = self._runner.run(
+                        [*prefix, reference],
                         cwd=run_root,
                     )
                 except Exception:
-                    pass
-        for container_id in state.get("containers", []):
-            if container_id:
-                try:
-                    self._runner.run(
-                        [self._container.engine, "rm", "-f", str(container_id)],
-                        cwd=run_root,
-                    )
-                except Exception:
-                    pass
-        for volume in state.get("volumes", []):
-            if volume:
-                try:
-                    self._runner.run(
-                        [self._container.engine, "volume", "rm", "-f", str(volume)],
-                        cwd=run_root,
-                    )
-                except Exception:
-                    pass
-        for network in state.get("networks", []):
-            if network:
-                try:
-                    self._runner.run(
-                        [self._container.engine, "network", "rm", str(network)],
-                        cwd=run_root,
-                    )
-                except Exception:
-                    pass
+                    continue
+                self._write_image_log(
+                    run_root / "logs",
+                    f"{log_prefix}-{_safe_artifact_name(reference)}.log",
+                    result,
+                )
+
+    def _canonical_state_resource_labels(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+    ) -> dict[str, str] | None:
+        labels = state.get("resource_labels")
+        if not isinstance(labels, dict):
+            return None
+        normalized = {str(key): str(value) for key, value in labels.items()}
+        run_id = normalized.get("spec.run_id", "")
+        spec_id = normalized.get("spec.spec_id", "")
+        try:
+            validate_workspace_run_identity(run_id, spec_id)
+        except ValueError:
+            return None
+        expected = self._resource_labels(
+            run_id=run_id,
+            spec_id=spec_id,
+            workspace_root=run_root / "source",
+        )
+        return expected if normalized == expected else None
+
+    def _remove_exact_owned_runtime_containers(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+    ) -> None:
+        """Remove and verify all run-owned containers without diagnostic I/O.
+
+        This is the fail-closed liveness primitive used before host access.
+        Worker-visible log directories are attacker-controlled and may be
+        unwritable; no logging operation is allowed to precede or interrupt
+        resource removal and positive engine verification.
+        """
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses runtime quiescence with non-canonical labels."
+            )
+        try:
+            owned = self._discover_owned_cleanup_resources(run_root, labels)
+        except OSError as exc:
+            raise RuntimeError(
+                "Container backend could not discover its exact-owned runtime resources."
+            ) from exc
+        for container_id in sorted(owned["container"]):
+            self._require_resource_owned(
+                run_root,
+                "container",
+                container_id,
+                labels,
+                allow_additional_labels=True,
+            )
+            removal = self._runner.run(
+                [self._container.engine, "rm", "-f", container_id],
+                cwd=run_root,
+            )
+            if removal.returncode != 0:
+                detail = (
+                    removal.stderr or removal.stdout or "unknown engine error"
+                ).strip()
+                raise RuntimeError(
+                    "Container backend could not remove an exact-owned runtime "
+                    f"container {container_id}: {detail}"
+                )
+            inspection = self._runner.run(
+                [
+                    self._container.engine,
+                    "inspect",
+                    "--type",
+                    "container",
+                    container_id,
+                ],
+                cwd=run_root,
+            )
+            missing_detail = f"{inspection.stdout}\n{inspection.stderr}".lower()
+            if inspection.returncode == 0 or "no such" not in missing_detail:
+                raise RuntimeError(
+                    "Container backend could not positively verify removal of "
+                    f"exact-owned container {container_id}."
+                )
 
     def _teardown_previous_attempt_containers(self, run_root: Path, state: dict[str, Any]) -> bool:
         """Remove containers left behind by earlier attempts of this run.
@@ -3084,11 +4681,11 @@ class ContainerExecutionBackend(CloneExecutionBackend):
 
         Called before any container for this attempt is created, so every
         match belongs to a previous attempt; ids already recorded in
-        ``state['containers']`` are excluded defensively. Best-effort and
-        loudly logged: a teardown failure is recorded but never aborts the
-        attempt (an operator can still clean up manually), and the label
-        filter guarantees containers from other runs — and unlabeled
-        containers — are never touched.
+        ``state['containers']`` are excluded defensively. A teardown failure is
+        loudly logged and causes workspace preparation to abort before any
+        replacement worker or workspace-volume mutation; the label filter
+        guarantees containers from other runs — and unlabeled containers — are
+        never touched.
 
         Ordering: enumerate -> ``rm -f`` -> *verify gone* (``docker inspect``
         must report each removed id not-found — ``rm -f`` exit 0 alone is not
@@ -3102,10 +4699,24 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         """
         labels = state.get("resource_labels", {})
         run_id = str(labels.get("spec.run_id") or "")
-        if not run_id:
-            # Without a run_id we cannot scope teardown at all, so we cannot
-            # assert any prior container is gone: treat as unverified and skip
-            # the pid cleanup rather than risk deleting a live lock.
+        spec_id = str(labels.get("spec.spec_id") or "")
+        workspace_root = str(labels.get("spec.workspace_root") or "").strip()
+        try:
+            validate_workspace_run_identity(run_id, spec_id)
+        except ValueError:
+            return False
+        expected_workspace = (run_root / "source").resolve()
+        recorded_workspace = Path(workspace_root).expanduser()
+        if (
+            not workspace_root
+            or not recorded_workspace.is_absolute()
+            or _lexical_absolute(recorded_workspace) != recorded_workspace
+            or recorded_workspace != expected_workspace
+            or recorded_workspace.resolve(strict=False) != expected_workspace
+        ):
+            # A run id is not globally unique across checkouts. Without a
+            # canonical exact workspace root we cannot safely identify prior
+            # attempts. Leave every container and pid file untouched.
             return False
         engine = self._container.engine
         logs = run_root / "logs"
@@ -3124,6 +4735,10 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 "label=spec.owner=spec-runtime",
                 "--filter",
                 f"label=spec.run_id={run_id}",
+                "--filter",
+                f"label=spec.spec_id={spec_id}",
+                "--filter",
+                f"label=spec.workspace_root={workspace_root}",
             ],
             cwd=run_root,
         )
@@ -3210,12 +4825,17 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         if result.returncode == 0:
             return False
         text = f"{result.stdout}\n{result.stderr}".lower()
-        return "no such" in text or "not found" in text
+        # Docker and Podman both report a missing container as "no such ...".
+        # A generic "not found" can instead describe a missing daemon context,
+        # plugin, or endpoint and is not positive proof that the container is
+        # absent.
+        return "no such" in text
 
     def _write_pid_cleanup_skipped_log(self, run_root: Path, reason: str) -> None:
         logs = run_root / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        (logs / "previous-attempt-postmaster-cleanup-skipped.log").write_text(
+        atomic_write_text(
+            logs / "previous-attempt-postmaster-cleanup-skipped.log",
             "\n".join(
                 [
                     f"logged_at: {datetime.now(timezone.utc).isoformat()}",
@@ -3235,11 +4855,9 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 f"detail: {detail or 'unknown error'}",
             ]
         )
-        has_content = path.exists() and path.stat().st_size > 0
-        with path.open("a", encoding="utf-8") as handle:
-            if has_content:
-                handle.write("\n---\n")
-            handle.write(entry)
+        # Logs are worker-visible. Replacing the leaf is safe even if the
+        # worker planted a symlink there; appending/opening would follow it.
+        atomic_write_text(path, entry, encoding="utf-8")
 
     def _clear_stale_postmaster_pids(
         self,
@@ -3278,7 +4896,19 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         """
         if state.get("workspace_mode") == "volume":
             return
-        data_dirs = [str(item) for item in state.get("service_data_dirs", []) if item]
+        try:
+            validated_dirs = self._validated_cleanup_service_data_dirs(
+                run_root / "source",
+                state.get("service_data_dirs", []),
+                topology=str(state.get("service_topology") or ""),
+            )
+        except OSError as exc:
+            self._write_pid_cleanup_skipped_log(
+                run_root,
+                f"unsafe service data path; leaving postmaster.pid untouched: {exc}",
+            )
+            return
+        data_dirs = [str(item) for item in validated_dirs]
         if not data_dirs:
             return
         removed: list[str] = []
@@ -3294,7 +4924,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         logs = run_root / "logs"
         if removed:
             logs.mkdir(parents=True, exist_ok=True)
-            (logs / "previous-attempt-postmaster-cleanup.log").write_text(
+            atomic_write_text(
+                logs / "previous-attempt-postmaster-cleanup.log",
                 "\n".join(
                     [
                         f"completed_at: {datetime.now(timezone.utc).isoformat()}",
@@ -3360,6 +4991,13 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             targets.append(f"{CONTAINER_RUNTIME_SOURCE}/{rel.as_posix()}/postmaster.pid")
         if not targets:
             return
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses stale-pid cleanup with "
+                "non-canonical resource labels."
+            )
+        self._require_volume_safe_to_use(run_root, volume, labels)
         script = " ; ".join(f"rm -f {shlex.quote(target)}" for target in targets)
         result = self._runner.run(
             [
@@ -3383,7 +5021,10 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         # or tearing down any external container resources. Clone cleanup
         # repeats this check immediately before deleting the run directory.
         run_root, source, _outbox = self._validated_cleanup_layout(workspace)
-        state = self._read_container_state(run_root, missing_ok=True)
+        try:
+            state = self._read_container_state(run_root, missing_ok=True)
+        except RuntimeError as exc:
+            raise OSError(str(exc)) from exc
         expected_labels = self._validated_container_cleanup_state(
             workspace,
             run_root=run_root,
@@ -3395,52 +5036,113 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             state.get("service_data_dirs", []),
             topology=str(state.get("service_topology") or ""),
         )
+        if state.get("service_topology") == "sidecar":
+            compose_project = str(state.get("compose_project") or "").strip()
+            if not compose_project:
+                raise OSError(
+                    "refusing container cleanup with missing compose project ownership"
+                )
+            try:
+                self._assert_compose_project_owned_or_unused(
+                    run_root,
+                    compose_project,
+                    expected_labels,
+                )
+            except RuntimeError as exc:
+                raise OSError(str(exc)) from exc
         owned_resources = self._discover_owned_cleanup_resources(
             run_root,
             expected_labels,
         )
+        recorded_workspace_volumes = set(state["workspace_volumes"])
+        if (
+            state["workspace_mode"] == "volume"
+            and not recorded_workspace_volumes.issubset(owned_resources["volume"])
+        ):
+            raise OSError(
+                "refusing container cleanup because the recorded workspace "
+                "volume is not present on the selected engine"
+            )
+        for volume in sorted(owned_resources["volume"]):
+            try:
+                self._require_volume_safe_to_use(
+                    run_root,
+                    volume,
+                    expected_labels,
+                )
+            except RuntimeError as exc:
+                raise OSError(str(exc)) from exc
+        # Stop every runtime writer before importing volume data or invoking
+        # host Git. A guarded cleanup may leave volumes/state for recovery, but
+        # it must never let a container race host-side validation.
+        for container_id in sorted(owned_resources["container"]):
+            try:
+                self._require_resource_owned(
+                    run_root,
+                    "container",
+                    container_id,
+                    expected_labels,
+                    allow_additional_labels=True,
+                )
+            except RuntimeError as exc:
+                raise OSError(str(exc)) from exc
+            result = self._runner.run(
+                [self._container.engine, "rm", "-f", container_id],
+                cwd=run_root,
+            )
+            self._require_owned_cleanup_success("container", container_id, result)
+            if not self._verify_container_removed(run_root, container_id):
+                raise OSError(
+                    "refusing container cleanup because removal could not be "
+                    f"positively verified: {container_id}"
+                )
         # For volume-mode workspaces the authoritative git state lives inside the
         # Docker volume, not the host ``source`` mirror. The post-run sync
         # (``_sync_volume_workspace_to_host``) normally keeps them in step, but a
         # crash mid-session — or a cleanup/resume that fires before that sync —
         # can leave commits or edits only in the volume while the host mirror
         # reads clean. Re-sync the volume back to the host before the guard so
-        # the deletability check reasons about the same content ``volume rm -f``
+        # the deletability check reasons about the same content ``volume rm``
         # would destroy. Skipped when deletion is already authorized
-        # (post-merge cleanup / ``spec clean``), where the work is durable.
+        # (an explicit operator ``spec clean``), where data loss is accepted.
         if not allow_unpushed_work and state.get("workspace_mode") == "volume":
-            workspace_volumes = {
-                str(item)
-                for item in state.get("workspace_volumes") or state.get("volumes", [])
-                if str(item)
-            }
-            owned_workspace_volumes = workspace_volumes & owned_resources["volume"]
-            if workspace_volumes and not owned_workspace_volumes:
-                raise OSError(
-                    "refusing container cleanup because the recorded workspace "
-                    "volume is not owned by this run"
-                )
+            owned_workspace_volumes = (
+                recorded_workspace_volumes & owned_resources["volume"]
+            )
             if owned_workspace_volumes:
                 safe_state = dict(state)
                 safe_state["workspace_volumes"] = sorted(owned_workspace_volumes)
                 safe_state["volumes"] = sorted(owned_resources["volume"])
                 self._sync_volume_workspace_to_host(run_root, safe_state)
-        # Refuse before tearing down any docker resources so a guarded deletion
-        # leaves the run fully recoverable.
+        if not allow_unpushed_work:
+            # Guarded cleanup invokes host Git below, so reinstall and validate
+            # the protected config first. Explicit operator discard mode does
+            # not invoke host Git and must remain able to remove exact-owned
+            # legacy workspaces created before the protected baseline existed.
+            self._restore_container_safe_git_config(
+                run_root=run_root,
+                source=source,
+            )
+        # Refuse before tearing down workspace data or remaining Docker
+        # resources so a guarded deletion leaves data and metadata recoverable.
+        # Owned containers are already stopped above to close the host-Git race.
         self._assert_workspace_deletable(
             source,
             allow_unpushed_work=allow_unpushed_work,
         )
+        # Re-resolve the destructive host paths only after every runtime writer
+        # is positively gone. A worker could have replaced an ancestor with a
+        # symlink between the initial state validation and container removal.
+        service_data_dirs = self._validated_cleanup_service_data_dirs(
+            source,
+            state.get("service_data_dirs", []),
+            topology=str(state.get("service_topology") or ""),
+        )
+
         # Never trust raw ids/names in persisted state. Discover resources from
         # the engine using the complete host-generated label set and remove
         # only those matches. This also collects resources from older attempts
         # that a single latest-id state record may not mention.
-        for container_id in sorted(owned_resources["container"]):
-            result = self._runner.run(
-                [self._container.engine, "rm", "-f", container_id],
-                cwd=run_root,
-            )
-            self._require_owned_cleanup_success("container", container_id, result)
         # Only remove host service data after every owned container is stopped;
         # otherwise a still-running database could race the deletion or keep
         # writing through its bind mount.
@@ -3448,12 +5150,28 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             if path.exists():
                 remove_tree(path)
         for volume in sorted(owned_resources["volume"]):
+            try:
+                self._require_volume_safe_to_use(
+                    run_root,
+                    volume,
+                    expected_labels,
+                )
+            except RuntimeError as exc:
+                raise OSError(str(exc)) from exc
             result = self._runner.run(
-                [self._container.engine, "volume", "rm", "-f", volume],
+                [self._container.engine, "volume", "rm", volume],
                 cwd=run_root,
             )
             self._require_owned_cleanup_success("volume", volume, result)
         for network in sorted(owned_resources["network"]):
+            try:
+                self._require_network_safe_to_use(
+                    run_root,
+                    network,
+                    expected_labels,
+                )
+            except RuntimeError as exc:
+                raise OSError(str(exc)) from exc
             result = self._runner.run(
                 [self._container.engine, "network", "rm", network],
                 cwd=run_root,
@@ -3482,6 +5200,58 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         source: Path,
         state: dict[str, Any],
     ) -> dict[str, str]:
+        if state.get("backend") != "container":
+            raise OSError(
+                "refusing container cleanup with an invalid backend identity"
+            )
+        saved_engine = state.get("engine")
+        if not isinstance(saved_engine, str) or not saved_engine:
+            raise OSError(
+                "refusing container cleanup with an invalid saved engine identity"
+            )
+        if saved_engine != self._container.engine:
+            raise OSError(
+                "refusing container cleanup through a different engine; restore "
+                "the run's original engine configuration before cleaning"
+            )
+        workspace_mode = state.get("workspace_mode")
+        if not isinstance(workspace_mode, str) or workspace_mode not in {
+            "bind",
+            "volume",
+        }:
+            raise OSError(
+                "refusing container cleanup with an invalid workspace mode"
+            )
+        service_topology = state.get("service_topology")
+        if not isinstance(service_topology, str) or service_topology not in {
+            "in-worker",
+            "sidecar",
+        }:
+            raise OSError(
+                "refusing container cleanup with an invalid service topology"
+            )
+        workspace_volumes = state.get("workspace_volumes")
+        if workspace_mode == "volume":
+            if (
+                not isinstance(workspace_volumes, list)
+                or len(workspace_volumes) != 1
+                or not isinstance(workspace_volumes[0], str)
+                or not workspace_volumes[0].strip()
+            ):
+                raise OSError(
+                    "refusing container cleanup with invalid workspace_volumes "
+                    "for volume mode"
+                )
+        elif workspace_volumes != []:
+            raise OSError(
+                "refusing container cleanup with invalid workspace_volumes "
+                "for bind mode"
+            )
+        service_processes = state.get("service_processes")
+        if not isinstance(service_processes, list):
+            raise OSError(
+                "refusing container cleanup with malformed service_processes"
+            )
         run_id = str(workspace.metadata.get("run_id") or run_root.name)
         spec_id = str(workspace.metadata.get("spec_id") or "")
         if not spec_id:
@@ -3522,7 +5292,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 )
         if any(
             isinstance(process, dict) and process.get("pid")
-            for process in state.get("service_processes", [])
+            for process in service_processes
         ):
             # Current container service records use container_id, never a host
             # PID. A raw PID in mutable state has no authenticated supervision
@@ -3640,6 +5410,399 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 line.strip() for line in result.stdout.splitlines() if line.strip()
             }
         return discovered
+
+    def _discover_owned_container_ids(
+        self,
+        run_root: Path,
+        labels: dict[str, str],
+    ) -> set[str]:
+        """Discover only exact-owned containers for runtime health checks."""
+        filters = [
+            argument
+            for key, value in sorted(labels.items())
+            for argument in ("--filter", f"label={key}={value}")
+        ]
+        result = self._runner.run(
+            [
+                self._container.engine,
+                "ps",
+                "-a",
+                "-q",
+                "--no-trunc",
+                *filters,
+            ],
+            cwd=run_root,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown error").strip()
+            raise OSError(
+                "container runtime health discovery failed: " + detail
+            )
+        return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+    def _inspect_resource_labels(
+        self,
+        run_root: Path,
+        kind: str,
+        reference: str,
+    ) -> dict[str, str]:
+        if kind == "container":
+            argv = [
+                self._container.engine,
+                "inspect",
+                "--type",
+                "container",
+                reference,
+            ]
+        elif kind == "volume":
+            argv = [self._container.engine, "volume", "inspect", reference]
+        elif kind == "network":
+            argv = [self._container.engine, "network", "inspect", reference]
+        else:
+            raise RuntimeError(f"Unknown container resource kind: {kind}")
+        result = self._runner.run(argv, cwd=run_root)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown error").strip()
+            raise RuntimeError(
+                f"Container backend could not inspect {kind} {reference}: {detail}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(
+                f"Container backend received malformed inspection data for {kind} {reference}."
+            ) from exc
+        if (
+            not isinstance(payload, list)
+            or len(payload) != 1
+            or not isinstance(payload[0], dict)
+        ):
+            raise RuntimeError(
+                f"Container backend received unexpected inspection data for {kind} {reference}."
+            )
+        item = payload[0]
+        if kind == "container":
+            config = item.get("Config") or item.get("config")
+            raw_labels = (
+                config.get("Labels") or config.get("labels")
+                if isinstance(config, dict)
+                else None
+            )
+        else:
+            raw_labels = item.get("Labels") or item.get("labels")
+        if not isinstance(raw_labels, dict):
+            return {}
+        return {str(key): str(value) for key, value in raw_labels.items()}
+
+    def _require_resource_owned(
+        self,
+        run_root: Path,
+        kind: str,
+        reference: str,
+        expected_labels: dict[str, str],
+        *,
+        allow_additional_labels: bool = False,
+    ) -> None:
+        actual_labels = self._inspect_resource_labels(run_root, kind, reference)
+        matches = (
+            all(actual_labels.get(key) == value for key, value in expected_labels.items())
+            if allow_additional_labels
+            else actual_labels == expected_labels
+        )
+        if not matches:
+            raise RuntimeError(
+                "Container backend refuses to use a pre-existing or replaced "
+                f"{kind} not owned by this checkout and run: {reference}"
+            )
+
+    def _require_volume_safe_to_use(
+        self,
+        run_root: Path,
+        volume: str,
+        expected_labels: dict[str, str],
+    ) -> None:
+        """Require both volume ownership and exclusively owned consumers.
+
+        Older releases named volumes from ``run_id`` alone. Two checkouts with
+        the same run id could therefore share one volume while its immutable
+        labels described only the checkout that created it. Inspect every
+        attached container before mounting the volume so labels cannot provide
+        a false proof of exclusive ownership.
+        """
+        self._require_resource_owned(
+            run_root,
+            "volume",
+            volume,
+            expected_labels,
+            allow_additional_labels=True,
+        )
+        result = self._runner.run(
+            [
+                self._container.engine,
+                "ps",
+                "-a",
+                "-q",
+                "--no-trunc",
+                "--filter",
+                f"volume={volume}",
+            ],
+            cwd=run_root,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown error").strip()
+            raise RuntimeError(
+                "Container backend could not verify consumers of volume "
+                f"{volume}: {detail}"
+            )
+        for container_id in (line.strip() for line in result.stdout.splitlines()):
+            if container_id:
+                self._require_resource_owned(
+                    run_root,
+                    "container",
+                    container_id,
+                    expected_labels,
+                    allow_additional_labels=True,
+                )
+
+    def _require_network_safe_to_use(
+        self,
+        run_root: Path,
+        network: str,
+        expected_labels: dict[str, str],
+        *,
+        endpoint_labels: dict[str, str] | None = None,
+    ) -> None:
+        """Require network ownership and exclusively owned endpoints."""
+        self._require_resource_owned(
+            run_root,
+            "network",
+            network,
+            expected_labels,
+            allow_additional_labels=True,
+        )
+        result = self._runner.run(
+            [self._container.engine, "network", "inspect", network],
+            cwd=run_root,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "unknown error").strip()
+            raise RuntimeError(
+                f"Container backend could not verify endpoints of network {network}: {detail}"
+            )
+        try:
+            payload = json.loads(result.stdout)
+            item = payload[0]
+        except (json.JSONDecodeError, IndexError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "Container backend received malformed endpoint data for "
+                f"network {network}."
+            ) from exc
+        if not isinstance(item, dict):
+            raise RuntimeError(
+                "Container backend received malformed endpoint data for "
+                f"network {network}."
+            )
+        raw_endpoints = item.get("Containers", item.get("containers", {}))
+        if raw_endpoints is None:
+            raw_endpoints = {}
+        if isinstance(raw_endpoints, dict):
+            container_ids = [str(value) for value in raw_endpoints]
+        elif isinstance(raw_endpoints, list):
+            container_ids = []
+            for endpoint in raw_endpoints:
+                if not isinstance(endpoint, dict):
+                    raise RuntimeError(
+                        "Container backend received malformed endpoint data for "
+                        f"network {network}."
+                    )
+                container_id = endpoint.get("Id", endpoint.get("id", ""))
+                if container_id:
+                    container_ids.append(str(container_id))
+        else:
+            raise RuntimeError(
+                "Container backend received malformed endpoint data for "
+                f"network {network}."
+            )
+        for container_id in container_ids:
+            self._require_resource_owned(
+                run_root,
+                "container",
+                container_id,
+                endpoint_labels or expected_labels,
+                allow_additional_labels=True,
+            )
+
+    def _require_workspace_volume_safe(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+    ) -> None:
+        if state.get("workspace_mode") != "volume":
+            return
+        volumes = state.get("workspace_volumes") or state.get("volumes", [])
+        if not volumes:
+            raise RuntimeError(
+                "Container backend refuses volume-mode execution without a "
+                "workspace volume."
+            )
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses volume-mode execution with "
+                "non-canonical resource labels."
+            )
+        self._require_volume_safe_to_use(run_root, str(volumes[0]), labels)
+
+    def _assert_compose_project_owned_or_unused(
+        self,
+        run_root: Path,
+        compose_project: str,
+        expected_labels: dict[str, str],
+    ) -> None:
+        project_filter = f"label=com.docker.compose.project={compose_project}"
+        commands = {
+            "container": [
+                self._container.engine,
+                "ps",
+                "-a",
+                "-q",
+                "--no-trunc",
+                "--filter",
+                project_filter,
+            ],
+            "volume": [
+                self._container.engine,
+                "volume",
+                "ls",
+                "-q",
+                "--filter",
+                project_filter,
+            ],
+            "network": [
+                self._container.engine,
+                "network",
+                "ls",
+                "-q",
+                "--filter",
+                project_filter,
+            ],
+        }
+        for kind, argv in commands.items():
+            result = self._runner.run(argv, cwd=run_root)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "unknown error").strip()
+                raise RuntimeError(
+                    "Container backend could not safely preflight compose project "
+                    f"{compose_project}: {kind} discovery failed: {detail}"
+                )
+            for reference in (line.strip() for line in result.stdout.splitlines()):
+                if reference:
+                    if kind == "volume":
+                        self._require_volume_safe_to_use(
+                            run_root,
+                            reference,
+                            expected_labels,
+                        )
+                    elif kind == "network":
+                        self._require_network_safe_to_use(
+                            run_root,
+                            reference,
+                            expected_labels,
+                        )
+                    else:
+                        self._require_resource_owned(
+                            run_root,
+                            kind,
+                            reference,
+                            expected_labels,
+                            allow_additional_labels=True,
+                        )
+
+    def _assert_compose_managed_names_owned_or_unused(
+        self,
+        run_root: Path,
+        compose_file: Path,
+        compose_project: str,
+        expected_labels: dict[str, str],
+    ) -> None:
+        """Reject deterministic Compose-name collisions before ``compose up``.
+
+        Compose will attach a newly started service to a pre-existing volume
+        named ``<project>_<key>`` even when that volume is unlabeled and foreign.
+        Project-label inventory cannot see that collision, so enumerate names
+        and inspect every managed deterministic target directly first.
+        """
+        try:
+            compose = yaml.safe_load(compose_file.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise RuntimeError(
+                "Container backend could not parse its protected Compose baseline."
+            ) from exc
+        if not isinstance(compose, dict):
+            raise RuntimeError("Container backend protected Compose baseline is invalid.")
+
+        managed: dict[str, set[str]] = {"volume": set(), "network": set()}
+        for kind, section_name in (("volume", "volumes"), ("network", "networks")):
+            section = compose.get(section_name, {})
+            if not isinstance(section, dict):
+                raise RuntimeError(
+                    f"Container backend Compose {section_name} must be a mapping."
+                )
+            for raw_name, value in section.items():
+                name = str(raw_name)
+                external = isinstance(value, dict) and value.get("external") is True
+                if not external:
+                    configured_name = (
+                        str(value.get("name") or "").strip()
+                        if isinstance(value, dict)
+                        else ""
+                    )
+                    managed[kind].add(
+                        configured_name or f"{compose_project}_{name}"
+                    )
+        default_network = compose.get("networks", {}).get("default")
+        default_external = (
+            isinstance(default_network, dict)
+            and default_network.get("external") is True
+        )
+        if not default_external:
+            default_name = (
+                str(default_network.get("name") or "").strip()
+                if isinstance(default_network, dict)
+                else ""
+            )
+            managed["network"].add(
+                default_name or f"{compose_project}_default"
+            )
+
+        inventories: dict[str, set[str]] = {}
+        for kind in ("volume", "network"):
+            result = self._runner.run(
+                [self._container.engine, kind, "ls", "-q"],
+                cwd=run_root,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "unknown error").strip()
+                raise RuntimeError(
+                    "Container backend could not safely inventory deterministic "
+                    f"Compose {kind} names: {detail}"
+                )
+            inventories[kind] = {
+                line.strip() for line in result.stdout.splitlines() if line.strip()
+            }
+
+        compose_labels = expected_labels | {
+            "com.docker.compose.project": compose_project,
+        }
+        for volume in sorted(managed["volume"] & inventories["volume"]):
+            self._require_volume_safe_to_use(run_root, volume, compose_labels)
+        for network in sorted(managed["network"] & inventories["network"]):
+            self._require_network_safe_to_use(
+                run_root,
+                network,
+                compose_labels,
+                endpoint_labels=expected_labels,
+            )
 
     def _ensure_engine_available(self) -> None:
         if shutil.which(self._container.engine):
@@ -3905,10 +6068,249 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             argv.extend(["--label", f"{key}={value}"])
         return argv
 
-    def _volume_names(self, run_id: str, mode: str) -> list[str]:
+    @staticmethod
+    def _resource_scope_digest(
+        run_id: str,
+        workspace_root: Path,
+        *,
+        purpose: str = "runtime",
+    ) -> str:
+        """Bind deterministic engine names to one physical checkout.
+
+        Run IDs are only repository-local. Including the canonical workspace
+        path prevents two clones that resume the same persisted run ID from
+        racing into one Docker/Compose namespace.
+        """
+        payload = f"{run_id}\0{workspace_root.resolve()}\0{purpose}"
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _legacy_resource_digest(run_id: str, *, purpose: str = "runtime") -> str:
+        payload = run_id if purpose == "runtime" else f"{run_id}:{purpose}"
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    def _adopt_previous_resource_names(
+        self,
+        *,
+        run_id: str,
+        run_root: Path,
+        workspace_root: Path,
+        mode: str,
+        service_topology: str,
+        previous_state: dict[str, Any],
+        preexisting_resources: dict[str, set[str]],
+        expected_labels: dict[str, str],
+        workspace_volumes: list[str],
+        compose_project: str,
+        service_volumes: list[str],
+        service_networks: list[str],
+        playwright_mcp: dict[str, Any],
+    ) -> tuple[
+        list[str],
+        str,
+        list[str],
+        list[str],
+        dict[str, Any],
+        dict[str, Any],
+    ]:
+        """Retain exact-owned names from protected development-era state.
+
+        Released pre-0.5 runs fail earlier because they lack the seed marker or
+        protected Compose baseline. New runs use checkout-scoped names; a retry
+        may retain an earlier development name only when canonical prior state
+        names that exact formula and the engine proves the resource belongs to
+        this checkout. Anything persistent that cannot be accounted for fails
+        closed instead of being silently orphaned behind a new namespace.
+        """
+        owned_volumes = set(preexisting_resources.get("volume", set()))
+        owned_networks = set(preexisting_resources.get("network", set()))
+        accounted_volumes: set[str] = set()
+        accounted_networks: set[str] = set()
+
+        scoped_digest = self._resource_scope_digest(run_id, workspace_root)
+        legacy_digest = self._legacy_resource_digest(run_id)
+        allowed_workspace_volumes = (
+            {
+                f"spec-{legacy_digest}-source",
+                f"spec-{scoped_digest}-source",
+            }
+            if mode == "volume"
+            else set()
+        )
+        existing_workspace_volumes = owned_volumes & allowed_workspace_volumes
+        if existing_workspace_volumes:
+            previous_workspace_raw = previous_state.get(
+                "workspace_volumes",
+                previous_state.get("volumes", []),
+            )
+            previous_workspace = (
+                [str(item) for item in previous_workspace_raw if str(item)]
+                if isinstance(previous_workspace_raw, list)
+                else []
+            )
+            if (
+                len(existing_workspace_volumes) != 1
+                or previous_workspace[:1] != sorted(existing_workspace_volumes)
+            ):
+                raise RuntimeError(
+                    "Container backend found an ambiguous existing workspace "
+                    "volume generation; refusing to abandon or overwrite it."
+                )
+            selected_workspace = next(iter(existing_workspace_volumes))
+            self._require_volume_safe_to_use(
+                run_root,
+                selected_workspace,
+                expected_labels,
+            )
+            workspace_volumes = [selected_workspace]
+            accounted_volumes.add(selected_workspace)
+
+        allowed_projects = (
+            {f"spec-{legacy_digest}", f"spec-{scoped_digest}"}
+            if service_topology == "sidecar"
+            else set()
+        )
+        compose_resources: dict[str, dict[str, set[str]]] = {
+            project: {"volume": set(), "network": set()}
+            for project in allowed_projects
+        }
+        for kind, references in (
+            ("volume", owned_volumes),
+            ("network", owned_networks),
+        ):
+            for reference in references:
+                labels = self._inspect_resource_labels(run_root, kind, reference)
+                project = labels.get("com.docker.compose.project", "")
+                if project in compose_resources:
+                    compose_resources[project][kind].add(reference)
+        existing_projects = {
+            project
+            for project, resources in compose_resources.items()
+            if resources["volume"] or resources["network"]
+        }
+        service_volume_snapshots: dict[str, Any] = {}
+        if existing_projects:
+            previous_project = str(previous_state.get("compose_project") or "")
+            if len(existing_projects) != 1 or previous_project not in existing_projects:
+                raise RuntimeError(
+                    "Container backend found an ambiguous existing Compose "
+                    "project generation; refusing to abandon its service data."
+                )
+            compose_project = previous_project
+            selected = compose_resources[compose_project]
+            for volume in sorted(selected["volume"]):
+                self._require_volume_safe_to_use(
+                    run_root,
+                    volume,
+                    expected_labels,
+                )
+            service_volumes = sorted(selected["volume"])
+            service_networks = sorted(selected["network"])
+            if not service_networks:
+                service_networks = [f"{compose_project}_default"]
+            accounted_volumes.update(selected["volume"])
+            accounted_networks.update(selected["network"])
+            snapshots = previous_state.get("service_volume_snapshots", {})
+            if not isinstance(snapshots, dict):
+                raise RuntimeError(
+                    "Container backend previous service snapshot state is invalid."
+                )
+            service_volume_snapshots = dict(snapshots)
+
+        legacy_playwright_digest = self._legacy_resource_digest(
+            run_id,
+            purpose="playwright-mcp",
+        )
+        scoped_playwright_digest = self._resource_scope_digest(
+            run_id,
+            workspace_root,
+            purpose="playwright-mcp",
+        )
+        playwright_generations = {
+            f"spec-{legacy_playwright_digest}-playwright-mcp": (
+                f"spec-{legacy_playwright_digest}-playwright-mcp"
+            ),
+            f"spec-{scoped_playwright_digest}-playwright-mcp": (
+                f"spec-{scoped_playwright_digest}-playwright-mcp"
+            ),
+        }
+        existing_playwright_networks = owned_networks & set(playwright_generations)
+        if existing_playwright_networks:
+            previous_playwright = previous_state.get("playwright_mcp", {})
+            previous_networks_raw = (
+                previous_playwright.get("sidecar_networks", [])
+                if isinstance(previous_playwright, dict)
+                else []
+            )
+            previous_networks = (
+                [str(item) for item in previous_networks_raw if str(item)]
+                if isinstance(previous_networks_raw, list)
+                else []
+            )
+            previous_container = (
+                str(previous_playwright.get("sidecar_container") or "")
+                if isinstance(previous_playwright, dict)
+                else ""
+            )
+            if (
+                playwright_mcp.get("topology") != "sidecar"
+                or len(existing_playwright_networks) != 1
+                or previous_networks != sorted(existing_playwright_networks)
+                or previous_container
+                != playwright_generations[next(iter(existing_playwright_networks))]
+            ):
+                raise RuntimeError(
+                    "Container backend found an ambiguous existing Playwright "
+                    "sidecar generation; refusing to reuse it."
+                )
+            selected_network = next(iter(existing_playwright_networks))
+            self._require_network_safe_to_use(
+                run_root,
+                selected_network,
+                expected_labels,
+            )
+            playwright_mcp = dict(playwright_mcp)
+            playwright_mcp["sidecar_networks"] = [selected_network]
+            playwright_mcp["sidecar_container"] = previous_container
+            server = dict(playwright_mcp.get("sidecar_mcp_server", {}))
+            if server:
+                port = int(
+                    playwright_mcp.get("sidecar_mcp_port")
+                    or CONTAINER_PLAYWRIGHT_MCP_SIDECAR_PORT
+                )
+                server["url"] = f"http://{previous_container}:{port}/sse"
+                playwright_mcp["sidecar_mcp_server"] = server
+            accounted_networks.add(selected_network)
+
+        unaccounted_volumes = owned_volumes - accounted_volumes
+        unaccounted_networks = owned_networks - accounted_networks
+        if unaccounted_volumes or unaccounted_networks:
+            preview = ", ".join(
+                sorted(unaccounted_volumes | unaccounted_networks)[:5]
+            )
+            raise RuntimeError(
+                "Container backend found persistent exact-owned resources that "
+                "do not match a trusted resource generation; refusing to leave "
+                f"their data behind ({preview})."
+            )
+        return (
+            workspace_volumes,
+            compose_project,
+            service_volumes,
+            service_networks,
+            playwright_mcp,
+            service_volume_snapshots,
+        )
+
+    def _volume_names(
+        self,
+        run_id: str,
+        mode: str,
+        workspace_root: Path,
+    ) -> list[str]:
         if mode != "volume":
             return []
-        digest = hashlib.sha256(run_id.encode()).hexdigest()[:16]
+        digest = self._resource_scope_digest(run_id, workspace_root)
         return [f"spec-{digest}-source"]
 
     def _service_topology(self) -> str:
@@ -3970,11 +6372,29 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             return []
         return []
 
-    def _service_network_names(self, run_id: str, topology: str) -> list[str]:
+    def _service_network_names(
+        self,
+        run_id: str,
+        topology: str,
+        workspace_root: Path,
+    ) -> list[str]:
         if topology != "sidecar":
             return []
-        digest = hashlib.sha256(run_id.encode()).hexdigest()[:16]
+        digest = self._resource_scope_digest(run_id, workspace_root)
         return [f"spec-{digest}_default"]
+
+    def _playwright_sidecar_names(
+        self,
+        run_id: str,
+        workspace_root: Path,
+    ) -> tuple[str, list[str]]:
+        digest = self._resource_scope_digest(
+            run_id,
+            workspace_root,
+            purpose="playwright-mcp",
+        )
+        name = f"spec-{digest}-playwright-mcp"
+        return name, [name]
 
     def _playwright_mcp_state(
         self,
@@ -3984,6 +6404,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         logs: Path,
         image: str,
         service_topology: str,
+        resource_labels: dict[str, str],
     ) -> dict[str, Any]:
         config = self._container.playwright_mcp
         topology = config.topology
@@ -4002,7 +6423,13 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             )
         )
         actual = config.actual_version or (
-            self._detect_worker_playwright_version(image=image, cwd=source) if expected else ""
+            self._detect_worker_playwright_version(
+                image=image,
+                cwd=source,
+                resource_labels=resource_labels,
+            )
+            if expected
+            else ""
         )
         if expected and actual and expected != actual:
             failure_path = logs / "playwright-mcp-version-mismatch.json"
@@ -4011,7 +6438,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 "a worker image whose Playwright browsers match the configured "
                 f"Playwright package version {expected}."
             )
-            failure_path.write_text(
+            atomic_write_text(
+                failure_path,
                 json.dumps(
                     {
                         "backend": "container",
@@ -4045,9 +6473,10 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         sidecar_mcp_note = ""
         sidecar_mcp_port = 0
         if topology == "sidecar":
-            digest = hashlib.sha256(f"{run_id}:playwright-mcp".encode()).hexdigest()[:16]
-            sidecar_networks = [f"spec-{digest}-playwright-mcp"]
-            sidecar_container = f"spec-{digest}-playwright-mcp"
+            sidecar_container, sidecar_networks = self._playwright_sidecar_names(
+                run_id,
+                source,
+            )
             sidecar_mcp_port = CONTAINER_PLAYWRIGHT_MCP_SIDECAR_PORT
             sidecar_mcp_transport = "sse"
             sidecar_mcp_note = (
@@ -4134,7 +6563,13 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             return match.group(0)
         return version
 
-    def _detect_worker_playwright_version(self, *, image: str, cwd: Path) -> str:
+    def _detect_worker_playwright_version(
+        self,
+        *,
+        image: str,
+        cwd: Path,
+        resource_labels: dict[str, str],
+    ) -> str:
         script = (
             "node - <<'NODE'\n"
             "const candidates = [\n"
@@ -4153,7 +6588,16 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             "NODE"
         )
         result = self._runner.run(
-            [self._container.engine, "run", "--rm", image, "sh", "-lc", script],
+            [
+                self._container.engine,
+                "run",
+                "--rm",
+                *self._label_argv({"resource_labels": resource_labels}),
+                image,
+                "sh",
+                "-lc",
+                script,
+            ],
             cwd=cwd,
         )
         if result.returncode != 0:
@@ -4200,7 +6644,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         sanitized_env = {
             key: "<redacted>" if not _is_container_worker_env_allowed(key) else "<set>" for key in service_env
         }
-        (logs / "playwright-mcp-diagnostics.json").write_text(
+        atomic_write_text(
+            logs / "playwright-mcp-diagnostics.json",
             json.dumps(
                 {
                     "backend": "container",
@@ -4228,28 +6673,6 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             encoding="utf-8",
         )
 
-    def _remove_playwright_mcp_sidecar(
-        self,
-        run_root: Path,
-        state: dict[str, Any],
-    ) -> None:
-        playwright_mcp = state.get("playwright_mcp", {})
-        if not isinstance(playwright_mcp, dict) or playwright_mcp.get("topology") != "sidecar":
-            return
-        container_id = str(playwright_mcp.get("sidecar_container") or "")
-        if container_id:
-            result = self._runner.run(
-                [self._container.engine, "rm", "-f", container_id],
-                cwd=run_root,
-            )
-            self._write_image_log(run_root / "logs", "playwright-mcp-sidecar-cleanup.log", result)
-        for network in playwright_mcp.get("sidecar_networks", []):
-            result = self._runner.run(
-                [self._container.engine, "network", "rm", str(network)],
-                cwd=run_root,
-            )
-            self._write_image_log(run_root / "logs", "playwright-mcp-network-cleanup.log", result)
-
     def _start_playwright_mcp_sidecar(
         self,
         run_root: Path,
@@ -4269,11 +6692,20 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 cwd=run_root,
             )
             self._write_image_log(logs, "playwright-mcp-network-create.log", result)
-            if result.returncode != 0:
-                raise RuntimeError(
-                    "Container backend could not create Playwright MCP sidecar network "
-                    f"{network}. See {logs / 'playwright-mcp-network-create.log'}"
+            try:
+                self._require_network_safe_to_use(
+                    run_root,
+                    network,
+                    state["resource_labels"],
                 )
+            except RuntimeError as exc:
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        "Container backend could not create or safely reuse "
+                        f"Playwright MCP sidecar network {network}. See "
+                        f"{logs / 'playwright-mcp-network-create.log'}"
+                    ) from exc
+                raise
         argv = [
             self._container.engine,
             "run",
@@ -4281,8 +6713,6 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             "--name",
             container,
             *self._label_argv(state),
-            "-v",
-            f"{run_root / 'source'}:/workspace/source",
             "-v",
             f"{run_root / 'logs'}:/workspace/logs",
             "-w",
@@ -4294,6 +6724,32 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             "--tmpfs",
             CONTAINER_RUNTIME_STATE_TMPFS,
         ]
+        workspace_volumes = state.get("workspace_volumes") or state.get(
+            "volumes", []
+        )
+        if state.get("workspace_mode") == "volume" and workspace_volumes:
+            volume = str(workspace_volumes[0])
+            labels = self._canonical_state_resource_labels(run_root, state)
+            if labels is None:
+                raise RuntimeError(
+                    "Container backend refuses Playwright sidecar start with "
+                    "non-canonical resource labels."
+                )
+            self._require_volume_safe_to_use(run_root, volume, labels)
+            argv.extend(["-v", f"{volume}:/workspace/source"])
+        else:
+            argv.extend(["-v", f"{run_root / 'source'}:/workspace/source"])
+        safe_git_config = self._container_safe_git_config_path(run_root)
+        if not safe_git_config.is_file() or path_is_link_or_junction(safe_git_config):
+            raise RuntimeError(
+                "Container backend safe Git configuration is unavailable."
+            )
+        argv.extend(
+            [
+                "-v",
+                f"{safe_git_config}:{CONTAINER_RUNTIME_SOURCE}/.git/config:ro",
+            ]
+        )
         user_mapping = self._container_user_mapping()
         if user_mapping:
             argv.extend(["--user", user_mapping])
@@ -4345,9 +6801,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             state["containers"] = containers
         self._write_container_state(run_root, state)
 
-    @staticmethod
-    def _compose_project_name(run_id: str) -> str:
-        digest = hashlib.sha256(run_id.encode()).hexdigest()[:16]
+    def _compose_project_name(self, run_id: str, workspace_root: Path) -> str:
+        digest = self._resource_scope_digest(run_id, workspace_root)
         return f"spec-{digest}"
 
     def _resolve_compose_file(self, repo_root: Path) -> Path:
@@ -4356,12 +6811,171 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             compose_file = repo_root / compose_file
         return compose_file.resolve()
 
-    def _compose_argv(self, compose_file: Path, compose_project: str, *args: str) -> list[str]:
+    def _pin_or_validate_operator_compose(
+        self,
+        *,
+        repo_root: Path,
+        run_root: Path,
+        source_created: bool,
+    ) -> Path:
+        """Freeze Compose authority outside the agent-writable checkout.
+
+        The first prepare copies the operator's file from the orchestration
+        checkout. Retries must reuse that exact protected copy: consulting the
+        implementation checkout again would let an agent turn a later retry
+        into an arbitrary host-daemon Compose launch.
+        """
+        pinned = self._pinned_compose_file_path(run_root)
+        if not source_created:
+            return self._validated_pinned_compose_file(run_root)
+
+        configured = self._resolve_compose_file(repo_root)
+        if (
+            not configured.is_file()
+            or path_is_link_or_junction(configured)
+            or configured.stat().st_size > 4 * 1024 * 1024
+        ):
+            raise RuntimeError(
+                "Container backend requires a regular operator-controlled "
+                f"Compose file no larger than 4 MiB: {configured}"
+            )
+        try:
+            payload = configured.read_text(encoding="utf-8")
+            parsed = yaml.safe_load(payload) or {}
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise RuntimeError(
+                "Container backend could not safely parse the Compose file "
+                "before pinning: "
+                f"{configured}: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError(
+                "Container backend requires the Compose file root to be a mapping."
+            )
+        services = parsed.get("services", {})
+        if not isinstance(services, dict):
+            raise RuntimeError("Container backend Compose services must be a mapping.")
+        declared_volumes = parsed.get("volumes", {})
+        if not isinstance(declared_volumes, dict):
+            raise RuntimeError("Container backend Compose volumes must be a mapping.")
+        deferred_inputs: list[str] = []
+        for service_name, service in services.items():
+            if not isinstance(service, dict):
+                raise RuntimeError(
+                    f"Container backend Compose service {service_name!r} must be a mapping."
+                )
+            for key in ("env_file", "label_file"):
+                if key in service:
+                    deferred_inputs.append(f"services.{service_name}.{key}")
+            for key in ("build", "develop", "provider", "volumes_from"):
+                if key in service:
+                    deferred_inputs.append(f"services.{service_name}.{key}")
+            for index, mount in enumerate(service.get("volumes", []) or []):
+                location = f"services.{service_name}.volumes[{index}]"
+                if isinstance(mount, str):
+                    source_name, separator, _target = mount.partition(":")
+                    # A path-only mount (``/var/lib/data``) and an empty
+                    # source (``:/var/lib/data``) both ask Compose to create
+                    # an anonymous volume.  It has no stable declared name,
+                    # cannot receive our top-level volume labels, and would
+                    # therefore escape snapshot/restore and GC reconciliation.
+                    if (
+                        not separator
+                        or not source_name
+                        or source_name not in declared_volumes
+                    ):
+                        deferred_inputs.append(location)
+                elif isinstance(mount, dict):
+                    mount_type = str(mount.get("type") or "volume")
+                    source_name = str(mount.get("source") or "")
+                    if mount_type == "volume":
+                        if not source_name or source_name not in declared_volumes:
+                            deferred_inputs.append(location)
+                    elif mount_type != "tmpfs":
+                        deferred_inputs.append(location)
+                else:
+                    deferred_inputs.append(location)
+        for section_name in ("configs", "secrets"):
+            section = parsed.get(section_name, {})
+            if not isinstance(section, dict):
+                raise RuntimeError(
+                    f"Container backend Compose {section_name} must be a mapping."
+                )
+            for name, value in section.items():
+                if isinstance(value, dict) and any(
+                    key in value for key in ("file", "environment", "content")
+                ):
+                    deferred_inputs.append(f"{section_name}.{name}")
+
+        interpolation = re.compile(r"(?<!\$)\$(?:[A-Za-z_]|\{)")
+
+        def contains_interpolation(value: object) -> bool:
+            if isinstance(value, str):
+                return interpolation.search(value) is not None
+            if isinstance(value, list):
+                return any(contains_interpolation(item) for item in value)
+            if isinstance(value, dict):
+                return any(
+                    contains_interpolation(key) or contains_interpolation(item)
+                    for key, item in value.items()
+                )
+            return False
+
+        if contains_interpolation(parsed):
+            deferred_inputs.append("environment interpolation")
+        if deferred_inputs:
+            raise RuntimeError(
+                "Container backend Compose files must be self-contained before "
+                "agent launch; inline deferred inputs: "
+                + ", ".join(sorted(deferred_inputs))
+            )
+        atomic_write_text(pinned, payload)
+        if os.name != "nt":
+            pinned.chmod(0o600)
+        project_directory = self._pinned_compose_project_directory(run_root)
+        if path_is_link_or_junction(project_directory) or (
+            project_directory.exists() and not project_directory.is_dir()
+        ):
+            raise RuntimeError(
+                "Container backend Compose project directory is unsafe."
+            )
+        project_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return self._validated_pinned_compose_file(run_root)
+
+    def _validated_pinned_compose_file(self, run_root: Path) -> Path:
+        pinned = self._pinned_compose_file_path(run_root)
+        if (
+            not pinned.is_file()
+            or path_is_link_or_junction(pinned)
+            or pinned.stat().st_size > 4 * 1024 * 1024
+        ):
+            raise RuntimeError(
+                "Container backend operator Compose baseline is missing or unsafe; "
+                "refusing to consult the agent workspace."
+            )
+        project_directory = self._pinned_compose_project_directory(run_root)
+        if not project_directory.is_dir() or path_is_link_or_junction(
+            project_directory
+        ):
+            raise RuntimeError(
+                "Container backend protected Compose project directory is unsafe."
+            )
+        return pinned
+
+    def _compose_argv(
+        self,
+        run_root: Path,
+        compose_file: Path,
+        compose_project: str,
+        *args: str,
+    ) -> list[str]:
         return [
             self._container.engine,
             "compose",
             "-p",
             compose_project,
+            "--project-directory",
+            str(self._pinned_compose_project_directory(run_root)),
             "-f",
             str(compose_file),
             *args,
@@ -4375,18 +6989,45 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         compose_file: Path,
         compose_project: str,
     ) -> None:
+        compose_file = self._validated_pinned_compose_file(run_root)
         state = self._read_container_state(run_root)
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses compose startup with non-canonical resource labels."
+            )
+        self._assert_compose_managed_names_owned_or_unused(
+            run_root,
+            compose_file,
+            compose_project,
+            labels,
+        )
+        self._assert_compose_project_owned_or_unused(
+            run_root,
+            compose_project,
+            labels,
+        )
         override_file = self._write_compose_label_override(run_root, compose_file, compose_project, state)
         state["compose_label_override"] = str(override_file)
         self._write_container_state(run_root, state)
         result = self._runner.run(
-            self._compose_argv(compose_file, compose_project, "-f", str(override_file), "up", "-d", "--remove-orphans"),
+            self._compose_argv(
+                run_root,
+                compose_file,
+                compose_project,
+                "-f",
+                str(override_file),
+                "up",
+                "-d",
+                "--remove-orphans",
+            ),
             cwd=run_root,
         )
         self._write_image_log(logs, "compose-services.log", result)
         if result.returncode != 0:
             failure_path = logs / "service-startup-failure.json"
-            failure_path.write_text(
+            atomic_write_text(
+                failure_path,
                 json.dumps(
                     {
                         "backend": "container",
@@ -4419,21 +7060,86 @@ class ContainerExecutionBackend(CloneExecutionBackend):
 
         try:
             compose = yaml.safe_load(compose_file.read_text(encoding="utf-8")) or {}
-        except (OSError, yaml.YAMLError):
-            compose = {}
-        services = compose.get("services", {}) if isinstance(compose, dict) else {}
-        volumes = compose.get("volumes", {}) if isinstance(compose, dict) else {}
-        networks = compose.get("networks", {}) if isinstance(compose, dict) else {}
+        except (OSError, yaml.YAMLError) as exc:
+            raise RuntimeError(
+                "Container backend could not safely parse the Compose file; "
+                f"refusing startup: {compose_file}: {exc}"
+            ) from exc
+        if not isinstance(compose, dict):
+            raise RuntimeError(
+                "Container backend requires the Compose file root to be a mapping."
+            )
+        if compose.get("include"):
+            # Includes can introduce services and globally named resources that
+            # are absent from this file. Until the resolved Compose model is
+            # available portably across Docker and Podman providers, reject the
+            # construct instead of starting resources we cannot label or own.
+            raise RuntimeError(
+                "Container backend does not support Compose include; inline the "
+                "included services so every managed resource can be safety-labeled."
+            )
+        services = compose.get("services", {})
+        volumes = compose.get("volumes", {})
+        networks = compose.get("networks", {})
+        default_network = networks.get("default") if isinstance(networks, dict) else None
+        if (
+            isinstance(default_network, dict)
+            and default_network.get("external") is True
+        ):
+            raise RuntimeError(
+                "Container backend requires the Compose default network to be "
+                "managed so the worker can join its run-scoped service network."
+            )
+        if isinstance(services, dict):
+            extended_services = [
+                str(name)
+                for name, value in services.items()
+                if isinstance(value, dict) and value.get("extends")
+            ]
+            if extended_services:
+                raise RuntimeError(
+                    "Container backend does not support Compose extends; inline "
+                    "the inherited service configuration so global names can be "
+                    f"validated: {', '.join(sorted(extended_services))}"
+                )
+            named_services = [
+                str(name)
+                for name, value in services.items()
+                if isinstance(value, dict) and value.get("container_name")
+            ]
+            if named_services:
+                raise RuntimeError(
+                    "Container backend compose files must not set container_name "
+                    "for managed services; remove it so Compose can scope names "
+                    f"to this run: {', '.join(sorted(named_services))}"
+                )
+        explicitly_named = [
+            f"{kind}:{name}"
+            for kind, resources in (("volume", volumes), ("network", networks))
+            if isinstance(resources, dict)
+            for name, value in resources.items()
+            if isinstance(value, dict)
+            and value.get("name")
+            and value.get("external") is not True
+        ]
+        if explicitly_named:
+            raise RuntimeError(
+                "Container backend compose files must not assign global names "
+                "to managed volumes or networks; remove name or declare the "
+                "resource external: "
+                + ", ".join(sorted(explicitly_named))
+            )
         network_names = (
             {
                 name: value
                 for name, value in networks.items()
-                if not isinstance(value, dict) or not value.get("external")
+                if not isinstance(value, dict) or value.get("external") is not True
             }
             if isinstance(networks, dict)
             else {}
         )
-        network_names.setdefault("default", {})
+        if not isinstance(networks, dict) or "default" not in networks:
+            network_names.setdefault("default", {})
 
         payload: dict[str, Any] = {
             "services": {str(name): {"labels": labels} for name in services},
@@ -4443,7 +7149,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             payload["volumes"] = {
                 str(name): {"labels": labels}
                 for name, value in volumes.items()
-                if not isinstance(value, dict) or not value.get("external")
+                if not isinstance(value, dict) or value.get("external") is not True
             }
         path = run_root / "container-compose-labels.json"
         path.write_text(
@@ -4452,13 +7158,32 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         return path
 
     def _stop_sidecar_services(self, run_root: Path, state: dict[str, Any]) -> None:
-        compose_file = str(state.get("compose_file") or "")
+        compose_file = self._validated_pinned_compose_file(run_root)
         compose_project = str(state.get("compose_project") or "")
-        if not compose_file or not compose_project:
-            return
+        if str(state.get("compose_file") or "") != str(compose_file) or not compose_project:
+            raise RuntimeError(
+                "Container backend cannot stop sidecar services because its "
+                "Compose state is incomplete."
+            )
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses compose stop with non-canonical resource labels."
+            )
+        self._assert_compose_project_owned_or_unused(
+            run_root,
+            compose_project,
+            labels,
+        )
         extra = ["-f", str(state["compose_label_override"])] if state.get("compose_label_override") else []
         result = self._runner.run(
-            self._compose_argv(Path(compose_file), compose_project, *extra, "stop"),
+            self._compose_argv(
+                run_root,
+                compose_file,
+                compose_project,
+                *extra,
+                "stop",
+            ),
             cwd=run_root,
         )
         self._write_image_log(run_root / "logs", "compose-stop-before-snapshot.log", result)
@@ -4468,23 +7193,349 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 f"for compose project {compose_project}. "
                 f"See {run_root / 'logs' / 'compose-stop-before-snapshot.log'}"
             )
-
-    def _remove_sidecar_services(self, run_root: Path, state: dict[str, Any]) -> None:
-        compose_file = str(state.get("compose_file") or "")
-        compose_project = str(state.get("compose_project") or "")
-        if not compose_file or not compose_project:
-            return
-        extra = ["-f", str(state["compose_label_override"])] if state.get("compose_label_override") else []
-        result = self._runner.run(
-            self._compose_argv(Path(compose_file), compose_project, *extra, "down", "--volumes", "--remove-orphans"),
+        filters = [
+            argument
+            for key, value in sorted(labels.items())
+            for argument in ("--filter", f"label={key}={value}")
+        ]
+        running = self._runner.run(
+            [
+                self._container.engine,
+                "ps",
+                "--filter",
+                f"label=com.docker.compose.project={compose_project}",
+                *filters,
+                "--format",
+                "{{.ID}}",
+            ],
             cwd=run_root,
         )
-        self._write_image_log(run_root / "logs", "compose-cleanup.log", result)
+        if running.returncode != 0 or running.stdout.strip():
+            raise RuntimeError(
+                "Container backend could not positively verify every sidecar "
+                "service stopped before snapshot."
+            )
+
+    @staticmethod
+    def _snapshot_pause_container_ids(state: dict[str, Any]) -> list[str]:
+        candidates = [str(state.get("worker_container") or "")]
+        playwright = state.get("playwright_mcp", {})
+        if isinstance(playwright, dict) and playwright.get("topology") == "sidecar":
+            candidates.append(str(playwright.get("sidecar_container") or ""))
+        return list(dict.fromkeys(item for item in candidates if item))
+
+    def _pause_owned_container(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+        container_id: str,
+    ) -> None:
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses snapshot pause with non-canonical labels."
+            )
+        self._require_resource_owned(
+            run_root,
+            "container",
+            container_id,
+            labels,
+            allow_additional_labels=True,
+        )
+        paused = self._runner.run(
+            [self._container.engine, "pause", container_id],
+            cwd=run_root,
+        )
+        if paused.returncode != 0:
+            raise RuntimeError(
+                "Container backend could not positively pause its worker before snapshot."
+            )
+        try:
+            positively_paused = self._container_pause_state(run_root, container_id)
+        except RuntimeError:
+            # The mutation succeeded but verification failed. Roll it back
+            # immediately because the caller cannot yet know it must resume
+            # this container in its outer finally block.
+            self._runner.run(
+                [self._container.engine, "unpause", container_id],
+                cwd=run_root,
+            )
+            raise
+        if not positively_paused:
+            self._runner.run(
+                [self._container.engine, "unpause", container_id],
+                cwd=run_root,
+            )
+            raise RuntimeError(
+                "Container backend could not positively pause its worker before snapshot."
+            )
+
+    def _unpause_owned_container(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+        container_id: str,
+    ) -> None:
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses snapshot unpause with non-canonical labels."
+            )
+        self._require_resource_owned(
+            run_root,
+            "container",
+            container_id,
+            labels,
+            allow_additional_labels=True,
+        )
+        unpaused = self._runner.run(
+            [self._container.engine, "unpause", container_id],
+            cwd=run_root,
+        )
+        if unpaused.returncode != 0 or self._container_pause_state(
+            run_root, container_id
+        ):
+            raise RuntimeError(
+                "Container backend could not positively resume its worker after snapshot."
+            )
+
+    def _container_pause_state(self, run_root: Path, container_id: str) -> bool:
+        inspected = self._runner.run(
+            [
+                self._container.engine,
+                "inspect",
+                "--format",
+                "{{.State.Paused}}",
+                container_id,
+            ],
+            cwd=run_root,
+        )
+        if inspected.returncode != 0:
+            raise RuntimeError(
+                "Container backend could not inspect worker pause state."
+            )
+        rendered = inspected.stdout.strip().casefold()
+        if rendered not in {"true", "false"}:
+            raise RuntimeError(
+                "Container backend received an invalid worker pause state."
+            )
+        return rendered == "true"
+
+    def _container_runtime_status(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+        container_id: str,
+    ) -> str:
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses container-state inspection with "
+                "non-canonical resource labels."
+            )
+        self._require_resource_owned(
+            run_root,
+            "container",
+            container_id,
+            labels,
+            allow_additional_labels=True,
+        )
+        inspected = self._runner.run(
+            [
+                self._container.engine,
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                container_id,
+            ],
+            cwd=run_root,
+        )
+        if inspected.returncode != 0:
+            raise RuntimeError(
+                "Container backend could not inspect exact-owned container state."
+            )
+        rendered = inspected.stdout.strip().casefold()
+        if rendered not in {
+            "created",
+            "running",
+            "paused",
+            "restarting",
+            "removing",
+            "exited",
+            "dead",
+        }:
+            raise RuntimeError(
+                "Container backend received an invalid exact-owned container state."
+            )
+        return rendered
+
+    def _container_exit_code(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+        container_id: str,
+    ) -> int:
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses container exit-code inspection with "
+                "non-canonical resource labels."
+            )
+        self._require_resource_owned(
+            run_root,
+            "container",
+            container_id,
+            labels,
+            allow_additional_labels=True,
+        )
+        inspected = self._runner.run(
+            [
+                self._container.engine,
+                "inspect",
+                "--format",
+                "{{.State.ExitCode}}",
+                container_id,
+            ],
+            cwd=run_root,
+        )
+        if inspected.returncode != 0:
+            raise RuntimeError(
+                "Container backend could not inspect exact-owned container exit code."
+            )
+        rendered = inspected.stdout.strip()
+        try:
+            exit_code = int(rendered, 10)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Container backend received an invalid exact-owned container exit code."
+            ) from exc
+        if exit_code < 0:
+            raise RuntimeError(
+                "Container backend received an invalid exact-owned container exit code."
+            )
+        return exit_code
+
+    def _record_runtime_generation(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+    ) -> None:
+        """Persist the complete set of live containers for one generation."""
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses to record a runtime with non-canonical labels."
+            )
+        owned = self._discover_owned_container_ids(run_root, labels)
+        running: list[str] = []
+        for container_id in sorted(owned):
+            status = self._container_runtime_status(run_root, state, container_id)
+            if status == "running":
+                if self._container_pause_state(run_root, container_id):
+                    raise RuntimeError(
+                        "Container backend found a paused container while recording "
+                        "a live runtime generation."
+                    )
+                running.append(container_id)
+            elif status == "exited" and self._container_exit_code(
+                run_root,
+                state,
+                container_id,
+            ) == 0:
+                # Successful one-shot Compose jobs are part of a healthy
+                # generation but are not live writers to record/pause.
+                continue
+            else:
+                raise RuntimeError(
+                    "Container backend found an unhealthy exact-owned container "
+                    f"while recording its runtime generation: {container_id} ({status})."
+                )
+        worker = str(state.get("worker_container") or "")
+        if not worker or worker not in running:
+            raise RuntimeError(
+                "Container backend could not verify its worker in the runtime generation."
+            )
+        playwright = state.get("playwright_mcp", {})
+        if isinstance(playwright, dict) and playwright.get("topology") == "sidecar":
+            sidecar = str(playwright.get("sidecar_container") or "")
+            if not sidecar or sidecar not in running:
+                raise RuntimeError(
+                    "Container backend could not verify its Playwright sidecar in "
+                    "the runtime generation."
+                )
+        state["runtime_generation_containers"] = running
+        state["runtime_generation_status"] = "running"
+        self._write_container_state(run_root, state)
+
+    def _recorded_runtime_is_healthy(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+        *,
+        allow_paused: bool = False,
+    ) -> bool:
+        """Check that durable state still describes one complete live runtime."""
+        if state.get("runtime_generation_status") != "running":
+            return False
+        raw_expected = state.get("runtime_generation_containers")
+        if not isinstance(raw_expected, list) or not raw_expected:
+            return False
+        expected_items = [str(item) for item in raw_expected if str(item)]
+        expected = set(expected_items)
+        if len(expected) != len(raw_expected) or len(expected) != len(expected_items):
+            return False
+        worker = str(state.get("worker_container") or "")
+        if not worker or worker not in expected:
+            return False
+        playwright = state.get("playwright_mcp", {})
+        if isinstance(playwright, dict) and playwright.get("topology") == "sidecar":
+            sidecar = str(playwright.get("sidecar_container") or "")
+            if not sidecar or sidecar not in expected:
+                return False
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses runtime health checks with non-canonical labels."
+            )
+        owned = self._discover_owned_container_ids(run_root, labels)
+        if not expected.issubset(owned):
+            return False
+        paused_raw = state.get("host_access_paused_containers", [])
+        if not isinstance(paused_raw, list):
+            return False
+        paused = {str(item) for item in paused_raw if str(item)}
+        if allow_paused:
+            if paused != expected:
+                return False
+        elif paused:
+            return False
+        for container_id in sorted(owned):
+            status = self._container_runtime_status(run_root, state, container_id)
+            if container_id in expected:
+                if status != "running":
+                    return False
+                is_paused = self._container_pause_state(run_root, container_id)
+                if allow_paused != is_paused:
+                    return False
+            elif status == "exited":
+                if self._container_exit_code(run_root, state, container_id) != 0:
+                    return False
+            else:
+                # A live exact-owned container omitted from the persisted set
+                # could be an unrecorded writer from a partial generation;
+                # created/dead/unstable members are incomplete generations.
+                return False
+        return True
 
     def _refresh_sidecar_service_volumes(self, run_root: Path, state: dict[str, Any]) -> None:
         compose_project = str(state.get("compose_project") or "")
         if not compose_project:
             return
+        label_filters = [
+            argument
+            for key, value in sorted(state.get("resource_labels", {}).items())
+            for argument in ("--filter", f"label={key}={value}")
+        ]
         result = self._runner.run(
             [
                 self._container.engine,
@@ -4492,6 +7543,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 "ls",
                 "--filter",
                 f"label=com.docker.compose.project={compose_project}",
+                *label_filters,
                 "--format",
                 "{{.Name}}",
             ],
@@ -4499,10 +7551,12 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         )
         self._write_image_log(run_root / "logs", "compose-volume-discovery.log", result)
         if result.returncode != 0:
-            return
+            detail = (result.stderr or result.stdout or "unknown engine error").strip()
+            raise RuntimeError(
+                "Container backend could not inventory sidecar service volumes "
+                f"for a consistent snapshot: {detail}"
+            )
         volumes = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        if not volumes:
-            return
         state["service_volumes"] = list(dict.fromkeys(volumes))
         state["volumes"] = list(dict.fromkeys([*state.get("workspace_volumes", []), *state["service_volumes"]]))
         self._write_container_state(run_root, state)
@@ -4517,59 +7571,270 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         if not volumes:
             return
         snapshot_root = run_root / "snapshots" / f"{_safe_artifact_name(label)}.service-volumes"
-        if snapshot_root.exists():
-            remove_tree(snapshot_root)
-        snapshot_root.mkdir(parents=True)
-        captured: dict[str, str] = {}
-        for volume in volumes:
-            archive_name = f"{_safe_artifact_name(volume)}.tar"
-            result = self._runner.run(
+        snapshot_root.parent.mkdir(parents=True, exist_ok=True)
+        staging_root = Path(
+            tempfile.mkdtemp(
+                dir=snapshot_root.parent,
+                prefix=f".{snapshot_root.name}.staging-",
+            )
+        )
+        captured: dict[str, dict[str, Any]] = {}
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses service-volume snapshot with "
+                "non-canonical resource labels."
+            )
+        try:
+            # Validate every source volume before capturing any archive, then
+            # publish the complete archive set with one directory rename.
+            for volume in volumes:
+                self._require_volume_safe_to_use(run_root, volume, labels)
+            for volume in volumes:
+                archive_name = f"{_safe_artifact_name(volume)}.tar"
+                result = self._runner.run(
+                    [
+                        self._container.engine,
+                        "run",
+                        "--rm",
+                        *self._label_argv(state),
+                        "-v",
+                        f"{volume}:/workspace/service-volume:ro",
+                        "-v",
+                        f"{staging_root}:/workspace/service-volume-snapshot",
+                        state["image"],
+                        "sh",
+                        "-lc",
+                        f"tar -C /workspace/service-volume -cf /workspace/service-volume-snapshot/{archive_name} .",
+                    ],
+                    cwd=run_root,
+                )
+                self._write_image_log(
+                    run_root / "logs",
+                    f"service-volume-snapshot-{_safe_artifact_name(volume)}.log",
+                    result,
+                )
+                archive_path = staging_root / archive_name
+                if result.returncode != 0 or not archive_path.is_file():
+                    raise RuntimeError(
+                        f"Container backend could not snapshot service volume {volume}. "
+                        f"See {run_root / 'logs' / ('service-volume-snapshot-' + _safe_artifact_name(volume) + '.log')}"
+                    )
+                archive_size, archive_sha256 = self._regular_file_sha256(
+                    archive_path
+                )
+                captured[volume] = {
+                    "path": str(snapshot_root / archive_name),
+                    "size": archive_size,
+                    "sha256": archive_sha256,
+                }
+            if path_is_link_or_junction(snapshot_root):
+                snapshot_root.unlink()
+            elif snapshot_root.exists():
+                remove_tree(snapshot_root)
+            os.replace(staging_root, snapshot_root)
+        finally:
+            if staging_root.exists():
+                remove_tree(staging_root, ignore_errors=True)
+        snapshots = dict(state.get("service_volume_snapshots", {}))
+        snapshots[label] = captured
+        state["service_volume_snapshots"] = snapshots
+        self._write_container_state(run_root, state)
+
+    @staticmethod
+    def _regular_file_sha256(path: Path) -> tuple[int, str]:
+        """Hash one regular file without following a last-component link."""
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise RuntimeError(f"Container backend could not safely read {path}.") from exc
+        digest = hashlib.sha256()
+        try:
+            metadata = os.fstat(descriptor)
+            reparse = bool(
+                getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            )
+            if not stat.S_ISREG(metadata.st_mode) or reparse:
+                raise RuntimeError(
+                    f"Container backend refuses non-regular snapshot archive {path}."
+                )
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            return metadata.st_size, digest.hexdigest()
+        finally:
+            os.close(descriptor)
+
+    def _validated_sidecar_service_volume_restore(
+        self,
+        run_root: Path,
+        state: dict[str, Any],
+        label: str,
+    ) -> list[tuple[str, Path]]:
+        snapshots = state.get("service_volume_snapshots", {})
+        volume_archives = snapshots.get(label, {}) if isinstance(snapshots, dict) else {}
+        if not isinstance(volume_archives, dict):
+            raise RuntimeError(
+                "Container backend service-volume snapshot metadata is invalid."
+            )
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses service-volume restore with "
+                "non-canonical resource labels."
+            )
+        expected_volumes = {
+            str(volume) for volume in state.get("service_volumes", []) if str(volume)
+        }
+        archived_volumes = {str(volume) for volume in volume_archives}
+        if archived_volumes != expected_volumes:
+            missing = sorted(expected_volumes - archived_volumes)
+            unexpected = sorted(archived_volumes - expected_volumes)
+            detail: list[str] = []
+            if missing:
+                detail.append("missing " + ", ".join(missing))
+            if unexpected:
+                detail.append("unexpected " + ", ".join(unexpected))
+            raise RuntimeError(
+                "Container backend service-volume snapshot is incomplete or "
+                "does not match the protected volume inventory: " + "; ".join(detail)
+            )
+        snapshot_root = (
+            run_root / "snapshots" / f"{_safe_artifact_name(label)}.service-volumes"
+        )
+        if expected_volumes and (
+            not snapshot_root.is_dir() or path_is_link_or_junction(snapshot_root)
+        ):
+            raise RuntimeError(
+                "Container backend service-volume snapshot directory is missing or unsafe."
+            )
+        prepared: list[tuple[str, Path]] = []
+        for volume in sorted(expected_volumes):
+            archive_record = volume_archives[volume]
+            expected_size: int | None = None
+            expected_sha256 = ""
+            if isinstance(archive_record, str):
+                # v0.4.0 recovery points stored only a path. They remain
+                # usable, but still receive the read-only tar validation below.
+                archive_path = Path(archive_record)
+            elif isinstance(archive_record, dict):
+                archive_path = Path(str(archive_record.get("path") or ""))
+                size_raw = archive_record.get("size")
+                sha256_raw = archive_record.get("sha256")
+                if (
+                    not isinstance(size_raw, int)
+                    or size_raw < 0
+                    or not isinstance(sha256_raw, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", sha256_raw) is None
+                ):
+                    raise RuntimeError(
+                        "Container backend service-volume archive integrity "
+                        f"metadata is invalid: {volume}"
+                    )
+                expected_size = size_raw
+                expected_sha256 = sha256_raw
+            else:
+                raise RuntimeError(
+                    "Container backend service-volume archive metadata is "
+                    f"invalid: {volume}"
+                )
+            expected_archive = snapshot_root / f"{_safe_artifact_name(volume)}.tar"
+            try:
+                metadata = archive_path.lstat()
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Container backend service-volume archive is missing: {volume}"
+                ) from exc
+            reparse = bool(
+                getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            )
+            if (
+                not archive_path.is_absolute()
+                or Path(os.path.abspath(archive_path)) != expected_archive
+                or not stat.S_ISREG(metadata.st_mode)
+                or reparse
+                or path_is_link_or_junction(archive_path)
+            ):
+                raise RuntimeError(
+                    f"Container backend service-volume archive is unsafe: {volume}"
+                )
+            actual_size, actual_sha256 = self._regular_file_sha256(archive_path)
+            if (
+                expected_size is not None
+                and (
+                    actual_size != expected_size
+                    or actual_sha256 != expected_sha256
+                )
+            ):
+                raise RuntimeError(
+                    "Container backend service-volume archive failed its "
+                    f"integrity check: {volume}"
+                )
+            archive_check = self._runner.run(
                 [
                     self._container.engine,
                     "run",
                     "--rm",
                     *self._label_argv(state),
                     "-v",
-                    f"{volume}:/workspace/service-volume:ro",
-                    "-v",
-                    f"{snapshot_root}:/workspace/service-volume-snapshot",
+                    f"{archive_path.parent}:/workspace/service-volume-snapshot:ro",
                     state["image"],
                     "sh",
                     "-lc",
-                    f"tar -C /workspace/service-volume -cf /workspace/service-volume-snapshot/{archive_name} .",
+                    "tar -tf "
+                    f"/workspace/service-volume-snapshot/{archive_path.name} "
+                    ">/dev/null",
                 ],
                 cwd=run_root,
             )
             self._write_image_log(
                 run_root / "logs",
-                f"service-volume-snapshot-{_safe_artifact_name(volume)}.log",
-                result,
+                f"service-volume-validate-{_safe_artifact_name(volume)}.log",
+                archive_check,
             )
-            if result.returncode != 0:
+            if archive_check.returncode != 0:
                 raise RuntimeError(
-                    f"Container backend could not snapshot service volume {volume}. "
-                    f"See {run_root / 'logs' / ('service-volume-snapshot-' + _safe_artifact_name(volume) + '.log')}"
+                    "Container backend service-volume archive is unreadable: "
+                    f"{volume}. See "
+                    f"{run_root / 'logs' / ('service-volume-validate-' + _safe_artifact_name(volume) + '.log')}"
                 )
-            captured[volume] = str(snapshot_root / archive_name)
-        snapshots = dict(state.get("service_volume_snapshots", {}))
-        snapshots[label] = captured
-        state["service_volume_snapshots"] = snapshots
-        self._write_container_state(run_root, state)
+            self._require_volume_safe_to_use(run_root, volume, labels)
+            prepared.append((volume, archive_path))
+
+        return prepared
 
     def _restore_sidecar_service_volumes(
         self,
         run_root: Path,
         state: dict[str, Any],
         label: str,
+        *,
+        prepared: list[tuple[str, Path]] | None = None,
     ) -> None:
-        snapshots = state.get("service_volume_snapshots", {})
-        volume_archives = snapshots.get(label, {}) if isinstance(snapshots, dict) else {}
-        if not isinstance(volume_archives, dict):
-            return
-        for volume, archive in volume_archives.items():
-            archive_path = Path(str(archive))
-            if not archive_path.is_file():
-                continue
+        # All archives, ownership labels, and foreign consumers are validated
+        # before the first destructive volume wipe. This prevents a bad later
+        # entry from leaving a partially restored service set.
+        prepared = (
+            prepared
+            if prepared is not None
+            else self._validated_sidecar_service_volume_restore(run_root, state, label)
+        )
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses service-volume restore with "
+                "non-canonical resource labels."
+            )
+        for volume, archive_path in prepared:
+            # Source rescue/restore can take arbitrarily long after the bulk
+            # archive preflight. Close that avoidable race by rechecking exact
+            # ownership and every attached consumer immediately before the
+            # destructive volume wipe helper is launched.
+            self._require_volume_safe_to_use(run_root, volume, labels)
             result = self._runner.run(
                 [
                     self._container.engine,
@@ -4601,8 +7866,12 @@ class ContainerExecutionBackend(CloneExecutionBackend):
 
     def _start_in_worker_container(self, run_root: Path, state: dict[str, Any]) -> None:
         if state.get("worker_container"):
-            return
-        cidfile = run_root / "logs" / "in-worker-services.cid"
+            raise RuntimeError(
+                "Container backend refuses to start a second worker in a "
+                "partially recorded runtime generation."
+            )
+        cidfile = run_root / "backend-state" / "in-worker-services.cid"
+        cidfile.parent.mkdir(parents=True, exist_ok=True)
         if cidfile.exists():
             cidfile.unlink()
         argv = [
@@ -4633,9 +7902,28 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             argv.extend(self._container_passwd_shim_argv(run_root))
         workspace_volumes = state.get("workspace_volumes") or state.get("volumes", [])
         if state.get("workspace_mode") == "volume" and workspace_volumes:
-            argv.extend(["-v", f"{workspace_volumes[0]}:/workspace/source"])
+            volume = str(workspace_volumes[0])
+            labels = self._canonical_state_resource_labels(run_root, state)
+            if labels is None:
+                raise RuntimeError(
+                    "Container backend refuses worker start with non-canonical "
+                    "resource labels."
+                )
+            self._require_volume_safe_to_use(run_root, volume, labels)
+            argv.extend(["-v", f"{volume}:/workspace/source"])
         else:
             argv.extend(["-v", f"{run_root / 'source'}:/workspace/source"])
+        safe_git_config = self._container_safe_git_config_path(run_root)
+        if not safe_git_config.is_file() or path_is_link_or_junction(safe_git_config):
+            raise RuntimeError(
+                "Container backend safe Git configuration is unavailable."
+            )
+        argv.extend(
+            [
+                "-v",
+                f"{safe_git_config}:{CONTAINER_RUNTIME_SOURCE}/.git/config:ro",
+            ]
+        )
         argv.extend(
             [
                 "-v",
@@ -4650,7 +7938,14 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 ]
             )
         )
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses worker network attachment with "
+                "non-canonical resource labels."
+            )
         for network in attached_networks:
+            self._require_network_safe_to_use(run_root, network, labels)
             argv.extend(["--network", network])
         argv.extend([state["image"], "sh", "-lc", "sleep infinity"])
         result = self._runner.run(argv, cwd=run_root)
@@ -4674,7 +7969,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             self._write_container_state(run_root, state)
         if result.returncode != 0 or not container_id:
             failure_path = run_root / "logs" / "service-startup-failure.json"
-            failure_path.write_text(
+            atomic_write_text(
+                failure_path,
                 json.dumps(
                     {
                         "backend": "container",
@@ -4721,17 +8017,45 @@ class ContainerExecutionBackend(CloneExecutionBackend):
     def _reset_in_worker_container(self, run_root: Path, state: dict[str, Any]) -> None:
         container_id = str(state.get("worker_container") or "")
         if container_id:
-            result = self._runner.run(
-                [self._container.engine, "rm", "-f", container_id],
-                cwd=run_root,
-            )
-            self._write_image_log(run_root / "logs", "in-worker-services-reset.log", result)
-        cidfile = run_root / "logs" / "in-worker-services.cid"
+            if not self._verify_container_removed(run_root, container_id):
+                labels = self._canonical_state_resource_labels(run_root, state)
+                if labels is None:
+                    raise RuntimeError(
+                        "Container backend refuses worker reset with "
+                        "non-canonical resource labels."
+                    )
+                self._require_resource_owned(
+                    run_root,
+                    "container",
+                    container_id,
+                    labels,
+                    allow_additional_labels=True,
+                )
+                result = self._runner.run(
+                    [self._container.engine, "rm", "-f", container_id],
+                    cwd=run_root,
+                )
+                self._write_image_log(
+                    run_root / "logs",
+                    "in-worker-services-reset.log",
+                    result,
+                )
+                if result.returncode != 0 or not self._verify_container_removed(
+                    run_root,
+                    container_id,
+                ):
+                    detail = (result.stderr or result.stdout or "unknown error").strip()
+                    raise RuntimeError(
+                        "Container backend could not positively remove the worker "
+                        f"before restore: {detail}"
+                    )
+        cidfile = run_root / "backend-state" / "in-worker-services.cid"
         if cidfile.exists():
             cidfile.unlink()
         containers = [str(item) for item in state.get("containers", []) if str(item) != container_id]
         state["containers"] = containers
         state["worker_container"] = ""
+        state["runtime_generation_containers"] = []
         state["service_processes"] = [
             process
             for process in state.get("service_processes", [])
@@ -4750,32 +8074,42 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         the stale volume must be re-seeded so the agent runs against the updated
         tree rather than the original base seed. No-op outside ``volume`` mode.
 
-        Re-seeding wipes ``/workspace/source`` before copying the (tracked) host
-        tree, which discards the gitignored dependencies/build state that the
-        preceding :func:`restore` installed into the volume via bootstrap. Mirror
-        ``restore``'s own volume sequence (seed → bootstrap install) so the freshly
-        repositioned volume has its dependencies reinstalled rather than being left
-        bare — otherwise the implement agent would run against a dependency-less
-        tree.
+        The workspace is quiesced here. Bootstrap is deliberately deferred to
+        the next runtime start, after sidecar services and the persistent worker
+        exist, so it runs exactly once in the environment the agent will use.
         """
         run_root = workspace.outbox_path.parent.resolve()
         state = self._read_container_state(run_root, missing_ok=True)
         if state.get("workspace_mode") != "volume":
             return
         self._seed_volume_workspace(workspace, state)
-        self._run_container_bootstrap_install(workspace)
+        state["workspace_volume_preseeded_for_runtime"] = True
+        self._write_container_state(run_root, state)
 
     def _seed_volume_workspace(self, workspace: WorkspaceHandle, state: dict[str, Any]) -> None:
         volumes = state.get("workspace_volumes") or state.get("volumes", [])
         if not volumes:
             return
         volume = str(volumes[0])
+        # This write is the crash boundary for a destructive reseed. A retry
+        # seeing ``seeding`` knows the volume may be empty or partial and keeps
+        # the existing host mirror authoritative instead of importing it.
+        state["workspace_volume_seed_state"] = "seeding"
+        self._write_container_state(workspace.outbox_path.parent, state)
         create = self._runner.run(
             [self._container.engine, "volume", "create", *self._label_argv(state), volume],
             cwd=workspace.outbox_path.parent,
         )
         if create.returncode != 0:
             raise RuntimeError(f"Container backend could not create source volume {volume}.")
+        run_root = workspace.outbox_path.parent
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses source-volume seed with "
+                "non-canonical resource labels."
+            )
+        self._require_volume_safe_to_use(run_root, volume, labels)
         user_mapping = self._container_user_mapping()
         seed_script = (
             "find /workspace/source -mindepth 1 -maxdepth 1 -exec rm -rf {} + && "
@@ -4806,6 +8140,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 f"Container backend could not seed source volume {volume}. "
                 f"See {workspace.outbox_path.parent / 'logs' / 'volume-seed.log'}"
             )
+        state["workspace_volume_seed_state"] = "ready"
+        self._write_container_state(workspace.outbox_path.parent, state)
 
     def sync_host_paths_into_workspace(
         self,
@@ -4835,6 +8171,13 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         if not volumes:
             return
         volume = str(volumes[0])
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses source-volume sync with "
+                "non-canonical resource labels."
+            )
+        self._require_volume_safe_to_use(run_root, volume, labels)
 
         host_source = run_root / "source"
         normalized: list[str] = []
@@ -4909,40 +8252,115 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         if not volumes:
             return
         volume = str(volumes[0])
-        argv = [
-            self._container.engine,
-            "run",
-            "--rm",
-            *self._label_argv(state),
-        ]
-        user_mapping = self._container_user_mapping()
-        if user_mapping:
-            argv.extend(["--user", user_mapping])
-            argv.extend(self._container_passwd_shim_argv(run_root))
-        argv.extend(
-            [
-                "-v",
-                f"{volume}:/workspace/source:ro",
-                "-v",
-                f"{run_root / 'source'}:/workspace/host",
-                state["image"],
-                "sh",
-                "-lc",
-                "find /workspace/host -mindepth 1 -maxdepth 1 -exec rm -rf {} + && "
-                "find /workspace/source -mindepth 1 -maxdepth 1 "
-                "-exec sh -c 'cp -a \"$@\" /workspace/host/' sh {} +",
-            ]
-        )
-        sync = self._runner.run(
-            argv,
-            cwd=run_root,
-        )
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise ExecutionBackendImportError(
+                "Container backend import refused non-canonical resource labels."
+            )
+        try:
+            self._require_volume_safe_to_use(run_root, volume, labels)
+        except RuntimeError as exc:
+            raise ExecutionBackendImportError(
+                f"Container backend import refused unsafe source volume {volume}: {exc}"
+            ) from exc
         logs = run_root / "logs"
         log_path = logs / "volume-import.log"
-        self._write_image_log(logs, "volume-import.log", sync)
-        if sync.returncode != 0:
+        failure_path = logs / "volume-import-failure.json"
+        try:
+            staging = Path(
+                tempfile.mkdtemp(prefix=".spec-volume-import-", dir=run_root)
+            )
+        except OSError as exc:
+            raise ExecutionBackendImportError(
+                "Container backend import failed: could not create a staging directory."
+            ) from exc
+        try:
+            argv = [
+                self._container.engine,
+                "run",
+                "--rm",
+                *self._label_argv(state),
+            ]
+            user_mapping = self._container_user_mapping()
+            if user_mapping:
+                argv.extend(["--user", user_mapping])
+                argv.extend(self._container_passwd_shim_argv(run_root))
+            argv.extend(
+                [
+                    "-v",
+                    f"{volume}:/workspace/source:ro",
+                    "-v",
+                    f"{staging}:/workspace/host",
+                    state["image"],
+                    "sh",
+                    "-lc",
+                    "find /workspace/source -mindepth 1 -maxdepth 1 "
+                    "-exec sh -c 'cp -a \"$@\" /workspace/host/' sh {} +",
+                ]
+            )
+            sync = self._runner.run(
+                argv,
+                cwd=run_root,
+            )
+            self._write_image_log(logs, "volume-import.log", sync)
+            if sync.returncode != 0:
+                atomic_write_text(
+                    failure_path,
+                    json.dumps(
+                        {
+                            "backend": "container",
+                            "failure_type": "import",
+                            "failure_subtype": "volume_workspace_import_failed",
+                            "created_at": datetime.now(timezone.utc).isoformat(),
+                            "volume": volume,
+                            "returncode": sync.returncode,
+                            "log_path": str(log_path),
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    ),
+                    encoding="utf-8",
+                )
+                raise ExecutionBackendImportError(
+                    f"Container backend import failed: could not import source volume {volume}.",
+                    artifact_paths=(log_path, failure_path),
+                )
+
+            host_source = run_root / "source"
+            git_dir = staging / ".git"
+            if (
+                not host_source.is_dir()
+                or path_is_link_or_junction(host_source)
+                or path_is_link_or_junction(staging)
+                or not git_dir.is_dir()
+                or path_is_link_or_junction(git_dir)
+            ):
+                raise OSError(
+                    "refusing to replace the host source with an incomplete or "
+                    "linked container workspace checkout"
+                )
+            # Replace the worker's local config inside the private staging
+            # tree, then reject every linked/special metadata entry before the
+            # host checkout is swapped. No Git process reads this untrusted
+            # staging tree.
+            self._restore_container_safe_git_config(
+                run_root=run_root,
+                source=staging,
+            )
+            backup = run_root / f"{staging.name}-previous"
+            host_source.rename(backup)
+            try:
+                staging.rename(host_source)
+            except OSError:
+                backup.rename(host_source)
+                raise
+            remove_tree(backup, ignore_errors=True)
+        except ExecutionBackendImportError:
+            raise
+        except (OSError, RuntimeError) as exc:
             failure_path = logs / "volume-import-failure.json"
-            failure_path.write_text(
+            atomic_write_text(
+                failure_path,
                 json.dumps(
                     {
                         "backend": "container",
@@ -4950,7 +8368,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                         "failure_subtype": "volume_workspace_import_failed",
                         "created_at": datetime.now(timezone.utc).isoformat(),
                         "volume": volume,
-                        "returncode": sync.returncode,
+                        "returncode": None,
+                        "detail": str(exc),
                         "log_path": str(log_path),
                     },
                     indent=2,
@@ -4959,9 +8378,12 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 encoding="utf-8",
             )
             raise ExecutionBackendImportError(
-                f"Container backend import failed: could not import source volume {volume}.",
+                f"Container backend import failed: could not install source volume {volume}.",
                 artifact_paths=(log_path, failure_path),
-            )
+            ) from exc
+        finally:
+            if staging.exists():
+                remove_tree(staging, ignore_errors=True)
 
     def _container_run_argv(
         self,
@@ -4988,40 +8410,12 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         path_mappings = self._container_path_mappings(run_root)
         translated_command = [self._translate_container_paths(value, path_mappings) for value in command]
         translated_command = self._relax_codex_sandbox_for_container(translated_command)
-        if state.get("worker_container"):
-            container_id = str(state.get("worker_container") or "")
-            if not container_id:
-                raise RuntimeError("Container backend worker container is not running.")
-            argv = [
-                self._container.engine,
-                "exec",
-                "-w",
-                container_cwd,
-                "-e",
-                f"{CONTAINER_COMPLETION_OUTBOX_ENV}={outbox_value}",
-                "-e",
-                f"PATH={path_value}",
-                "-e",
-                f"NODE_PATH={CONTAINER_BOOTSTRAP_SOURCE}/node_modules",
-            ]
-            for key in sorted(worker_env):
-                argv.extend(["-e", self._container_worker_env_arg(key)])
-            if not agent and "HOME" not in worker_env:
-                argv.extend(["-e", f"HOME={CONTAINER_RUNTIME_SOURCE}/.spec-claude-home"])
-            argv.extend([container_id, *translated_command])
-            return argv
-        cidfile = run_root / "logs" / f"container-{datetime.now(timezone.utc).timestamp():.6f}.cid"
+        container_id = str(state.get("worker_container") or "")
+        if not container_id:
+            raise RuntimeError("Container backend worker container is not running.")
         argv = [
             self._container.engine,
-            "run",
-            "--rm",
-            *self._label_argv(state),
-            "--cidfile",
-            str(cidfile),
-            "-v",
-            f"{run_root / 'outbox'}:/workspace/outbox",
-            "-v",
-            f"{run_root / 'logs'}:/workspace/logs",
+            "exec",
             "-w",
             container_cwd,
             "-e",
@@ -5030,41 +8424,12 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             f"PATH={path_value}",
             "-e",
             f"NODE_PATH={CONTAINER_BOOTSTRAP_SOURCE}/node_modules",
-            "--tmpfs",
-            CONTAINER_RUNTIME_STATE_TMPFS,
         ]
-        user_mapping = self._container_user_mapping()
-        if user_mapping:
-            argv.extend(["--user", user_mapping])
-            argv.extend(self._container_passwd_shim_argv(run_root))
-        volumes = state.get("volumes", [])
-        workspace_volumes = state.get("workspace_volumes") or volumes
-        if state.get("workspace_mode") == "volume" and workspace_volumes:
-            argv.extend(["-v", f"{workspace_volumes[0]}:/workspace/source"])
-        else:
-            argv.extend(["-v", f"{run_root / 'source'}:/workspace/source"])
-        if agent:
-            argv.extend(
-                [
-                    "-v",
-                    f"{run_root / 'provider-homes' / 'codex' / '.spec-codex-home'}:{CONTAINER_CODEX_HOME}",
-                ]
-            )
-        attached_networks = list(
-            dict.fromkeys(
-                [
-                    *(str(network) for network in state.get("service_networks", [])),
-                    *self._playwright_sidecar_networks(state),
-                ]
-            )
-        )
-        for network in attached_networks:
-            argv.extend(["--network", network])
         for key in sorted(worker_env):
             argv.extend(["-e", self._container_worker_env_arg(key)])
         if not agent and "HOME" not in worker_env:
             argv.extend(["-e", f"HOME={CONTAINER_RUNTIME_SOURCE}/.spec-claude-home"])
-        argv.extend([state["image"], *translated_command])
+        argv.extend([container_id, *translated_command])
         return argv
 
     @staticmethod
@@ -5137,7 +8502,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         *,
         declared_env_keys: frozenset[str] = frozenset(),
     ) -> dict[str, str]:
-        return {
+        filtered = {
             key: value
             for key, value in env.items()
             if isinstance(value, str)
@@ -5153,6 +8518,11 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 )
             )
         }
+        # Generic secret filtering deliberately rejects GIT_CONFIG_KEY_n, but
+        # the publication guard is a host-generated all-or-nothing bundle.
+        # Validate it structurally and restore only that exact safe subset.
+        filtered.update(_trusted_container_git_guard_environment(env))
+        return filtered
 
     @staticmethod
     def _container_cwd(run_root: Path, cwd: Path) -> str:
@@ -5202,26 +8572,47 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         container_path: str,
         run_root: Path,
         log_name: str,
+        resource_labels: dict[str, str],
     ) -> str | None:
         shim_dir = run_root / "passwd-shim"
         shim_dir.mkdir(parents=True, exist_ok=True)
-        digest_input = f"{run_root.name}:{image}:{container_path}".encode()
-        tmp_name = f"spec-extract-{hashlib.sha256(digest_input).hexdigest()[:16]}"
         dest_path = shim_dir / f"{Path(container_path).name}.image"
         engine = self._container.engine
         logs = run_root / "logs"
-        try:
-            create = self._runner.run(
-                [engine, "create", "--name", tmp_name, image],
-                cwd=run_root,
+        create = self._runner.run(
+            [
+                engine,
+                "create",
+                *self._label_argv({"resource_labels": resource_labels}),
+                image,
+            ],
+            cwd=run_root,
+        )
+        container_id = (create.stdout or "").strip().splitlines()[:1]
+        if create.returncode != 0 or not container_id:
+            skipped = subprocess.CompletedProcess(
+                [engine, "cp"],
+                1,
+                "",
+                "skipped because image extraction container creation failed",
             )
+            self._write_passwd_shim_extract_log(
+                logs,
+                log_name,
+                create=create,
+                cp=skipped,
+                rm=skipped,
+            )
+            return None
+        owned_id = container_id[0]
+        try:
             cp = self._runner.run(
-                [engine, "cp", f"{tmp_name}:{container_path}", str(dest_path)],
+                [engine, "cp", f"{owned_id}:{container_path}", str(dest_path)],
                 cwd=run_root,
             )
         finally:
             rm = self._runner.run(
-                [engine, "rm", "-f", tmp_name],
+                [engine, "rm", "-f", owned_id],
                 cwd=run_root,
             )
         self._write_passwd_shim_extract_log(
@@ -5264,7 +8655,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     result.stderr or "",
                 ]
             )
-        (logs / name).write_text("\n".join(sections), encoding="utf-8")
+        atomic_write_text(logs / name, "\n".join(sections), encoding="utf-8")
 
     @staticmethod
     def _passwd_line_has_id(line: str, target_id: int) -> bool:
@@ -5281,6 +8672,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         *,
         run_root: Path,
         image: str,
+        resource_labels: dict[str, str],
     ) -> tuple[Path, Path] | None:
         user_mapping = self._container_user_mapping()
         if not user_mapping:
@@ -5298,6 +8690,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             container_path="/etc/passwd",
             run_root=run_root,
             log_name="image-passwd-extract.log",
+            resource_labels=resource_labels,
         )
         if passwd_text is None:
             passwd_text = baseline_passwd
@@ -5306,6 +8699,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             container_path="/etc/group",
             run_root=run_root,
             log_name="image-group-extract.log",
+            resource_labels=resource_labels,
         )
         if group_text is None:
             group_text = baseline_group
@@ -5360,20 +8754,6 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             )
         return translated
 
-    def _remember_container_id(self, run_root: Path, state: dict[str, Any]) -> None:
-        logs = run_root / "logs"
-        containers = list(state.get("containers", []))
-        for cidfile in logs.glob("container-*.cid"):
-            try:
-                container_id = cidfile.read_text(encoding="utf-8").strip()
-            except OSError:
-                continue
-            if container_id and container_id not in containers:
-                containers.append(container_id)
-        if containers != state.get("containers", []):
-            state["containers"] = containers
-            self._write_container_state(run_root, state)
-
     def _container_state_path(self, run_root: Path) -> Path:
         return run_root / "backend-state" / "container-backend-state.json"
 
@@ -5384,20 +8764,80 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         missing_ok: bool = False,
     ) -> dict[str, Any]:
         path = self._container_state_path(run_root)
-        if not path.is_file():
+        try:
+            path.lstat()
+        except FileNotFoundError:
             if missing_ok:
                 return {}
             raise RuntimeError(f"Container backend state is missing: {path}")
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+        except OSError as exc:
             raise RuntimeError(f"Container backend state is invalid: {path}") from exc
-        return payload if isinstance(payload, dict) else {}
+        try:
+            def reject_nonfinite_constant(value: str) -> None:
+                raise ValueError(f"non-finite JSON number: {value}")
+
+            def parse_finite_float(value: str) -> float:
+                parsed = float(value)
+                if not math.isfinite(parsed):
+                    raise ValueError(f"non-finite JSON number: {value}")
+                return parsed
+
+            payload = json.loads(
+                read_bounded_regular_text(
+                    path,
+                    max_bytes=_CONTAINER_BACKEND_STATE_MAX_BYTES,
+                ),
+                parse_constant=reject_nonfinite_constant,
+                parse_float=parse_finite_float,
+            )
+        except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+            raise RuntimeError(f"Container backend state is invalid: {path}") from exc
+        if not isinstance(payload, dict) or not payload:
+            raise RuntimeError(f"Container backend state is invalid: {path}")
+        if payload.get("backend") != "container":
+            raise RuntimeError(
+                f"Container backend state has an invalid backend identity: {path}"
+            )
+        saved_engine = payload.get("engine")
+        if not isinstance(saved_engine, str) or not saved_engine:
+            raise RuntimeError(
+                f"Container backend state has an invalid engine identity: {path}"
+            )
+        if saved_engine != self._container.engine:
+            raise RuntimeError(
+                "Container backend cannot change container engines while using "
+                "an existing run; restore the original engine before retrying, "
+                f"running phases, or cleaning that run: {path}"
+            )
+        return payload
 
     def _write_container_state(self, run_root: Path, state: dict[str, Any]) -> None:
         path = self._container_state_path(run_root)
+        if not isinstance(state, dict) or not state:
+            raise RuntimeError(
+                f"Container backend state must be a non-empty JSON object: {path}"
+            )
+        try:
+            payload = json.dumps(
+                state,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise RuntimeError(
+                f"Container backend state is not JSON-serializable: {path}"
+            ) from exc
+        if len(payload.encode("utf-8")) > _CONTAINER_BACKEND_STATE_MAX_BYTES:
+            raise RuntimeError(
+                f"Container backend state exceeds the size limit: {path}"
+            )
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        atomic_write_text(
+            path,
+            payload,
+            encoding="utf-8",
+        )
 
     @staticmethod
     def _write_image_log(
@@ -5413,7 +8853,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             logged_args = [ContainerExecutionBackend._redact_log_text(str(item), redactions) for item in result.args]
         else:
             logged_args = ContainerExecutionBackend._redact_log_text(str(result.args), redactions)
-        (logs / name).write_text(
+        atomic_write_text(
+            logs / name,
             "\n".join(
                 [
                     f"completed_at: {datetime.now(timezone.utc).isoformat()}",

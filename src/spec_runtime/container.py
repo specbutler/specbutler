@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import math
 import os
 import platform
 import re
@@ -15,8 +16,9 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import BootstrapCacheConfig, SpecRuntimeConfig, load_repo_spec_runtime_config
@@ -25,11 +27,16 @@ from .execution_backend import (
     CommandResult,
     ExecutionBackend,
     WorkspaceHandle,
+    _first_link_or_junction,
+    _lexical_absolute,
     get_execution_backend,
     host_spec_runtime_source_id,
     host_spec_runtime_version,
+    path_is_link_or_junction,
+    validate_workspace_run_identity,
 )
-from .git_common import run_git
+from .git_common import resolve_common_root, run_git
+from .platform_fs import FileLock, read_bounded_regular_text
 from .process_supervisor import run as run_supervised
 from .source_repository import runtime_repository_https_url
 
@@ -104,10 +111,27 @@ class GcResource:
     resource_id: str
     name: str
     reason: str
+    # Kept for patch-level compatibility with callers that constructed or
+    # inspected the original internal result model. Name-only legacy matches
+    # are no longer authorized for automatic removal.
     legacy: bool = False
+    run_id: str = ""
+    spec_id: str = ""
+    labels: tuple[tuple[str, str], ...] = ()
 
 
-_LEGACY_RESOURCE_RE = re.compile(r"^spec-[0-9a-f]{16}(?:[-_].+)?$")
+@dataclass(frozen=True)
+class _GcRunKnowledge:
+    active: frozenset[str]
+    terminal: frozenset[str]
+
+
+class ContainerGcError(RuntimeError):
+    """A fail-closed container-GC discovery or ownership failure."""
+
+
+_GC_STATE_MAX_BYTES = 8 * 1024 * 1024
+_GC_SMALL_STATE_MAX_BYTES = 1024 * 1024
 
 
 class _SubprocessContainerRunner:
@@ -160,38 +184,64 @@ def cmd_container(args: argparse.Namespace) -> int:
 
 
 def cmd_gc(args: argparse.Namespace) -> int:
-    repo_root = Path(getattr(args, "repo_root", "") or Path.cwd()).resolve()
-    config = load_repo_spec_runtime_config(repo_root)
+    requested_root = Path(getattr(args, "repo_root", "") or Path.cwd()).expanduser()
+    try:
+        repository_check = run_git(
+            ["rev-parse", "--is-inside-work-tree"],
+            cwd=requested_root,
+            check=False,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Error: container GC could not inspect the repository: {exc}", file=sys.stderr)
+        return 1
+    if repository_check.returncode != 0 or repository_check.stdout.strip() != "true":
+        print("Error: container GC must run inside a Git repository.", file=sys.stderr)
+        return 1
+    repo_root = resolve_common_root(requested_root).resolve()
+    try:
+        config = load_repo_spec_runtime_config(repo_root)
+        workspace_scope = _resolved_workspace_scope(
+            repo_root,
+            config.execution.workspace_root,
+        )
+    except (ContainerGcError, OSError, RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     runner = _SubprocessContainerRunner()
-    resources = discover_gc_resources(
-        repo_root,
-        config.execution.container.engine or "docker",
-        runner=runner,
-        state_dir=config.paths.state_dir,
-    )
+    engine = config.execution.container.engine or "docker"
+    try:
+        resources = discover_gc_resources(
+            repo_root,
+            engine,
+            runner=runner,
+            state_dir=config.paths.state_dir,
+            workspace_root=config.execution.workspace_root,
+        )
+    except (ContainerGcError, OSError, RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     if not resources:
         print("No stale spec container resources found.")
         return 0
     apply = bool(getattr(args, "apply", False))
     for resource in resources:
-        marker = "legacy match; " if resource.legacy else ""
-        action = "removing" if apply else "would remove"
-        print(f"{action} {resource.kind} {resource.name}: {marker}{resource.reason}")
         if not apply:
-            continue
-        if resource.kind == "container":
-            argv = [config.execution.container.engine or "docker", "rm", "-f", resource.resource_id]
-        elif resource.kind == "volume":
-            argv = [config.execution.container.engine or "docker", "volume", "rm", "-f", resource.name]
-        else:
-            argv = [config.execution.container.engine or "docker", "network", "rm", resource.name]
-        result = runner.run(argv, cwd=repo_root)
-        if result.returncode != 0:
-            print(f"failed to remove {resource.kind} {resource.name}: {_one_line(result.stderr)}", file=sys.stderr)
-            return 1
+            print(f"would remove {resource.kind} {resource.name}: {resource.reason}")
     if not apply:
         print("Re-run with --apply to remove these resources.")
-    return 0
+        return 0
+    try:
+        return _apply_gc_resources(
+            repo_root,
+            engine,
+            resources,
+            runner=runner,
+            state_dir=config.paths.state_dir,
+            workspace_scope=workspace_scope,
+        )
+    except (ContainerGcError, OSError, RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
 
 def discover_gc_resources(
@@ -200,91 +250,616 @@ def discover_gc_resources(
     *,
     runner: object,
     state_dir: str = ".spec-state",
+    workspace_root: str = ".spec-workspaces",
 ) -> list[GcResource]:
-    """Return stale owned resources while conservatively protecting live runs."""
-    active_run_ids = _active_run_ids(repo_root, state_dir=state_dir)
+    """Return stale resources owned by this checkout only.
+
+    Engine inventory is host-global.  A ``spec.owner`` label alone therefore
+    cannot authorize deletion: another checkout may have an active run with a
+    resource that is absent from this checkout's state. Resources are admitted
+    only when their canonical workspace path has the exact
+    ``<configured-root>/<run-id>/source`` layout for this checkout. Ambiguous
+    unlabeled legacy resources fail closed and require manual engine cleanup.
+    """
+    run_knowledge = _gc_run_knowledge(repo_root, state_dir=state_dir)
+    workspace_scope = _resolved_workspace_scope(repo_root, workspace_root)
     discovered: list[GcResource] = []
     commands = {
-        "container": [engine, "ps", "-a", "--format", "{{json .}}"],
-        "volume": [engine, "volume", "ls", "--format", "{{json .}}"],
-        "network": [engine, "network", "ls", "--format", "{{json .}}"],
+        "container": [
+            engine,
+            "ps",
+            "-a",
+            "-q",
+            "--no-trunc",
+            "--filter",
+            "label=spec.owner=spec-runtime",
+        ],
+        "volume": [
+            engine,
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            "label=spec.owner=spec-runtime",
+        ],
+        "network": [
+            engine,
+            "network",
+            "ls",
+            "-q",
+            "--filter",
+            "label=spec.owner=spec-runtime",
+        ],
     }
     for kind, argv in commands.items():
         result = runner.run(argv, cwd=repo_root)
         if result.returncode != 0:
-            continue
-        for line in result.stdout.splitlines():
-            try:
-                item = json.loads(line)
-            except (json.JSONDecodeError, TypeError):
+            detail = _one_line(result.stderr or result.stdout) or "unknown error"
+            raise ContainerGcError(
+                f"container GC {kind} inventory failed: {detail}"
+            )
+        for reference in (line.strip() for line in result.stdout.splitlines()):
+            if not reference:
                 continue
-            name = str(item.get("Names") or item.get("Name") or "").lstrip("/")
-            resource_id = str(item.get("ID") or item.get("Id") or name)
-            labels = _parse_engine_labels(str(item.get("Labels") or item.get("Label") or ""))
-            owned = labels.get("spec.owner") == "spec-runtime"
-            legacy = not owned and bool(_LEGACY_RESOURCE_RE.fullmatch(name))
-            if not owned and not legacy:
+            resource = _inspect_gc_resource(
+                repo_root,
+                engine,
+                kind,
+                reference,
+                runner=runner,
+            )
+            labels = dict(resource.labels)
+            if not _resource_matches_workspace_scope(labels, workspace_scope):
                 continue
-            run_id = labels.get("spec.run_id", "")
-            if run_id and run_id in active_run_ids:
+            reason = _gc_removal_reason(resource, run_knowledge)
+            if reason is None:
                 continue
-            if kind == "container":
-                state = str(item.get("State") or item.get("Status") or "").lower()
-                stopped = state.startswith(("created", "exited", "dead"))
-                # Detect workers via the spec.phase=execution label rather than the
-                # Command column, which Docker truncates (e.g. "sh -lc 'sleep infin…")
-                # and so never contained the literal "sleep infinity" match.
-                worker = owned and labels.get("spec.phase") == "execution"
-                if not stopped and not worker:
-                    continue
-                reason = "container is stopped" if stopped else "running worker of finished run"
-            else:
-                reason = "owning run is finished or missing" if owned else "strict legacy spec name"
-            discovered.append(GcResource(kind, resource_id, name, reason, legacy))
+            discovered.append(replace(resource, reason=reason))
     order = {"container": 0, "volume": 1, "network": 2}
     return sorted(discovered, key=lambda item: (order[item.kind], item.name))
 
 
-def _parse_engine_labels(raw: str) -> dict[str, str]:
-    labels: dict[str, str] = {}
-    for part in raw.split(","):
-        key, separator, value = part.partition("=")
-        if separator:
-            labels[key.strip()] = value.strip()
-    return labels
+def _resolved_workspace_scope(repo_root: Path, workspace_root: str) -> Path:
+    # ``cmd_gc`` resolves subdirectories and linked worktrees through the Git
+    # common root before loading config. Keep this lower-level helper explicit
+    # about its already-canonical repository argument so tests and adapters do
+    # not accidentally bind to an unrelated ancestor containing ``.git``.
+    canonical_repo = repo_root.resolve()
+    configured = Path(workspace_root).expanduser()
+    if not configured.is_absolute():
+        configured = canonical_repo / configured
+    lexical_scope = _lexical_absolute(configured)
+    linked = _first_link_or_junction(lexical_scope, floor=canonical_repo)
+    if linked is not None:
+        raise ContainerGcError(
+            "container GC refuses a workspace root outside the repository or "
+            f"through a symlink/junction: {linked}"
+        )
+    scope = lexical_scope.resolve(strict=False)
+    try:
+        relative = scope.relative_to(canonical_repo)
+    except ValueError as exc:
+        raise ContainerGcError(
+            f"container GC workspace root must be inside {canonical_repo}: {scope}"
+        ) from exc
+    if not relative.parts:
+        raise ContainerGcError(
+            "container GC workspace root must be a dedicated directory below "
+            f"the repository root: {scope}"
+        )
+    return scope
+
+
+def _resource_matches_workspace_scope(
+    labels: Mapping[str, str],
+    expected_scope: Path,
+) -> bool:
+    """Fail closed unless engine labels prove checkout-local ownership."""
+    if labels.get("spec.owner") != "spec-runtime":
+        return False
+    run_id = str(labels.get("spec.run_id") or "").strip()
+    spec_id = str(labels.get("spec.spec_id") or "").strip()
+    try:
+        validate_workspace_run_identity(run_id, spec_id)
+    except ValueError:
+        return False
+    workspace_root = str(labels.get("spec.workspace_root") or "").strip()
+    if not workspace_root:
+        return False
+    candidate = Path(workspace_root).expanduser()
+    expected_source = expected_scope / run_id / "source"
+    if (
+        not candidate.is_absolute()
+        or _lexical_absolute(candidate) != candidate
+        or candidate != expected_source
+    ):
+        return False
+    try:
+        if candidate.resolve(strict=False) != expected_source.resolve(strict=False):
+            return False
+    except (OSError, RuntimeError):
+        return False
+
+    # A development build briefly emitted this additive label. It is not
+    # needed for ownership proof, but if present it must agree exactly rather
+    # than allowing a conflicting label to fall back to workspace_root.
+    recorded_scope = str(labels.get("spec.workspace_scope") or "").strip()
+    if recorded_scope:
+        candidate = Path(recorded_scope).expanduser()
+        if (
+            not candidate.is_absolute()
+            or _lexical_absolute(candidate) != candidate
+            or candidate != expected_scope
+        ):
+            return False
+    return True
+
+
+def _inspect_gc_resource(
+    repo_root: Path,
+    engine: str,
+    kind: str,
+    reference: str,
+    *,
+    runner: object,
+) -> GcResource:
+    if kind == "container":
+        argv = [engine, "inspect", "--type", "container", reference]
+    elif kind == "volume":
+        argv = [engine, "volume", "inspect", reference]
+    elif kind == "network":
+        argv = [engine, "network", "inspect", reference]
+    else:
+        raise ContainerGcError(f"unknown container GC resource kind: {kind}")
+    result = runner.run(argv, cwd=repo_root)
+    if result.returncode != 0:
+        detail = _one_line(result.stderr or result.stdout) or "unknown error"
+        raise ContainerGcError(
+            f"container GC could not inspect {kind} {reference}: {detail}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except (ValueError, RecursionError, TypeError) as exc:
+        raise ContainerGcError(
+            f"container GC received malformed inspection data for {kind} {reference}"
+        ) from exc
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        raise ContainerGcError(
+            f"container GC received unexpected inspection data for {kind} {reference}"
+        )
+    item = payload[0]
+    if kind == "container":
+        config = item.get("Config") or item.get("config")
+        labels_raw = (
+            config.get("Labels") or config.get("labels")
+            if isinstance(config, dict)
+            else None
+        )
+        state_raw = item.get("State") or item.get("state")
+        state = (
+            str(state_raw.get("Status") or state_raw.get("status") or "")
+            if isinstance(state_raw, dict)
+            else ""
+        )
+        name = str(item.get("Name") or item.get("name") or "").lstrip("/")
+    else:
+        labels_raw = item.get("Labels") or item.get("labels")
+        state = ""
+        name = str(item.get("Name") or item.get("name") or "")
+    labels = (
+        {str(key): str(value) for key, value in labels_raw.items()}
+        if isinstance(labels_raw, dict)
+        else {}
+    )
+    resource_id = str(
+        item.get("Id") or item.get("ID") or item.get("id") or name
+    )
+    if not name or not resource_id:
+        raise ContainerGcError(
+            f"container GC inspection omitted identity for {kind} {reference}"
+        )
+    return GcResource(
+        kind=kind,
+        resource_id=resource_id,
+        name=name,
+        reason=state,
+        run_id=str(labels.get("spec.run_id") or ""),
+        spec_id=str(labels.get("spec.spec_id") or ""),
+        labels=tuple(sorted(labels.items())),
+    )
+
+
+def _gc_removal_reason(
+    resource: GcResource,
+    knowledge: _GcRunKnowledge,
+) -> str | None:
+    if resource.run_id in knowledge.active:
+        return None
+    if resource.kind != "container":
+        return "owning run is finished or missing"
+    state = resource.reason.lower()
+    if state.startswith(("created", "exited", "dead")):
+        return "container is stopped"
+    labels = dict(resource.labels)
+    if (
+        labels.get("spec.phase") == "execution"
+        and resource.run_id in knowledge.terminal
+    ):
+        return "running worker of finished run"
+    return None
+
+
+def _same_gc_identity(expected: GcResource, actual: GcResource) -> bool:
+    return (
+        expected.kind == actual.kind
+        and expected.resource_id == actual.resource_id
+        and expected.name == actual.name
+        and expected.run_id == actual.run_id
+        and expected.spec_id == actual.spec_id
+        and expected.labels == actual.labels
+    )
+
+
+def _apply_gc_resources(
+    repo_root: Path,
+    engine: str,
+    resources: list[GcResource],
+    *,
+    runner: object,
+    state_dir: str,
+    workspace_scope: Path,
+) -> int:
+    state_root = _validated_gc_state_root(repo_root, state_dir)
+    locks: list[FileLock] = []
+    with ExitStack() as stack:
+        lock_paths = [state_root / "container-gc.lock"]
+        lock_paths.extend(
+            state_root / "locks" / f"{spec_id}.lock"
+            for spec_id in sorted({resource.spec_id for resource in resources})
+        )
+        for path in lock_paths:
+            lock = FileLock(path, blocking=False)
+            if not lock.acquire():
+                raise ContainerGcError(
+                    f"container GC refused apply because an operation lock is held: {path}"
+                )
+            locks.append(lock)
+            stack.callback(lock.release)
+
+        knowledge = _gc_run_knowledge(repo_root, state_dir=state_dir)
+        validated: list[GcResource] = []
+        for resource in resources:
+            current = _inspect_gc_resource(
+                repo_root,
+                engine,
+                resource.kind,
+                resource.resource_id,
+                runner=runner,
+            )
+            reason = _gc_removal_reason(current, knowledge)
+            if (
+                not _same_gc_identity(resource, current)
+                or not _resource_matches_workspace_scope(
+                    dict(current.labels),
+                    workspace_scope,
+                )
+                or reason is None
+            ):
+                raise ContainerGcError(
+                    "container GC ownership or liveness changed before apply; "
+                    f"refusing to remove {resource.kind} {resource.name}"
+                )
+            validated.append(replace(current, reason=reason))
+
+        for resource in validated:
+            # Re-inspect immediately before the destructive call. Docker does
+            # not expose an atomic label precondition for volume deletion, so
+            # this is the narrowest practical name-reuse window.
+            current = _inspect_gc_resource(
+                repo_root,
+                engine,
+                resource.kind,
+                resource.resource_id,
+                runner=runner,
+            )
+            current_knowledge = _gc_run_knowledge(repo_root, state_dir=state_dir)
+            current_reason = _gc_removal_reason(current, current_knowledge)
+            if (
+                not _same_gc_identity(
+                    resource,
+                    replace(current, reason=resource.reason),
+                )
+                or not _resource_matches_workspace_scope(
+                    dict(current.labels),
+                    workspace_scope,
+                )
+                or current_reason is None
+            ):
+                raise ContainerGcError(
+                    "container GC resource identity or liveness changed during apply; "
+                    f"refusing to remove {resource.kind} {resource.name}"
+                )
+            print(f"removing {resource.kind} {resource.name}: {resource.reason}")
+            if resource.kind == "container":
+                argv = [engine, "rm", "-f", resource.resource_id]
+            elif resource.kind == "volume":
+                # Podman interprets forced volume removal as authorization to
+                # remove containers using the volume. Never broaden GC from a
+                # selected volume to an attached container implicitly.
+                argv = [engine, "volume", "rm", resource.name]
+            else:
+                argv = [engine, "network", "rm", resource.resource_id]
+            result = runner.run(argv, cwd=repo_root)
+            if result.returncode != 0:
+                detail = _one_line(result.stderr or result.stdout) or "unknown error"
+                print(
+                    f"failed to remove {resource.kind} {resource.name}: {detail}",
+                    file=sys.stderr,
+                )
+                return 1
+    return 0
 
 
 def _active_run_ids(repo_root: Path, *, state_dir: str = ".spec-state") -> set[str]:
-    from .control_plane import CanonicalRunStatus
+    return set(_gc_run_knowledge(repo_root, state_dir=state_dir).active)
+
+
+def _gc_run_knowledge(
+    repo_root: Path,
+    *,
+    state_dir: str = ".spec-state",
+) -> _GcRunKnowledge:
+    from .control_plane import CanonicalRunStatus, LeaseStatus
     from .spec_status import project_run_record_status
 
     active: set[str] = set()
-    state_root = repo_root / state_dir
+    terminal: set[str] = set()
+    state_root = _validated_gc_state_root(repo_root, state_dir)
     runs_dir = state_root / "runs"
     for path in runs_dir.glob("*.json") if runs_dir.is_dir() else ():
         try:
-            run = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
+            run = json.loads(
+                read_bounded_regular_text(
+                    path,
+                    max_bytes=_GC_STATE_MAX_BYTES,
+                )
+            )
+        except (OSError, UnicodeError, ValueError, RecursionError, TypeError):
+            # Run-state files are named by run id. Protect the matching
+            # resource group when the content cannot be trusted.
+            active.add(path.stem)
             continue
-        projection = project_run_record_status(runs_dir, run)
-        protected = projection is not None and projection.status not in {
+        if not isinstance(run, dict):
+            active.add(path.stem)
+            continue
+        claimed_run_id = str(run.get("run_id") or "").strip()
+        spec_id = str(run.get("spec_id") or "").strip()
+        if claimed_run_id != path.stem:
+            # The filename is the durable run identity. A contradictory body
+            # must not let either the filename's resources or the claimed
+            # run's resources be treated as missing.
+            active.add(path.stem)
+            if claimed_run_id:
+                active.add(claimed_run_id)
+            continue
+        try:
+            validate_workspace_run_identity(claimed_run_id, spec_id)
+        except ValueError:
+            active.add(path.stem)
+            continue
+        run_id = claimed_run_id
+        raw_status = str(run.get("status") or "").strip()
+        state_run_dir = runs_dir / run_id
+        projection_inputs = _gc_projection_input_snapshot(
+            state_run_dir,
+            raw_status,
+            run_id=run_id,
+            spec_id=spec_id,
+        )
+        if projection_inputs is None:
+            active.add(run_id)
+            continue
+        try:
+            projection = project_run_record_status(runs_dir, run)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            active.add(run_id)
+            continue
+        current_projection_inputs = _gc_projection_input_snapshot(
+            state_run_dir,
+            raw_status,
+            run_id=run_id,
+            spec_id=spec_id,
+        )
+        if (
+            current_projection_inputs is None
+            or current_projection_inputs != projection_inputs
+        ):
+            active.add(run_id)
+            continue
+        # A phase runner briefly persists ``passed`` between successful
+        # intermediate phases. A current lease is stronger liveness evidence
+        # than that transitional raw status. The lease remains useful for
+        # crash recovery and read-only discovery even though built-in
+        # workflows also serialize destructive GC with the per-spec lock.
+        if projection is not None and projection.lease_status is LeaseStatus.ACTIVE:
+            active.add(run_id)
+            continue
+        if raw_status in {
+            "pending",
+            "running",
+            "failed",
+            "blocked",
+            "waiting-for-input",
+        }:
+            active.add(run_id)
+            continue
+        if raw_status in {"passed", "abandoned", "superseded"}:
+            terminal.add(run_id)
+            continue
+        terminal_statuses = {
             CanonicalRunStatus.MERGED,
-            CanonicalRunStatus.NOT_STARTED,
             CanonicalRunStatus.PASSED,
             CanonicalRunStatus.STALE,
         }
-        if protected and run.get("run_id"):
-            active.add(str(run["run_id"]))
+        if projection is None:
+            active.add(run_id)
+        elif projection.status in terminal_statuses:
+            terminal.add(run_id)
+        else:
+            active.add(run_id)
     active_path = state_root / "autopilot" / "active.json"
+    if active_path.exists() or active_path.is_symlink():
+        try:
+            payload = json.loads(
+                read_bounded_regular_text(
+                    active_path,
+                    max_bytes=_GC_STATE_MAX_BYTES,
+                )
+            )
+        except (OSError, UnicodeError, ValueError, RecursionError, TypeError) as exc:
+            raise ContainerGcError(
+                f"container GC refuses unreadable autopilot state: {active_path}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ContainerGcError(
+                f"container GC refuses malformed autopilot state: {active_path}"
+            )
+        for raw_spec_id, entry in payload.items():
+            spec_id = str(raw_spec_id).strip()
+            run_id = (
+                str(entry.get("run_id") or "").strip()
+                if isinstance(entry, dict)
+                else ""
+            )
+            try:
+                validate_workspace_run_identity(run_id, spec_id)
+            except ValueError as exc:
+                raise ContainerGcError(
+                    f"container GC refuses malformed autopilot state: {active_path}"
+                ) from exc
+            active.add(run_id)
+    terminal.difference_update(active)
+    return _GcRunKnowledge(frozenset(active), frozenset(terminal))
+
+
+def _gc_projection_input_snapshot(
+    state_run_dir: Path,
+    run_status: str,
+    *,
+    run_id: str,
+    spec_id: str,
+) -> tuple[tuple[str, str | None], ...] | None:
+    """Return validated, comparable projection inputs or fail closed.
+
+    The caller compares snapshots around status projection. This detects an
+    atomic lease/gate/request replacement during the observation instead of
+    accepting two independently valid but contradictory versions.
+    """
+    from .control_plane.gate_records import GateStatus
+    from .control_plane.lease import RunLease
+
+    if not state_run_dir.exists() and not state_run_dir.is_symlink():
+        return ()
+    if path_is_link_or_junction(state_run_dir) or not state_run_dir.is_dir():
+        return None
+    candidates = [
+        ("lease", state_run_dir / "lease.json", _GC_SMALL_STATE_MAX_BYTES),
+        ("gates", state_run_dir / "gate-records.json", _GC_STATE_MAX_BYTES),
+    ]
+    if run_status.strip().lower() == "waiting-for-input":
+        candidates.append(
+            (
+                "operator",
+                state_run_dir / "operator-request.json",
+                _GC_SMALL_STATE_MAX_BYTES,
+            )
+        )
+    observed: list[tuple[str, str | None]] = []
+    for kind, candidate, max_bytes in candidates:
+        if not candidate.exists() and not candidate.is_symlink():
+            observed.append((kind, None))
+            continue
+        try:
+            text = read_bounded_regular_text(
+                candidate,
+                max_bytes=max_bytes,
+            )
+            payload = json.loads(text)
+        except (OSError, UnicodeError, ValueError, RecursionError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if kind == "lease":
+            try:
+                lease = RunLease.from_dict(payload)
+                heartbeat = datetime.fromisoformat(lease.heartbeat_at)
+                timeout_seconds = float(payload["timeout_seconds"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if (
+                lease.run_id != run_id
+                or lease.spec_id != spec_id
+                or not math.isfinite(timeout_seconds)
+                or timeout_seconds <= 0
+                or timeout_seconds > timedelta.max.total_seconds()
+                or heartbeat.year < 1970
+            ):
+                return None
+        elif kind == "gates":
+            records = payload.get("records")
+            if payload.get("version") != 1 or not isinstance(records, list):
+                return None
+            valid_statuses = {status.value for status in GateStatus}
+            if any(
+                not isinstance(record, dict)
+                or not str(record.get("name") or "").strip()
+                or str(record.get("status") or "").strip() not in valid_statuses
+                for record in records
+            ):
+                return None
+        else:
+            if (
+                not str(payload.get("kind") or "").strip()
+                or not str(payload.get("prompt") or "").strip()
+                or str(payload.get("status") or "pending").strip()
+                not in {"pending", "resolved", "consumed"}
+            ):
+                return None
+        observed.append((kind, text))
+    return tuple(observed)
+
+
+def _validated_gc_state_root(repo_root: Path, state_dir: str) -> Path:
+    """Return a checkout-local, link-free state boundary for GC and its locks."""
+    canonical_repo = repo_root.resolve()
+    configured = Path(state_dir).expanduser()
+    if not configured.is_absolute():
+        configured = canonical_repo / configured
+    state_root = _lexical_absolute(configured)
     try:
-        payload = json.loads(active_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError):
-        payload = {}
-    if isinstance(payload, dict):
-        for entry in payload.values():
-            if isinstance(entry, dict) and entry.get("run_id"):
-                active.add(str(entry["run_id"]))
-    return active
+        relative = state_root.relative_to(canonical_repo)
+    except ValueError as exc:
+        raise ContainerGcError(
+            f"container GC state directory must be inside {canonical_repo}: {state_root}"
+        ) from exc
+    if not relative.parts:
+        raise ContainerGcError("container GC requires a dedicated state directory")
+    for boundary in (
+        state_root,
+        state_root / "runs",
+        state_root / "autopilot",
+        state_root / "locks",
+    ):
+        linked = _first_link_or_junction(boundary, floor=canonical_repo)
+        if linked is not None:
+            raise ContainerGcError(
+                f"container GC refuses a linked state boundary: {linked}"
+            )
+        if boundary.exists() and not boundary.is_dir():
+            raise ContainerGcError(
+                f"container GC requires directory state boundaries: {boundary}"
+            )
+    return state_root
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
