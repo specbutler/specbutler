@@ -105,6 +105,41 @@ def test_oauth_launch_journal_is_durable_before_staged_auth_copy(tmp_path: Path)
     session.finish()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="native Windows reparse coverage is separate")
+def test_staging_parent_rejects_a_symlinked_ancestor(tmp_path: Path) -> None:
+    actual = tmp_path / "actual"
+    staged_home = actual / "home"
+    staged_home.mkdir(parents=True)
+    linked = tmp_path / "linked"
+    linked.symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="detected symlink"):
+        pe._staging_parent_metadata(linked / "home" / "auth.json")
+
+
+def test_windows_path_virtualization_is_not_misreported_as_a_link(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    staged_home = tmp_path / "lexical-appdata" / "SpecButler"
+    staged_home.mkdir(parents=True)
+    redirected = tmp_path / "Packages" / "OpenAI.Codex" / "SpecButler"
+
+    with (
+        patch.object(pe.sys, "platform", "win32"),
+        patch.object(Path, "resolve", return_value=redirected),
+        caplog.at_level("INFO", logger="spec_runtime.provider_env"),
+    ):
+        absolute_auth, metadata = pe._staging_parent_metadata(
+            staged_home / "auth.json"
+        )
+
+    assert absolute_auth == staged_home / "auth.json"
+    assert stat.S_ISDIR(metadata.st_mode)
+    assert "Windows path redirection" in caplog.text
+    assert "no symlink, junction, or reparse point was detected" in caplog.text
+
+
 def test_oauth_launch_journal_parent_identity_tamper_fails_closed(
     tmp_path: Path,
 ) -> None:

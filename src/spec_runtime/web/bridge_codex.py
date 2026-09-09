@@ -26,6 +26,7 @@ from typing import AsyncIterator
 
 from spec_runtime.agent_adapter import (
     CODEX_AMBIENT_CAPABILITY_OVERRIDES,
+    CODEX_WINDOWS_SANDBOX_MODE,
     codex_capability_probe_command,
     codex_capability_probe_unavailability_reason,
     codex_isolation_unavailability_reason,
@@ -386,7 +387,10 @@ class _CodexSession:
         for override in CODEX_AMBIENT_CAPABILITY_OVERRIDES:
             overrides += ["-c", override]
         if os.name == "nt":
-            overrides += ["-c", 'windows.sandbox="unelevated"']
+            overrides += [
+                "-c",
+                f'windows.sandbox="{CODEX_WINDOWS_SANDBOX_MODE}"',
+            ]
         return overrides
 
     async def start(self, system_prompt: str) -> None:

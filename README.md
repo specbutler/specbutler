@@ -336,6 +336,8 @@ carefully.
 
 Repository-defined implement setup/teardown hooks and their structured handoff
 format are documented in [Implement setup manifests](docs/setup-manifest.md).
+Opt-in native test receipts and the pre-commit operator handoff are documented
+in [Host verification evidence](docs/review-evidence.md).
 
 ## Architecture
 
@@ -476,6 +478,10 @@ your project needs; see [Execution backends](docs/execution-backends.md).
   both host mirrors and container volumes before verification continues.
   `spec doctor` exercises Codex's strict configuration parser without making a
   model request, so an older CLI that rejects a required boundary fails early.
+  On native Windows it also runs a model-free command through the explicitly
+  selected elevated sandbox and requires both allowed writes and protected-path
+  read denial to work before any implementation agent can launch. Spec Butler
+  does not fall back to the unelevated sandbox or to an unsandboxed process.
 - Interactive authoring starts from the same provider allowlist and adds only
   environment names explicitly referenced by trusted user MCP configuration.
   Claude prompts before shell commands; Codex blocks network in its authoring

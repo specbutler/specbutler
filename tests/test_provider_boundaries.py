@@ -22,6 +22,8 @@ from spec_runtime.agent_adapter import (
     _codex_implement_permission_overrides,
     claude_restricted_mode_unavailability_reason,
     codex_isolation_unavailability_reason,
+    codex_windows_sandbox_probe_command,
+    codex_windows_sandbox_probe_unavailability_reason,
 )
 from spec_runtime.provider_env import (
     CLAUDE_PROVIDER_CREDENTIAL_ENV_KEYS,
@@ -597,7 +599,7 @@ def test_codex_isolation_preflight_requires_every_launch_control() -> None:
             "--strict-config",
         )
     )
-    sandbox_help = "--permission-profile"
+    sandbox_help = "--permission-profile --include-managed-config"
 
     assert codex_isolation_unavailability_reason(exec_help, sandbox_help) == ""
     reason = codex_isolation_unavailability_reason(
@@ -606,6 +608,53 @@ def test_codex_isolation_preflight_requires_every_launch_control() -> None:
     )
     assert "--ignore-rules" in reason
     assert "npm install -g @openai/codex" in reason
+
+
+def test_codex_windows_probe_uses_elevated_full_permission_profile(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    state = tmp_path / "state"
+    provider_home = tmp_path / "codex-home"
+    denied_file = tmp_path / "denied" / "canary.txt"
+    for path in (workspace, state, provider_home, denied_file.parent):
+        path.mkdir()
+
+    command = codex_windows_sandbox_probe_command(
+        workspace=workspace,
+        state_dir=state,
+        provider_home=provider_home,
+        denied_file=denied_file,
+        codex_path="codex.exe",
+        python_path="python.exe",
+    )
+    rendered = "\0".join(command)
+
+    assert command[:2] == ["codex.exe", "sandbox"]
+    assert "--include-managed-config" in command
+    assert 'windows.sandbox="elevated"' in command
+    assert 'default_permissions="specbutler-implement"' in command
+    assert f'{json.dumps(str(denied_file.resolve()))}="deny"' in rendered
+    assert f'{json.dumps(str(state.resolve()))}="write"' in rendered
+    assert command[command.index("-P") + 1] == "specbutler-implement"
+
+
+def test_codex_windows_probe_requires_execution_marker() -> None:
+    assert (
+        codex_windows_sandbox_probe_unavailability_reason(
+            0,
+            "SPEC_CODEX_WINDOWS_SANDBOX_ENFORCED",
+            "",
+        )
+        == ""
+    )
+    reason = codex_windows_sandbox_probe_unavailability_reason(
+        1,
+        "",
+        "unelevated sandbox cannot enforce deny-read",
+    )
+    assert "elevated Windows sandbox" in reason
+    assert "will not use the incompatible unelevated sandbox" in reason
 
 
 def test_local_review_transports_large_prompt_over_stdin(tmp_path: Path) -> None:

@@ -33,6 +33,8 @@ _logger = logging.getLogger(__name__)
 _BARE_TOML_KEY_RE = re.compile(r"[A-Za-z0-9_-]+")
 _CODEX_IMPLEMENT_PERMISSION_PROFILE = "specbutler-implement"
 _CODEX_AUTHORING_PERMISSION_PROFILE = "specbutler-authoring"
+CODEX_WINDOWS_SANDBOX_MODE = "elevated"
+CODEX_WINDOWS_SANDBOX_PROBE_MARKER = "SPEC_CODEX_WINDOWS_SANDBOX_ENFORCED"
 _CODEX_PROVIDER_AUTH_ENV_KEYS = (
     "CODEX_API_KEY",
     "CODEX_HOME",
@@ -118,7 +120,7 @@ def codex_isolation_unavailability_reason(
         "--output-schema",
         "--strict-config",
     )
-    required_sandbox = ("--permission-profile",)
+    required_sandbox = ("--permission-profile", "--include-managed-config")
     missing = [flag for flag in required_exec if flag not in exec_help_text]
     missing.extend(
         flag for flag in required_sandbox if flag not in sandbox_help_text
@@ -784,7 +786,19 @@ _CODEX_CAPABILITY_PROBE_OVERRIDES = (
 )
 
 
-def codex_capability_probe_command(codex_path: str = "codex") -> list[str]:
+def codex_windows_sandbox_toml(*, platform: str | None = None) -> str:
+    """Return the isolated-home setting for the supported native Windows tier."""
+    active_platform = platform or sys.platform
+    if active_platform != "win32":
+        return ""
+    return f'[windows]\nsandbox = "{CODEX_WINDOWS_SANDBOX_MODE}"\n\n'
+
+
+def codex_capability_probe_command(
+    codex_path: str = "codex",
+    *,
+    platform: str | None = None,
+) -> list[str]:
     """Build a provider-free strict-config capability probe.
 
     ``app-server --listen off`` parses the same configuration surface used by
@@ -792,6 +806,9 @@ def codex_capability_probe_command(codex_path: str = "codex") -> list[str]:
     model request. Current CLIs report that no transport is configured after
     successfully parsing the controls; a future CLI may instead exit zero.
     """
+    overrides = list(_CODEX_CAPABILITY_PROBE_OVERRIDES)
+    if (platform or sys.platform) == "win32":
+        overrides.append(f'windows.sandbox="{CODEX_WINDOWS_SANDBOX_MODE}"')
     return [
         codex_path,
         "app-server",
@@ -800,7 +817,7 @@ def codex_capability_probe_command(codex_path: str = "codex") -> list[str]:
         "off",
         *(
             item
-            for override in _CODEX_CAPABILITY_PROBE_OVERRIDES
+            for override in overrides
             for item in ("-c", override)
         ),
     ]
@@ -820,6 +837,83 @@ def codex_capability_probe_unavailability_reason(
         "The installed Codex CLI rejected security controls Spec Butler "
         f"requires under strict config ({detail}). Upgrade Codex with `npm "
         "install -g @openai/codex`, then rerun `spec doctor`."
+    )
+
+
+def codex_windows_sandbox_probe_command(
+    *,
+    workspace: Path,
+    state_dir: Path,
+    provider_home: Path,
+    denied_file: Path,
+    codex_path: str = "codex",
+    python_path: str | None = None,
+    include_windows_override: bool = True,
+) -> list[str]:
+    """Build a provider-free probe of the complete implementation profile."""
+    permission_args = _codex_implement_permission_overrides(
+        workspace,
+        [state_dir],
+        provider_home=provider_home,
+        additional_protected_paths=(denied_file,),
+    )
+    config_args: list[str] = []
+    for index, value in enumerate(permission_args[:-1]):
+        if value == "-c":
+            config_args.extend(("-c", permission_args[index + 1]))
+    if include_windows_override:
+        config_args.extend(
+            ("-c", f'windows.sandbox="{CODEX_WINDOWS_SANDBOX_MODE}"')
+        )
+    script = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "workspace, state, denied = map(Path, sys.argv[1:4])\n"
+        "try:\n"
+        "    (workspace / 'workspace-write.ok').write_text('ok', encoding='utf-8')\n"
+        "    (state / 'state-write.ok').write_text('ok', encoding='utf-8')\n"
+        "except OSError:\n"
+        "    raise SystemExit(41)\n"
+        "try:\n"
+        "    denied.read_bytes()\n"
+        "except OSError:\n"
+        f"    print('{CODEX_WINDOWS_SANDBOX_PROBE_MARKER}')\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(42)\n"
+    )
+    return [
+        codex_path,
+        "sandbox",
+        "-C",
+        str(workspace),
+        "--include-managed-config",
+        *config_args,
+        "-P",
+        _CODEX_IMPLEMENT_PERMISSION_PROFILE,
+        python_path or sys.executable,
+        "-c",
+        script,
+        str(workspace),
+        str(state_dir),
+        str(denied_file),
+    ]
+
+
+def codex_windows_sandbox_probe_unavailability_reason(
+    returncode: int,
+    stdout: str,
+    stderr: str,
+) -> str:
+    """Explain why the elevated sandbox did not enforce the required profile."""
+    if returncode == 0 and CODEX_WINDOWS_SANDBOX_PROBE_MARKER in stdout:
+        return ""
+    detail = " ".join(f"{stdout}\n{stderr}".split())[:240] or f"exit status {returncode}"
+    return (
+        "Codex elevated Windows sandbox could not enforce Spec Butler's required "
+        f"write and deny-read profile ({detail}). Complete the administrator-approved "
+        "elevated sandbox setup, confirm local policy permits its sandbox users, and "
+        "rerun `spec doctor`. Spec Butler will not use the incompatible unelevated "
+        "sandbox or run unsandboxed."
     )
 
 
