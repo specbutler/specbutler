@@ -11914,6 +11914,19 @@ class TestPublishPhase:
             verify_head_sha=verified_head,
             agent="codex",
         )
+        receipt = repo / ".spec-state" / "evidence" / "native.txt"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text("native assertions passed\n", encoding="utf-8")
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            verify_gates=(
+                VerifyGateConfig(
+                    name="test",
+                    command="make test",
+                    review_evidence=(".spec-state/evidence/native.txt",),
+                ),
+            ),
+        )
         forge = MagicMock()
         forge.find_pr_for_branch.return_value = None
         forge.push_branch.return_value = orch.PushResult(ok=True)
@@ -11926,11 +11939,26 @@ class TestPublishPhase:
         ]
 
         with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
             patch.object(orch, "_forge", return_value=forge),
             patch.object(orch, "_check_forge_auth", return_value=None),
             patch.object(orch, "_reset_local_review_gate_for_head"),
         ):
+            evidence = orch._capture_gate_review_evidence("test", repo)
+            orch._record_gate_result(
+                orch._gate_status_path(repo, run),
+                run.spec_id,
+                "test",
+                "make test",
+                0,
+                review_evidence=evidence,
+            )
             result = orch.phase_publish(run, repo)
+            rendered_evidence = orch._format_gate_evidence_for_review(
+                repo,
+                run,
+                expected_head_sha=run.verify_head_sha,
+            )
 
         marker_head = _run_git_stdout("rev-parse", "HEAD", cwd=repo).strip()
         recent_commits = _run_git_stdout(
@@ -11952,6 +11980,12 @@ class TestPublishPhase:
         )
         assert run.verify_head_sha == marker_head
         assert run.readiness_head_sha == marker_head
+        _, gate_status = orch._read_gate_status(repo, run)
+        assert gate_status is not None
+        assert gate_status["gates"]["test"]["review_evidence"][0][
+            "verified_head_sha"
+        ] == marker_head
+        assert "native assertions passed" in rendered_evidence
         assert run.nonfatal_warnings[-1]["failure_subtype"] == "no_diff_completion_provenance"
         assert forge.push_branch.call_count == 2
         assert forge.create_pr.call_count == 2

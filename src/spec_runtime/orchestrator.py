@@ -20933,6 +20933,46 @@ def _is_no_commits_between_error(message: str) -> bool:
     return "no commits between" in str(message or "").lower()
 
 
+def _carry_forward_gate_review_evidence_binding(
+    repo_root: Path,
+    run: RunState,
+    *,
+    verified_head: str,
+    marker_head: str,
+) -> int:
+    """Rebind gate receipts after a proven tree-identical provenance commit."""
+    gate_status_path, gate_data = _read_gate_status(repo_root, run)
+    if not isinstance(gate_data, dict):
+        return 0
+
+    with _locked_state_path(gate_status_path):
+        gate_data = _read_json_dict(gate_status_path)
+        if gate_data is None:
+            raise OSError(f"Could not re-read gate status at {gate_status_path}")
+        gates = gate_data.get("gates")
+        if not isinstance(gates, dict):
+            return 0
+
+        updated = 0
+        for entry in gates.values():
+            if not isinstance(entry, dict):
+                continue
+            records = entry.get("review_evidence")
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                if not isinstance(record, dict):
+                    continue
+                if str(record.get("verified_head_sha", "")).strip() != verified_head:
+                    continue
+                record["verified_head_sha"] = marker_head
+                updated += 1
+
+        if updated:
+            _write_json_file_atomically(gate_status_path, gate_data)
+        return updated
+
+
 def _create_verified_no_diff_completion_commit(
     run: RunState,
     repo_root: Path,
@@ -21022,6 +21062,29 @@ def _create_verified_no_diff_completion_commit(
         )
         return False
 
+    try:
+        carried_evidence = _carry_forward_gate_review_evidence_binding(
+            repo_root,
+            run,
+            verified_head=current_head,
+            marker_head=marker_head,
+        )
+    except OSError as exc:
+        rollback = run_subprocess(
+            ["git", "update-ref", "HEAD", current_head, marker_head],
+            cwd=worktree_path,
+            env=git_env,
+            inherit_env=git_env is None,
+        )
+        rollback_detail = rollback.stderr.strip() or rollback.stdout.strip()
+        run.last_error = (
+            "Could not carry review evidence across the no-diff completion "
+            f"provenance commit: {exc}."
+        )
+        if rollback.returncode != 0:
+            run.last_error += f" The empty marker also could not be rolled back: {rollback_detail}"
+        return False
+
     run.verify_head_sha = marker_head
     _record_nonfatal_warning(
         run,
@@ -21036,6 +21099,11 @@ def _create_verified_no_diff_completion_commit(
             f"Verification was carried from {_short_sha(current_head)} to the tree-identical "
             f"marker {_short_sha(marker_head)} after all {len(checklist)} acceptance items "
             "were confirmed checked."
+            + (
+                f" Rebound {carried_evidence} captured review evidence record(s) to the marker."
+                if carried_evidence
+                else ""
+            )
         ),
     )
     logger.warning(
