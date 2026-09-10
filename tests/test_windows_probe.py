@@ -162,7 +162,10 @@ def main():
         print("Logged in using fixture credentials")
         return 0
     if args == ["sandbox", "--help"]:
-        print("codex sandbox --permission-profile")
+        print("codex sandbox --permission-profile --include-managed-config")
+        return 0
+    if args[:1] == ["sandbox"]:
+        print("SPEC_CODEX_WINDOWS_SANDBOX_ENFORCED")
         return 0
     if args[:1] == ["app-server"]:
         return 0

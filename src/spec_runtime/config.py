@@ -6,7 +6,7 @@ import subprocess
 import tomllib
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .command_runtime import CommandConfigurationError, CommandVariants, parse_command_variants
 from .git_common import run_git
@@ -27,6 +27,7 @@ class VerifyGateConfig:
     parallel: bool = False
     role: str = ""  # Semantic role: "test", "lint", "e2e". Defaults to name.
     command_variants: CommandVariants = CommandVariants()
+    review_evidence: tuple[str, ...] = ()
 
     @property
     def effective_role(self) -> str:
@@ -237,6 +238,49 @@ class SpecConfigNotFoundError(FileNotFoundError):
 
 class SpecConfigError(ValueError):
     """Raised when .spec.toml contains invalid values."""
+
+
+_MAX_REVIEW_EVIDENCE_FILES_PER_GATE = 8
+
+
+def _parse_review_evidence_paths(payload: object, *, gate_name: str) -> tuple[str, ...]:
+    """Return a bounded exact-path allowlist for one gate's review receipts."""
+    source = f"[[verify.gates]] name={gate_name!r} review_evidence"
+    if payload in (None, (), []):
+        return ()
+    if not isinstance(payload, list):
+        raise SpecConfigError(f"{source} must be a list of repository-relative paths")
+    if len(payload) > _MAX_REVIEW_EVIDENCE_FILES_PER_GATE:
+        raise SpecConfigError(
+            f"{source} may contain at most {_MAX_REVIEW_EVIDENCE_FILES_PER_GATE} paths"
+        )
+
+    paths: list[str] = []
+    for item in payload:
+        if not isinstance(item, str) or not item.strip():
+            raise SpecConfigError(f"{source} must contain only non-empty strings")
+        normalized = item.strip().replace("\\", "/")
+        relative = PurePosixPath(normalized)
+        if (
+            relative.is_absolute()
+            or (
+                len(normalized) >= 3
+                and normalized[0].isalpha()
+                and normalized[1:3] == ":/"
+            )
+            or relative == PurePosixPath(".")
+            or ".." in relative.parts
+            or not relative.parts
+            or "\x00" in normalized
+        ):
+            raise SpecConfigError(
+                f"{source} path {item!r} must stay within the execution workspace"
+            )
+        rendered = relative.as_posix()
+        if rendered in paths:
+            raise SpecConfigError(f"{source} contains duplicate path {rendered!r}")
+        paths.append(rendered)
+    return tuple(paths)
 
 
 def _parse_execution_section(payload: object) -> ExecutionConfig:
@@ -579,6 +623,10 @@ def load_spec_runtime_config(
                 parallel=bool(gate.get("parallel", False)),
                 role=str(gate.get("role", "")).strip(),
                 command_variants=variants,
+                review_evidence=_parse_review_evidence_paths(
+                    gate.get("review_evidence", ()),
+                    gate_name=name,
+                ),
             )
         )
     # Only fall back to hardcoded defaults when there is NO [verify] section

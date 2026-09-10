@@ -51,6 +51,14 @@ Configure Git's long-path support from an elevated PowerShell once:
 git config --system core.longpaths true
 ```
 
+Complete the administrator-approved Codex elevated-sandbox setup described in
+the [Codex Windows sandbox documentation](https://learn.chatgpt.com/docs/windows/windows-sandbox).
+Spec Butler writes `windows.sandbox = "elevated"` into each isolated provider
+home. Both `spec doctor` and the implementation preflight run a model-free
+canary through that exact permission profile: writes to the execution workspace
+and state outbox must succeed, and a protected-path read must fail. An
+unelevated or unsandboxed fallback is never selected.
+
 Run the remaining setup and all Spec Butler commands from an ordinary,
 non-elevated PowerShell session.
 
@@ -89,6 +97,8 @@ name = "test"
 command = '.venv/bin/python -m pytest'
 argv_windows = [".venv/Scripts/python.exe", "-m", "pytest"]
 parallel = true
+# Optional exact-path native receipt for built-in review:
+# review_evidence = ["artifacts/windows-native-receipt.json"]
 ```
 
 The Windows-specific command and shell are required for a PowerShell script;
@@ -129,6 +139,12 @@ Only one such OAuth-backed session per canonical Codex auth file can be active,
 because Codex may rotate its refresh token. A concurrent launch fails promptly
 rather than freezing another session or the web server. Configure
 `OPENAI_API_KEY` or `CODEX_API_KEY` when parallel native Codex runs are needed.
+Packaged desktop hosts may transparently redirect `%LOCALAPPDATA%` into their
+package-local cache. Spec Butler logs that path redirection separately and
+accepts it only when no lexical ancestor is a symlink, junction, or reparse
+point and the staging directory's identity remains stable. If an operator uses
+`XDG_STATE_HOME` to select a different state root, keep that root unchanged for
+the whole run: OAuth locks and recovery journals live there as well.
 
 ## Troubleshooting
 
@@ -158,6 +174,15 @@ This is an intentional fail-closed result on native Windows, not a missing PATH
 entry. Select Codex, or run the repository in WSL2/Linux where Claude's required
 host isolation is available. Do not bypass the preflight or change the sandbox
 policy.
+
+### The elevated Codex sandbox preflight fails
+
+Run `spec doctor` from the same ordinary PowerShell and Windows account that
+will run the lifecycle. Complete the elevated-sandbox setup, confirm local
+policy permits the dedicated sandbox users, and retry the doctor check. A
+failure means the configured sandbox did not prove the complete write and
+deny-read profile; repeated implementation launches will not be attempted.
+Do not switch to `windows.sandbox = "unelevated"` or bypass the sandbox.
 
 ### A stopped run left state behind
 

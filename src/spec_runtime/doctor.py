@@ -8,6 +8,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -560,6 +562,8 @@ def _agent_checks(
                 codex_capability_probe_command,
                 codex_capability_probe_unavailability_reason,
                 codex_isolation_unavailability_reason,
+                codex_windows_sandbox_probe_command,
+                codex_windows_sandbox_probe_unavailability_reason,
             )
 
             exec_help = run([path, "exec", "--help"], repo_root, 10.0)
@@ -581,6 +585,53 @@ def _agent_checks(
                     capability_probe.stdout,
                     capability_probe.stderr,
                 )
+            if not isolation_reason and is_windows():
+                try:
+                    with tempfile.TemporaryDirectory(
+                        prefix="spec-codex-windows-sandbox-probe-"
+                    ) as raw_root:
+                        root = Path(raw_root)
+                        workspace = root / "workspace"
+                        state_dir = root / "state"
+                        provider_home = root / "codex-home"
+                        denied_dir = root / "denied"
+                        for candidate in (
+                            workspace,
+                            state_dir,
+                            provider_home,
+                            denied_dir,
+                        ):
+                            candidate.mkdir()
+                        denied_file = denied_dir / "canary.txt"
+                        denied_file.write_text(
+                            "must-not-be-readable",
+                            encoding="utf-8",
+                        )
+                        sandbox_probe = run(
+                            codex_windows_sandbox_probe_command(
+                                workspace=workspace,
+                                state_dir=state_dir,
+                                provider_home=provider_home,
+                                denied_file=denied_file,
+                                codex_path=path,
+                                python_path=sys.executable,
+                            ),
+                            workspace,
+                            30.0,
+                        )
+                except OSError as exc:
+                    isolation_reason = (
+                        "Could not execute the Codex elevated Windows sandbox "
+                        f"enforcement preflight: {exc}"
+                    )
+                else:
+                    isolation_reason = (
+                        codex_windows_sandbox_probe_unavailability_reason(
+                            sandbox_probe.returncode,
+                            sandbox_probe.stdout,
+                            sandbox_probe.stderr,
+                        )
+                    )
             if isolation_reason:
                 checks.append(
                     severity(
@@ -593,7 +644,12 @@ def _agent_checks(
                 checks.append(
                     _ok(
                         "agent isolation (codex)",
-                        "required permission-profile and non-interactive controls are available",
+                        (
+                            "elevated Windows sandbox enforced the required write and "
+                            "deny-read permission profile"
+                            if is_windows()
+                            else "required permission-profile and non-interactive controls are available"
+                        ),
                     )
                 )
             config_path = repo_root / ".codex"

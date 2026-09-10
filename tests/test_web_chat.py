@@ -1119,7 +1119,8 @@ class TestCodexBridge:
             returncode=0,
             stdout=(
                 "--add-dir --ephemeral --ignore-rules --ignore-user-config "
-                "--json --output-schema --strict-config --permission-profile"
+                "--json --output-schema --strict-config --permission-profile "
+                "--include-managed-config"
             ),
             stderr="",
         )
@@ -1165,7 +1166,8 @@ class TestCodexBridge:
             returncode=0,
             stdout=(
                 "--add-dir --ephemeral --ignore-rules --ignore-user-config "
-                "--json --output-schema --strict-config --permission-profile"
+                "--json --output-schema --strict-config --permission-profile "
+                "--include-managed-config"
             ),
             stderr="",
         )

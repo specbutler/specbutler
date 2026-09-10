@@ -173,7 +173,19 @@ class _Runner:
                 "",
             )
         if Path(argv[0]).name == "codex" and argv[1:] == ["sandbox", "--help"]:
-            return subprocess.CompletedProcess(argv, 0, "--permission-profile", "")
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "--permission-profile --include-managed-config",
+                "",
+            )
+        if Path(argv[0]).name == "codex" and argv[1:2] == ["sandbox"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "SPEC_CODEX_WINDOWS_SANDBOX_ENFORCED\n",
+                "",
+            )
         if Path(argv[0]).name == "codex" and argv[1:] == ["login", "status"]:
             return subprocess.CompletedProcess(argv, 0, "Logged in using ChatGPT", "")
         if Path(argv[0]).name == "codex" and argv[1:2] == ["app-server"]:
@@ -510,6 +522,41 @@ def test_required_codex_rejecting_strict_security_config_is_blocked(
     assert check.status == "error"
     assert "rejected security controls" in check.detail
     assert report.exit_code == 1
+
+
+def test_windows_codex_without_enforced_deny_read_is_blocked(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo(tmp_path, _config_text())
+    config = load_repo_spec_runtime_config(repo, require=True)
+
+    class _RejectingSandboxRunner(_Runner):
+        def __call__(self, argv, cwd, timeout):
+            if (
+                Path(argv[0]).name == "codex"
+                and argv[1:2] == ["sandbox"]
+                and "--help" not in argv
+            ):
+                return subprocess.CompletedProcess(
+                    argv,
+                    1,
+                    "",
+                    "unelevated sandbox cannot enforce deny-read",
+                )
+            return super().__call__(argv, cwd, timeout)
+
+    with patch.object(doctor, "is_windows", return_value=True):
+        checks = doctor._agent_checks(
+            repo,
+            config,
+            _resolver(),
+            _RejectingSandboxRunner(),
+        )
+
+    check = {item.name: item for item in checks}["agent isolation (codex)"]
+    assert check.status == "error"
+    assert "elevated Windows sandbox" in check.detail
+    assert "will not use the incompatible unelevated sandbox" in check.detail
 
 
 def test_required_claude_without_restricted_controls_is_blocked(

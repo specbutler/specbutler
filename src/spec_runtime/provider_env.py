@@ -11,6 +11,7 @@ by the selected model provider.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import stat
@@ -24,6 +25,8 @@ from hashlib import sha256
 from pathlib import Path
 
 from .platform_fs import FileLock, remove_tree
+
+logger = logging.getLogger(__name__)
 
 _PROCESS_ENV_KEYS = frozenset(
     {
@@ -594,27 +597,67 @@ def _staging_parent_metadata(staged_auth: Path) -> tuple[Path, os.stat_result]:
         raise RuntimeError("Codex OAuth staging path must end in auth.json")
     parent = absolute_auth.parent
     try:
-        resolved_parent = parent.resolve(strict=True)
         metadata = os.lstat(parent)
+        resolved_parent = parent.resolve(strict=True)
     except OSError as exc:
         raise RuntimeError(
             f"Could not validate Codex OAuth staging directory: {parent}"
         ) from exc
-    if os.path.normcase(str(resolved_parent)) != os.path.normcase(str(parent)):
+
+    # Inspect every lexical ancestor directly. Comparing Path.resolve() with
+    # the lexical spelling conflates real links with packaged-host AppData
+    # virtualization, where Windows redirects the path without marking any
+    # component as a symlink, junction, or other reparse point.
+    current = parent
+    current_metadata = metadata
+    while True:
+        if stat.S_ISLNK(current_metadata.st_mode) or _is_windows_reparse_point(current):
+            raise RuntimeError(
+                "Codex OAuth staging directory contains a detected symlink or "
+                f"Windows reparse point at {current}: {parent}"
+            )
+        if not stat.S_ISDIR(current_metadata.st_mode):
+            raise RuntimeError(
+                f"Codex OAuth staging path contains a non-directory ancestor at {current}: {parent}"
+            )
+        if current.parent == current:
+            break
+        current = current.parent
+        try:
+            current_metadata = os.lstat(current)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not validate Codex OAuth staging ancestor {current}: {parent}"
+            ) from exc
+
+    redirected = os.path.normcase(str(resolved_parent)) != os.path.normcase(str(parent))
+    if redirected and sys.platform != "win32":
         raise RuntimeError(
-            f"Codex OAuth staging directory must not contain symlinks: {parent}"
+            f"Codex OAuth staging directory resolved through an unsafe path redirection: {parent}"
         )
-    if (
-        stat.S_ISLNK(metadata.st_mode)
-        or _is_windows_reparse_point(parent)
-        or not stat.S_ISDIR(metadata.st_mode)
-    ):
-        raise RuntimeError(f"Refusing unsafe Codex OAuth staging directory: {parent}")
+    if redirected:
+        logger.info(
+            "Codex OAuth staging directory is subject to Windows path redirection "
+            "(%s -> %s), but no symlink, junction, or reparse point was detected; "
+            "continuing with directory identity checks",
+            parent,
+            resolved_parent,
+        )
     if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
         raise RuntimeError(
             f"Codex OAuth staging directory is not owned by the current user: {parent}"
         )
-    return absolute_auth, metadata
+    after = os.lstat(parent)
+    if (
+        stat.S_ISLNK(after.st_mode)
+        or _is_windows_reparse_point(parent)
+        or not stat.S_ISDIR(after.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != (after.st_dev, after.st_ino)
+    ):
+        raise RuntimeError(
+            f"Codex OAuth staging directory changed during validation: {parent}"
+        )
+    return absolute_auth, after
 
 
 def _create_codex_oauth_launch_journal(

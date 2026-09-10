@@ -6,6 +6,7 @@ Uses pytest tmp_path fixtures — no Postgres or network needed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import logging
@@ -11913,6 +11914,19 @@ class TestPublishPhase:
             verify_head_sha=verified_head,
             agent="codex",
         )
+        receipt = repo / ".spec-state" / "evidence" / "native.txt"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text("native assertions passed\n", encoding="utf-8")
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            verify_gates=(
+                VerifyGateConfig(
+                    name="test",
+                    command="make test",
+                    review_evidence=(".spec-state/evidence/native.txt",),
+                ),
+            ),
+        )
         forge = MagicMock()
         forge.find_pr_for_branch.return_value = None
         forge.push_branch.return_value = orch.PushResult(ok=True)
@@ -11925,11 +11939,26 @@ class TestPublishPhase:
         ]
 
         with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
             patch.object(orch, "_forge", return_value=forge),
             patch.object(orch, "_check_forge_auth", return_value=None),
             patch.object(orch, "_reset_local_review_gate_for_head"),
         ):
+            evidence = orch._capture_gate_review_evidence("test", repo)
+            orch._record_gate_result(
+                orch._gate_status_path(repo, run),
+                run.spec_id,
+                "test",
+                "make test",
+                0,
+                review_evidence=evidence,
+            )
             result = orch.phase_publish(run, repo)
+            rendered_evidence = orch._format_gate_evidence_for_review(
+                repo,
+                run,
+                expected_head_sha=run.verify_head_sha,
+            )
 
         marker_head = _run_git_stdout("rev-parse", "HEAD", cwd=repo).strip()
         recent_commits = _run_git_stdout(
@@ -11951,6 +11980,12 @@ class TestPublishPhase:
         )
         assert run.verify_head_sha == marker_head
         assert run.readiness_head_sha == marker_head
+        _, gate_status = orch._read_gate_status(repo, run)
+        assert gate_status is not None
+        assert gate_status["gates"]["test"]["review_evidence"][0][
+            "verified_head_sha"
+        ] == marker_head
+        assert "native assertions passed" in rendered_evidence
         assert run.nonfatal_warnings[-1]["failure_subtype"] == "no_diff_completion_provenance"
         assert forge.push_branch.call_count == 2
         assert forge.create_pr.call_count == 2
@@ -22200,6 +22235,17 @@ class TestBuildAgentCommand:
 
 
 class TestValidateCodexExec:
+    @pytest.fixture(autouse=True)
+    def _default_to_non_windows(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        """Keep existing static capability tests independent of the CI OS."""
+        if request.node.name.startswith("test_windows_"):
+            return
+        monkeypatch.setattr(orch.sys, "platform", "linux")
+
     def test_passes_when_exec_available(self):
         run = orch.RunState(
             run_id="test-20260101T000000",
@@ -22296,6 +22342,46 @@ class TestValidateCodexExec:
         ):
             assert orch._validate_codex_exec(run) is False
         assert "rejected security controls" in run.last_error
+
+    def test_windows_fails_before_launch_when_elevated_sandbox_cannot_enforce_profile(
+        self,
+    ):
+        run = orch.RunState(
+            run_id="test-20260101T000000",
+            spec_id="my-feature",
+            branch="spec/my-feature",
+        )
+        help_result = subprocess.CompletedProcess(
+            args=["codex", "exec", "--help"],
+            returncode=0,
+            stdout="--json --output-schema",
+            stderr="",
+        )
+        capability_result = subprocess.CompletedProcess(
+            args=["codex", "app-server"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        sandbox_result = subprocess.CompletedProcess(
+            args=["codex", "sandbox"],
+            returncode=1,
+            stdout="",
+            stderr="unelevated sandbox cannot enforce deny-read",
+        )
+
+        with (
+            patch.object(orch.sys, "platform", "win32"),
+            patch.object(
+                orch,
+                "run_subprocess",
+                side_effect=[help_result, capability_result, sandbox_result],
+            ),
+        ):
+            assert orch._validate_codex_exec(run) is False
+
+        assert "elevated Windows sandbox" in run.last_error
+        assert "will not use the incompatible unelevated sandbox" in run.last_error
 
 
 class TestWriteSandboxConfig:
@@ -35660,7 +35746,7 @@ class TestCodexIsolatedHome:
         assert not auth_path.is_symlink()
         assert auth_path.read_text() == '{"token":"x"}'
         assert (home / "config.toml").read_text().startswith(
-            '[windows]\nsandbox = "unelevated"\n'
+            '[windows]\nsandbox = "elevated"\n'
         )
 
     def test_non_windows_isolated_home_does_not_override_windows_sandbox(
@@ -39808,6 +39894,277 @@ class TestReviewGateEvidence:
         run = self._run(tmp_path)
 
         assert orch._format_gate_evidence_for_review(tmp_path, run) == ""
+
+    def test_materializes_allowlisted_hashed_redacted_attachment(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        worktree = tmp_path / "worktree"
+        receipt = worktree / ".spec" / "evidence" / "native.json"
+        receipt.parent.mkdir(parents=True)
+        secret = "native-review-secret-value"
+        receipt.write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "api_token": secret,
+                    "assertions": 12,
+                }
+            ),
+            encoding="utf-8",
+        )
+        head_sha = "a" * 40
+        run = self._run(tmp_path)
+        run.worktree_path = str(worktree)
+        run.verify_head_sha = head_sha
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            verify_gates=(
+                VerifyGateConfig(
+                    name="test",
+                    command="make test",
+                    review_evidence=(".spec/evidence/native.json",),
+                ),
+            ),
+        )
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(orch, "_head_sha", return_value=head_sha),
+        ):
+            evidence = orch._capture_gate_review_evidence("test", worktree)
+            self._gate_status(
+                tmp_path,
+                run,
+                {
+                    "test": {
+                        "last_status": "passed",
+                        "last_command": "make test",
+                        "review_evidence": evidence,
+                    }
+                },
+            )
+            out = orch._format_gate_evidence_for_review(
+                tmp_path,
+                run,
+                expected_head_sha=head_sha,
+            )
+
+        assert "Host-materialized gate attachments" in out
+        assert ".spec/evidence/native.json" in out
+        assert head_sha in out
+        assert evidence[0]["sha256"] in out
+        assert '"assertions": 12' in out
+        assert secret not in out
+        assert '"api_token": "<REDACTED>"' in out
+
+    def test_attachment_changed_after_gate_fails_review(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "worktree"
+        receipt = worktree / "evidence" / "native.txt"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text("native assertions passed\n", encoding="utf-8")
+        head_sha = "b" * 40
+        run = self._run(tmp_path)
+        run.worktree_path = str(worktree)
+        run.verify_head_sha = head_sha
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            verify_gates=(
+                VerifyGateConfig(
+                    name="test",
+                    command="make test",
+                    review_evidence=("evidence/native.txt",),
+                ),
+            ),
+        )
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(orch, "_head_sha", return_value=head_sha),
+        ):
+            evidence = orch._capture_gate_review_evidence("test", worktree)
+            self._gate_status(
+                tmp_path,
+                run,
+                {
+                    "test": {
+                        "last_status": "passed",
+                        "last_command": "make test",
+                        "review_evidence": evidence,
+                    }
+                },
+            )
+            receipt.write_text("receipt changed after verify\n", encoding="utf-8")
+            with pytest.raises(ValueError, match="changed after verification"):
+                orch._format_gate_evidence_for_review(
+                    tmp_path,
+                    run,
+                    expected_head_sha=head_sha,
+                )
+
+    def test_attachment_captured_for_an_older_revision_fails_review(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        worktree = tmp_path / "worktree"
+        receipt = worktree / "evidence" / "native.txt"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text("native assertions passed\n", encoding="utf-8")
+        captured_head = "1" * 40
+        reviewed_head = "2" * 40
+        run = self._run(tmp_path)
+        run.worktree_path = str(worktree)
+        run.verify_head_sha = reviewed_head
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            verify_gates=(
+                VerifyGateConfig(
+                    name="test",
+                    command="make test",
+                    review_evidence=("evidence/native.txt",),
+                ),
+            ),
+        )
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(orch, "_head_sha", return_value=captured_head),
+        ):
+            evidence = orch._capture_gate_review_evidence("test", worktree)
+            self._gate_status(
+                tmp_path,
+                run,
+                {
+                    "test": {
+                        "last_status": "passed",
+                        "last_command": "make test",
+                        "review_evidence": evidence,
+                    }
+                },
+            )
+            with pytest.raises(ValueError, match="is stale"):
+                orch._format_gate_evidence_for_review(
+                    tmp_path,
+                    run,
+                    expected_head_sha=reviewed_head,
+                )
+
+    def test_redacted_attachment_must_remain_within_the_file_limit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        worktree = tmp_path / "worktree"
+        receipt = worktree / "evidence" / "native.txt"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text("passed\n", encoding="utf-8")
+        head_sha = "3" * 40
+        payload = receipt.read_bytes()
+        gate_entry = {
+            "last_status": "passed",
+            "review_evidence": [
+                {
+                    "path": "evidence/native.txt",
+                    "size_bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                    "verified_head_sha": head_sha,
+                }
+            ],
+        }
+
+        with (
+            patch.object(
+                orch,
+                "_redact_review_evidence_text",
+                return_value="x" * (orch.REVIEW_EVIDENCE_MAX_FILE_BYTES + 1),
+            ),
+            pytest.raises(ValueError, match="Redacted review evidence exceeds"),
+        ):
+            orch._materialize_gate_review_attachments(
+                gate_name="test",
+                gate_entry=gate_entry,
+                configured_paths=("evidence/native.txt",),
+                worktree_path=worktree,
+                expected_head_sha=head_sha,
+            )
+
+    def test_missing_required_attachment_turns_green_gate_red(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            verify_gates=(
+                VerifyGateConfig(
+                    name="e2e",
+                    command="make e2e",
+                    review_evidence=("evidence/missing.txt",),
+                ),
+            ),
+        )
+        result = orch.VerifyGateResult(
+            subprocess.CompletedProcess(["make", "e2e"], 0, "passed", "")
+        )
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(orch, "_head_sha", return_value="c" * 40),
+        ):
+            checked = orch._attach_gate_review_evidence("e2e", worktree, result)
+
+        assert checked.completed_process.returncode == 1
+        assert checked.failure_subtype == "review_evidence_invalid"
+        assert "required review evidence is missing" in checked.completed_process.stderr
+
+    def test_oversized_required_attachment_fails_closed(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "worktree"
+        receipt = worktree / "evidence" / "large.txt"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_bytes(b"x" * (orch.REVIEW_EVIDENCE_MAX_FILE_BYTES + 1))
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            verify_gates=(
+                VerifyGateConfig(
+                    name="e2e",
+                    command="make e2e",
+                    review_evidence=("evidence/large.txt",),
+                ),
+            ),
+        )
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(orch, "_head_sha", return_value="d" * 40),
+            pytest.raises(ValueError, match="unsafe or exceeds"),
+        ):
+            orch._capture_gate_review_evidence("e2e", worktree)
+
+    @pytest.mark.skipif(os.name == "nt", reason="native Windows reparse coverage is separate")
+    def test_attachment_parent_symlink_is_rejected(self, tmp_path: Path) -> None:
+        worktree = tmp_path / "worktree"
+        outside = tmp_path / "outside"
+        worktree.mkdir()
+        outside.mkdir()
+        (outside / "receipt.txt").write_text("passed", encoding="utf-8")
+        (worktree / "evidence").symlink_to(outside, target_is_directory=True)
+        config = replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            verify_gates=(
+                VerifyGateConfig(
+                    name="e2e",
+                    command="make e2e",
+                    review_evidence=("evidence/receipt.txt",),
+                ),
+            ),
+        )
+
+        with (
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
+            patch.object(orch, "_head_sha", return_value="e" * 40),
+            pytest.raises(ValueError, match="contains a link"),
+        ):
+            orch._capture_gate_review_evidence("e2e", worktree)
 
     def test_prompt_appends_evidence_when_template_lacks_placeholder(self, tmp_path: Path):
         prompts = tmp_path / ".github" / "prompts"

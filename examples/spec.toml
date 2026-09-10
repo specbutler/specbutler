@@ -86,6 +86,10 @@ install_command = "python -m venv .venv && .venv/bin/python -m pip install -e '.
 #
 # The `role` field is optional — it gives the gate a semantic role ("test",
 # "lint", "e2e") used for diagnostics. Defaults to the gate name.
+# `review_evidence` is an optional exact allowlist of UTF-8 receipt files that
+# the gate writes inside its execution workspace. Passing gates bind each file
+# to the verified commit and include a bounded, redacted copy in built-in review.
+# Generated receipt paths should be gitignored so gates leave the worktree clean.
 
 [verify]
 
@@ -104,6 +108,7 @@ parallel = true
 # name = "e2e"
 # command = "playwright test"
 # parallel = false
+# review_evidence = ["artifacts/native-test-receipt.json"]
 
 # ---------------------------------------------------------------------------
 # Coordination (optional)
