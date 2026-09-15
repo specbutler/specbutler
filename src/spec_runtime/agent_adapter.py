@@ -418,6 +418,23 @@ def _codex_implement_permission_overrides(
         worktree_path.resolve(strict=False),
         *(path.resolve(strict=False) for path in writable_roots),
     }
+    # Denying an ancestor already denies its descendants. Emitting both makes
+    # bubblewrap try to create a child mount below the read-only denied parent.
+    # Keep a descendant deny when a more-specific writable root between them
+    # makes it necessary to preserve the original restriction.
+    protected = {
+        path
+        for path in protected
+        if not any(
+            parent != path
+            and path.is_relative_to(parent)
+            and not any(
+                root.is_relative_to(parent) and path.is_relative_to(root)
+                for root in writable
+            )
+            for parent in protected
+        )
+    }
     filesystem_entries = [
         '":root"="read"',
         '":workspace_roots"="write"',

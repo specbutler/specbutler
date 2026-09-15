@@ -657,6 +657,31 @@ def test_codex_windows_probe_requires_execution_marker() -> None:
     assert "will not use the incompatible unelevated sandbox" in reason
 
 
+@pytest.mark.parametrize("writable_between", [False, True])
+def test_codex_profile_deduplicates_nested_denies_without_losing_restrictions(
+    tmp_path: Path, writable_between: bool,
+) -> None:
+    workspace = tmp_path / "workspace"
+    state = tmp_path / "operator-state"
+    launch_root = state / "provider-homes"
+    provider_home = launch_root / "launch" / ".spec-codex-home"
+    sibling = tmp_path / "other-credentials"
+    with patch(
+        "spec_runtime.agent_adapter.protected_operator_paths",
+        return_value=(state, sibling),
+    ):
+        overrides = _codex_implement_permission_overrides(
+            workspace,
+            [launch_root] if writable_between else [],
+            provider_home=provider_home,
+        )
+    policy = next(item for item in overrides if ".filesystem=" in item)
+    assert f'{json.dumps(str(state))}="deny"' in policy
+    assert f'{json.dumps(str(sibling))}="deny"' in policy
+    assert (f'{json.dumps(str(provider_home))}="deny"' in policy) is writable_between
+    assert (f'{json.dumps(str(launch_root))}="write"' in policy) is writable_between
+
+
 def test_local_review_transports_large_prompt_over_stdin(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     cwd = tmp_path / "scratch"
