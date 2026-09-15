@@ -196,7 +196,10 @@ CONTAINER_COMPLETION_OUTBOX_ENV = "SPEC_COMPLETION_OUTBOX"
 CONTAINER_COMPLETION_ARTIFACT = "completion-report.json"
 CONTAINER_BOOTSTRAP_SOURCE = "/workspace/bootstrap/source"
 CONTAINER_RUNTIME_SOURCE = "/workspace/source"
-CONTAINER_CODEX_HOME = f"{CONTAINER_RUNTIME_SOURCE}/.spec-codex-home"
+# Legacy provider-state cleanup can remove source/.spec-codex-home while the
+# worker is paused. Keep the mount target outside source too: deleting a bind
+# mount's target on the host makes that path unreachable inside the container.
+CONTAINER_CODEX_HOME = "/workspace/provider-homes/codex"
 CONTAINER_RUNTIME_STATE = f"{CONTAINER_RUNTIME_SOURCE}/.spec-state"
 CONTAINER_RUNTIME_STATE_TMPFS = f"{CONTAINER_RUNTIME_STATE}:rw,noexec,nosuid,nodev,mode=1777"
 CONTAINER_CODEX_SANDBOX_MODE = "danger-full-access"

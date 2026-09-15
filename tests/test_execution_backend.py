@@ -3637,7 +3637,7 @@ class TestContainerBackend:
         source_mount = next(
             value for value in worker_start if value.endswith(":/workspace/source")
         )
-        provider_mount = f"{provider_home}:/workspace/source/.spec-codex-home"
+        provider_mount = f"{provider_home}:/workspace/provider-homes/codex"
         assert provider_mount in worker_start
         assert worker_start.index(provider_mount) > worker_start.index(source_mount)
 
@@ -3663,8 +3663,8 @@ class TestContainerBackend:
         )
         exec_call = runner.calls[exec_index]
         assert str(provider_home) not in " ".join(exec_call)
-        assert "/workspace/source/.spec-codex-home" in " ".join(exec_call)
-        assert runner.envs[exec_index]["CODEX_HOME"] == "/workspace/source/.spec-codex-home"
+        assert "/workspace/provider-homes/codex" in " ".join(exec_call)
+        assert runner.envs[exec_index]["CODEX_HOME"] == "/workspace/provider-homes/codex"
 
     def test_prepare_rejects_credential_bearing_origin_before_worker_start(
         self,
