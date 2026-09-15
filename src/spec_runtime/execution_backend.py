@@ -7537,7 +7537,11 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         for container_id in sorted(owned):
             status = self._container_runtime_status(run_root, state, container_id)
             if container_id in expected:
-                if status != "running":
+                # Docker reports State.Status="paused" while State.Running
+                # remains true. A suspended generation is healthy only when
+                # its pause flag also matches the host-access boundary below.
+                allowed_statuses = {"running", "paused"} if allow_paused else {"running"}
+                if status not in allowed_statuses:
                     return False
                 is_paused = self._container_pause_state(run_root, container_id)
                 if allow_paused != is_paused:

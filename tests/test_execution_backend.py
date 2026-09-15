@@ -2726,7 +2726,7 @@ class _FakeContainerRunner:
                     container_id
                     for container_id in ids
                     if self.container_statuses.get(container_id, "running")
-                    == "running"
+                    in {"running", "paused"}
                 }
             return subprocess.CompletedProcess(
                 argv,
@@ -2752,12 +2752,14 @@ class _FakeContainerRunner:
             if target not in self.ps_container_ids:
                 return subprocess.CompletedProcess(argv, 1, "", "missing container\n")
             self.paused_container_ids.add(target)
+            self.container_statuses[target] = "paused"
             return subprocess.CompletedProcess(argv, 0, target + "\n", "")
         if argv[:2] == ["docker", "unpause"]:
             target = argv[-1]
             if target not in self.ps_container_ids:
                 return subprocess.CompletedProcess(argv, 1, "", "missing container\n")
             self.paused_container_ids.discard(target)
+            self.container_statuses[target] = "running"
             return subprocess.CompletedProcess(argv, 0, target + "\n", "")
         if argv[:2] == ["docker", "inspect"]:
             target = argv[-1]
@@ -8255,14 +8257,16 @@ class TestContainerBackend:
         assert completed not in persisted["host_access_paused_containers"]
         assert "container-123" in persisted["host_access_paused_containers"]
 
-    def test_volume_suspend_resume_preserves_the_same_runtime_generation(
+    @pytest.mark.parametrize("workspace_mode", ["bind", "volume"])
+    def test_suspend_resume_preserves_the_same_runtime_generation(
         self,
         tmp_path: Path,
+        workspace_mode: str,
     ) -> None:
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         runner = _FakeContainerRunner()
-        backend = self._make(runner, compose_file="", workspace_mode="volume")
+        backend = self._make(runner, compose_file="", workspace_mode=workspace_mode)
         with patch("shutil.which", return_value="/usr/bin/docker"):
             handle = backend.prepare_workspace(
                 run_id="my-feature-abc",
