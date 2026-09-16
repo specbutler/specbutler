@@ -629,6 +629,7 @@ class TestCodexAgent:
         (common_git / "objects").mkdir()
         isolation = MagicMock()
         isolation.worktree = worktree.resolve()
+        isolation.common_git_dir = common_git.resolve()
         isolation.writable_paths = (private_git.resolve(),)
         isolation.read_only_paths = (
             (worktree / ".git").resolve(),
@@ -661,7 +662,7 @@ class TestCodexAgent:
         )
         assert f'{json.dumps(str(tmp_path / ".spec-state"))}="write"' in filesystem_policy
         assert f'{json.dumps(str(private_git.resolve()))}="write"' in filesystem_policy
-        assert f'{json.dumps(str((worktree / ".git").resolve()))}="read"' in filesystem_policy
+        assert f'{json.dumps(str((worktree / ".git").resolve()))}="deny"' in filesystem_policy
         assert f'{json.dumps(str((common_git / "objects").resolve()))}="read"' in filesystem_policy
         assert f'{json.dumps(str(gitdir.resolve()))}="write"' not in filesystem_policy
         assert f'{json.dumps(str(common_git.resolve()))}="write"' not in filesystem_policy

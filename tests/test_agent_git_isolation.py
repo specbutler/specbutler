@@ -118,6 +118,7 @@ def test_real_codex_private_commit_can_read_shared_objects_without_writing_them(
     from spec_runtime.provider_env import minimal_provider_environment
 
     repository, worktree = _linked_worktree(tmp_path)
+    _git(repository, "config", "private.canary", "synthetic-credential")
     isolation = prepare_agent_git_isolation(worktree)
     shared_objects = repository / ".git" / "objects"
     shared_refs = repository / ".git" / "refs"
@@ -143,6 +144,12 @@ subprocess.run(['git', 'show', 'HEAD:tracked.txt'], check=True)
 Path('tracked.txt').write_text('sandbox commit\\n')
 subprocess.run(['git', 'add', 'tracked.txt'], check=True)
 subprocess.run(['git', 'commit', '-m', 'sandbox'], check=True)
+try:
+    Path({str(repository / '.git' / 'config')!r}).read_bytes()
+except OSError:
+    pass
+else:
+    raise AssertionError('shared credential-bearing Git config was readable')
 for target in {tuple(str(path) for path in (shared_objects / 'forbidden', shared_refs / 'forbidden'))!r}:
     try:
         Path(target).write_text('forbidden')

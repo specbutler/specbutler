@@ -390,6 +390,20 @@ def _codex_add_dir_args(paths: list[Path]) -> list[str]:
     return args
 
 
+def _codex_shared_git_paths(
+    git_isolation: AgentGitIsolation | None,
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """Deny real metadata except the object store used by private Git."""
+    if git_isolation is None:
+        return (), ()
+    objects = (git_isolation.common_git_dir / "objects").resolve(strict=False)
+    protected = tuple(
+        path for path in git_isolation.read_only_paths
+        if path.resolve(strict=False) != objects
+    )
+    return protected, (objects,)
+
+
 def _codex_implement_permission_overrides(
     worktree_path: Path,
     writable_roots: list[Path],
@@ -989,6 +1003,7 @@ class CodexAgent:
             state_dir,
             *_codex_git_metadata_dirs(worktree_path, git_isolation),
         ]
+        protected_git_paths, readable_git_paths = _codex_shared_git_paths(git_isolation)
         cmd = [
             "codex",
             "-a",
@@ -1001,9 +1016,8 @@ class CodexAgent:
                 writable_roots,
                 excluded_env_keys=_codex_mcp_secret_env_keys(mcp_servers),
                 provider_home=provider_home,
-                additional_read_only_paths=(
-                    git_isolation.read_only_paths if git_isolation is not None else ()
-                ),
+                additional_protected_paths=protected_git_paths,
+                additional_read_only_paths=readable_git_paths,
             ),
         ]
         for override in CODEX_AMBIENT_CAPABILITY_OVERRIDES:
@@ -1044,6 +1058,7 @@ class CodexAgent:
         if state_dir:
             add_dirs.append(state_dir)
         add_dirs.extend(_codex_git_metadata_dirs(worktree_path, git_isolation))
+        protected_git_paths, readable_git_paths = _codex_shared_git_paths(git_isolation)
         cmd += _codex_add_dir_args(add_dirs)
         cmd += _codex_implement_permission_overrides(
             worktree_path,
@@ -1053,9 +1068,8 @@ class CodexAgent:
             network_enabled=False,
             ignore_rules=False,
             strict_config=False,
-            additional_read_only_paths=(
-                git_isolation.read_only_paths if git_isolation is not None else ()
-            ),
+            additional_protected_paths=protected_git_paths,
+            additional_read_only_paths=readable_git_paths,
         )
         cmd += _codex_linux_sandbox_overrides()
         cmd += _codex_mcp_server_overrides(mcp_servers)
