@@ -196,7 +196,10 @@ CONTAINER_COMPLETION_OUTBOX_ENV = "SPEC_COMPLETION_OUTBOX"
 CONTAINER_COMPLETION_ARTIFACT = "completion-report.json"
 CONTAINER_BOOTSTRAP_SOURCE = "/workspace/bootstrap/source"
 CONTAINER_RUNTIME_SOURCE = "/workspace/source"
-CONTAINER_CODEX_HOME = f"{CONTAINER_RUNTIME_SOURCE}/.spec-codex-home"
+# Legacy provider-state cleanup can remove source/.spec-codex-home while the
+# worker is paused. Keep the mount target outside source too: deleting a bind
+# mount's target on the host makes that path unreachable inside the container.
+CONTAINER_CODEX_HOME = "/workspace/provider-homes/codex"
 CONTAINER_RUNTIME_STATE = f"{CONTAINER_RUNTIME_SOURCE}/.spec-state"
 CONTAINER_RUNTIME_STATE_TMPFS = f"{CONTAINER_RUNTIME_STATE}:rw,noexec,nosuid,nodev,mode=1777"
 CONTAINER_CODEX_SANDBOX_MODE = "danger-full-access"
@@ -7537,7 +7540,11 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         for container_id in sorted(owned):
             status = self._container_runtime_status(run_root, state, container_id)
             if container_id in expected:
-                if status != "running":
+                # Docker reports State.Status="paused" while State.Running
+                # remains true. A suspended generation is healthy only when
+                # its pause flag also matches the host-access boundary below.
+                allowed_statuses = {"running", "paused"} if allow_paused else {"running"}
+                if status not in allowed_statuses:
                     return False
                 is_paused = self._container_pause_state(run_root, container_id)
                 if allow_paused != is_paused:
