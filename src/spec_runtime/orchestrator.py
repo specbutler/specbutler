@@ -6374,19 +6374,25 @@ def _with_verify_test_environment(
         return
 
     was_running = _worktree_local_postgres_is_running(worktree_path)
-    start_result = run_subprocess([str(postgres_script), "start"], cwd=worktree_path)
-    if start_result.returncode != 0:
-        detail = _format_subprocess_failure(start_result)
-        raise RuntimeError(f"Could not prepare verify test environment: local_postgres.sh start failed.\n{detail}")
-    auto_started_postgres = not was_running and "Started local Postgres" in (start_result.stdout or "")
-    if auto_started_postgres and repo_root is not None:
-        _register_worktree_postgres_process(
-            repo_root,
-            worktree_path,
-            name="verify-postgres",
-        )
-
+    # The start command deliberately hands a daemon to the gate. Normal
+    # RUN_OWNED command completion would reap it before the first DB query.
+    start_result = run_subprocess(
+        [str(postgres_script), "start"], cwd=worktree_path,
+        preserve_descendants=True,
+    )
+    ownership_token = getattr(start_result, "ownership_token", None)
+    auto_started_postgres = False
     try:
+        if start_result.returncode != 0:
+            detail = _format_subprocess_failure(start_result)
+            raise RuntimeError(f"Could not prepare verify test environment: local_postgres.sh start failed.\n{detail}")
+        auto_started_postgres = not was_running and "Started local Postgres" in (start_result.stdout or "")
+        if auto_started_postgres and repo_root is not None:
+            _register_worktree_postgres_process(
+                repo_root,
+                worktree_path,
+                name="verify-postgres",
+            )
         url_result = run_subprocess([str(postgres_script), "url"], cwd=worktree_path)
         if url_result.returncode != 0:
             detail = _format_subprocess_failure(url_result)
@@ -6405,10 +6411,16 @@ def _with_verify_test_environment(
         test_env["SIM_TEST_DATABASE_URL"] = test_database_url
         yield test_env
     finally:
-        if auto_started_postgres:
-            _stop_worktree_local_postgres(worktree_path)
-            if repo_root is not None:
-                _prune_registered_worktree_processes(repo_root, worktree_path)
+        try:
+            if auto_started_postgres:
+                _stop_worktree_local_postgres(worktree_path)
+                if repo_root is not None:
+                    _prune_registered_worktree_processes(repo_root, worktree_path)
+        finally:
+            if ownership_token is not None:
+                terminate_supervision_token(ownership_token, grace_seconds=0)
+                close_empty_held_posix_groups()
+                close_empty_held_windows_jobs()
 
 
 def _stop_worktree_local_postgres(

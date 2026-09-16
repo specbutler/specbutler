@@ -106,6 +106,80 @@ def test_private_git_commit_does_not_touch_shared_metadata(tmp_path: Path) -> No
     assert repository / ".git" / "objects" in isolation.read_only_paths
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux") or shutil.which("codex") is None,
+    reason="requires the installed Codex Linux sandbox",
+)
+@pytest.mark.parametrize("mode", ["implement", "authoring"])
+def test_real_codex_private_commit_can_read_shared_objects_without_writing_them(
+    tmp_path: Path, mode: str,
+) -> None:
+    from spec_runtime.agent_adapter import CodexAgent
+    from spec_runtime.provider_env import minimal_provider_environment
+
+    repository, worktree = _linked_worktree(tmp_path)
+    _git(repository, "config", "private.canary", "synthetic-credential")
+    isolation = prepare_agent_git_isolation(worktree)
+    shared_objects = repository / ".git" / "objects"
+    shared_refs = repository / ".git" / "refs"
+    objects_before = _tree_fingerprint(shared_objects)
+    refs_before = _tree_fingerprint(shared_refs)
+    state_dir = tmp_path / "outbox"
+    state_dir.mkdir()
+    (worktree / ".spec-codex-home").mkdir()
+    build = getattr(CodexAgent(), f"build_{mode}_command")
+    command = build(
+        prompt="unused", worktree_path=worktree, state_dir=state_dir,
+        git_isolation=isolation,
+    )
+    overrides = []
+    for index, value in enumerate(command[:-1]):
+        if value == "-c":
+            overrides.extend(("-c", command[index + 1]))
+    script = f"""
+import os
+import subprocess
+from pathlib import Path
+subprocess.run(['git', 'show', 'HEAD:tracked.txt'], check=True)
+Path('tracked.txt').write_text('sandbox commit\\n')
+subprocess.run(['git', 'add', 'tracked.txt'], check=True)
+subprocess.run(['git', 'commit', '-m', 'sandbox'], check=True)
+try:
+    Path({str(repository / '.git' / 'config')!r}).read_bytes()
+except OSError:
+    pass
+else:
+    raise AssertionError('shared credential-bearing Git config was readable')
+for target in {tuple(str(path) for path in (shared_objects / 'forbidden', shared_refs / 'forbidden'))!r}:
+    try:
+        Path(target).write_text('forbidden')
+    except OSError:
+        pass
+    else:
+        raise AssertionError('shared Git path was writable')
+source = {str(next(path for path in shared_objects.rglob('*') if path.is_file()))!r}
+alias = {str(isolation.private_git_dir / 'object-alias')!r}
+try:
+    os.link(source, alias)
+except OSError:
+    pass
+else:
+    raise AssertionError('shared object could be hardlinked into writable metadata')
+"""
+    result = subprocess.run(
+        ["codex", "sandbox", "-C", str(worktree), *overrides,
+         "-P", f"specbutler-{mode}", sys.executable, "-c", script],
+        env=isolation.apply_to_environment(minimal_provider_environment("codex")),
+        text=True, capture_output=True, check=False, timeout=30,
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    assert _tree_fingerprint(shared_objects) == objects_before
+    assert _tree_fingerprint(shared_refs) == refs_before
+    assert _git(worktree, "rev-parse", "HEAD").stdout.strip() == isolation.initial_head
+    assert agent_git_head(isolation) != isolation.initial_head
+    assert reconcile_agent_git_isolation(isolation).imported_commit_count == 1
+
+
 def test_private_git_inherits_excludes_and_supports_private_recovery_patterns(
     tmp_path: Path,
 ) -> None:

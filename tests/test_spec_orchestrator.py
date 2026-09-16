@@ -18321,10 +18321,12 @@ class TestVerifyTestEnvironment:
             *,
             inherit_env=True,
             input_text=None,
+            preserve_descendants=False,
         ):
             del env, timeout, inherit_env, input_text
             assert cwd == worktree
             commands.append(cmd)
+            assert preserve_descendants is (cmd == [str(postgres_script), "start"])
             if cmd == [str(postgres_script), "status"]:
                 return subprocess.CompletedProcess(
                     args=cmd,
