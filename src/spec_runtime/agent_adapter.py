@@ -401,6 +401,7 @@ def _codex_implement_permission_overrides(
     ignore_rules: bool = True,
     strict_config: bool = True,
     additional_protected_paths: tuple[Path, ...] = (),
+    additional_read_only_paths: tuple[Path, ...] = (),
 ) -> list[str]:
     """Build the host implementation policy around explicit path classes.
 
@@ -417,6 +418,14 @@ def _codex_implement_permission_overrides(
     writable = {
         worktree_path.resolve(strict=False),
         *(path.resolve(strict=False) for path in writable_roots),
+    }
+    # Private Git uses the shared object store as an alternate. It needs read
+    # access while shared metadata must remain immutable. These paths must not
+    # override an operator/provider credential denial.
+    read_only = {
+        path.resolve(strict=False)
+        for path in additional_read_only_paths
+        if not any(path.resolve(strict=False).is_relative_to(root) for root in protected)
     }
     # Denying an ancestor already denies its descendants. Emitting both makes
     # bubblewrap try to create a child mount below the read-only denied parent.
@@ -441,6 +450,10 @@ def _codex_implement_permission_overrides(
         *(
             f"{_toml_quote(str(path))}=\"write\""
             for path in sorted(writable, key=str)
+        ),
+        *(
+            f"{_toml_quote(str(path))}=\"read\""
+            for path in sorted(read_only, key=str)
         ),
         *(
             f"{_toml_quote(str(path))}=\"deny\""
@@ -988,7 +1001,7 @@ class CodexAgent:
                 writable_roots,
                 excluded_env_keys=_codex_mcp_secret_env_keys(mcp_servers),
                 provider_home=provider_home,
-                additional_protected_paths=(
+                additional_read_only_paths=(
                     git_isolation.read_only_paths if git_isolation is not None else ()
                 ),
             ),
@@ -1040,7 +1053,7 @@ class CodexAgent:
             network_enabled=False,
             ignore_rules=False,
             strict_config=False,
-            additional_protected_paths=(
+            additional_read_only_paths=(
                 git_isolation.read_only_paths if git_isolation is not None else ()
             ),
         )

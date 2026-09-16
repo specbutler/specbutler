@@ -661,8 +661,8 @@ class TestCodexAgent:
         )
         assert f'{json.dumps(str(tmp_path / ".spec-state"))}="write"' in filesystem_policy
         assert f'{json.dumps(str(private_git.resolve()))}="write"' in filesystem_policy
-        assert f'{json.dumps(str((worktree / ".git").resolve()))}="deny"' in filesystem_policy
-        assert f'{json.dumps(str((common_git / "objects").resolve()))}="deny"' in filesystem_policy
+        assert f'{json.dumps(str((worktree / ".git").resolve()))}="read"' in filesystem_policy
+        assert f'{json.dumps(str((common_git / "objects").resolve()))}="read"' in filesystem_policy
         assert f'{json.dumps(str(gitdir.resolve()))}="write"' not in filesystem_policy
         assert f'{json.dumps(str(common_git.resolve()))}="write"' not in filesystem_policy
 

@@ -708,6 +708,22 @@ def test_local_review_transports_large_prompt_over_stdin(tmp_path: Path) -> None
     assert all(len(argument) < 32_000 for argument in cmd)
 
 
+def test_codex_read_only_paths_cannot_override_credential_denials(tmp_path: Path) -> None:
+    protected = tmp_path / "operator-state"
+    with patch(
+        "spec_runtime.agent_adapter.protected_operator_paths",
+        return_value=(protected,),
+    ):
+        overrides = _codex_implement_permission_overrides(
+            tmp_path / "worktree", [],
+            additional_read_only_paths=(protected, protected / "credentials"),
+        )
+    policy = next(item for item in overrides if ".filesystem=" in item)
+    assert f'{json.dumps(str(protected))}="deny"' in policy
+    assert f'{json.dumps(str(protected))}="read"' not in policy
+    assert f'{json.dumps(str(protected / "credentials"))}="read"' not in policy
+
+
 def test_scoped_outbox_round_trip_uses_granted_channel_until_launch_cleanup(
     tmp_path: Path,
 ) -> None:
