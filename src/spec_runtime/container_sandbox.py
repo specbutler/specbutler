@@ -125,7 +125,7 @@ def sandbox_probe_failure(returncode: int, stdout: str, stderr: str) -> str:
         "Container Codex sandbox preflight failed: " + detail + ". "
         "The worker cannot enforce the required write and deny-read profile. "
         "Use the worktree backend with its normal provider sandbox via a scoped "
-        "SPEC_CONFIG override, or repair the worker's namespace support and rerun "
+        "SPEC_CONFIG override for a new run, or repair the worker's namespace support and rerun "
         "spec container smoke. No implementation was launched; retrying the same "
         "worker or installing bubblewrap alone will not repair this failure."
     )
