@@ -2599,6 +2599,20 @@ def _apply_agent_git_environment(
         env.update(git_isolation.env_overrides)
 
 
+def _apply_host_implement_temp_environment(
+    env: dict[str, str],
+    backend: ExecutionBackend,
+    completion_outbox_path: Path,
+) -> None:
+    """Keep host scratch writable, outside the checkout, and launch-scoped."""
+    if backend.identity.backend == "container":
+        return
+    scratch = completion_outbox_path.parent / "tmp"
+    _ensure_private_agent_outbox_directory(scratch)
+    for name in ("TMPDIR", "TMP", "TEMP"):
+        env[name] = str(scratch)
+
+
 def _build_implement_agent_env(
     run: RunState,
     worktree_path: Path,
@@ -16428,6 +16442,7 @@ def _prepare_implement_launch_plan(
     # inputs and may not redirect Git away from the private layout or replace
     # the orchestrator's no-publish config entries.
     _apply_agent_git_environment(agent_env, worktree_path, git_isolation)
+    _apply_host_implement_temp_environment(agent_env, backend, completion_outbox_path)
 
     if adapter.capabilities.supports_mcp:
         ctx.visual_feedback_available = bool(setup_mcp_servers)
@@ -17901,6 +17916,7 @@ def _attempt_no_handshake_recovery(
             worktree_path,
             recovery_git_isolation,
         )
+        _apply_host_implement_temp_environment(recovery_env, backend, recovery_outbox_path)
         if adapter.capabilities.supports_mcp:
             recovery_ctx.visual_feedback_available = bool(setup_mcp_servers)
 
