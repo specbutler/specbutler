@@ -4085,6 +4085,30 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             argv=list(request.argv),
         )
 
+    def preflight_agent_sandbox(self, agent: str, cwd: Path) -> None:
+        """Check enforcement under the actual worker user before setup/model work."""
+        if agent != "codex":
+            return
+        from .container_sandbox import (
+            SANDBOX_PROBE_TIMEOUT,
+            ContainerSandboxUnavailableError,
+            codex_container_probe_command,
+            sandbox_probe_failure,
+        )
+
+        try:
+            result = self.run_command(CommandRequest(
+                argv=codex_container_probe_command(),
+                cwd=cwd,
+                inherit_env=False,
+                timeout=SANDBOX_PROBE_TIMEOUT,
+            ))
+            reason = sandbox_probe_failure(result.returncode, result.stdout, result.stderr)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            reason = sandbox_probe_failure(1, "", str(exc))
+        if reason:
+            raise ContainerSandboxUnavailableError(reason)
+
     def launch_agent(
         self,
         request: AgentRequest,

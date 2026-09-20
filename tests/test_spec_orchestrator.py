@@ -3069,6 +3069,43 @@ class TestPhaseImplementHandshake:
         assert run.pending_block_debugger_signature == ""
         assert run.last_block_debugger_guided_retry_signature == "sig-first"
 
+    def test_container_sandbox_failure_blocks_before_setup_and_model(self, repo: Path):
+        from spec_runtime.container_sandbox import ContainerSandboxUnavailableError, sandbox_probe_failure
+
+        run = self._make_run()
+        run.agent = "codex"
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True)
+        workspace = eb.WorkspaceHandle(path=worktree, outbox_path=repo / "outbox",
+                                       branch=run.branch, backend="container")
+        backend = MagicMock(spec=eb.ContainerExecutionBackend)
+        backend.identity = eb.BackendIdentity(backend="container", safety_mode="safe", workspace_root=".spec-workspaces")
+        reason = sandbox_probe_failure(1, "", "bwrap: No permissions to create new namespace")
+        backend.preflight_agent_sandbox.side_effect = ContainerSandboxUnavailableError(reason)
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+            patch.object(orch, "_resolve_workspace_handle", return_value=workspace),
+            patch.object(orch, "_restore_container_workspace_for_retry", return_value=workspace),
+            patch.object(orch, "_position_review_retry_workspace_head"),
+            patch.object(orch, "prepare_workspace_for_host_access"),
+            patch.object(orch, "resume_workspace_after_host_access"),
+            patch.object(orch, "_sync_orchestrator_paths_into_workspace"),
+            patch.object(orch, "_run_implement_setup_command") as setup,
+            patch.object(orch, "_run_implement_teardown_command") as teardown,
+            patch.object(orch, "_prepare_implement_launch_plan") as launch,
+            patch.object(orch, "_validate_codex_exec", return_value=True),
+            patch.object(orch, "_head_sha", return_value="abc123"),
+            patch.object(orch, "_recent_commit_lines", return_value=[]),
+        ):
+            status = orch._phase_implement_with_runtime(run, repo)
+        assert status == "blocked"
+        assert run.attempts == 0
+        assert run.last_error == reason
+        setup.assert_not_called()
+        teardown.assert_not_called()
+        launch.assert_not_called()
+        backend.preflight_agent_sandbox.assert_called_once_with("codex", worktree)
+
     def test_phase_implement_fails_before_agent_launch_when_setup_fails(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id

@@ -88,6 +88,7 @@ from .agent_git_isolation import (
 )
 from .command_runtime import CommandSpec, CommandVariants
 from .config import load_spec_runtime_config
+from .container_sandbox import ContainerSandboxUnavailableError
 from .control_plane import (
     DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
     GateRecordStore,
@@ -10410,6 +10411,8 @@ def _no_progress_retry_threshold() -> int:
 
 def _is_retryable_implement_failure_message(message: object) -> bool:
     normalized = str(message or "").strip().lower()
+    if "container codex sandbox preflight failed" in normalized:
+        return False
     if not normalized:
         return False
     return (
@@ -17361,6 +17364,12 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
             ctx.launch_number = _reserve_implement_launch(run, repo_root)
             if backend.identity.backend == "container":
                 resume_workspace_after_host_access(workspace)
+            if isinstance(backend, ContainerExecutionBackend):
+                # A host CLI/version check cannot establish that this worker's
+                # user, kernel and outer isolation can enforce the provider policy.
+                should_run_teardown = False
+                backend.preflight_agent_sandbox(run.agent, worktree_path)
+                should_run_teardown = True
             setup_manifest = _run_implement_setup_command(run, worktree_path)
             _register_setup_manifest_processes(
                 repo_root,
@@ -17401,6 +17410,9 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
         except ExecutionBackendImportError as exc:
             run.last_error = f"Container backend import failed after worker execution: {exc}"
             return "failed"
+        except ContainerSandboxUnavailableError as exc:
+            run.last_error = str(exc)
+            return "blocked"
         except (OSError, RuntimeError) as exc:
             run.last_error = str(exc)
             return "failed"
@@ -24714,6 +24726,14 @@ def _classify_phase_result(
 
     message = run.last_error or ""
     normalized = message.lower()
+    if "container codex sandbox preflight failed" in normalized:
+        metadata.update(
+            failure_type="environment",
+            failure_subtype="container_sandbox_unavailable",
+            retryable=False,
+            nonfatal=False,
+        )
+        return metadata
     if "container backend import failed" in normalized:
         metadata.update(
             {

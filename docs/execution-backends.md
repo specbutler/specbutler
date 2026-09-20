@@ -5,6 +5,54 @@ or a container. The orchestrator remains on the host in all three modes: it
 owns retry policy, run state, forge credentials, publishing, review, merge, and
 cleanup.
 
+## Codex container preflight
+
+Codex container execution requires a worker whose outer isolation permits its
+provider sandbox to run. An installed `bwrap`, a successful image build, or
+`codex --version` does not establish that capability. Before implementation
+setup and model launch, Spec Butler runs a bounded, credential-free
+`codex sandbox` probe inside the prepared worker under its effective user. It
+checks workspace and outbox writes, denial of a synthetic protected read, and
+denial of a write outside the permitted roots. Failure is an environment
+blocker (`container_sandbox_unavailable`), not a retryable missing handshake.
+The captured diagnostic is retained in the command log and run error.
+
+`spec container doctor` probes an explicitly configured worker image in a
+disposable container without mounting the repository or credentials. For a
+Dockerfile source, it reports sandbox enforcement as unverified and directs
+you to `spec container smoke`, which builds/prepares the actual worker and runs
+the same check. Neither command relaxes container privileges or disables the
+provider sandbox. The doctor image check does not replace the per-launch check
+against the actual workspace mounts.
+
+If the worker reports `bwrap: No permissions to create new namespace`, use the
+existing `worktree` backend with its normal provider sandbox via a scoped
+`SPEC_CONFIG` override for a new run, or repair and validate namespace support
+in the worker environment before resuming. Existing runs retain their backend
+identity and cannot switch backends just by changing config. Preserve the
+stalled branch and workspace before explicitly retiring/resetting an old run;
+do not increase the retry cap to repeat an unchanged environment failure.
+
+### Landlock and alternative sandbox runtimes
+
+[Landlock](https://docs.kernel.org/userspace-api/landlock.html) can restrict
+unprivileged processes without creating user namespaces. Its ABI and enabled
+rights must be checked at runtime; availability alone does not establish the
+required filesystem, network, credential, or process-lifecycle boundary.
+Codex's current Linux sandbox still uses Bubblewrap. Installing a Landlock
+wrapper does not change the sandbox Codex creates internally.
+
+The [Vetto proposal on #16](https://github.com/specbutler/specbutler/issues/16#issuecomment-5745232187)
+is a possible future integration, not a supported replacement. Vetto's
+[platform boundary documentation](https://github.com/shleder/vetto/blob/main/docs/platform-backends.md)
+also uses user/mount namespaces for secret masking and network/PID namespaces
+for its full Linux boundary. Its current namespace-free FS-only path blocks
+network access, so it is not equivalent to our network-enabled provider
+session. A replacement must demonstrate the exact
+Spec Butler write/deny-read contract, provider-credential separation, MCP
+behavior, and descendant cleanup under ordinary worker restrictions before it
+can replace the existing policy. The preflight does not silently switch runtimes.
+
 ## Choose a backend
 
 | Backend | Use it when | Isolation and cost |
