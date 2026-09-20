@@ -58,6 +58,8 @@ class FakeRunner:
             )
         if argv == [self.engine, "info"]:
             return subprocess.CompletedProcess(argv, 0, "ok\n", "")
+        if "--entrypoint" in argv and "python3" in argv:
+            return subprocess.CompletedProcess(argv, 0, "SPEC_CODEX_CONTAINER_SANDBOX_ENFORCED\n", "")
         if argv[:2] == [self.engine, "run"]:
             return subprocess.CompletedProcess(argv, 0, "hello\n", "")
         return subprocess.CompletedProcess(argv, 0, "", "")

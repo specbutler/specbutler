@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass, replace
@@ -22,9 +23,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import BootstrapCacheConfig, SpecRuntimeConfig, load_repo_spec_runtime_config
+from .container_sandbox import (
+    SANDBOX_PROBE_TIMEOUT,
+    codex_container_probe_command,
+    sandbox_probe_failure,
+)
 from .execution_backend import (
     CommandRequest,
     CommandResult,
+    ContainerExecutionBackend,
     ExecutionBackend,
     WorkspaceHandle,
     _first_link_or_junction,
@@ -941,7 +948,52 @@ def run_doctor_checks(
         )
     )
     checks.extend(_config_checks(repo_root, config, env=env))
+    if info.returncode == 0 and "codex" in config.agents.allowed:
+        checks.append(_codex_worker_sandbox_check(repo_root, config, runner, system_name))
     return checks
+
+
+def _codex_worker_sandbox_check(
+    repo_root: Path, config: SpecRuntimeConfig, runner: object, system_name: str,
+) -> CheckResult:
+    """Probe a configured image without mounting credentials or the checkout.
+
+    Doctor does not build a Dockerfile. Smoke/implementation probe the prepared
+    worker as well, including its actual mounts, before launching a model.
+    """
+    image = config.execution.container.image
+    if not image:
+        return CheckResult(
+            "Codex worker sandbox", False,
+            "not verified: a Dockerfile and a working engine do not prove sandbox enforcement",
+            ("Run `spec container smoke` to build and probe the configured worker, "
+             "or configure a prepared [execution.container].image for this check.",),
+        )
+    engine = config.execution.container.engine or "docker"
+    name = f"spec-sandbox-doctor-{uuid.uuid4().hex}"
+    argv = [engine, "run", "--rm", "--name", name, "--pull=never", "--network=none"]
+    if system_name != "Windows" and hasattr(os, "getuid"):
+        argv += ["--user", f"{os.getuid()}:{os.getgid()}"]
+    for path in ("/workspace/source", "/workspace/outbox"):
+        argv += ["--tmpfs", f"{path}:mode=1777"]
+    argv += ["--entrypoint", "python3", image, *codex_container_probe_command()[1:]]
+    try:
+        result = runner.run(argv, cwd=repo_root, timeout=SANDBOX_PROBE_TIMEOUT)
+        reason = sandbox_probe_failure(result.returncode, result.stdout, result.stderr)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        reason = sandbox_probe_failure(1, "", str(exc))
+        # Killing a Docker client does not kill its container. Remove only this
+        # diagnostic's unique container; never enumerate or sweep other workers.
+        try:
+            cleanup = runner.run([engine, "rm", "-f", name], cwd=repo_root, timeout=10)
+            if cleanup.returncode and "no such" not in (cleanup.stderr or "").lower():
+                reason += f" Diagnostic cleanup failed for {name}: {_one_line(cleanup.stderr)}"
+        except (OSError, subprocess.TimeoutExpired):
+            reason += f" Diagnostic cleanup could not confirm removal of {name}."
+    return CheckResult(
+        "Codex worker sandbox", not reason,
+        reason or f"{image}: workspace/outbox writes, protected reads and external writes checked",
+    )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -1168,6 +1220,10 @@ def run_smoke(
         print(f"Prepared disposable container backend workspace: {workspace.path}")
         if workspace.metadata.get("logs_path"):
             print(f"Logs: {workspace.metadata['logs_path']}")
+
+        if isinstance(backend, ContainerExecutionBackend):
+            for agent in config.agents.allowed:
+                backend.preflight_agent_sandbox(agent, workspace.path)
 
         commands = [
             ("git", ["git", "--version"]),
