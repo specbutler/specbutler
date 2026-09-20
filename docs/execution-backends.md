@@ -65,6 +65,13 @@ The default is `worktree`. Existing projects do not need an `[execution]`
 section unless they want a different backend or an explicit opt-out from
 future rollout policy.
 
+Host implementation and handshake-recovery sessions receive `TMPDIR`, `TMP`,
+and `TEMP` pointing to a private `tmp` directory under their launch-scoped
+completion outbox. This is outside the checkout and already covered by the
+launch's writable grant. It is removed with that launch's outbox. Repository
+setup values cannot redirect these variables; container sessions retain their
+worker-specific temporary paths.
+
 On native Windows, the supported tier is limited to Windows 11, a local fixed
 NTFS repository, Codex, PowerShell, and the `worktree` backend. The clone and
 Docker Desktop container combinations are not release-qualified on Windows;

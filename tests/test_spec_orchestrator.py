@@ -4739,6 +4739,7 @@ class TestPhaseImplementHandshake:
         setup_calls = 0
         captured_kwargs: list[dict[str, object]] = []
         captured_envs: list[dict[str, str]] = []
+        scratch_paths: list[Path] = []
 
         def fake_run_setup_command(*_args, **_kwargs):
             nonlocal setup_calls
@@ -4752,6 +4753,9 @@ class TestPhaseImplementHandshake:
                     "SPEC_PATH": "specs/other-spec.md",
                     "SPEC_ATTEMPT": "999",
                     "SPEC_IMPLEMENT_LAUNCH": "999",
+                    "TMPDIR": str(worktree / "wrong-scratch"),
+                    "TMP": str(worktree / "wrong-scratch"),
+                    "TEMP": str(worktree / "wrong-scratch"),
                 },
                 failure=orch.ImplementSetupFailure(
                     command="scripts/implement-setup.sh",
@@ -4774,6 +4778,12 @@ class TestPhaseImplementHandshake:
         def fake_spawn(cmd, cwd=None, env=None, **kwargs):
             del cwd, kwargs
             captured_envs.append(dict(env or {}))
+            scratch = Path(env["TMPDIR"])
+            assert env["TMP"] == env["TEMP"] == str(scratch)
+            assert scratch.parent == Path(env["SPEC_COMPLETION_OUTBOX"]).parent
+            assert not scratch.is_relative_to(worktree)
+            (scratch / "test.tmp").write_text("writable")
+            scratch_paths.append(scratch)
             if recovery_call_index:
                 _write_fake_agent_completion_outbox(
                     env,
@@ -4801,6 +4811,9 @@ class TestPhaseImplementHandshake:
 
         assert status == "passed"
         assert recovery_call_index, "recovery agent should have been built"
+        assert len(scratch_paths) == 2
+        assert scratch_paths[0] != scratch_paths[1]
+        assert all(not path.exists() for path in scratch_paths)
         recovery_kwargs = captured_kwargs[recovery_call_index[0]]
         recovery_setup_prompt = recovery_kwargs.get("setup_prompt") or ""
         assert "prepare step failed" in recovery_setup_prompt
