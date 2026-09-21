@@ -1225,6 +1225,55 @@ def test_run_reaps_descendant_that_inherits_redirected_stdio(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_exited_process_drains_output_after_communication_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_supervisor, "_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS", 0.2)
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "import sys; print('result'); print('diagnostic', file=sys.stderr)"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        # Reap only the leader, leaving its captured output for ManagedProcess.
+        managed.process.wait(timeout=5.0)
+        stdout, stderr = managed.communicate(timeout=0)
+        assert stdout.strip() == "result"
+        assert stderr.strip() == "diagnostic"
+        assert not managed.owned_tree_active()
+    finally:
+        terminate_managed_process_tree(managed, grace_seconds=0)
+        managed.process.communicate(timeout=2.0)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
+def test_output_drain_stays_bounded_when_external_writer_holds_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_supervisor, "_STRICT_PROCESS_TREE_KILL_TIMEOUT_SECONDS", 0.2)
+    read_fd, write_fd = os.pipe()
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [sys.executable, "-c", "print('result', flush=True)"],
+        stdout=write_fd,
+        stderr=subprocess.PIPE,
+    )
+    managed.process.stdout = os.fdopen(read_fd, "rb")
+    try:
+        managed.process.wait(timeout=5.0)
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="redirected stdio did not close"):
+            managed.communicate(timeout=0)
+        assert time.monotonic() - started < 2.0
+        assert not managed.owned_tree_active()
+        os.fstat(write_fd)  # The unrelated parent writer remains owned by us.
+    finally:
+        os.close(write_fd)
+        terminate_managed_process_tree(managed, grace_seconds=0)
+        managed.process.communicate(timeout=2.0)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_managed_communicate_timeout_preserves_tree_for_polling_retry() -> None:
     managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
         [

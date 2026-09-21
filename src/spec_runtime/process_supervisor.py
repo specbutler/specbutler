@@ -2600,8 +2600,12 @@ class ManagedProcess:
         drain_deadline: float | None = None
         communicate_input = input
         while True:
+            # Once the owned tree has exited, use its bounded drain window.
+            # Reusing an expired caller poll passes timeout=0 to Popen, which
+            # can raise before collecting even already-buffered output/EOF.
+            active_deadline = drain_deadline if drain_deadline is not None else deadline
             remaining = (
-                None if deadline is None else max(0.0, deadline - time.monotonic())
+                None if active_deadline is None else max(0.0, active_deadline - time.monotonic())
             )
             wait_timeout = _MANAGED_PROCESS_IO_POLL_SECONDS
             if remaining is not None:
