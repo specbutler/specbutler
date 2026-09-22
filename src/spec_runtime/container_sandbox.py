@@ -48,7 +48,6 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import shutil
 import sys
 import tempfile
 
@@ -83,25 +82,13 @@ with contextlib.ExitStack() as stack:
             str(private_auth)]
     env = {key: os.environ[key] for key in ('PATH', 'LANG') if key in os.environ}
     env.update(HOME=str(external), CODEX_HOME=str(home))
-    # Codex startup file reads re-exec an absolute alias inside the denied
-    # provider home. Exercise that path too, without contacting a model.
-    helper_target = shutil.which('codex-linux-sandbox')
-    if helper_target is None:
-        raise SystemExit('Codex system sandbox helper is missing')
-    helper_dir = home / 'tmp' / 'arg0' / 'codex-arg0preflight'
-    helper_dir.mkdir(parents=True)
-    helper = helper_dir / 'codex-linux-sandbox'
-    helper.symlink_to(helper_target)
     try:
-        helper_result = subprocess.run(
-            ['bwrap', '--unshare-user', '--unshare-pid', '--die-with-parent',
-             '--ro-bind', '/', '/', '--dev', '/dev', '--tmpfs', str(home),
-             '--', str(helper), '--help'],
-            cwd=workspace, env=env, stdin=subprocess.DEVNULL,
-            capture_output=True, text=True, timeout=5)
-        if helper_result.returncode:
-            print(helper_result.stderr, file=sys.stderr)
-            raise SystemExit('Codex protected-home helper startup probe failed')
+        capability = subprocess.run(['bwrap', '--help'], env=env,
+                                    capture_output=True, text=True, timeout=5)
+        if capability.returncode or '--argv0' not in capability.stdout:
+            raise SystemExit('Bubblewrap must support --argv0 for Codex startup '
+                             'with its credential home denied; rebuild the worker '
+                             'with a current Bubblewrap (validated: 0.12.0)')
         result = subprocess.run(argv, cwd=workspace, env=env, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as exc:

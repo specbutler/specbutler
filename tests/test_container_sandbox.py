@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import tomllib
@@ -13,6 +14,7 @@ from spec_runtime import orchestrator as orch
 from spec_runtime.config import ContainerExecutionConfig, ExecutionConfig, SpecRuntimeConfig
 from spec_runtime.container_sandbox import (
     _CHILD_SCRIPT,
+    _SETUP_SCRIPT,
     SANDBOX_PROBE_MARKER,
     SANDBOX_PROBE_TIMEOUT,
     ContainerSandboxUnavailableError,
@@ -20,6 +22,33 @@ from spec_runtime.container_sandbox import (
     sandbox_probe_failure,
 )
 from spec_runtime.execution_backend import CommandResult, ContainerExecutionBackend
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="worker probe runs on Linux")
+@pytest.mark.parametrize("supports_argv0", [False, True])
+def test_probe_checks_bwrap_capability_and_still_requires_enforcement(tmp_path, supports_argv0):
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    workspace, outbox = tmp_path / "workspace", tmp_path / "outbox"
+    workspace.mkdir()
+    outbox.mkdir()
+    called = tmp_path / "provider-called"
+    bwrap = binaries / "bwrap"
+    bwrap.write_text("#!/bin/sh\nprintf '%s\\n' " + ("--argv0" if supports_argv0 else "--help") + "\n")
+    bwrap.chmod(0o755)
+    codex = binaries / "codex"
+    codex.write_text("#!/bin/sh\nprintf called > " + shlex.quote(str(called)) + "\n")
+    codex.chmod(0o755)
+    result = subprocess.run(
+        [sys.executable, "-c", _SETUP_SCRIPT, json.dumps([[], str(workspace), str(outbox), ""])],
+        env={"PATH": str(binaries), "LANG": "C"}, capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert called.exists() is supports_argv0
+    if supports_argv0:
+        assert "did not prove the boundary" in result.stderr
+    else:
+        assert "Bubblewrap must support --argv0" in result.stderr
 
 
 def test_probe_uses_implementation_profile_without_provider_or_exec():

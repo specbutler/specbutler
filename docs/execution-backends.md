@@ -341,16 +341,17 @@ Simply loading it does not attach it to existing containers or change Docker's
 default profile. A profile loaded from a checkout without installation under
 `/etc/apparmor.d` is temporary and will not survive reboot.
 
-For npm-distributed Codex, expose `codex-linux-sandbox` and `apply_patch` as
-root-owned system PATH aliases to the installed native Codex executable.
-Codex 0.154.0 also re-executes absolute aliases under CODEX_HOME during startup
-filesystem reads. Install the bundled `spec_runtime/codex_bwrap.py` as a
-root-owned executable at `/usr/local/bin/bwrap`, retaining the original
-Bubblewrap at `/usr/bin/bwrap`. This compatibility launcher redirects only the
-Codex helper command in its known worker/synthetic-preflight location to the
-system alias; it preserves every sandbox flag and command argument.
-CODEX_HOME remains denied because it contains provider credentials. Pin the provider
-version used to validate the image and rerun the probe when upgrading it.
+Use a security-maintained Bubblewrap with `--argv0` support (validated here:
+0.12.0). Codex needs that option to re-execute its native helper while keeping
+its credential home denied. The preflight rejects older Bubblewrap before
+launching Codex; installing helper aliases inside the hidden home is insufficient.
+Pin provider and sandbox versions and rerun the probe after upgrades.
+
+Codex 0.154.0 also recognizes an unavailable proc mount by its legacy
+`/newroot/proc` error text. Bubblewrap 0.12.0 changed that diagnostic to `/proc`.
+The validated worker build retains the legacy spelling for that one error;
+mount operations, errno, and exit status remain unchanged. This permits Codex's
+existing proc-mount fallback without widening the worker's procfs access.
 
 Run `spec container doctor` with a configured image, then `spec container smoke`
 to check the actual worker. Both use the selected policy; the Codex enforcement
