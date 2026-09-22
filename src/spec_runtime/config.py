@@ -346,7 +346,7 @@ def _parse_container_execution_section(payload: object) -> ContainerExecutionCon
         payload.get("playwright_mcp", {})
     )
     if sandbox_profile == "nested-v1" and (
-        engine != "docker" or compose_file or playwright_mcp.topology != "in-worker"
+        engine != "docker" or compose_file or playwright_mcp.topology == "sidecar"
     ):
         raise SpecConfigError(
             "The nested-v1 sandbox profile requires Docker with in-worker services "

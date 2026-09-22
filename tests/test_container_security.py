@@ -34,6 +34,17 @@ def test_nested_policy_is_explicit_and_cannot_inject_arbitrary_docker_flags():
             _parse_container_execution_section({"sandbox_profile": "nested-v1", **extra})
 
 
+@pytest.mark.parametrize("topology", ["disabled", "in-worker"])
+def test_nested_policy_accepts_services_within_worker_only(monkeypatch, topology):
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    config = _parse_container_execution_section({
+        "sandbox_profile": "nested-v1", "playwright_mcp": {"topology": topology},
+    })
+    assert "--cap-drop=ALL" in worker_security_args(
+        config, system_name="Linux", user_mapping="1000:1000",
+    )
+
+
 def test_nested_policy_rejects_sidecar_before_engine_contact(monkeypatch, tmp_path):
     monkeypatch.setattr("platform.machine", lambda: "x86_64")
     monkeypatch.setattr("os.getuid", lambda: 1000, raising=False)
