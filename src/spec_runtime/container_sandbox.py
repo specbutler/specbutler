@@ -14,6 +14,7 @@ from .agent_adapter import _codex_implement_permission_overrides
 SANDBOX_PROBE_MARKER = "SPEC_CODEX_CONTAINER_SANDBOX_ENFORCED"
 SANDBOX_PROBE_TIMEOUT = 25.0
 _DENIED_PLACEHOLDER = "/__SPECBUTLER_PROBE_DENIED__"
+_HOME_PLACEHOLDER = "/__SPECBUTLER_PROBE_HOME__"
 
 
 class ContainerSandboxUnavailableError(RuntimeError):
@@ -22,15 +23,16 @@ class ContainerSandboxUnavailableError(RuntimeError):
 _CHILD_SCRIPT = """\
 from pathlib import Path
 import sys
-workspace, outbox, denied, outside = map(Path, sys.argv[1:])
+workspace, outbox, denied, outside = map(Path, sys.argv[1:5])
 (workspace / 'write.ok').write_text('ok')
 (outbox / 'write.ok').write_text('ok')
-try:
-    denied.read_bytes()
-except (PermissionError, FileNotFoundError):
-    pass
-else:
-    raise SystemExit('sandbox allowed a protected read')
+for protected in [denied, *map(Path, sys.argv[5:])]:
+    try:
+        protected.read_bytes()
+    except (PermissionError, FileNotFoundError):
+        pass
+    else:
+        raise SystemExit('sandbox allowed a protected read')
 try:
     outside.write_text('changed')
 except (PermissionError, OSError):
@@ -57,8 +59,13 @@ with contextlib.ExitStack() as stack:
     writable = scratch(workspace)
     state = scratch(outbox)
     external = scratch()
-    home = external / 'codex'
+    # npm-installed Codex creates its sandbox-helper PATH aliases under its
+    # home, and intentionally refuses to create those aliases under /tmp.
+    # This home is synthetic, credential-free, and cleaned with the outbox.
+    home = state / 'codex'
     home.mkdir()
+    private_auth = home / 'auth.json'
+    private_auth.write_text('{"synthetic": "preflight fixture"}')
     denied = writable / 'protected.txt'
     outside = external / 'readonly.txt'
     denied.write_text('synthetic preflight fixture')
@@ -67,13 +74,21 @@ with contextlib.ExitStack() as stack:
     assert denied.read_text() == 'synthetic preflight fixture'
     outside.write_text('original')
     config_args = [arg.replace('/__SPECBUTLER_PROBE_DENIED__', str(denied))
+                   .replace('/__SPECBUTLER_PROBE_HOME__', str(home))
                    for arg in config_args]
     argv = ['codex', 'sandbox', '-C', workspace, '--include-managed-config',
             *config_args, '-P', 'specbutler-implement', sys.executable, '-c',
-            child_script, str(writable), str(state), str(denied), str(outside)]
+            child_script, str(writable), str(state), str(denied), str(outside),
+            str(private_auth)]
     env = {key: os.environ[key] for key in ('PATH', 'LANG') if key in os.environ}
     env.update(HOME=str(external), CODEX_HOME=str(home))
     try:
+        capability = subprocess.run(['bwrap', '--help'], env=env,
+                                    capture_output=True, text=True, timeout=5)
+        if capability.returncode or '--argv0' not in capability.stdout:
+            raise SystemExit('Bubblewrap must support --argv0 for Codex startup '
+                             'with its credential home denied; rebuild the worker '
+                             'with a current Bubblewrap (validated: 0.12.0)')
         result = subprocess.run(argv, cwd=workspace, env=env, stdin=subprocess.DEVNULL,
                                 capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -98,7 +113,7 @@ def codex_container_probe_command() -> list[str]:
         workspace,
         [outbox],
         provider_home=Path("/workspace/provider-homes/codex"),
-        additional_protected_paths=(Path(_DENIED_PLACEHOLDER),),
+        additional_protected_paths=(Path(_DENIED_PLACEHOLDER), Path(_HOME_PLACEHOLDER)),
     )
     config_args = [
         item
@@ -108,7 +123,7 @@ def codex_container_probe_command() -> list[str]:
     ]
     # The command runs in Linux even when constructed on a Windows coordinator.
     for remote in ("/workspace/source", "/workspace/outbox",
-                   "/workspace/provider-homes/codex", _DENIED_PLACEHOLDER):
+                   "/workspace/provider-homes/codex", _DENIED_PLACEHOLDER, _HOME_PLACEHOLDER):
         local = json.dumps(str(Path(remote).resolve()))
         config_args = [arg.replace(local, json.dumps(remote)) for arg in config_args]
     return [

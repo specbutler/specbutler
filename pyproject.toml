@@ -72,7 +72,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-spec_runtime = ["templates/*.md", "templates/*.json", "examples/*.toml", "web/static/*"]
+spec_runtime = ["templates/*.md", "templates/*.json", "examples/*.toml", "web/static/*", "profiles/*.apparmor", "profiles/*.json", "profiles/*.md", "profiles/LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
