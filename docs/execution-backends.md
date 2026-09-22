@@ -343,8 +343,13 @@ default profile. A profile loaded from a checkout without installation under
 
 For npm-distributed Codex, expose `codex-linux-sandbox` and `apply_patch` as
 root-owned system PATH aliases to the installed native Codex executable.
-Aliases generated under CODEX_HOME cannot be used: that directory contains
-provider credentials and remains denied to sandboxed commands. Pin the provider
+Codex 0.154.0 also re-executes absolute aliases under CODEX_HOME during startup
+filesystem reads. Install the bundled `spec_runtime/codex_bwrap.py` as a
+root-owned executable at `/usr/local/bin/bwrap`, retaining the original
+Bubblewrap at `/usr/bin/bwrap`. This compatibility launcher redirects only the
+Codex helper command in its known worker/synthetic-preflight location to the
+system alias; it preserves every sandbox flag and command argument.
+CODEX_HOME remains denied because it contains provider credentials. Pin the provider
 version used to validate the image and rerun the probe when upgrading it.
 
 Run `spec container doctor` with a configured image, then `spec container smoke`

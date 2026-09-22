@@ -21,7 +21,7 @@ bind/remount/propagation operations. Seccomp retains the remaining default
 allowlist and clone3 fallback restriction. It does not grant setns access.
 
 The required launch uses a non-root user, drops ALL outer capabilities, and
-enables no-new-privileges. It never mounts a Docker socket or host credentials.
+enables no-new-privileges. The disposable probe mounts neither a Docker socket nor host credentials.
 These are mandatory parts of the candidate, not optional hardening. Namespace
 and mount operations expose more kernel code than Docker's default policy;
 this is an explicit per-worker tradeoff requiring operator approval.
@@ -44,7 +44,9 @@ this is an explicit per-worker tradeoff requiring operator approval.
 - Codex helper aliases must be available on a root-owned system PATH: npm Codex
   otherwise creates them inside CODEX_HOME, which this boundary deliberately
   denies. The tested image links `codex-linux-sandbox` and `apply_patch` to the
-  installed native Codex executable outside that home.
+  installed native Codex executable outside that home. A root-owned compatibility
+  launcher additionally redirects startup filesystem reads that use the absolute
+  hidden helper path; all Bubblewrap flags are preserved.
 - A disposable bind workspace passes actual backend preparation, sandbox
   preflight, pause/resume with a host-written handoff, agent launch, runtime
   quiescence/recreation, command execution, and cleanup. Host and worker use
@@ -55,3 +57,8 @@ this is an explicit per-worker tradeoff requiring operator approval.
 reproduces the failure; `--profile nested` tests the candidate. Run with this
 checkout's `src` on PYTHONPATH and a Python environment containing Spec Butler's
 dependencies. Both commands use disposable workers and leave defaults alone.
+
+A real Codex 0.154.0 session also completed a shell write/read round trip under
+the implementation permission profile with the provider home denied. The
+preflight now catches the absolute-helper startup failure without a model call;
+the helper-alias-only image fails this check and the complete image passes.
