@@ -30,6 +30,7 @@ def test_probe_uses_implementation_profile_without_provider_or_exec():
     assert fs[workspace] == fs[outbox] == "write"
     assert fs["/workspace/provider-homes/codex"] == "deny"
     assert fs["/__SPECBUTLER_PROBE_DENIED__"] == "deny"
+    assert fs["/__SPECBUTLER_PROBE_HOME__"] == "deny"
     assert fs[":root"] == "read"
     assert "sandbox'" in argv[2]
     assert "'exec'" not in argv[2]

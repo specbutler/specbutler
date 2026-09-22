@@ -3455,6 +3455,12 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         base_ref: str = "",
         start_runtime: bool,
     ) -> WorkspaceHandle:
+        from .container_security import worker_security_args
+
+        worker_security_args(
+            self._container, system_name=self._system_name,
+            user_mapping=self._container_user_mapping() or "",
+        )
         # Retry compatibility is a filesystem-only preflight. In particular,
         # do not contact or mutate the container engine for a pre-0.5 sidecar
         # run that cannot be resumed without a protected Compose baseline.
@@ -3500,6 +3506,11 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                     "Container backend cannot change service topology while resuming "
                     "an existing run; clean or finish that run before changing config."
                 )
+            from .container_security import require_same_sandbox_profile
+
+            require_same_sandbox_profile(
+                prior_state.get("sandbox_profile", "default"), self._container.sandbox_profile,
+            )
             prior_mode = prior_state.get("workspace_mode")
             current_mode = self._effective_workspace_mode()
             if (
@@ -3710,6 +3721,7 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             "image": image,
             "workspace_mode": mode,
             "requested_workspace_mode": self._container.workspace_mode,
+            "sandbox_profile": self._container.sandbox_profile,
             "service_topology": service_topology,
             "service_env": service_env,
             "service_env_redactions": service_redactions,
@@ -3930,12 +3942,17 @@ class ContainerExecutionBackend(CloneExecutionBackend):
         )
 
     def _ensure_container_runtime_started(self, workspace_cwd: Path) -> None:
+        from .container_security import require_same_sandbox_profile
+
         run_root = self._workspace_run_root(workspace_cwd)
         if run_root is None:
             raise RuntimeError(
                 f"Container backend command cwd is not inside a prepared workspace: {workspace_cwd}"
             )
         state = self._read_container_state(run_root)
+        require_same_sandbox_profile(
+            state.get("sandbox_profile", "default"), self._container.sandbox_profile,
+        )
         paused = [
             str(item)
             for item in state.get("host_access_paused_containers", [])
@@ -7921,6 +7938,8 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 )
 
     def _start_in_worker_container(self, run_root: Path, state: dict[str, Any]) -> None:
+        from .container_security import worker_security_args
+
         if state.get("worker_container"):
             raise RuntimeError(
                 "Container backend refuses to start a second worker in a "
@@ -7953,6 +7972,9 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             CONTAINER_RUNTIME_STATE_TMPFS,
         ]
         user_mapping = self._container_user_mapping()
+        argv.extend(worker_security_args(
+            self._container, system_name=self._system_name, user_mapping=user_mapping or "",
+        ))
         if user_mapping:
             argv.extend(["--user", user_mapping])
             argv.extend(self._container_passwd_shim_argv(run_root))

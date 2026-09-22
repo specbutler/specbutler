@@ -2957,6 +2957,39 @@ def _docker_label_filter_values(argv: Sequence[str]) -> dict[str, str]:
 
 
 class TestContainerBackend:
+    def test_nested_worker_controls_and_profile_drift_fail_closed(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, sandbox_profile="nested-v1")
+        with (
+            patch("shutil.which", return_value="/usr/bin/docker"),
+            patch("platform.machine", return_value="x86_64"),
+            patch.object(backend, "_container_user_mapping", return_value="1000:1000"),
+        ):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc", spec_id="my-feature",
+                branch="code/my-feature--abc", repo_root=repo, base_ref="master",
+            )
+            state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+            assert state["sandbox_profile"] == "nested-v1"
+            worker = next(call for call in runner.calls if call[:3] == ["docker", "run", "-d"])
+            assert "--cap-drop=ALL" in worker
+            assert "--security-opt=no-new-privileges=true" in worker
+            assert "--security-opt=apparmor=specbutler-nested-v1" in worker
+            assert worker[worker.index("--user") + 1] == "1000:1000"
+            backend._container = replace(backend._container, sandbox_profile="default")
+            runner.calls.clear()
+            with pytest.raises(RuntimeError, match="cannot change sandbox profile"):
+                backend.run_command(eb.CommandRequest(argv=["true"], cwd=handle.path))
+            assert runner.calls == []
+            with pytest.raises(RuntimeError, match="cannot change sandbox profile"):
+                backend.prepare_workspace(
+                    run_id="my-feature-abc", spec_id="my-feature",
+                    branch="code/my-feature--abc", repo_root=repo, base_ref="master",
+                )
+            assert runner.calls == []
+
     def _make(
         self,
         runner: _FakeContainerRunner,
@@ -2972,6 +3005,7 @@ class TestContainerBackend:
         playwright_mcp: object | None = None,
         build_ssh: str = "",
         engine: str = "docker",
+        sandbox_profile: str = "default",
     ) -> eb.ContainerExecutionBackend:
         container_config = ContainerExecutionConfig(
             engine=engine,
@@ -2980,6 +3014,7 @@ class TestContainerBackend:
             workspace_mode=workspace_mode,
             compose_file=compose_file,
             build_ssh=build_ssh,
+            sandbox_profile=sandbox_profile,
         )
         if playwright_mcp is not None:
             container_config = replace(container_config, playwright_mcp=playwright_mcp)

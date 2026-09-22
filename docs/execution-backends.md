@@ -309,6 +309,51 @@ When cleaning up a run created by an older Spec Butler release, cleanup also
 refuses an unexpected unlabeled resource in the same Compose project so the run
 metadata remains available for manual recovery.
 
+## Explicit nested sandbox profile (Linux Docker)
+
+Docker's default seccomp/AppArmor policies can prevent Codex from creating its
+inner Bubblewrap sandbox. Installing Bubblewrap alone does not change those
+outer policies. For Linux x86_64/aarch64 Docker coordinators using in-worker
+services, an operator can explicitly select the versioned nested worker policy:
+
+```toml
+[execution.container]
+sandbox_profile = "nested-v1"
+```
+
+The default remains `"default"`. The nested policy always uses a non-root numeric
+worker uid/gid, drops all outer Linux capabilities, and enables
+`no-new-privileges`. It permits the namespace and mount operations needed by the
+inner sandbox while retaining the other Docker seccomp/AppArmor restrictions.
+This exposes additional kernel operations and must be an explicit operator
+choice. It does not use privileged containers, add SYS_ADMIN, or disable either
+security subsystem. Compose services, Podman, and other coordinator platforms
+are not supported by this policy.
+
+An administrator must install and load the bundled
+`spec_runtime/profiles/specbutler-nested-v1.apparmor` profile on the Docker daemon
+host. The corresponding seccomp JSON is supplied by the installed CLI, not by
+the model-writable checkout. Locate the AppArmor file in the installed Python
+environment, review it, then install it with root ownership under
+`/etc/apparmor.d/specbutler-nested-v1` and load it with
+`sudo apparmor_parser --replace /etc/apparmor.d/specbutler-nested-v1`.
+Simply loading it does not attach it to existing containers or change Docker's
+default profile. A profile loaded from a checkout without installation under
+`/etc/apparmor.d` is temporary and will not survive reboot.
+
+For npm-distributed Codex, expose `codex-linux-sandbox` and `apply_patch` as
+root-owned system PATH aliases to the installed native Codex executable.
+Aliases generated under CODEX_HOME cannot be used: that directory contains
+provider credentials and remains denied to sandboxed commands. Pin the provider
+version used to validate the image and rerun the probe when upgrading it.
+
+Run `spec container doctor` with a configured image, then `spec container smoke`
+to check the actual worker. Both use the selected policy; the Codex enforcement
+probe must prove workspace/outbox writes, protected-file read denial, and
+external write denial before implementation begins. Missing host profiles fail
+closed. A run records its selected policy and cannot switch policies on resume;
+create a new run when selecting a different policy.
+
 ## Operations and recovery
 
 Inspect the backend and recorded safety label with `spec status` or `spec

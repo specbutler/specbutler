@@ -126,6 +126,7 @@ class ContainerExecutionConfig:
     playwright_mcp: ContainerPlaywrightMcpConfig = field(
         default_factory=ContainerPlaywrightMcpConfig
     )
+    sandbox_profile: str = "default"
 
 
 @dataclass(frozen=True)
@@ -336,6 +337,16 @@ def _parse_container_execution_section(payload: object) -> ContainerExecutionCon
     workspace_mode = str(payload.get("workspace_mode", "auto")).strip() or "auto"
     compose_file = str(payload.get("compose_file", "")).strip()
     build_ssh = str(payload.get("build_ssh", "")).strip()
+    sandbox_profile = str(payload.get("sandbox_profile", "default")).strip()
+    if sandbox_profile not in {"default", "nested-v1"}:
+        raise SpecConfigError(
+            "[execution.container].sandbox_profile must be default or nested-v1"
+        )
+    if sandbox_profile == "nested-v1" and (engine != "docker" or compose_file):
+        raise SpecConfigError(
+            "The nested-v1 sandbox profile requires Docker with in-worker services "
+            "(no compose_file)"
+        )
     playwright_mcp = _parse_container_playwright_mcp_section(
         payload.get("playwright_mcp", {})
     )
@@ -353,6 +364,7 @@ def _parse_container_execution_section(payload: object) -> ContainerExecutionCon
         workspace_mode=workspace_mode,
         compose_file=compose_file,
         build_ssh=build_ssh,
+        sandbox_profile=sandbox_profile,
         playwright_mcp=playwright_mcp,
     )
 

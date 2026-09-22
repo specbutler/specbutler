@@ -961,6 +961,8 @@ def _codex_worker_sandbox_check(
     Doctor does not build a Dockerfile. Smoke/implementation probe the prepared
     worker as well, including its actual mounts, before launching a model.
     """
+    from .container_security import worker_security_args
+
     image = config.execution.container.image
     if not image:
         return CheckResult(
@@ -972,8 +974,16 @@ def _codex_worker_sandbox_check(
     engine = config.execution.container.engine or "docker"
     name = f"spec-sandbox-doctor-{uuid.uuid4().hex}"
     argv = [engine, "run", "--rm", "--name", name, "--pull=never", "--network=none"]
+    user_mapping = ""
     if system_name != "Windows" and hasattr(os, "getuid"):
-        argv += ["--user", f"{os.getuid()}:{os.getgid()}"]
+        user_mapping = f"{os.getuid()}:{os.getgid()}"
+        argv += ["--user", user_mapping]
+    try:
+        argv.extend(worker_security_args(
+            config.execution.container, system_name=system_name, user_mapping=user_mapping,
+        ))
+    except RuntimeError as exc:
+        return CheckResult("Codex worker sandbox", False, str(exc))
     for path in ("/workspace/source", "/workspace/outbox"):
         argv += ["--tmpfs", f"{path}:mode=1777"]
     argv += ["--entrypoint", "python3", image, *codex_container_probe_command()[1:]]
