@@ -342,14 +342,16 @@ def _parse_container_execution_section(payload: object) -> ContainerExecutionCon
         raise SpecConfigError(
             "[execution.container].sandbox_profile must be default or nested-v1"
         )
-    if sandbox_profile == "nested-v1" and (engine != "docker" or compose_file):
-        raise SpecConfigError(
-            "The nested-v1 sandbox profile requires Docker with in-worker services "
-            "(no compose_file)"
-        )
     playwright_mcp = _parse_container_playwright_mcp_section(
         payload.get("playwright_mcp", {})
     )
+    if sandbox_profile == "nested-v1" and (
+        engine != "docker" or compose_file or playwright_mcp.topology != "in-worker"
+    ):
+        raise SpecConfigError(
+            "The nested-v1 sandbox profile requires Docker with in-worker services "
+            "(no compose_file or Playwright sidecar)"
+        )
 
     if workspace_mode not in ALLOWED_CONTAINER_WORKSPACE_MODES:
         allowed = ", ".join(ALLOWED_CONTAINER_WORKSPACE_MODES)

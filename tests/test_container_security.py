@@ -10,6 +10,7 @@ import pytest
 from spec_runtime import container
 from spec_runtime.config import (
     ContainerExecutionConfig,
+    ContainerPlaywrightMcpConfig,
     ExecutionConfig,
     SpecConfigError,
     SpecRuntimeConfig,
@@ -24,9 +25,33 @@ def test_nested_policy_is_explicit_and_cannot_inject_arbitrary_docker_flags():
     for name in ("unconfined", "--privileged", "", "custom.json"):
         with pytest.raises(SpecConfigError, match="sandbox_profile"):
             _parse_container_execution_section({"sandbox_profile": name})
-    for extra in ({"engine": "podman"}, {"compose_file": "services.yml"}):
+    for extra in (
+        {"engine": "podman"},
+        {"compose_file": "services.yml"},
+        {"playwright_mcp": {"topology": "sidecar"}},
+    ):
         with pytest.raises(SpecConfigError, match="requires Docker"):
             _parse_container_execution_section({"sandbox_profile": "nested-v1", **extra})
+
+
+def test_nested_policy_rejects_sidecar_before_engine_contact(monkeypatch, tmp_path):
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    monkeypatch.setattr("os.getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr("os.getgid", lambda: 1000, raising=False)
+    config = SpecRuntimeConfig(execution=ExecutionConfig(
+        backend="container", container=ContainerExecutionConfig(
+            image="worker", sandbox_profile="nested-v1",
+            playwright_mcp=ContainerPlaywrightMcpConfig(topology="sidecar"),
+        ),
+    ))
+    runner = Mock()
+    check = container._codex_worker_sandbox_check(tmp_path, config, runner, "Linux")
+    assert not check.ok
+    runner.run.assert_not_called()
+    with pytest.raises(RuntimeError, match="in-worker services"):
+        worker_security_args(
+            config.execution.container, system_name="Linux", user_mapping="1000:1000",
+        )
 
 
 @pytest.mark.parametrize("user", ["", "root", "0:0", "0:1000", "1000:0", "1000", "foo:bar"])

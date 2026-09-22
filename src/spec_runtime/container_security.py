@@ -32,6 +32,7 @@ def worker_security_args(
         or platform.machine() not in {"x86_64", "aarch64"}
         or config.engine != "docker"
         or config.compose_file
+        or config.playwright_mcp.topology != "in-worker"
     ):
         raise RuntimeError(
             "nested-v1 requires a Linux x86_64/aarch64 Docker coordinator "
