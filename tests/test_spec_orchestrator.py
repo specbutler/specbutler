@@ -16189,8 +16189,9 @@ class TestImplementSetupTeardownHelpers:
             "args": ["tool.py"],
         }
 
+    @pytest.mark.parametrize("reason", ["initial", "verify_retry"])
     def test_prepare_implement_writes_claude_mcp_config_for_container_backend(
-        self, repo: Path
+        self, repo: Path, reason: str
     ):
         run = self._run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -16227,8 +16228,15 @@ class TestImplementSetupTeardownHelpers:
             def sync_host_paths_into_workspace(self, workspace_path, relative_paths):
                 sync_calls.append((workspace_path, tuple(relative_paths)))
 
+        build_agent_command = orch._build_agent_command
+
         def fake_build_agent_command(*args, **kwargs):
-            del args, kwargs
+            # Check the actual provider prompt, not just the persisted context.
+            assert (kwargs["retry_context"] is None) == (reason == "initial")
+            prompt = build_agent_command(*args, **kwargs)[-1]
+            assert prompt.count("Use the approved aggregate migration.") == 1
+            assert "Provided by: operator" in prompt
+            assert "Provided at: 2026-09-23T18:25:17Z" in prompt
             payload = json.loads((worktree / ".claude" / "mcp-servers.json").read_text())
             playwright = payload["mcpServers"]["playwright"]
             assert playwright["command"] == "node"
@@ -16244,11 +16252,14 @@ class TestImplementSetupTeardownHelpers:
             return ["agent"]
 
         ctx = orch.ImplementContext(
-            implement_reason="initial",
+            implement_reason=reason,
             run_id=run.run_id,
             attempt_number=1,
             spec_path="specs/my-feature.md",
             spec_revision="sha256:deadbeef",
+            operator_steering_message="Use the approved aggregate migration.",
+            operator_steering_provided_by="operator",
+            operator_steering_provided_at="2026-09-23T18:25:17Z",
         )
 
         with (
@@ -16271,7 +16282,7 @@ class TestImplementSetupTeardownHelpers:
                 repo,
                 worktree,
                 ctx,
-                reason="initial",
+                reason=reason,
                 use_stream_json=False,
             )
 
