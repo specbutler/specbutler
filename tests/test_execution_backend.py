@@ -6149,7 +6149,8 @@ class TestContainerBackend:
         state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
         assert "container-123" in state["containers"]
 
-    def test_agent_launch_keeps_live_completion_outbox(self, tmp_path: Path):
+    @pytest.mark.parametrize("agent", ["claude", "codex"])
+    def test_agent_launch_keeps_live_completion_outbox(self, tmp_path: Path, agent: str):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         runner = _FakeContainerRunner()
@@ -6165,13 +6166,16 @@ class TestContainerBackend:
 
         result = backend.launch_agent(
             eb.AgentRequest(
-                argv=["claude", "-p", "implement"],
+                argv=[agent, "-p" if agent == "claude" else "exec", "implement"],
                 cwd=handle.path,
                 env={
                     "APP_FEATURE_FLAG": "agent-feature-enabled",
                     "DATABASE_URL": "postgres://agent:credential@db/spec",
                     "DB_PASSWORD": "declared-db-password",
                     "STRIPE_API_KEY": "declared-stripe-key",
+                    "TMPDIR": "/var/folders/host-only/tmp",
+                    "TMP": "/host-only/tmp",
+                    "TEMP": "/host-only/tmp",
                 },
                 declared_env_keys=frozenset({"DB_PASSWORD", "STRIPE_API_KEY"}),
             )
@@ -6194,6 +6198,9 @@ class TestContainerBackend:
             "DATABASE_URL": "postgres://agent:credential@db/spec",
             "DB_PASSWORD": "declared-db-password",
             "STRIPE_API_KEY": "declared-stripe-key",
+            "TMPDIR": "/workspace/outbox",
+            "TMP": "/workspace/outbox",
+            "TEMP": "/workspace/outbox",
         }.items():
             assert key in agent_call
             assert f"{key}={value}" not in agent_call

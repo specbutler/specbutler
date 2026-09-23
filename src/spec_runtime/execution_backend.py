@@ -4144,6 +4144,11 @@ class ContainerExecutionBackend(CloneExecutionBackend):
             state=state,
             declared_env_keys=request.declared_env_keys,
         )
+        # Host temporary paths stay filtered out. Nested provider sandboxes can
+        # also deny /tmp, so choose an existing writable worker mount outside
+        # the checkout instead of letting tempfile fall back to the source tree.
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            worker_env[key] = "/workspace/outbox"
         argv = self._container_run_argv(
             run_root=run_root,
             cwd=request.cwd,
