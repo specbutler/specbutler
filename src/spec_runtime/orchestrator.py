@@ -16476,6 +16476,11 @@ def _prepare_implement_launch_plan(
         # retry_context intentionally remains None there because it also marks
         # no-handshake recovery launches throughout the existing interface.
         "intake": ctx.intake,
+        # Steering is launch context too, including before the first attempt.
+        # Use the captured snapshot rather than rereading a midflight update.
+        "operator_steering_message": ctx.operator_steering_message,
+        "operator_steering_provided_by": ctx.operator_steering_provided_by,
+        "operator_steering_provided_at": ctx.operator_steering_provided_at,
         "spec_id": run.spec_id,
         "spec_path": _spec_path_for_run(run),
         "spec_revision": run.spec_revision,
@@ -19354,6 +19359,9 @@ def _build_agent_command(
     externally_sandboxed: bool = False,
     provider_home: Path | None = None,
     git_isolation: AgentGitIsolation | None = None,
+    operator_steering_message: str | None = None,
+    operator_steering_provided_by: str = "",
+    operator_steering_provided_at: str = "",
 ) -> list[str]:
     """Build the command to launch the agent."""
     acceptance_checklist = list(
@@ -19394,13 +19402,17 @@ def _build_agent_command(
         if resolved_operator_request is not None
         else _format_resolved_input_for_prompt(input_question, input_response)
     )
+    if operator_steering_message is None and retry_context is not None:
+        operator_steering_message = retry_context.operator_steering_message
+        operator_steering_provided_by = retry_context.operator_steering_provided_by
+        operator_steering_provided_at = retry_context.operator_steering_provided_at
     resolved_steering = (
         _format_operator_steering_for_prompt(
-            retry_context.operator_steering_message,
-            provided_by=retry_context.operator_steering_provided_by,
-            provided_at=retry_context.operator_steering_provided_at,
+            operator_steering_message,
+            provided_by=operator_steering_provided_by,
+            provided_at=operator_steering_provided_at,
         )
-        if retry_context is not None and retry_context.operator_steering_message
+        if operator_steering_message
         else ""
     )
     intake_context = intake
