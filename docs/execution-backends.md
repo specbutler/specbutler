@@ -69,8 +69,11 @@ Host implementation and handshake-recovery sessions receive `TMPDIR`, `TMP`,
 and `TEMP` pointing to a private `tmp` directory under their launch-scoped
 completion outbox. This is outside the checkout and already covered by the
 launch's writable grant. It is removed with that launch's outbox. Repository
-setup values cannot redirect these variables; container sessions retain their
-worker-specific temporary paths.
+setup values cannot redirect these variables. Container agent sessions use the
+existing `/workspace/outbox` mount for all three variables, replacing host paths
+after environment filtering. This keeps temporary files outside the checkout
+even when the nested provider sandbox denies writes to `/tmp`; it does not add
+any writable roots or change the sandbox policy.
 
 On native Windows, the supported tier is limited to Windows 11, a local fixed
 NTFS repository, Codex, PowerShell, and the `worktree` backend. The clone and
