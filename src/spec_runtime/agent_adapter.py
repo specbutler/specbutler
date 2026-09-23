@@ -365,12 +365,14 @@ def _codex_git_metadata_dirs(
     worktree_path: Path,
     git_isolation: AgentGitIsolation | None = None,
 ) -> list[Path]:
-    """Return only private external Git paths needed for local commits."""
+    """Return isolated Git paths that Codex must explicitly allow for commits."""
     dot_git = worktree_path / ".git"
-    # A full clone's metadata is already below the workspace root. No external
-    # writable root is needed (notably for clone/container execution).
+    if dot_git.is_symlink():
+        raise RuntimeError("Refusing symlinked Git metadata without private Git isolation")
+    # Codex protects .git even below a writable checkout. A disposable full
+    # clone needs its own explicit grant; linked worktrees still use private Git.
     if dot_git.is_dir():
-        return []
+        return [dot_git.resolve(strict=True)]
     if not dot_git.exists():
         return []
     if git_isolation is None:
@@ -436,9 +438,15 @@ def _codex_implement_permission_overrides(
     # Private Git uses the shared object store as an alternate. It needs read
     # access while shared metadata must remain immutable. These paths must not
     # override an operator/provider credential denial.
+    clone_git = worktree_path / ".git"
+    clone_controls = tuple(
+        clone_git / name
+        for name in ("config", "config.worktree", "hooks", "info")
+        if clone_git.is_dir() and (clone_git / name).exists()
+    )
     read_only = {
         path.resolve(strict=False)
-        for path in additional_read_only_paths
+        for path in (*additional_read_only_paths, *clone_controls)
         if not any(path.resolve(strict=False).is_relative_to(root) for root in protected)
     }
     # Denying an ancestor already denies its descendants. Emitting both makes
