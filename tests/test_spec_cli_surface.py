@@ -679,21 +679,27 @@ class TestCodexAgent:
                 state_dir=tmp_path / ".spec-state",
             )
 
-    def test_build_authoring_command_needs_no_external_path_for_full_clone(self, tmp_path):
+    @pytest.mark.parametrize("mode", ["implement", "authoring"])
+    def test_full_clone_can_commit_without_writing_git_configuration_or_hooks(self, tmp_path, mode):
         worktree = tmp_path / "checkout"
         gitdir = worktree / ".git"
         gitdir.mkdir(parents=True)
+        (gitdir / "config").write_text("[core]\n\tbare = false\n")
+        (gitdir / "hooks").mkdir()
+        (gitdir / "info").mkdir()
 
-        cmd = CodexAgent().build_authoring_command(
+        build = getattr(CodexAgent(), f"build_{mode}_command")
+        kwargs = {"protected_env_keys": {"AUTHORING_MCP_TOKEN"}} if mode == "authoring" else {}
+        cmd = build(
             prompt="Author a spec",
             worktree_path=worktree,
             state_dir=tmp_path / ".spec-state",
-            protected_env_keys={"AUTHORING_MCP_TOKEN"},
+            **kwargs,
         )
 
         add_dirs = [cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "--add-dir"]
         assert str(tmp_path / ".spec-state") in add_dirs
-        assert str(gitdir.resolve()) not in add_dirs
+        assert str(gitdir.resolve()) in add_dirs
 
         config_overrides = [
             cmd[index + 1] for index, value in enumerate(cmd[:-1]) if value == "-c"
@@ -701,17 +707,37 @@ class TestCodexAgent:
         filesystem_policy = next(
             value
             for value in config_overrides
-            if value.startswith("permissions.specbutler-authoring.filesystem=")
+            if value.startswith(f"permissions.specbutler-{mode}.filesystem=")
         )
         assert f'{json.dumps(str(tmp_path / ".spec-state"))}="write"' in filesystem_policy
-        assert f'{json.dumps(str(gitdir.resolve()))}="write"' not in filesystem_policy
-        assert 'permissions.specbutler-authoring.network={enabled=false}' in cmd
-        shell_policy = next(
-            value
-            for value in config_overrides
-            if value.startswith("shell_environment_policy.exclude=")
-        )
-        assert '"AUTHORING_MCP_TOKEN"' in shell_policy
+        assert f'{json.dumps(str(gitdir.resolve()))}="write"' in filesystem_policy
+        for name in ("config", "hooks", "info"):
+            assert f'{json.dumps(str(gitdir / name))}="read"' in filesystem_policy
+        # Missing file rules break Bubblewrap mount setup; config.worktree is
+        # only protected when present, with config always immutable above.
+        assert str(gitdir / "config.worktree") not in filesystem_policy
+        if mode == "authoring":
+            assert 'permissions.specbutler-authoring.network={enabled=false}' in cmd
+            shell_policy = next(
+                value
+                for value in config_overrides
+                if value.startswith("shell_environment_policy.exclude=")
+            )
+            assert '"AUTHORING_MCP_TOKEN"' in shell_policy
+
+    def test_codex_rejects_symlinked_full_clone_metadata(self, tmp_path):
+        shared_git = tmp_path / "shared-git"
+        shared_git.mkdir()
+        worktree = tmp_path / "checkout"
+        worktree.mkdir()
+        try:
+            (worktree / ".git").symlink_to(shared_git, target_is_directory=True)
+        except OSError:
+            pytest.skip("Directory symlinks are unavailable")
+        with pytest.raises(RuntimeError, match="symlinked Git metadata"):
+            CodexAgent().build_implement_command(
+                prompt="Do the work", worktree_path=worktree, state_dir=tmp_path / ".state",
+            )
 
     def test_codex_git_metadata_dirs_ignores_non_git_directory(self, tmp_path):
         assert _codex_git_metadata_dirs(tmp_path) == []
