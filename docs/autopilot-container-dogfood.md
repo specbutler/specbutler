@@ -1,3 +1,5 @@
+> **Alpha: container mode has known reliability issues (image builds, in-worker services such as Postgres, credential refresh, nested provider sandboxing). Prefer the clone or worktree backend.**
+
 # Autopilot Container Dogfood Checklist
 
 Use this checklist before setting `[autopilot].container_default_enabled = true`

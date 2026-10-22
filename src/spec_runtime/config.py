@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import sys
 import tomllib
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
+from typing import TextIO
 
 from .command_runtime import CommandConfigurationError, CommandVariants, parse_command_variants
 from .git_common import run_git
@@ -90,6 +92,28 @@ ALLOWED_EXECUTION_BACKENDS: tuple[str, ...] = (
     SUPPORTED_EXECUTION_BACKENDS + KNOWN_FUTURE_EXECUTION_BACKENDS
 )
 ALLOWED_EXECUTION_SAFETY_MODES: tuple[str, ...] = ("safe", "full-auto", "trusted")
+CONTAINER_ALPHA_WARNING = (
+    "Alpha: container mode has known reliability issues (image builds, in-worker "
+    "services such as Postgres, credential refresh, nested provider sandboxing). "
+    "Prefer the clone or worktree backend."
+)
+
+
+def container_alpha_warning(config: object) -> str | None:
+    """Return the container-alpha warning when ``config`` selects that backend."""
+    execution = getattr(config, "execution", None)
+    if getattr(execution, "backend", "") == "container":
+        return CONTAINER_ALPHA_WARNING
+    return None
+
+
+def emit_container_alpha_warning(config: object, stream: TextIO | None = None) -> None:
+    """Print the single-line container-alpha warning to stderr when applicable."""
+    message = container_alpha_warning(config)
+    if message:
+        print(f"Warning: {message}", file=stream or sys.stderr)
+
+
 ALLOWED_CONTAINER_WORKSPACE_MODES: tuple[str, ...] = ("auto", "bind", "volume")
 ALLOWED_CONTAINER_PLAYWRIGHT_MCP_TOPOLOGIES: tuple[str, ...] = (
     "disabled",

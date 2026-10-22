@@ -22,7 +22,12 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import BootstrapCacheConfig, SpecRuntimeConfig, load_repo_spec_runtime_config
+from .config import (
+    BootstrapCacheConfig,
+    SpecRuntimeConfig,
+    emit_container_alpha_warning,
+    load_repo_spec_runtime_config,
+)
 from .container_sandbox import (
     SANDBOX_PROBE_TIMEOUT,
     codex_container_probe_command,
@@ -872,6 +877,7 @@ def _validated_gc_state_root(repo_root: Path, state_dir: str) -> Path:
 def cmd_doctor(args: argparse.Namespace) -> int:
     repo_root = Path(getattr(args, "repo_root", "") or Path.cwd()).resolve()
     config = load_repo_spec_runtime_config(repo_root)
+    emit_container_alpha_warning(config)
     checks = run_doctor_checks(repo_root, config)
     for check in checks:
         prefix = "ok" if check.ok else "fail"
