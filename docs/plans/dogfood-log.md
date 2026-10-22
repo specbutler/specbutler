@@ -43,6 +43,9 @@ it, logged because the same constraints will affect dogfood runs.
   coordinator relayed it verbatim to every linked session. **Follow-up:** briefs for
   unattended sessions should carry the user's authorization for publish and merge
   steps up front.
+- 2026-10-22 Phase 1 — Strict "branch must be up to date" rule: each merge (#40 ecb8711) left the other open PRs (#38, #41, #42) BEHIND, so auto-merge stalled. Resolution: coordinator ran `gh pr update-branch` and started a merge-train monitor that updates BEHIND auto-merge PRs every 2 minutes. Follow-up: Spec Butler's own merge phase already handles BEHIND (orchestrator ~23457); concurrent autopilot runs will hit the same serialization.
+- 2026-10-22 Phase 1 — #43 (1A) went red on all test jobs + review gate and became DIRTY after #40 merged; its session had the CI monitor off (auto_fix=false), so nothing would have woken it. Resolution: coordinator messaged it to enable the monitor, sync, and fix from CI logs. Follow-up: briefs should tell sessions to enable auto_fix when they open a PR; the sandbox `ps` block makes local full-suite runs meaningless (canary-ps-test-skip addresses this).
+- 2026-10-22 Phase 1 — Spec PR #41: the CI Codex review gate approved the specs at dbcb3df, then requested changes on the next head (only a merge of main), flagging that harness-integration could dispatch before spec-lint-and-authoring (its lint_spec tool needs spec lint). The finding was valid but newly raised — the same re-review drift seen in run history. Resolution: added the dependency (aa04bb3). Follow-up: review-convergence spec covers prior-findings context and incremental diffs.
 
 ## Phase 2 (Spec Butler runs)
 

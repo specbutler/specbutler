@@ -103,8 +103,9 @@ Write these as specs in `specs/`, review and merge the spec PRs, then run them w
 | `agent-sessions` | Turn on session persistence with `--session-id`, resume the same session for verify and review retries, take the final result from `--json-schema` / Codex `--output-schema` instead of the `spec report` handshake, and add `spec attach` to take over interactively. | Phase 1 |
 | `model-and-cost` | Model per role (implement, review, debugger, retry escalation). Save cost and tokens per run and per phase for both providers. Add `--max-budget-usd` as a stop-loss. Have `spec doctor` warn when `ANTHROPIC_API_KEY` would override subscription login. | `agent-sessions` |
 | `spec-lint-and-authoring` | A `spec lint` command (building on #39), bundled authoring and scoping prompts (generalised from retirementlab's), a critique pass before implementing, an option to put the spec and its implementation in one PR, and detection of specs already landed by hand. | Phase 1 |
+| `canary-ps-test-skip`, `canary-doctor-cli-versions` | The Phase 1 canaries (see exit criteria). | — |
 | `generality-cleanup` | Remove hardcoded retirementlab leftovers: Postgres stop on cleanup, "origin/master" and "conflicts with master" in prompts, and the pytest-only diagnostic rerun. | Phase 1 |
-| `harness-integration` | Spec Butler as a Claude Code plugin/skill/MCP server (dispatch, status, steer, take over), and the option to use the repo's CI review gates as the review phase. | `agent-sessions`, `review-convergence` |
+| `harness-integration` | Spec Butler as a Claude Code plugin/skill/MCP server (dispatch, status, steer, take over), and the option to use the repo's CI review gates as the review phase. | `agent-sessions`, `review-convergence`, `spec-lint-and-authoring` |
 
 ### Dogfood protocol
 
