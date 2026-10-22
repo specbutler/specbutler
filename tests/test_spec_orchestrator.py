@@ -40920,7 +40920,8 @@ class TestFailureClassification:
             "/h/.claude/.credentials.json is expired": "agent_auth",
             "GitHub CLI not authenticated. Run: gh auth login": "forge_auth",
             "You've hit your session limit · resets 8:30pm (America/Los_Angeles)": "provider_capacity",
-            "git push failed: ! [rejected] code/x--20260709T032323195731 (fetch first)": "publish_push",
+            "git push failed: fatal: unable to access 'https://github.com/o/r.git/': "
+            "Could not resolve host: github.com": "publish_push",
             "gh pr create failed: error connecting to api.github.com": "pr_create",
             "Timed out waiting for auto-merge on PR #12 (mergeStateStatus=BLOCKED)": "ci_wait_timeout",
         }
@@ -40939,6 +40940,13 @@ class TestFailureClassification:
         )
         assert orch.classify_failure("required checks failing: test").kind == "required_checks"
         assert orch.classify_failure("stopped by user").category is orch.FailureCategory.UNKNOWN
+        # Branch divergence keeps its remote_diverged handling; backing it off
+        # as an outage would hide the actionable error.
+        rejected = orch.classify_failure(
+            "git push failed: ! [rejected] code/x--20260709T032323195731 (fetch first)",
+            phase="publish",
+        )
+        assert not rejected.is_infrastructure
 
     def test_signature_ignores_run_ids_paths_and_wrappers(self):
         first = orch.classify_failure(

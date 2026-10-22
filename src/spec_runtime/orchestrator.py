@@ -4500,7 +4500,9 @@ def _infrastructure_failure_kind(text: str) -> tuple[str, bool, str] | None:
         return "verify_environment", True, "backend"
     if "git worktree add failed" in text and ("cannot lock" in text or "could not lock" in text):
         return "git_lock", True, "backend"
-    if text.startswith("git push failed"):
+    if text.startswith("git push failed") and not _is_non_fast_forward_push_rejection(text):
+        # A rejected non-fast-forward push is branch divergence, not an
+        # outage: it keeps the actionable remote_diverged classification.
         return "publish_push", True, "spec"
     if "gh pr create failed" in text and not _is_no_commits_between_error(text):
         return "pr_create", True, "spec"
@@ -4561,6 +4563,17 @@ def classify_failure(
         category=FailureCategory.UNKNOWN,
         kind="",
         signature=_failure_signature("unknown", raw) if raw else "",
+    )
+
+
+def _is_non_fast_forward_push_rejection(error: str) -> bool:
+    """Return True when the remote rejected a push because the branch diverged."""
+    normalized = str(error or "").lower()
+    return (
+        "fetch first" in normalized
+        or "[rejected]" in normalized
+        or "non-fast-forward" in normalized
+        or "tip of your current branch is behind" in normalized
     )
 
 
@@ -25215,12 +25228,7 @@ def _classify_phase_result(
         # remote moved somewhere this run cannot prove it owns. Surface it as
         # a distinct, clearly non-retryable subtype so operators see the
         # divergence rather than a silent retry storm.
-        non_fast_forward = (
-            "fetch first" in normalized
-            or "[rejected]" in normalized
-            or "non-fast-forward" in normalized
-            or "tip of your current branch is behind" in normalized
-        )
+        non_fast_forward = _is_non_fast_forward_push_rejection(normalized)
         metadata.update(
             {
                 "failure_type": "publish",
