@@ -2,7 +2,7 @@
 id: harness-integration
 area: backend
 priority: 60
-depends_on: [agent-sessions, review-convergence]
+depends_on: [agent-sessions, review-convergence, spec-lint-and-authoring]
 description: Drive Spec Butler from inside Claude Code and Codex sessions, and optionally use CI review gates
 ---
 
@@ -59,5 +59,6 @@ spec runs. Also allow the repo's CI review gates to serve as the review phase.
 - The review gate and sticky comment code is in `src/spec_runtime/review_gate.py` and
   `review_gate_sticky_comment.py`. Forge check reads are in
   `src/spec_runtime/forge.py`.
-- Takeover depends on `agent-sessions` (`spec attach`). CI review results must go
+- `lint_spec` depends on `spec lint` from `spec-lint-and-authoring`. Takeover
+  depends on `agent-sessions` (`spec attach`). CI review results must go
   through the convergence rules from `review-convergence`.
