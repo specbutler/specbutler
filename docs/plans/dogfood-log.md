@@ -34,6 +34,16 @@ it, logged because the same constraints will affect dogfood runs.
   probes nor `spec` runs can be launched from a session's shell. **Resolution:**
   probes and `spec` runs are launched from the user's terminal.
 
+- **2026-10-22, Phase 1:** the user fixed the sandbox settings so `gh` passes TLS
+  verification, and `gh api` and `gh pr create` now work from sessions. The
+  container-alpha session's `gh pr create` was then still denied by the auto-mode
+  classifier, because nothing in that session said the user had authorized it.
+  **Resolution:** the user granted standing authorization ("feel free to make changes
+  to the specbutler repo without further manual authorization from me"), and the
+  coordinator relayed it verbatim to every linked session. **Follow-up:** briefs for
+  unattended sessions should carry the user's authorization for publish and merge
+  steps up front.
+
 ## Phase 2 (Spec Butler runs)
 
 _No runs yet._
