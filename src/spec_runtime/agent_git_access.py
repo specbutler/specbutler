@@ -62,6 +62,13 @@ class AgentGitAccess:
             for ref in self.protected_refs:
                 ref_path = self.common_dir.joinpath(*ref.split("/"))
                 paths.extend((ref_path, ref_path.with_name(ref_path.name + ".lock")))
+            if self.protected_refs:
+                # A packed protected ref could otherwise be moved by
+                # rewriting packed-refs. Agents still create and update loose
+                # refs; only deleting a packed branch is refused.
+                paths.extend(
+                    (self.common_dir / "packed-refs", self.common_dir / "packed-refs.lock")
+                )
         return tuple(paths)
 
 

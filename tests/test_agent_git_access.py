@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -122,6 +123,8 @@ def test_linked_worktree_grants_its_gitdir_and_the_shared_common_dir(tmp_path: P
         common / "index",
         common / "refs" / "heads" / "main",
         common / "refs" / "heads" / "main.lock",
+        common / "packed-refs",
+        common / "packed-refs.lock",
     )
 
 
@@ -164,7 +167,9 @@ def test_repointed_worktree_git_file_is_rejected(tmp_path: Path) -> None:
     other_worktree = other_root / "other-worktree"
     _git(other_repository, "worktree", "add", "-b", "code/other", str(other_worktree), "main")
     other_git_dir = other_repository.resolve() / ".git" / "worktrees" / "other-worktree"
-    (worktree / ".git").write_text(f"gitdir: {other_git_dir}\n", encoding="utf-8")
+    pointer = worktree / ".git"
+    os.chmod(pointer, stat.S_IREAD | stat.S_IWRITE)  # Git for Windows marks it read-only.
+    pointer.write_text(f"gitdir: {other_git_dir}\n", encoding="utf-8")
 
     with pytest.raises(UnsafeAgentGitLayoutError, match="registered to another worktree"):
         agent_git_access(worktree)
@@ -523,6 +528,7 @@ def test_codex_probe_runs_git_under_codex_sandbox_with_the_implement_profile(
     assert not result.passed
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="srt supports macOS and Linux only")
 @pytest.mark.parametrize("backend", ["clone", "worktree"])
 def test_claude_probe_runs_git_under_srt_with_generated_settings(backend: str) -> None:
     calls: list[list[str]] = []
@@ -550,6 +556,7 @@ def test_claude_probe_runs_git_under_srt_with_generated_settings(backend: str) -
     assert result.git_works
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="srt supports macOS and Linux only")
 def test_claude_probe_reports_missing_sandbox_runner() -> None:
     result = probe.run_agent_git_probe("claude", "clone", which=lambda _name: None)
 
@@ -671,6 +678,26 @@ def test_launch_preflight_blocks_only_when_git_fails_in_the_sandbox(
     assert "Git does not work inside the codex sandbox" in first
     assert second == first
     assert calls == [("codex", "clone")]
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "leak"),
+    [("clone", "git hooks"), ("clone", "outside workspace"), ("worktree", "outside workspace")],
+)
+def test_launch_preflight_blocks_writes_the_sandbox_should_deny(
+    monkeypatch: pytest.MonkeyPatch,
+    backend_name: str,
+    leak: str,
+) -> None:
+    monkeypatch.delenv(probe.PROBE_DISABLE_ENV, raising=False)
+    monkeypatch.setattr(orch, "_AGENT_GIT_PROBE_RESULTS", {})
+    backend = SimpleNamespace(identity=SimpleNamespace(backend=backend_name))
+    result = _probe_result("codex", backend_name, leaked_writes=(leak,))
+
+    with patch.object(orch, "run_agent_git_probe", return_value=result):
+        error = orch._agent_git_launch_preflight_error("codex", backend)
+
+    assert f"did not block writes for the {backend_name} backend ({leak})" in error
 
 
 @pytest.mark.parametrize(

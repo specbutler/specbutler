@@ -391,6 +391,15 @@ def run_agent_git_probe(
         runner_path = resolve("codex")
         runner_name = "codex sandbox"
         missing = "Codex CLI is not installed; nothing to probe"
+    elif agent == "claude" and sys.platform == "win32":
+        return AgentGitProbeResult(
+            agent=agent,
+            backend=backend,
+            unavailable_reason=(
+                "Anthropic's sandbox-runtime (`srt`) supports macOS and Linux "
+                "only, so Git inside the Claude sandbox is unverified on Windows"
+            ),
+        )
     elif agent == "claude":
         runner_path = resolve("srt")
         runner_name = "srt"

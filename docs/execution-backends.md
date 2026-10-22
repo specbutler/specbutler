@@ -102,8 +102,9 @@ of its own worth committing to: objects, refs, the stash, and the reflog live
 in the repository's shared common directory next to your own checkout's
 metadata. An agent that can commit can therefore write refs and objects that
 your checkout also sees. Spec Butler keeps the branches checked out in other
-worktrees and the main checkout's `HEAD` and `index` read-only, but other
-branches and the stash are shared. Spec Butler used to give each worktree launch a
+worktrees, `packed-refs`, and the main checkout's `HEAD` and `index`
+read-only, but other branches and the stash are shared. Because `packed-refs`
+is read-only, deleting a branch that Git has packed fails inside the session. Spec Butler used to give each worktree launch a
 private `GIT_DIR` and import its commits afterwards, but that import's
 metadata guards failed runs whenever the shared repository changed during a
 session. Worktree mode now grants the common directory directly. Set
@@ -132,8 +133,9 @@ other backend is a warning. In worktree mode a write that was not blocked is
 reported as a warning rather than failed.
 
 Implementation launches on the host run the same probe once per process. A
-launch is refused only when the probe ran and Git itself failed; a missing
-runner or a probe that could not start is logged. Run `spec doctor` from a
+launch is refused when the probe ran and Git itself failed, or the sandbox let
+it write outside the workspace (or, for a clone, to Git config or hooks). A
+missing runner or a probe that could not start is logged. Run `spec doctor` from a
 normal terminal: a sandboxed agent session cannot start another sandbox
 (`sandbox_apply: Operation not permitted`). Set `SPEC_AGENT_GIT_PROBE=0` to
 skip the probe.
