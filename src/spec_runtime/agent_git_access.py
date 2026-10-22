@@ -16,6 +16,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .git_common import subprocess_text_kwargs
+
 GIT_CONTROL_NAMES = ("config", "config.worktree", "hooks", "info")
 
 _GIT_LAYOUT_ENV_KEYS = (
@@ -39,6 +41,10 @@ class AgentGitAccess:
     git_dir: Path
     common_dir: Path
     linked: bool
+    # Branches checked out in the repository's other worktrees, such as the
+    # operator's own checkout. A linked-worktree agent can write shared refs,
+    # but not these.
+    protected_refs: tuple[str, ...] = ()
 
     @property
     def writable_paths(self) -> tuple[Path, ...]:
@@ -51,43 +57,77 @@ class AgentGitAccess:
         paths = [self.common_dir / name for name in GIT_CONTROL_NAMES]
         if self.git_dir != self.common_dir:
             paths.append(self.git_dir / "config.worktree")
+            # The main checkout's own HEAD and index live in the common dir.
+            paths.extend((self.common_dir / "HEAD", self.common_dir / "index"))
+            for ref in self.protected_refs:
+                ref_path = self.common_dir.joinpath(*ref.split("/"))
+                paths.extend((ref_path, ref_path.with_name(ref_path.name + ".lock")))
         return tuple(paths)
 
 
-def _rev_parse_paths(worktree: Path) -> tuple[Path, Path]:
+def _git_output(worktree: Path, args: list[str]) -> str:
     env = {
         key: value
         for key, value in os.environ.items()
         if key not in _GIT_LAYOUT_ENV_KEYS
     }
     env["GIT_TERMINAL_PROMPT"] = "0"
+    argv = ["git", *args]
     try:
         completed = subprocess.run(
-            [
-                "git",
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-dir",
-                "--git-common-dir",
-            ],
+            argv,
             cwd=worktree,
             env=env,
-            text=True,
             capture_output=True,
             timeout=10,
             check=False,
+            **subprocess_text_kwargs(argv),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise UnsafeAgentGitLayoutError(
             f"Could not inspect Git metadata for {worktree}: {exc}"
         ) from exc
-    lines = completed.stdout.splitlines() if completed.returncode == 0 else []
-    if len(lines) != 2:
+    if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
         raise UnsafeAgentGitLayoutError(
             f"Could not inspect Git metadata for {worktree}: {detail}"
         )
+    return completed.stdout
+
+
+def _rev_parse_paths(worktree: Path) -> tuple[Path, Path]:
+    output = _git_output(
+        worktree,
+        ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+    )
+    lines = output.splitlines()
+    if len(lines) != 2:
+        raise UnsafeAgentGitLayoutError(
+            f"Could not inspect Git metadata for {worktree}: {output.strip()}"
+        )
     return Path(lines[0]), Path(lines[1])
+
+
+def _other_worktree_branches(worktree: Path) -> tuple[str, ...]:
+    """Return refs checked out in every worktree except *worktree*."""
+    refs: list[str] = []
+    for block in _git_output(worktree, ["worktree", "list", "--porcelain"]).split("\n\n"):
+        path = ""
+        branch = ""
+        for line in block.splitlines():
+            if line.startswith("worktree "):
+                path = line[len("worktree "):]
+            elif line.startswith("branch refs/heads/"):
+                branch = line[len("branch "):]
+        if not branch or not path:
+            continue
+        try:
+            if Path(path).resolve() == worktree:
+                continue
+        except OSError:
+            pass
+        refs.append(branch)
+    return tuple(dict.fromkeys(refs))
 
 
 def _real_directory(path: Path, *, label: str) -> Path:
@@ -137,6 +177,7 @@ def agent_git_access(worktree_path: Path) -> AgentGitAccess | None:
         git_dir=git_dir,
         common_dir=common_dir,
         linked=True,
+        protected_refs=_other_worktree_branches(worktree),
     )
 
 
@@ -144,8 +185,12 @@ _FALLBACK_NAME = "Spec Butler"
 _FALLBACK_EMAIL = "spec-butler@localhost"
 # Command-scoped config for agent Git. Repository config stays read-only, so
 # creating a branch from a remote-tracking ref must not try to record its
-# upstream there.
-_AGENT_GIT_CONFIG_ENTRIES = (("branch.autoSetupMerge", "false"),)
+# upstream there. Auto-gc is left to the host: in a linked worktree it would
+# repack the shared store and try to prune protected loose refs.
+_AGENT_GIT_CONFIG_ENTRIES = (
+    ("branch.autoSetupMerge", "false"),
+    ("gc.auto", "0"),
+)
 
 
 def _operator_git_identity(worktree_path: Path) -> tuple[str, str]:
@@ -153,13 +198,14 @@ def _operator_git_identity(worktree_path: Path) -> tuple[str, str]:
     values: dict[str, str] = {}
     for key in ("user.name", "user.email"):
         try:
+            argv = ["git", "config", "--get", key]
             completed = subprocess.run(
-                ["git", "config", "--get", key],
+                argv,
                 cwd=worktree_path,
-                text=True,
                 capture_output=True,
                 timeout=5,
                 check=False,
+                **subprocess_text_kwargs(argv),
             )
         except (OSError, subprocess.TimeoutExpired):
             continue

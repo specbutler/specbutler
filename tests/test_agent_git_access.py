@@ -111,12 +111,17 @@ def test_linked_worktree_grants_its_gitdir_and_the_shared_common_dir(tmp_path: P
     assert access is not None and access.linked
     common = repository / ".git"
     assert access.writable_paths == (common / "worktrees" / "worktree", common)
+    assert access.protected_refs == ("refs/heads/main",)
     assert access.read_only_paths == (
         common / "config",
         common / "config.worktree",
         common / "hooks",
         common / "info",
         common / "worktrees" / "worktree" / "config.worktree",
+        common / "HEAD",
+        common / "index",
+        common / "refs" / "heads" / "main",
+        common / "refs" / "heads" / "main.lock",
     )
 
 
@@ -168,8 +173,12 @@ def test_claude_worktree_settings_allow_shared_git_but_not_its_controls(tmp_path
     assert filesystem["allowWrite"] == sorted(
         [str(common), str(common / "worktrees" / "worktree")]
     )
-    for control in ("config", "hooks", "info"):
+    for control in ("config", "hooks", "info", "HEAD", "index"):
         assert str(common / control) in filesystem["denyWrite"]
+    # The operator's checked-out branch cannot be moved from the session.
+    assert str(common / "refs" / "heads" / "main") in filesystem["denyWrite"]
+    assert str(common / "refs" / "heads" / "main.lock") in filesystem["denyWrite"]
+    assert str(common / "refs" / "heads" / "sibling") not in filesystem["denyWrite"]
     # Objects, refs and the stash live in the common dir and stay writable.
     for shared in ("objects", "refs", "logs"):
         assert str(common / shared) not in filesystem["denyWrite"]
@@ -305,6 +314,7 @@ def test_agent_environment_sets_identity_husky_and_upstream_policy(tmp_path: Pat
         for index in range(int(env["GIT_CONFIG_COUNT"]))
     }
     assert entries["branch.autoSetupMerge"] == "false"
+    assert entries["gc.auto"] == "0"
     assert entries["credential.helper"] == ""
 
 
@@ -358,6 +368,52 @@ def test_clone_backend_fetches_origin_before_cloning(tmp_path: Path) -> None:
 
     assert _git(handle.path, "rev-parse", "origin/main") == remote_head
     assert _git(handle.path, "rev-parse", "HEAD") == remote_head
+
+
+def test_host_clone_borrows_host_objects_instead_of_hardlinking(tmp_path: Path) -> None:
+    """The agent may write its clone's .git, so it must not share host inodes."""
+    from spec_runtime.execution_backend import (
+        CloneExecutionBackend,
+        ContainerExecutionBackend,
+    )
+
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
+    repository = tmp_path / "repository"
+    _git(tmp_path, "clone", str(remote), str(repository))
+    for key, value in (("user.name", "Test Operator"), ("user.email", "operator@example.com")):
+        _git(repository, "config", key, value)
+    (repository / "README.md").write_text("one\n", encoding="utf-8")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "one")
+    _git(repository, "push", "origin", "main")
+    _git(repository, "gc", "-q")
+
+    backend = CloneExecutionBackend(
+        ExecutionConfig(backend="clone", workspace_root=".spec-workspaces", backend_explicit=True)
+    )
+    handle = backend.prepare_workspace(
+        run_id="probe-abc",
+        spec_id="probe",
+        branch="code/probe--abc",
+        repo_root=repository,
+        base_ref="origin/main",
+    )
+
+    alternates = handle.path / ".git" / "objects" / "info" / "alternates"
+    assert alternates.read_text(encoding="utf-8").strip()
+    host_inodes = {
+        path.stat().st_ino
+        for path in (repository / ".git" / "objects").rglob("*")
+        if path.is_file()
+    }
+    clone_inodes = {
+        path.stat().st_ino
+        for path in (handle.path / ".git" / "objects").rglob("*")
+        if path.is_file()
+    }
+    assert not host_inodes & clone_inodes
+    assert ContainerExecutionBackend._share_host_objects is False
 
 
 # ---------------------------------------------------------------------------

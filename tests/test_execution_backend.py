@@ -1127,6 +1127,8 @@ class TestCloneBackend:
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         backend = self._make()
+        # Only hardlinked clones (the container worker's) can hit EXDEV.
+        monkeypatch.setattr(backend, "_share_host_objects", False)
         original_run_git = eb.CloneExecutionBackend._run_git
         clone_commands: list[list[str]] = []
 

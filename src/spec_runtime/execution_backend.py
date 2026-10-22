@@ -1309,6 +1309,14 @@ class WorktreeExecutionBackend:
 class CloneExecutionBackend:
     """Backend that prepares a full disposable checkout for a run."""
 
+    # The agent may write its clone's whole ``.git``. A plain ``--local`` clone
+    # hardlinks the host's object files, so a write through the clone (after a
+    # chmod) would corrupt the host repository. Borrow host objects through an
+    # alternate instead: nothing is copied or linked, and new objects land in
+    # the clone's own store. Container workers cannot see host paths and
+    # refuse alternates, so they keep the hardlinked clone.
+    _share_host_objects = True
+
     def __init__(self, config: ExecutionConfig):
         self._identity = BackendIdentity(
             backend=config.backend,
@@ -2218,8 +2226,9 @@ class CloneExecutionBackend:
             )
 
     def _clone_source_checkout(self, repo_root: Path, source: Path) -> None:
+        mode = "--shared" if self._share_host_objects else "--local"
         clone = self._run_git(
-            ["clone", "--local", "--no-checkout", str(repo_root), str(source)],
+            ["clone", mode, "--no-checkout", str(repo_root), str(source)],
             cwd=repo_root,
         )
         if clone.returncode == 0:
@@ -3095,6 +3104,8 @@ class ContainerCliRunner:
 
 class ContainerExecutionBackend(CloneExecutionBackend):
     """Preview backend that runs workspace commands in a container worker."""
+
+    _share_host_objects = False
 
     def __init__(
         self,

@@ -85,9 +85,14 @@ the repository controls read-only:
 | Backend | Writable Git paths | Read-only |
 |---------|--------------------|-----------|
 | `clone` | `<clone>/.git` | `config`, `config.worktree`, `hooks/`, `info/` |
-| `worktree` | `.git/worktrees/<name>/` and the shared `.git` common directory | the same four controls in the common directory, plus the worktree's `config.worktree` |
+| `worktree` | `.git/worktrees/<name>/` and the shared `.git` common directory | the same four controls in the common directory, the worktree's `config.worktree`, the main checkout's `HEAD` and `index`, and the refs of branches checked out in other worktrees (such as your `main`) |
 
-A symlinked `.git` is refused. Claude receives these as `sandbox.filesystem`
+A symlinked `.git` is refused. Host clones use `git clone --shared`: they
+borrow the orchestration checkout's objects through an alternate instead of
+hardlinking them, so a write through the clone's `.git` can never reach the
+host's object files. (Container workers cannot see host paths and keep a
+hardlinked `--local` clone.) Agent sessions also run with `gc.auto=0`; the host
+owns garbage collection. Claude receives these as `sandbox.filesystem`
 `allowWrite`/`denyWrite` entries in the generated `.claude/settings.local.json`;
 Codex receives them as writable roots and `read` entries in its permission
 profile (Codex rules only name paths that exist).
@@ -96,7 +101,9 @@ Linked worktrees are the harder case because a worktree has no Git directory
 of its own worth committing to: objects, refs, the stash, and the reflog live
 in the repository's shared common directory next to your own checkout's
 metadata. An agent that can commit can therefore write refs and objects that
-your checkout also sees. Spec Butler used to give each worktree launch a
+your checkout also sees. Spec Butler keeps the branches checked out in other
+worktrees and the main checkout's `HEAD` and `index` read-only, but other
+branches and the stash are shared. Spec Butler used to give each worktree launch a
 private `GIT_DIR` and import its commits afterwards, but that import's
 metadata guards failed runs whenever the shared repository changed during a
 session. Worktree mode now grants the common directory directly. Set
@@ -187,7 +194,7 @@ belongs in `.spec.toml`.
 ## Clone mode
 
 Clone mode, the default, creates a disposable checkout at
-`.spec-workspaces/<run-id>/source/` with `git clone --local`, with durable logs
+`.spec-workspaces/<run-id>/source/` with `git clone --shared`, with durable logs
 and outbox data beside it. The host refreshes the clone's refs from the
 orchestration checkout before every launch, points `origin` at the forge for
 host-owned publishing, and publishes the run branch from the clone. Configure

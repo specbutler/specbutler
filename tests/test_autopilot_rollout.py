@@ -246,7 +246,7 @@ def test_run_loop_surfaces_effective_concurrency_in_dry_run(
     monkeypatch,
     capsys,
 ) -> None:
-    _write_config(tmp_path, "")
+    _write_config(tmp_path, '[execution]\nbackend = "worktree"\n')
     args = argparse.Namespace(
         repo_root=str(tmp_path),
         concurrency=None,
