@@ -132,7 +132,7 @@ def test_open_breaker_allows_one_probe_per_cooldown_and_closes_on_progress(tmp_p
 
 def test_spec_scoped_breaker_only_holds_the_failing_spec():
     breaker = _breaker(threshold=2)
-    push = orch.classify_failure("git push failed: fatal: unable to access 'https://github.com/o/r.git/': 502")
+    push = orch.classify_failure("git push failed: error: RPC failed; HTTP 500 curl 22")
     assert push.scope == "spec"
     _record(breaker, "alpha", push, now=0.0)
     outcome = _record(breaker, "alpha", push, now=100.0)

@@ -40920,9 +40920,11 @@ class TestFailureClassification:
             "/h/.claude/.credentials.json is expired": "agent_auth",
             "GitHub CLI not authenticated. Run: gh auth login": "forge_auth",
             "You've hit your session limit · resets 8:30pm (America/Los_Angeles)": "provider_capacity",
+            "git push failed: error: RPC failed; HTTP 500 curl 22": "publish_push",
+            "gh pr create failed: GraphQL: Something went wrong (createPullRequest)": "pr_create",
             "git push failed: fatal: unable to access 'https://github.com/o/r.git/': "
-            "Could not resolve host: github.com": "publish_push",
-            "gh pr create failed: error connecting to api.github.com": "pr_create",
+            "Could not resolve host: github.com": "forge_network",
+            "gh pr create failed: error connecting to api.github.com": "forge_network",
             "Timed out waiting for auto-merge on PR #12 (mergeStateStatus=BLOCKED)": "ci_wait_timeout",
         }
         for message, kind in cases.items():
@@ -40947,6 +40949,17 @@ class TestFailureClassification:
             phase="publish",
         )
         assert not rejected.is_infrastructure
+
+    def test_forge_outage_during_push_is_backend_scoped(self):
+        # A shared outage must open one breaker for the backend, not one per
+        # spec, or every queued spec still fails on it in turn.
+        for message in (
+            "git push failed: fatal: unable to access 'https://github.com/o/r.git/': 502 Bad Gateway",
+            "gh pr create failed: API rate limit exceeded for installation",
+        ):
+            classification = orch.classify_failure(message, phase="publish")
+            assert classification.kind == "forge_network", message
+            assert classification.scope == "backend", message
 
     def test_signature_ignores_run_ids_paths_and_wrappers(self):
         first = orch.classify_failure(

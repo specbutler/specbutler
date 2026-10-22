@@ -4500,6 +4500,11 @@ def _infrastructure_failure_kind(text: str) -> tuple[str, bool, str] | None:
         return "verify_environment", True, "backend"
     if "git worktree add failed" in text and ("cannot lock" in text or "could not lock" in text):
         return "git_lock", True, "backend"
+    if any(marker in text for marker in _FORGE_NETWORK_MARKERS) and not _is_non_fast_forward_push_rejection(text):
+        # Checked before the push/PR classifiers: a forge or network outage
+        # hits every spec, so it must open one backend-wide breaker rather
+        # than one per spec.
+        return "forge_network", True, "backend"
     if text.startswith("git push failed") and not _is_non_fast_forward_push_rejection(text):
         # A rejected non-fast-forward push is branch divergence, not an
         # outage: it keeps the actionable remote_diverged classification.
@@ -4512,8 +4517,6 @@ def _infrastructure_failure_kind(text: str) -> tuple[str, bool, str] | None:
         return "ci_wait_timeout", True, "spec"
     if _is_retryable_merge_race_error(text) or _is_readiness_promotion_forge_failure(text):
         return "forge_transient", True, "spec"
-    if any(marker in text for marker in _FORGE_NETWORK_MARKERS):
-        return "forge_network", True, "backend"
     return None
 
 
