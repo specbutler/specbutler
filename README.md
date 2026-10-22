@@ -200,6 +200,8 @@ the `web` extra; see [Web dashboard and chat](docs/web.md).
 
 ### Container backend
 
+> **Alpha: container mode has known reliability issues (image builds, in-worker services such as Postgres, credential refresh, nested provider sandboxing). Prefer the clone or worktree backend.**
+
 Container execution is an optional isolation backend, independent of how runs
 are dispatched or monitored:
 
@@ -436,7 +438,7 @@ in a command argument.
 `spec` configures a fixed launch policy for the agent sessions it starts. The
 `[execution].safety_mode` setting is currently a recorded compatibility label,
 not an enforcement switch. Choose the
-`worktree`, `clone`, or `container` execution backend based on the isolation
+`worktree`, `clone`, or `container` (alpha) execution backend based on the isolation
 your project needs; see [Execution backends](docs/execution-backends.md).
 
 - Implementation and authoring run in the provider's own sandbox. Agents can
@@ -512,7 +514,8 @@ not intentionally copied into worker images, non-interactive agent MCP
 configurations, or agent process environments. Agent completion reports travel
 through a narrow per-launch outbox rather than shared orchestrator state. That
 separation does not make repository commands safe. Use the container backend
-for a stronger process/toolchain boundary and a disposable machine or VM when
+for a stronger process/toolchain boundary (alpha; see the warning under
+[Container backend](#container-backend)) and a disposable machine or VM when
 evaluating genuinely untrusted repositories. See the
 [Security Policy](SECURITY.md#trust-model) and [Execution
 backends](docs/execution-backends.md).

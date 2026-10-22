@@ -1,3 +1,5 @@
+> **Alpha: container mode has known reliability issues (image builds, in-worker services such as Postgres, credential refresh, nested provider sandboxing). Prefer the clone or worktree backend.**
+
 # Execution backends
 
 `spec` can run implementation work in a linked worktree, a full local clone,
@@ -59,7 +61,7 @@ can replace the existing policy. The preflight does not silently switch runtimes
 |---------|-------------|--------------------|
 | `clone` | The default: a disposable full checkout without Docker | Own `.git` directory per run, so agent Git needs no shared metadata; about as fast as a worktree (`git clone --local` hardlinks objects); uses the host toolchain |
 | `worktree` | You want runs inside the repository's `.worktrees/` | Shares the main repository's Git directory and host toolchain; the agent must be allowed to write that shared `.git` |
-| `container` | You want the agent and project toolchain inside a worker image | Strongest process/toolchain boundary; requires a Docker-compatible engine and image setup |
+| `container` | You want the agent and project toolchain inside a worker image | Strongest process/toolchain boundary, but **alpha**; requires a Docker-compatible engine and image setup |
 
 The default is `clone` (`worktree` on native Windows, its only qualified
 backend). `spec init` writes the backend explicitly. A `.spec.toml` without a
@@ -157,7 +159,7 @@ workspace_root = ".spec-workspaces"
 > `full-auto`, and `trusted` values are reserved for compatibility and must not
 > be treated as security boundaries. Actual isolation comes from the selected
 > backend, the fixed provider launch policy, credential handling, and the host's
-> own controls. `container` provides the strongest process/toolchain boundary.
+> own controls. `container` (alpha) provides the strongest process/toolchain boundary.
 
 ## Worktree mode
 

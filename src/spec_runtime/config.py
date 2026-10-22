@@ -8,6 +8,7 @@ import tomllib
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
+from typing import TextIO
 
 from .command_runtime import CommandConfigurationError, CommandVariants, parse_command_variants
 from .git_common import run_git
@@ -101,6 +102,30 @@ def default_execution_backend(platform: str | None = None) -> str:
     only backend in its qualified support tier.
     """
     return "worktree" if (platform or sys.platform) == "win32" else "clone"
+
+
+CONTAINER_ALPHA_WARNING = (
+    "Alpha: container mode has known reliability issues (image builds, in-worker "
+    "services such as Postgres, credential refresh, nested provider sandboxing). "
+    "Prefer the clone or worktree backend."
+)
+
+
+def container_alpha_warning(config: object) -> str | None:
+    """Return the container-alpha warning when ``config`` selects that backend."""
+    execution = getattr(config, "execution", None)
+    if getattr(execution, "backend", "") == "container":
+        return CONTAINER_ALPHA_WARNING
+    return None
+
+
+def emit_container_alpha_warning(config: object, stream: TextIO | None = None) -> None:
+    """Print the single-line container-alpha warning to stderr when applicable."""
+    message = container_alpha_warning(config)
+    if message:
+        print(f"Warning: {message}", file=stream or sys.stderr)
+
+
 ALLOWED_CONTAINER_WORKSPACE_MODES: tuple[str, ...] = ("auto", "bind", "volume")
 ALLOWED_CONTAINER_PLAYWRIGHT_MCP_TOPOLOGIES: tuple[str, ...] = (
     "disabled",

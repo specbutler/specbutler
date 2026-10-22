@@ -23,7 +23,12 @@ from .agent_git_probe import (
     run_agent_git_probe,
 )
 from .command_runtime import CommandSpec, looks_posix_script
-from .config import SpecRuntimeConfig, load_repo_spec_runtime_config, resolve_spec_path
+from .config import (
+    SpecRuntimeConfig,
+    container_alpha_warning,
+    load_repo_spec_runtime_config,
+    resolve_spec_path,
+)
 from .git_common import subprocess_text_kwargs
 from .platform import is_unc_path, is_windows
 from .spec_metadata import format_spec_graph_problems, iter_spec_metadata, task_spec_ids, validate_spec_graph
@@ -282,6 +287,7 @@ def run_doctor_checks(
         return DoctorReport(tuple(checks))
 
     checks.extend(_execution_policy_checks(config))
+    checks.extend(_container_alpha_checks(config))
     checks.extend(_git_checks(repo_root, config, run))
     checks.extend(_agent_checks(repo_root, config, resolve_executable, run))
     checks.extend(_agent_git_probe_checks(config, agent_git_probe))
@@ -302,7 +308,7 @@ def _execution_policy_checks(config: SpecRuntimeConfig) -> list[DoctorCheck]:
             _warning(
                 "execution safety label",
                 f"safety_mode={execution.safety_mode!r} is metadata only and does not change runtime enforcement",
-                "Choose the execution backend based on the isolation you need; container is the strongest boundary.",
+                "Choose the execution backend based on the isolation you need; container is the strongest boundary but is alpha.",
                 "See docs/execution-backends.md before running untrusted repository code.",
             )
         ]
@@ -312,6 +318,11 @@ def _execution_policy_checks(config: SpecRuntimeConfig) -> list[DoctorCheck]:
             "implicit `safe` compatibility label; provider launch policy is fixed",
         )
     ]
+
+
+def _container_alpha_checks(config: SpecRuntimeConfig) -> list[DoctorCheck]:
+    message = container_alpha_warning(config)
+    return [_warning("container backend (alpha)", message)] if message else []
 
 
 def _git_checks(
