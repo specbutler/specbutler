@@ -1,3 +1,5 @@
+> **Alpha: container mode has known reliability issues (image builds, in-worker services such as Postgres, credential refresh, nested provider sandboxing). Prefer the clone or worktree backend.**
+
 # Nested container sandbox validation
 
 Docker defaults prevent the provider sandbox from creating the user namespaces
