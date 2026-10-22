@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from spec_runtime import autopilot
-from spec_runtime.config import load_spec_runtime_config
+from spec_runtime.config import default_execution_backend, load_spec_runtime_config
 from spec_runtime.execution_backend import WorkspaceHandle
 from spec_runtime.process_supervisor import available_memory_bytes, system_memory_bytes
 
@@ -24,7 +24,7 @@ def _write_config(path: Path, body: str) -> Path:
     return config_path
 
 
-def test_autopilot_backend_policy_defaults_to_worktree_before_rollout(tmp_path: Path) -> None:
+def test_autopilot_backend_policy_uses_the_default_backend_before_rollout(tmp_path: Path) -> None:
     config = load_spec_runtime_config(
         require=True,
         config_path=_write_config(tmp_path, ""),
@@ -32,7 +32,7 @@ def test_autopilot_backend_policy_defaults_to_worktree_before_rollout(tmp_path: 
 
     policy = autopilot.resolve_autopilot_backend_policy(config)
 
-    assert policy.backend == "worktree"
+    assert policy.backend == default_execution_backend()
     assert policy.source == "legacy-default"
     assert policy.safety_mode == "safe"
 
@@ -93,7 +93,7 @@ def test_autopilot_actor_env_flips_implicit_backend_only(tmp_path: Path) -> None
         env={"SPEC_ACTOR": "autopilot"},
     )
 
-    assert manual.execution.backend == "worktree"
+    assert manual.execution.backend == default_execution_backend()
     assert unattended.execution.backend == "container"
     assert unattended.execution.safety_mode == "safe"
 

@@ -16,6 +16,7 @@ from typing import Callable
 from packaging.requirements import InvalidRequirement, Requirement
 
 from .agent_adapter import host_agent_unavailability_reason
+from .config import default_execution_backend
 from .git_common import run_git
 
 
@@ -445,6 +446,10 @@ def _generate_spec_toml(
         lines.append('# teardown_command = "scripts/implement-teardown.sh"')
 
     lines += [
+        "",
+        "[execution]",
+        "# clone gives each run its own .git so agents can commit; worktree also works.",
+        f'backend = "{default_execution_backend()}"',
         "",
         "[verify]",
     ]

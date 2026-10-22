@@ -57,13 +57,77 @@ can replace the existing policy. The preflight does not silently switch runtimes
 
 | Backend | Use it when | Isolation and cost |
 |---------|-------------|--------------------|
-| `worktree` | You want the simplest local setup | Fastest; shares the main repository's Git object database and host toolchain |
-| `clone` | You want a disposable full checkout without Docker | Separate `.git` directory and workspace; still uses the host toolchain |
+| `clone` | The default: a disposable full checkout without Docker | Own `.git` directory per run, so agent Git needs no shared metadata; about as fast as a worktree (`git clone --local` hardlinks objects); uses the host toolchain |
+| `worktree` | You want runs inside the repository's `.worktrees/` | Shares the main repository's Git directory and host toolchain; the agent must be allowed to write that shared `.git` |
 | `container` | You want the agent and project toolchain inside a worker image | Strongest process/toolchain boundary; requires a Docker-compatible engine and image setup |
 
-The default is `worktree`. Existing projects do not need an `[execution]`
-section unless they want a different backend or an explicit opt-out from
-future rollout policy.
+The default is `clone` (`worktree` on native Windows, its only qualified
+backend). `spec init` writes the backend explicitly. A `.spec.toml` without a
+backend picks up the default, so runs started under the old `worktree`
+default must be resumed with `backend = "worktree"` set; the orchestrator
+refuses to switch an existing run's backend.
+
+## Agent Git
+
+Implementation agents use Git as a person would: `add`, `commit`, `stash`,
+`branch`, `rebase`, `log`, and `fetch` from origin. The host supplies a commit
+identity through `GIT_AUTHOR_*`/`GIT_COMMITTER_*` (your own `user.name` and
+`user.email` when it can read them), sets `HUSKY=0`, and turns off
+`branch.autoSetupMerge` for the session. Pushing and pull requests stay with
+the host, which publishes the run branch with its own command-scoped config and
+hooks disabled.
+
+The provider sandbox grants writes to the workspace's Git directory and keeps
+the repository controls read-only:
+
+| Backend | Writable Git paths | Read-only |
+|---------|--------------------|-----------|
+| `clone` | `<clone>/.git` | `config`, `config.worktree`, `hooks/`, `info/` |
+| `worktree` | `.git/worktrees/<name>/` and the shared `.git` common directory | the same four controls in the common directory, plus the worktree's `config.worktree` |
+
+A symlinked `.git` is refused. Claude receives these as `sandbox.filesystem`
+`allowWrite`/`denyWrite` entries in the generated `.claude/settings.local.json`;
+Codex receives them as writable roots and `read` entries in its permission
+profile (Codex rules only name paths that exist).
+
+Linked worktrees are the harder case because a worktree has no Git directory
+of its own worth committing to: objects, refs, the stash, and the reflog live
+in the repository's shared common directory next to your own checkout's
+metadata. An agent that can commit can therefore write refs and objects that
+your checkout also sees. Spec Butler used to give each worktree launch a
+private `GIT_DIR` and import its commits afterwards, but that import's
+metadata guards failed runs whenever the shared repository changed during a
+session. Worktree mode now grants the common directory directly. Set
+`SPEC_PRIVATE_AGENT_GIT=1` to use the old private `GIT_DIR` import instead.
+A clone avoids the question entirely, which is why it is the default.
+
+### Git probe
+
+`spec doctor` runs a model-free Git probe for each allowed provider and both
+host backends. It builds a throwaway repository, generates the same sandbox
+policy an implementation launch would use, and runs a small script under the
+provider's own sandbox runner: `codex sandbox` for Codex, and Anthropic's
+`srt` ([sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime),
+the library Claude Code's sandbox is built on) for Claude. Claude Code has no
+model-free way to run a command in its sandbox, so without `srt` the Claude
+probe is reported as unverified. Install it with:
+
+```bash
+npm install -g @anthropic-ai/sandbox-runtime
+```
+
+Inside the sandbox, `add`, `commit`, `stash`, `branch`, and `log` must
+succeed, and writes to `.git/config`, `.git/hooks/` and a path outside the
+workspace must fail. A failure for the configured backend is a blocker; the
+other backend is a warning. In worktree mode a write that was not blocked is
+reported as a warning rather than failed.
+
+Implementation launches on the host run the same probe once per process. A
+launch is refused only when the probe ran and Git itself failed; a missing
+runner or a probe that could not start is logged. Run `spec doctor` from a
+normal terminal: a sandboxed agent session cannot start another sandbox
+(`sandbox_apply: Operation not permitted`). Set `SPEC_AGENT_GIT_PROBE=0` to
+skip the probe.
 
 Host implementation and handshake-recovery sessions receive `TMPDIR`, `TMP`,
 and `TEMP` pointing to a private `tmp` directory under their launch-scoped
@@ -83,7 +147,7 @@ when the repository and orchestrator live inside the WSL Linux filesystem.
 
 ```toml
 [execution]
-backend = "worktree"             # worktree, clone, or container
+backend = "clone"                # clone, worktree, or container
 safety_mode = "safe"             # compatibility label; see warning below
 workspace_root = ".spec-workspaces"
 ```
@@ -101,14 +165,9 @@ Worktree mode uses `.worktrees/code-<spec-id>--<token>/` and the corresponding
 `code/<spec-id>--<token>` branch. The main worktree is for orchestration only.
 Do not edit it while an implementation run is active.
 
-Agent-side Git writes do not go directly to the linked worktree's shared
-administrative directory. Spec Butler creates a disposable Git directory for
-each provider launch, backed by a read-only object alternate. Once the provider
-ownership boundary is confirmed stopped, the host validates and imports only a
-fast-forward commit chain for that worktree's exact branch. This keeps sibling
-refs, the shared object database, hooks, config, and real worktree index outside
-the agent's write boundary while preserving normal `git add` and `git commit`
-inside the session.
+Select it with `backend = "worktree"`. The agent writes the linked
+worktree's Git directory and the repository's shared common directory, with
+config and hooks read-only; see [Agent Git](#agent-git).
 
 Before the first run, confirm that a clean worktree can execute the commands in
 `[bootstrap]` and `[verify]`:
@@ -125,9 +184,12 @@ belongs in `.spec.toml`.
 
 ## Clone mode
 
-Clone mode creates a disposable checkout at
-`.spec-workspaces/<run-id>/source/`, with durable logs and outbox data beside
-it. Enable it with:
+Clone mode, the default, creates a disposable checkout at
+`.spec-workspaces/<run-id>/source/` with `git clone --local`, with durable logs
+and outbox data beside it. The host refreshes the clone's refs from the
+orchestration checkout before every launch, points `origin` at the forge for
+host-owned publishing, and publishes the run branch from the clone. Configure
+it explicitly with:
 
 ```toml
 [execution]
@@ -138,8 +200,7 @@ workspace_root = ".spec-workspaces"
 
 The repository must have a usable configured base ref. `spec` ignores the
 workspace root before creating artifacts and refuses to use a tracked source
-path. Clone mode is a good diagnostic step when worktree-specific Git behavior
-is suspected but a container is unnecessary.
+path.
 
 ## Container mode
 

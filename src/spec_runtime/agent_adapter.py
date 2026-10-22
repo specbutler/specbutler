@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
+from .agent_git_access import UnsafeAgentGitLayoutError, agent_git_access
 from .agent_git_isolation import AgentGitIsolation
 from .provider_env import PROXY_ENV_KEYS, protected_operator_paths
 
@@ -366,23 +367,36 @@ def _codex_git_metadata_dirs(
     git_isolation: AgentGitIsolation | None = None,
 ) -> list[Path]:
     """Return isolated Git paths that Codex must explicitly allow for commits."""
-    dot_git = worktree_path / ".git"
-    if dot_git.is_symlink():
-        raise RuntimeError("Refusing symlinked Git metadata without private Git isolation")
-    # Codex protects .git even below a writable checkout. A disposable full
-    # clone needs its own explicit grant; linked worktrees still use private Git.
-    if dot_git.is_dir():
-        return [dot_git.resolve(strict=True)]
-    if not dot_git.exists():
-        return []
+    # Codex protects .git even below a writable checkout, so the Git
+    # directory (and a linked worktree's shared common directory) needs an
+    # explicit grant. Repository controls stay read-only via the profile.
     if git_isolation is None:
-        raise RuntimeError(
-            "Refusing linked-worktree Git metadata access without a prepared "
-            "private Git directory"
-        )
+        return list(_codex_git_access(worktree_path).writable)
     if git_isolation.worktree != worktree_path.resolve(strict=True):
         raise RuntimeError("Private Git metadata belongs to a different worktree")
     return list(git_isolation.writable_paths)
+
+
+@dataclass(frozen=True)
+class _CodexGitAccess:
+    writable: tuple[Path, ...] = ()
+    read_only: tuple[Path, ...] = ()
+
+
+def _codex_git_access(worktree_path: Path) -> _CodexGitAccess:
+    try:
+        access = agent_git_access(worktree_path)
+    except (OSError, UnsafeAgentGitLayoutError) as exc:
+        raise RuntimeError(f"Refusing agent Git metadata access: {exc}") from exc
+    if access is None:
+        return _CodexGitAccess()
+    # Codex profile entries must name existing paths; a missing control
+    # (usually config.worktree) is still protected by Codex's own .git rules
+    # for clones, and is never read by host publication.
+    return _CodexGitAccess(
+        writable=access.writable_paths,
+        read_only=tuple(path for path in access.read_only_paths if path.exists()),
+    )
 
 
 def _codex_add_dir_args(paths: list[Path]) -> list[str]:
@@ -418,6 +432,7 @@ def _codex_implement_permission_overrides(
     strict_config: bool = True,
     additional_protected_paths: tuple[Path, ...] = (),
     additional_read_only_paths: tuple[Path, ...] = (),
+    git_read_only_paths: tuple[Path, ...] | None = None,
 ) -> list[str]:
     """Build the host implementation policy around explicit path classes.
 
@@ -435,18 +450,18 @@ def _codex_implement_permission_overrides(
         worktree_path.resolve(strict=False),
         *(path.resolve(strict=False) for path in writable_roots),
     }
-    # Private Git uses the shared object store as an alternate. It needs read
-    # access while shared metadata must remain immutable. These paths must not
-    # override an operator/provider credential denial.
-    clone_git = worktree_path / ".git"
-    clone_controls = tuple(
-        clone_git / name
-        for name in ("config", "config.worktree", "hooks", "info")
-        if clone_git.is_dir() and (clone_git / name).exists()
+    # Repository Git controls (config, hooks, info) stay read-only inside the
+    # writable Git directories. Legacy private Git also passes the shared
+    # object store here. These paths must not override an operator/provider
+    # credential denial.
+    git_controls = (
+        _codex_git_access(worktree_path).read_only
+        if git_read_only_paths is None
+        else git_read_only_paths
     )
     read_only = {
         path.resolve(strict=False)
-        for path in (*additional_read_only_paths, *clone_controls)
+        for path in (*additional_read_only_paths, *git_controls)
         if not any(path.resolve(strict=False).is_relative_to(root) for root in protected)
     }
     # Denying an ancestor already denies its descendants. Emitting both makes
@@ -1026,6 +1041,7 @@ class CodexAgent:
                 provider_home=provider_home,
                 additional_protected_paths=protected_git_paths,
                 additional_read_only_paths=readable_git_paths,
+                **({"git_read_only_paths": ()} if git_isolation is not None else {}),
             ),
         ]
         for override in CODEX_AMBIENT_CAPABILITY_OVERRIDES:
@@ -1078,6 +1094,7 @@ class CodexAgent:
             strict_config=False,
             additional_protected_paths=protected_git_paths,
             additional_read_only_paths=readable_git_paths,
+            **({"git_read_only_paths": ()} if git_isolation is not None else {}),
         )
         cmd += _codex_linux_sandbox_overrides()
         cmd += _codex_mcp_server_overrides(mcp_servers)

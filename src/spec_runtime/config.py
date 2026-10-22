@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import subprocess
+import sys
 import tomllib
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -90,6 +91,16 @@ ALLOWED_EXECUTION_BACKENDS: tuple[str, ...] = (
     SUPPORTED_EXECUTION_BACKENDS + KNOWN_FUTURE_EXECUTION_BACKENDS
 )
 ALLOWED_EXECUTION_SAFETY_MODES: tuple[str, ...] = ("safe", "full-auto", "trusted")
+
+
+def default_execution_backend(platform: str | None = None) -> str:
+    """Return the backend used when config does not name one.
+
+    A per-run clone gives the agent its own ``.git``, so ordinary Git commands
+    work under the provider sandbox. Native Windows keeps ``worktree``, the
+    only backend in its qualified support tier.
+    """
+    return "worktree" if (platform or sys.platform) == "win32" else "clone"
 ALLOWED_CONTAINER_WORKSPACE_MODES: tuple[str, ...] = ("auto", "bind", "volume")
 ALLOWED_CONTAINER_PLAYWRIGHT_MCP_TOPOLOGIES: tuple[str, ...] = (
     "disabled",
@@ -131,7 +142,7 @@ class ContainerExecutionConfig:
 
 @dataclass(frozen=True)
 class ExecutionConfig:
-    backend: str = "worktree"
+    backend: str = field(default_factory=default_execution_backend)
     safety_mode: str = "safe"
     workspace_root: str = ".spec-workspaces"
     container: ContainerExecutionConfig = field(default_factory=ContainerExecutionConfig)
@@ -298,7 +309,9 @@ def _parse_execution_section(payload: object) -> ExecutionConfig:
     backend_explicit = backend_raw is not None
     safety_explicit = safety_raw is not None
 
-    backend = (str(backend_raw).strip() if backend_explicit else "worktree") or "worktree"
+    backend = (
+        str(backend_raw).strip() if backend_explicit else ""
+    ) or default_execution_backend()
     safety_mode = (str(safety_raw).strip() if safety_explicit else "safe") or "safe"
     workspace_root = (
         str(workspace_raw).strip() if workspace_raw is not None else ".spec-workspaces"

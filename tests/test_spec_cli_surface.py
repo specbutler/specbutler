@@ -667,12 +667,12 @@ class TestCodexAgent:
         assert f'{json.dumps(str(gitdir.resolve()))}="write"' not in filesystem_policy
         assert f'{json.dumps(str(common_git.resolve()))}="write"' not in filesystem_policy
 
-    def test_build_implement_command_refuses_unisolated_linked_worktree(self, tmp_path):
+    def test_build_implement_command_refuses_unresolvable_linked_worktree(self, tmp_path):
         worktree = tmp_path / "worktree"
         worktree.mkdir()
         (worktree / ".git").write_text("gitdir: /tmp/untrusted\n")
 
-        with pytest.raises(RuntimeError, match="without a prepared private Git"):
+        with pytest.raises(RuntimeError, match="Refusing agent Git metadata access"):
             CodexAgent().build_implement_command(
                 prompt="Do the work",
                 worktree_path=worktree,
@@ -1467,6 +1467,24 @@ class TestResolveRepoRoot:
         mock_common_root.assert_called_once_with(worktree)
 
 
+
+@pytest.fixture
+def pin_worktree_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the orchestrator to the worktree backend (the default is now clone)."""
+    from dataclasses import replace
+
+    from spec_runtime import orchestrator as orch
+
+    monkeypatch.setattr(
+        orch,
+        "SPEC_RUNTIME_CONFIG",
+        replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            execution=replace(orch.SPEC_RUNTIME_CONFIG.execution, backend="worktree"),
+        ),
+    )
+
+@pytest.mark.usefixtures("pin_worktree_backend")
 class TestPhasePublishCwdPropagation:
     """Verify that phase_publish passes cwd=worktree_path to forge.find_pr_for_branch."""
 

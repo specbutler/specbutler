@@ -40,7 +40,12 @@ backend.
 When launched by the orchestrator for `implement`, follow this contract:
 
 1. **Read context first** — read the spec file and `AGENTS.md` before editing.
-2. **Stay in the provided workspace** — do not switch branches or start another run.
+2. **Stay in the provided workspace** — do not start another run, and leave
+   the run's branch checked out when you finish.
+   - You may use git freely: `add`, `commit`, `stash`, `branch`, `rebase`,
+     `log`, and `fetch` from origin. Your commit identity is already set.
+   - Do not push or open pull requests; publishing stays with the orchestrator.
+   - Repository Git config and hooks are read-only inside the session.
 3. **Apply only this attempt's scope**:
    - Initial/retry: implement remaining spec work
    - Verify retry: fix the failing gate output provided by orchestrator

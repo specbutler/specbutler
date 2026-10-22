@@ -15,6 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .agent_git_probe import (
+    PROBE_AGENTS,
+    PROBE_BACKENDS,
+    AgentGitProbeResult,
+    agent_git_probe_disabled,
+    run_agent_git_probe,
+)
 from .command_runtime import CommandSpec, looks_posix_script
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config, resolve_spec_path
 from .git_common import subprocess_text_kwargs
@@ -25,6 +32,7 @@ DoctorStatus = Literal["ok", "warning", "error"]
 CommandRunner = Callable[[list[str], Path, float], subprocess.CompletedProcess[str]]
 ExecutableResolver = Callable[[str], str | None]
 ConfigLoader = Callable[[Path], SpecRuntimeConfig]
+AgentGitProbe = Callable[[str, str], AgentGitProbeResult]
 
 
 @dataclass(frozen=True)
@@ -201,6 +209,7 @@ def run_doctor_checks(
     which: ExecutableResolver | None = None,
     config_loader: ConfigLoader | None = None,
     windows_volume_probe: WindowsVolumeProbe | None = None,
+    agent_git_probe: AgentGitProbe | None = None,
 ) -> DoctorReport:
     """Inspect project readiness without changing files, refs, or services."""
     run = runner or _run_command
@@ -275,6 +284,7 @@ def run_doctor_checks(
     checks.extend(_execution_policy_checks(config))
     checks.extend(_git_checks(repo_root, config, run))
     checks.extend(_agent_checks(repo_root, config, resolve_executable, run))
+    checks.extend(_agent_git_probe_checks(config, agent_git_probe))
     checks.extend(_github_checks(repo_root, run, resolve_executable))
     checks.extend(_command_checks(repo_root, config, run, resolve_executable))
     path_checks, runtime_paths = _runtime_path_checks(repo_root, config, run)
@@ -673,6 +683,51 @@ def _agent_checks(
                         "`.codex/` is absent or a directory",
                     )
                 )
+    return checks
+
+
+def _agent_git_probe_checks(
+    config: SpecRuntimeConfig,
+    probe: AgentGitProbe | None = None,
+) -> list[DoctorCheck]:
+    """Probe Git inside each provider's sandbox for clone and worktree layouts.
+
+    Failures for the configured backend are blockers. The other backend is
+    reported as a warning so switching backends is an informed choice.
+    Worktree mode grants the shared ``.git`` directory by design, so a
+    write that was not blocked there is reported rather than failed.
+    """
+    if agent_git_probe_disabled():
+        return []
+    run_probe = probe or run_agent_git_probe
+    agents = [
+        agent for agent in dict.fromkeys(config.agents.allowed) if agent in PROBE_AGENTS
+    ]
+    configured_backend = config.execution.backend
+    checks: list[DoctorCheck] = []
+    for agent in agents:
+        for backend in PROBE_BACKENDS:
+            name = f"agent git ({agent}, {backend})"
+            result = run_probe(agent, backend)
+            detail = result.summary()
+            if result.passed:
+                checks.append(_ok(name, detail))
+                continue
+            if result.unavailable_reason:
+                checks.append(_warning(name, detail))
+                continue
+            blocking = backend == configured_backend and (
+                not result.git_works or backend != "worktree"
+            )
+            severity = _error if blocking else _warning
+            checks.append(
+                severity(
+                    name,
+                    detail,
+                    "Run `spec doctor` from a normal terminal, not inside a sandboxed agent session.",
+                    "See the agent Git section of docs/execution-backends.md.",
+                )
+            )
     return checks
 
 
