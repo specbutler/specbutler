@@ -60,6 +60,17 @@ def _lazy_config():
     return load_spec_runtime_config()
 
 
+def _warn_container_alpha() -> None:
+    """Print the container-alpha warning once when the container backend is selected."""
+    from .config import emit_container_alpha_warning
+
+    try:
+        config = _lazy_config()
+    except Exception:
+        return
+    emit_container_alpha_warning(config)
+
+
 def _configure_windows_stdio(
     *,
     platform: str | None = None,
@@ -704,6 +715,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 def _cmd_implement(args: argparse.Namespace) -> int:
     """Start or resume a full implementation workflow (maps to orchestrator ``run`` command)."""
+    _warn_container_alpha()
     orch = _lazy_orchestrator()
     return orch.cmd_run(args)
 
@@ -741,6 +753,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
 
 def _cmd_task(args: argparse.Namespace) -> int:
     """Describe and execute a quick task."""
+    _warn_container_alpha()
     orch = _lazy_orchestrator()
     return orch.cmd_task(args)
 
@@ -955,6 +968,8 @@ def _cmd_auto(args: argparse.Namespace) -> int:
         return 1
     if auto_cmd == "run":
         from .autopilot import parse_notify_backends, run_loop
+
+        _warn_container_alpha()
 
         args.notify_backends = parse_notify_backends(
             getattr(args, "notify", []),
