@@ -23330,6 +23330,8 @@ class TestNoProgressCircuitBreaker:
         assert run.no_progress_retries == 2
         assert run.attempts == 2
         assert "No-progress circuit breaker triggered" in run.last_error
+        # Durable: survives the counter reset when a resumed run later passes verify.
+        assert run.no_progress_trips == 1
 
     def test_repeated_verify_failures_on_same_dirty_head_block(self, repo: Path):
         run = self._make_run()
@@ -40733,3 +40735,230 @@ class TestMergeConflictRetryBudget:
         assert label == "8/11"
         # Raw attempts would have rendered "13/13" -- past a cap it never hit.
         assert orch.format_attempt_progress(run.attempts, run.retry_cap) == "13/13"
+
+
+class TestInfrastructureFailureBackoff:
+    """Infrastructure failures back off in place and never spend retry_cap."""
+
+    SERVICE_STARTUP_ERROR = (
+        "Exception in publish: Container backend in-worker service startup failed. "
+        "See /home/u/repo/.spec-workspaces/my-feature-20260101T000000123456/logs/in-worker-services.log"
+    )
+
+    def _make_run(self) -> orch.RunState:
+        return orch.RunState(
+            run_id="infra-backoff-20260101T000000",
+            spec_id="my-feature",
+            branch="spec/my-feature",
+        )
+
+    @contextmanager
+    def _harness(self, handlers, *, attempts: int = 2):
+        waits: list[float] = []
+        real_wait = orch._wait_holding_run_lease
+
+        def recording_wait(run, repo_root, phase, delay_seconds):
+            waits.append(delay_seconds)
+            real_wait(run, repo_root, phase, delay_seconds)
+
+        poll_sleep = MagicMock()
+        with (
+            patch.dict(orch.PHASE_HANDLERS, handlers),
+            patch.object(orch, "INFRA_RETRY_ATTEMPTS", attempts),
+            patch.object(orch, "INFRA_BACKOFF_BASE_SECONDS", 30.0),
+            patch.object(orch, "INFRA_BACKOFF_MAX_SECONDS", 600.0),
+            patch.object(orch, "_wait_holding_run_lease", side_effect=recording_wait),
+            patch.object(orch, "_poll_sleep", poll_sleep),
+        ):
+            yield waits, poll_sleep
+
+    def test_repeating_infrastructure_failure_backs_off_then_stops(self, repo: Path):
+        run = self._make_run()
+        run.save(repo)
+        calls = {"publish": 0}
+
+        def failing_publish(r, root):
+            del root
+            calls["publish"] += 1
+            r.last_error = self.SERVICE_STARTUP_ERROR
+            return "failed"
+
+        handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
+        handlers["publish"] = failing_publish
+
+        with self._harness(handlers) as (waits, poll_sleep):
+            result = orch.run_full_workflow(run, repo, retry_cap=10)
+
+        assert result == "failed"
+        # One original attempt plus INFRA_RETRY_ATTEMPTS in-place reruns, then
+        # the process gives up instead of looping.
+        assert calls["publish"] == 3
+        assert len(waits) == 2
+        # Equal-jitter exponential backoff: [15, 30] then [30, 60].
+        assert 15.0 <= waits[0] <= 30.0
+        assert 30.0 <= waits[1] <= 60.0
+        # Every second of the wait goes through the orchestrator sleep seam.
+        assert sum(call.args[0] for call in poll_sleep.call_args_list) == pytest.approx(sum(waits))
+        # No convergence budget was spent.
+        assert run.attempts == 0
+        assert run.implement_failures == run.verify_failures == run.review_changes == 0
+        assert run.last_failure_category == "infrastructure"
+        assert run.last_failure_signature.startswith("container_service_startup:")
+        assert run.infra_failure_streak == 3
+        handlers["implement"].assert_called_once()
+
+        audits = [
+            json.loads(path.read_text(encoding="utf-8"))["result"]
+            for path in sorted((repo / ".spec-state" / "orchestrator").glob(f"{run.run_id}-publish-*.json"))
+        ]
+        assert audits
+        assert all(audit["failure_type"] == "infrastructure" for audit in audits)
+        assert all(audit["failure_subtype"] == "container_service_startup" for audit in audits)
+        assert all(audit["failure_category"] == "infrastructure" for audit in audits)
+
+        analytics = orch._compute_orchestrator_analytics(repo, run_id=run.run_id)
+        # Audit filenames have one-second resolution, so count what is on disk.
+        assert analytics["failures_by_category"] == {"infrastructure": len(audits)}
+        assert analytics["failures_by_type_subtype"] == {
+            "infrastructure.container_service_startup": len(audits)
+        }
+
+    def test_relaunched_run_gets_no_fresh_inprocess_retries(self, repo: Path):
+        run = self._make_run()
+        run.phase = "verify"
+        run.status = "passed"
+        run.verify_passed_once = True
+        run.last_failure_signature = orch.classify_failure(self.SERVICE_STARTUP_ERROR).signature
+        run.infra_failure_streak = 3
+        run.save(repo)
+        calls = {"publish": 0}
+
+        def failing_publish(r, root):
+            del root
+            calls["publish"] += 1
+            r.last_error = self.SERVICE_STARTUP_ERROR.replace("20260101T000000123456", "20260102T000000999999")
+            return "failed"
+
+        handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
+        handlers["publish"] = failing_publish
+
+        with self._harness(handlers) as (waits, poll_sleep):
+            result = orch.run_full_workflow(run, repo, retry_cap=10)
+
+        assert result == "failed"
+        assert calls["publish"] == 1
+        assert waits == []
+        poll_sleep.assert_not_called()
+        assert run.infra_failure_streak == 4
+
+    def test_operator_infrastructure_failure_fails_without_waiting(self, repo: Path):
+        run = self._make_run()
+        run.save(repo)
+        calls = {"verify": 0}
+
+        def failing_verify(r, root):
+            del root
+            calls["verify"] += 1
+            r.last_error = "make setup failed: Missing uv; see docs/setup.md"
+            return "failed"
+
+        handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
+        handlers["verify"] = failing_verify
+
+        with self._harness(handlers) as (waits, poll_sleep):
+            result = orch.run_full_workflow(run, repo, retry_cap=10)
+
+        assert result == "failed"
+        assert calls["verify"] == 1
+        assert waits == []
+        assert run.attempts == 0
+        assert run.last_failure_signature.startswith("toolchain_missing:")
+
+    def test_code_failures_still_retry_implement_without_backoff(self, repo: Path):
+        run = self._make_run()
+        run.save(repo)
+        calls = {"verify": 0, "implement": 0}
+
+        def implement(r, root):
+            del root
+            calls["implement"] += 1
+            return "passed"
+
+        def verify(r, root):
+            del root
+            calls["verify"] += 1
+            if calls["verify"] <= 2:
+                r.last_error = f"Gate 'lint' failed (exit 1). output: E501 line too long ({calls['verify']})"
+                return "failed"
+            return "passed"
+
+        handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
+        handlers["implement"] = implement
+        handlers["verify"] = verify
+
+        with self._harness(handlers) as (waits, poll_sleep):
+            result = orch.run_full_workflow(run, repo, retry_cap=10)
+
+        assert result == "passed"
+        assert calls == {"verify": 3, "implement": 3}
+        assert run.attempts == 2
+        assert run.verify_failures == 2
+        assert waits == []
+        poll_sleep.assert_not_called()
+
+
+class TestFailureClassification:
+    def test_infrastructure_errors_seen_in_relaunch_storms(self):
+        cases = {
+            "Container backend image build failed for spec-worker:a9db77abb0330705662dcbf8. "
+            "See /r/.spec-workspaces/x-20260630T004645226547/logs/image-build.log": "container_image_build",
+            "Exception in publish: Container backend in-worker service startup failed. See /r/logs": (
+                "container_service_startup"
+            ),
+            "make setup failed: Missing uv; see docs/setup.md": "toolchain_missing",
+            "Claude agent credentials are not authenticated: the host OAuth access token in "
+            "/h/.claude/.credentials.json is expired": "agent_auth",
+            "GitHub CLI not authenticated. Run: gh auth login": "forge_auth",
+            "You've hit your session limit · resets 8:30pm (America/Los_Angeles)": "provider_capacity",
+            "git push failed: ! [rejected] code/x--20260709T032323195731 (fetch first)": "publish_push",
+            "gh pr create failed: error connecting to api.github.com": "pr_create",
+            "Timed out waiting for auto-merge on PR #12 (mergeStateStatus=BLOCKED)": "ci_wait_timeout",
+        }
+        for message, kind in cases.items():
+            classification = orch.classify_failure(message)
+            assert classification.category is orch.FailureCategory.INFRASTRUCTURE, message
+            assert classification.kind == kind, message
+            assert classification.signature.startswith(f"{kind}:")
+
+    def test_code_errors_stay_code(self):
+        assert orch.classify_failure("Gate 'test' failed (exit 1). output: 1 failed").kind == "verify_gate"
+        assert orch.classify_failure("Merge conflict, CONFLICT (content)").kind == "merge_conflict"
+        assert (
+            orch.classify_failure("Review blocked", phase="review", review_decision_status="request_changes").kind
+            == "review_changes"
+        )
+        assert orch.classify_failure("required checks failing: test").kind == "required_checks"
+        assert orch.classify_failure("stopped by user").category is orch.FailureCategory.UNKNOWN
+
+    def test_signature_ignores_run_ids_paths_and_wrappers(self):
+        first = orch.classify_failure(
+            "Container backend image build failed for spec-worker:a9db77abb0330705662dcbf8. "
+            "See /Users/u/repo/.spec-workspaces/spec-a-20260630T004645226547/logs/image-build.log"
+        )
+        relaunch = orch.classify_failure(
+            "Exception in implement: Container backend image build failed for "
+            "spec-worker:a9db77abb0330705662dcbf8. "
+            "See /Users/u/repo/.spec-workspaces/spec-b-20260701T102554396670/logs/image-build.log"
+        )
+        other = orch.classify_failure("Container backend image build failed: no space left on device")
+        assert first.signature == relaunch.signature
+        assert first.signature != other.signature
+
+    def test_wrapped_gate_output_is_not_infrastructure(self):
+        # A test that prints a network error is still a code failure, also
+        # when autopilot only has the wrapped log line.
+        message = (
+            "Workflow failed for my-feature: Gate 'test' failed (exit 1). output: "
+            "requests.exceptions.ConnectionError: error connecting to localhost"
+        )
+        assert orch.classify_failure(message).category is orch.FailureCategory.CODE

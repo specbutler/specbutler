@@ -57,17 +57,26 @@ from spec_runtime.execution_backend import (
     validate_workspace_run_identity,
 )
 from spec_runtime.git_common import resolve_common_root, run_git, subprocess_text_kwargs
+from spec_runtime.infra_breaker import (
+    BLOCKED_ON_INFRASTRUCTURE,
+    BreakerEntry,
+    InfrastructureCircuitBreaker,
+    infra_breaker_state_path,
+    read_infra_breaker_entries,
+)
 from spec_runtime.orchestrator import (
     BASE_REF,
     BLOCK_DEBUGGER_AUTO_RESUME_LIMIT,
     BlockDiagnosis,
+    FailureCategory,
     OperatorSteering,
     RunState,
     _branch_commits_ahead_of_base,
     _latest_non_superseded_run,
-    _normalize_error_for_fingerprint,
     _operator_continuation_for_run,
     _select_default_run,
+    classify_failure,
+    failure_signature_text,
     format_attempt_progress,
     read_spec_lock_owner,
 )
@@ -179,7 +188,9 @@ class DispatchCircuitBreaker:
 
     def record_failure(self, spec_id: str, phase: str, error_text: str, *, now: float) -> int:
         """Record a failed run; returns the consecutive identical-failure count."""
-        fingerprint = _normalize_error_for_fingerprint(error_text or "")
+        # failure_signature_text drops paths and run ids: an error that points
+        # at a per-run log directory must still compare equal across relaunches.
+        fingerprint = failure_signature_text(error_text or "", strip_paths=False)
         key = (spec_id, str(phase or ""), fingerprint)
         entry = self._entries.get(spec_id)
         if entry is not None and entry.key == key:
@@ -1033,6 +1044,14 @@ def resolve_repo_root(explicit: str | None = None) -> Path:
 
 def autopilot_state_root(repo_root: Path) -> Path:
     return resolve_common_root(repo_root) / SPEC_RUNTIME_CONFIG.paths.state_dir / "autopilot"
+
+
+def autopilot_infra_breaker_path(repo_root: Path) -> Path:
+    return infra_breaker_state_path(resolve_common_root(repo_root) / SPEC_RUNTIME_CONFIG.paths.state_dir)
+
+
+def read_infra_breakers(repo_root: Path) -> list[BreakerEntry]:
+    return read_infra_breaker_entries(autopilot_infra_breaker_path(repo_root))
 
 
 def autopilot_runs_root(repo_root: Path) -> Path:
@@ -2078,6 +2097,16 @@ def format_failure_notification(spec_id: str, phase_reached: str, tail: list[str
     return f"Spec: {spec_id}\nPhase: {phase_reached}\nOutput tail ({line_count} lines):\n{output}"
 
 
+def format_infra_breaker_notification(entry: BreakerEntry, *, cooldown_seconds: float) -> str:
+    return (
+        f"Infrastructure circuit breaker open ({entry.kind or 'infrastructure'}).\n"
+        f"{entry.describe()}.\n"
+        f"Dispatch for affected work is paused; one probe every {cooldown_seconds:.0f}s. "
+        f"Fix the environment, or restart with `spec auto run --reset-infra-breaker`.\n"
+        f"Latest error: {entry.error or 'unknown'}"
+    )
+
+
 def render_queue(
     queue: list[DispatchCandidate],
     lease_backoff_until: dict[str, float] | None = None,
@@ -2506,6 +2535,13 @@ def remove_pid_file(repo_root: Path) -> None:
     autopilot_pid_path(repo_root).unlink(missing_ok=True)
 
 
+def _announce_infra_recovery(closed: list[BreakerEntry], spec_id: str, notify_backends: list[str]) -> None:
+    for entry in closed:
+        message = f"Infrastructure recovered: {entry.signature} cleared by {spec_id}; dispatch resumes."
+        print(format_status_line("resume", message))
+        notify(notify_backends, title=AUTOPILOT_TITLE, message=message)
+
+
 def run_loop(args: argparse.Namespace) -> int:
     repo_root = resolve_repo_root(args.repo_root)
     repo_config = load_repo_spec_runtime_config(repo_root)
@@ -2590,6 +2626,21 @@ def run_loop(args: argparse.Namespace) -> int:
     lease_backoff_until: dict[str, float] = {}
     dispatch_breaker = DispatchCircuitBreaker()
     breaker_announced: set[str] = set()
+    infra_breaker = InfrastructureCircuitBreaker(
+        backend=backend_policy.backend,
+        threshold=repo_config.autopilot.infra_breaker_threshold,
+        base_backoff=repo_config.autopilot.infra_backoff_base_seconds,
+        max_backoff=repo_config.autopilot.infra_backoff_max_seconds,
+        cooldown=repo_config.autopilot.infra_breaker_cooldown_seconds,
+        state_path=None if args.dry_run else autopilot_infra_breaker_path(repo_root),
+    )
+    if getattr(args, "reset_infra_breaker", False) and not args.dry_run:
+        infra_breaker.reset()
+        print(format_status_line("resume", "infrastructure circuit breaker reset by operator"))
+    for entry in infra_breaker.entries:
+        if entry.is_open:
+            print(format_status_line(BLOCKED_ON_INFRASTRUCTURE, f"{entry.describe()} (restored)"))
+    infra_announced: set[str] = set()
     lock_tracker = LockContentionTracker(
         base_backoff=repo_config.autopilot.lock_backoff_base_seconds,
         max_backoff=repo_config.autopilot.lock_backoff_max_seconds,
@@ -2700,6 +2751,11 @@ def run_loop(args: argparse.Namespace) -> int:
                     # Forward progress resets the same-error circuit breaker.
                     dispatch_breaker.record_success(spec_id)
                     breaker_announced.discard(spec_id)
+                    _announce_infra_recovery(
+                        infra_breaker.record_progress(spec_id),
+                        spec_id,
+                        args.notify_backends,
+                    )
                     print(
                         format_status_line(
                             "done",
@@ -2738,11 +2794,10 @@ def run_loop(args: argparse.Namespace) -> int:
                     failure_error = str((run_record or {}).get("last_error", "")).strip()
                     if not failure_error and tail:
                         failure_error = tail[-1]
-                    dispatch_breaker.record_failure(
-                        spec_id,
-                        phase_reached,
+                    failure_class = classify_failure(
                         failure_error,
-                        now=time.monotonic(),
+                        phase=phase_reached,
+                        review_decision_status=str((run_record or {}).get("review_decision_status", "")),
                     )
                     print(
                         format_status_line(
@@ -2750,11 +2805,66 @@ def run_loop(args: argparse.Namespace) -> int:
                             f"{spec_id} outcome=failure phase={phase_reached} duration={duration}s",
                         )
                     )
-                    notify(
-                        args.notify_backends,
-                        title=AUTOPILOT_TITLE,
-                        message=format_failure_notification(spec_id, phase_reached, tail),
-                    )
+                    notify_failure = True
+                    if failure_class.is_infrastructure:
+                        # Infrastructure failures get their own signature-keyed
+                        # backoff and repo/backend breaker instead of the
+                        # per-spec same-error breaker.
+                        infra_outcome = infra_breaker.record_failure(
+                            spec_id,
+                            signature=failure_class.signature,
+                            kind=failure_class.kind,
+                            scope=failure_class.scope,
+                            error=failure_error,
+                            now=time.time(),
+                        )
+                        print(
+                            format_status_line(
+                                "infra-backoff",
+                                (
+                                    f"{spec_id} {failure_class.kind} signature={failure_class.signature} "
+                                    f"streak={infra_outcome.spec_streak} "
+                                    f"consecutive={infra_outcome.entry.count} "
+                                    f"retry_in={infra_outcome.backoff_seconds:.0f}s"
+                                ),
+                            )
+                        )
+                        if infra_outcome.tripped:
+                            print(format_status_line(BLOCKED_ON_INFRASTRUCTURE, infra_outcome.entry.describe()))
+                            notify(
+                                args.notify_backends,
+                                title=AUTOPILOT_TITLE,
+                                message=format_infra_breaker_notification(
+                                    infra_outcome.entry,
+                                    cooldown_seconds=repo_config.autopilot.infra_breaker_cooldown_seconds,
+                                ),
+                            )
+                            notify_failure = False
+                        elif infra_outcome.spec_streak > 1 or infra_outcome.entry.is_open:
+                            # One notification per spec and signature; the
+                            # breaker notification covers the rest.
+                            notify_failure = False
+                    else:
+                        dispatch_breaker.record_failure(
+                            spec_id,
+                            phase_reached,
+                            failure_error,
+                            now=time.monotonic(),
+                        )
+                        if failure_class.category is FailureCategory.CODE:
+                            # A code failure means the environment got far
+                            # enough to run the code.
+                            _announce_infra_recovery(
+                                infra_breaker.record_progress(spec_id),
+                                spec_id,
+                                args.notify_backends,
+                            )
+                    if notify_failure:
+                        notify(
+                            args.notify_backends,
+                            title=AUTOPILOT_TITLE,
+                            message=format_failure_notification(spec_id, phase_reached, tail),
+                        )
                 completed.append(spec_id)
 
             for spec_id in completed:
@@ -2974,6 +3084,35 @@ def run_loop(args: argparse.Namespace) -> int:
                             )
                         continue
                     breaker_announced.discard(candidate.spec_id)
+                    # Infrastructure backoff and circuit breaker: hold specs
+                    # that just failed on infrastructure, and everything an
+                    # open breaker covers, except one probe per cooldown.
+                    infra_decision = infra_breaker.check_dispatch(candidate.spec_id, now=time.time())
+                    if not infra_decision.allowed:
+                        if (
+                            infra_decision.reason == "blocked"
+                            and infra_decision.entry is not None
+                            and candidate.spec_id not in infra_announced
+                        ):
+                            infra_announced.add(candidate.spec_id)
+                            print(
+                                format_status_line(
+                                    BLOCKED_ON_INFRASTRUCTURE,
+                                    (
+                                        f"{candidate.spec_id} held: {infra_decision.entry.signature}; "
+                                        f"next probe in {infra_decision.retry_in_seconds:.0f}s"
+                                    ),
+                                )
+                            )
+                        continue
+                    infra_announced.discard(candidate.spec_id)
+                    if infra_decision.reason == "probe" and infra_decision.entry is not None:
+                        print(
+                            format_status_line(
+                                "infra-probe",
+                                f"{candidate.spec_id} dispatching as probe for {infra_decision.entry.signature}",
+                            )
+                        )
                     if candidate.lease_state == "waiting-remote":
                         lease_backoff_until[candidate.spec_id] = time.monotonic() + max(args.poll_interval * 3, 30)
                         print(
@@ -3476,6 +3615,7 @@ def _render_watch_screen(
     merged_count: int = 0,
     passed_count: int = 0,
     coordinator_unavailable: str = "",
+    infrastructure_breakers: list[BreakerEntry] | None = None,
 ) -> str:
     non_active_statuses = ("failed", "blocked", "stale")
     active_count = sum(1 for r in run_rows if r["status"] not in non_active_statuses)
@@ -3504,6 +3644,13 @@ def _render_watch_screen(
     lines.append("─" * 80)
     if coordinator_unavailable:
         lines.append(f"Coordinator unavailable: {coordinator_unavailable}")
+        lines.append("─" * 80)
+    open_breakers = [entry for entry in infrastructure_breakers or () if entry.is_open]
+    if open_breakers:
+        for entry in open_breakers:
+            lines.append(f"{entry.describe()}")
+            probe = entry.to_payload().get("next_probe_at") or "unknown"
+            lines.append(f"  next probe: {probe}  error: {(entry.error or '').splitlines()[0][:120] if entry.error else '—'}")
         lines.append("─" * 80)
 
     if run_rows:
@@ -3646,6 +3793,7 @@ def watch_command(args: argparse.Namespace) -> int:
             merged_count=len(git_state.merged_specs),
             passed_count=passed_count,
             coordinator_unavailable=coordinator_snapshot.unavailable_message,
+            infrastructure_breakers=read_infra_breakers(repo_root),
         )
 
     if not interactive:

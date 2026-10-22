@@ -57,6 +57,7 @@
       merged: "badge-merged",
       failed: "badge-failed",
       blocked: "badge-blocked",
+      "blocked-on-infrastructure": "badge-blocked",
       waiting: "badge-waiting",
       stale: "badge-stale",
       queued: "badge-queued",
@@ -195,6 +196,23 @@
     html += summaryCard(data.merged_count, "Merged");
     html += "</div>";
 
+    // Open infrastructure circuit breakers hold dispatch until a probe passes.
+    var breakers = (data.infrastructure_breakers || []).filter(function (b) {
+      return b.status === "blocked-on-infrastructure";
+    });
+    for (var b = 0; b < breakers.length; b++) {
+      var entry = breakers[b];
+      html += '<div class="infra-banner">';
+      html += badge("blocked-on-infrastructure") + " ";
+      html += "<strong>" + escapeHtml(entry.kind || "infrastructure") + "</strong> ";
+      html += "<code>" + escapeHtml(entry.signature) + "</code> on " + escapeHtml(entry.backend || "?");
+      html += " &middot; " + escapeHtml(String(entry.count)) + " consecutive failures";
+      html += " &middot; affects " + escapeHtml(entry.scope === "backend" ? "all specs" : (entry.specs || []).join(", "));
+      html += " &middot; next probe " + escapeHtml(entry.next_probe_at || "-");
+      html += '<div class="infra-banner-error">' + escapeHtml(String(entry.error || "").split("\n")[0]) + "</div>";
+      html += "</div>";
+    }
+
     // Full spec table with status badges
     if (data.specs && data.specs.length > 0) {
       // Build a lookup of active run info by spec_id
@@ -257,7 +275,7 @@
         var row = data.rows[i];
         html += "<tr>";
         html += '<td data-label="Spec"><a href="' + specRoute(row.spec_id) + '">' + escapeHtml(row.display_spec_id || row.spec_id) + "</a></td>";
-        html += '<td data-label="Status">' + badge(row.status) + "</td>";
+        html += '<td data-label="Status">' + badge(row.status) + (row.infra_blocked ? " " + badge("blocked-on-infrastructure") : "") + "</td>";
         html += '<td data-label="Phase">' + escapeHtml(row.phase) + "</td>";
         html += '<td data-label="Agent">' + escapeHtml(row.agent) + "</td>";
         html += '<td data-label="Retries">' + escapeHtml(row.retries) + "</td>";
