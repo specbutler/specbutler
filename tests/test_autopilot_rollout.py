@@ -5,6 +5,7 @@ import json
 import os
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -262,7 +263,7 @@ def test_run_loop_surfaces_effective_concurrency_in_dry_run(
     monkeypatch.setattr(autopilot, "remove_pid_file", lambda _repo_root: None)
     monkeypatch.setattr(autopilot, "adopt_active_processes", lambda _repo_root: {})
     monkeypatch.setattr(autopilot, "refresh_runtime_git_refs", lambda _repo_root: (True, ""))
-    monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: object())
+    monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: SimpleNamespace(merged_specs=frozenset()))
     monkeypatch.setattr(autopilot, "load_run_record_index", lambda _repo_root: autopilot.RunRecordIndex())
     monkeypatch.setattr(autopilot, "fetch_coordinator_lease_snapshot", lambda _repo_root: autopilot.CoordinatorLeaseSnapshot())
     monkeypatch.setattr(
@@ -343,7 +344,7 @@ def test_run_loop_cleans_stale_container_artifacts_on_restart(
     monkeypatch.setattr(autopilot, "adopt_active_processes", lambda _repo_root: {})
     monkeypatch.setattr(autopilot, "get_execution_backend", lambda _execution: CleanupBackend())
     monkeypatch.setattr(autopilot, "refresh_runtime_git_refs", lambda _repo_root: (True, ""))
-    monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: object())
+    monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: SimpleNamespace(merged_specs=frozenset()))
     monkeypatch.setattr(autopilot, "load_run_record_index", lambda _repo_root: autopilot.RunRecordIndex())
     monkeypatch.setattr(autopilot, "fetch_coordinator_lease_snapshot", lambda _repo_root: autopilot.CoordinatorLeaseSnapshot())
     monkeypatch.setattr(

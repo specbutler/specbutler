@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
-from .config import resolve_specs_root
+from .config import SpecRuntimeConfig, load_repo_spec_runtime_config, resolve_specs_root
 from .spec_identity import SPEC_ID_RE
 
 VALID_SPEC_AREAS = ("frontend", "backend", "fullstack", "orchestrator")
@@ -138,9 +140,9 @@ def parse_spec_metadata(spec_path: Path) -> SpecMetadata:
     )
 
 
-def iter_spec_metadata(repo_root: Path) -> list[SpecMetadata]:
+def iter_spec_metadata(repo_root: Path, *, config: SpecRuntimeConfig | None = None) -> list[SpecMetadata]:
     specs: list[SpecMetadata] = []
-    specs_root = resolve_specs_root(repo_root)
+    specs_root = resolve_specs_root(repo_root, config=config)
     for spec_path in sorted(specs_root.glob("*.md")):
         if spec_path.name == "TEMPLATE.md":
             continue
@@ -159,6 +161,100 @@ def iter_spec_metadata(repo_root: Path) -> list[SpecMetadata]:
             continue
         specs.append(metadata)
     return specs
+
+
+@dataclass(frozen=True)
+class SpecGraphProblem:
+    """A ``depends_on`` defect that prevents a spec from ever being dispatched."""
+
+    spec_id: str
+    kind: str  # "unknown-dependency" | "dependency-cycle"
+    detail: str
+
+
+def task_spec_ids(repo_root: Path, *, config: SpecRuntimeConfig | None = None) -> set[str]:
+    """Ids of task specs, which ``depends_on`` may reference but discovery skips."""
+    runtime_config = config or load_repo_spec_runtime_config(repo_root)
+    task_root = repo_root / runtime_config.paths.task_specs_dir
+    return {path.stem for path in task_root.glob("*.md") if path.name != "TEMPLATE.md"}
+
+
+def validate_spec_graph(
+    specs: Iterable[SpecMetadata],
+    *,
+    merged_spec_ids: Iterable[str] = (),
+    external_spec_ids: Iterable[str] = (),
+) -> dict[str, tuple[SpecGraphProblem, ...]]:
+    """Find unknown ``depends_on`` ids and dependency cycles among discovered specs.
+
+    ``merged_spec_ids`` are treated as satisfied dependencies even when their spec
+    file is no longer discovered, and merged specs are left out of cycle detection
+    because their own dependencies no longer gate anything. ``external_spec_ids``
+    (task specs) are valid dependency targets outside the discovered catalog.
+    """
+    specs = list(specs)
+    merged = set(merged_spec_ids)
+    known = {spec.spec_id for spec in specs}
+    external = set(external_spec_ids)
+    problems: dict[str, list[SpecGraphProblem]] = {}
+
+    for spec in specs:
+        for dep in spec.depends_on:
+            if dep not in known and dep not in merged and dep not in external:
+                problems.setdefault(spec.spec_id, []).append(
+                    SpecGraphProblem(
+                        spec.spec_id,
+                        "unknown-dependency",
+                        f"depends on unknown spec {dep!r}",
+                    )
+                )
+
+    pending = known - merged
+    graph = {
+        spec.spec_id: [dep for dep in dict.fromkeys(spec.depends_on) if dep in pending]
+        for spec in specs
+        if spec.spec_id in pending
+    }
+
+    for spec_id in graph:
+        cycle = _shortest_cycle_through(graph, spec_id)
+        if cycle:
+            problems.setdefault(spec_id, []).append(
+                SpecGraphProblem(
+                    spec_id,
+                    "dependency-cycle",
+                    "dependency cycle " + " -> ".join(cycle),
+                )
+            )
+    return {spec_id: tuple(items) for spec_id, items in problems.items()}
+
+
+def format_spec_graph_problems(problems: Iterable[SpecGraphProblem]) -> str:
+    return "; ".join(problem.detail for problem in problems)
+
+
+def _shortest_cycle_through(graph: dict[str, list[str]], start: str) -> list[str]:
+    """Return ``[start, ..., start]`` for the shortest dependency cycle through ``start``."""
+    parents: dict[str, str] = {}
+    queue: deque[str] = deque()
+    for dep in graph.get(start, ()):
+        if dep == start:
+            return [start, start]
+        if dep not in parents:
+            parents[dep] = start
+            queue.append(dep)
+    while queue:
+        node = queue.popleft()
+        for dep in graph.get(node, ()):
+            if dep == start:
+                path = [node]
+                while path[-1] != start:
+                    path.append(parents[path[-1]])
+                return [*reversed(path), start]
+            if dep not in parents:
+                parents[dep] = node
+                queue.append(dep)
+    return []
 
 
 def _to_bool(value: object) -> bool:

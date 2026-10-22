@@ -21430,44 +21430,81 @@ def _extract_acceptance_checklist(spec_path: Path) -> str:
     return "\n".join(items) if items else "- [ ] No checklist items found in spec."
 
 
-def _extract_markdown_section_items(
-    spec_path: Path,
-    heading: str,
-    *,
-    checklist_only: bool,
-) -> list[str]:
+def _markdown_section_lines(spec_path: Path, heading: str) -> list[str]:
     if not spec_path.exists():
         return []
 
     text = spec_path.read_text(encoding="utf-8")
     in_section = False
-    items: list[str] = []
+    lines: list[str] = []
     heading_pattern = f"## {heading}"
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
-        stripped = line.strip()
         if line.startswith(heading_pattern):
             in_section = True
             continue
         if in_section and line.startswith("## "):
             break
-        if not in_section or not stripped:
-            continue
-        if checklist_only:
-            if re.match(r"^- \[[ xX]\]\s+", stripped):
-                items.append(stripped)
-            continue
+        if in_section:
+            lines.append(line)
+    return lines
+
+
+def _extract_markdown_section_items(spec_path: Path, heading: str) -> list[str]:
+    items: list[str] = []
+    for line in _markdown_section_lines(spec_path, heading):
+        stripped = line.strip()
         if re.match(r"^- \[[ xX]\]\s+", stripped) or re.match(r"^- .+", stripped) or re.match(r"^\d+\. .+", stripped):
             items.append(stripped)
     return items
 
 
+_ACCEPTANCE_ITEM_RE = re.compile(r"^(?P<indent>\s*)(?:[-*+]|\d+[.)])\s+(?:\[(?P<mark>[ xX])\]\s+)?(?P<text>\S.*)$")
+
+
 def _extract_acceptance_checklist_items(spec_path: Path) -> list[str]:
-    return _extract_markdown_section_items(
-        spec_path,
-        "Acceptance Criteria",
-        checklist_only=True,
-    )
+    """Return the spec's acceptance criteria as ``- [ ] text`` / ``- [x] text`` items.
+
+    Checkbox, numbered (``1.``/``1)``) and plain bullet (``-``/``*``/``+``) list
+    items are all criteria; only checkboxes carry a completed state. Wrapped
+    continuation lines are joined into their item. Nested plain or numbered
+    bullets are folded into their parent criterion, while nested checkboxes stay
+    separate items because they carry their own state.
+    """
+    items: list[list[str]] = []  # [mark, text] pairs, mutated while joining lines
+    current: list[str] | None = None
+    top_indent: int | None = None
+    in_fence = False
+    after_blank = False
+    for line in _markdown_section_lines(spec_path, "Acceptance Criteria"):
+        stripped = line.strip()
+        if stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if not stripped:
+            after_blank = True
+            continue
+        indent = len(line) - len(line.lstrip())
+        match = _ACCEPTANCE_ITEM_RE.match(line)
+        mark = match.group("mark") if match else None
+        if match and (top_indent is None or indent <= top_indent or mark is not None):
+            if top_indent is None or indent < top_indent:
+                top_indent = indent
+            current = ["x" if mark in ("x", "X") else " ", match.group("text").strip()]
+            items.append(current)
+        elif current is not None and (indent > (top_indent or 0) or not after_blank):
+            if match:
+                separator = " " if current[1].endswith(":") else "; "
+                current[1] += separator + match.group("text").strip()
+            else:
+                current[1] += " " + stripped
+        else:
+            # Prose that is not part of the list ends the current criterion.
+            current = None
+        after_blank = False
+    return [f"- [{mark}] {text}" for mark, text in items]
 
 
 def _default_verification_expectations() -> list[str]:
@@ -21480,11 +21517,7 @@ def _default_verification_expectations() -> list[str]:
 
 
 def _extract_verification_expectations(spec_path: Path) -> list[str]:
-    items = _extract_markdown_section_items(
-        spec_path,
-        "Verification",
-        checklist_only=False,
-    )
+    items = _extract_markdown_section_items(spec_path, "Verification")
     return items if items else _default_verification_expectations()
 
 

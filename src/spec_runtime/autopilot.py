@@ -95,7 +95,14 @@ from spec_runtime.spec_merge_tags import (
     push_tag_command,
     utc_timestamp_now,
 )
-from spec_runtime.spec_metadata import DEFAULT_SPEC_PRIORITY, SpecMetadata, iter_spec_metadata
+from spec_runtime.spec_metadata import (
+    DEFAULT_SPEC_PRIORITY,
+    SpecMetadata,
+    format_spec_graph_problems,
+    iter_spec_metadata,
+    task_spec_ids,
+    validate_spec_graph,
+)
 from spec_runtime.spec_status import (
     TERMINAL_RUN_STATUSES,
     blocks_on_required_intake,
@@ -1219,16 +1226,54 @@ def compute_unlock_counts(
     cache: dict[str, set[str]] = {}
 
     def descendants(spec_id: str) -> set[str]:
+        # Iterative walk with a visited set: a malformed ``depends_on`` cycle must
+        # not recurse forever (cycles are reported by ``validate_spec_graph``).
         if spec_id in cache:
             return cache[spec_id]
         result: set[str] = set()
-        for child in reverse.get(spec_id, set()):
+        stack = list(reverse.get(spec_id, ()))
+        while stack:
+            child = stack.pop()
+            if child in result:
+                continue
             result.add(child)
-            result.update(descendants(child))
+            stack.extend(reverse.get(child, ()))
+        result.discard(spec_id)
         cache[spec_id] = result
         return result
 
     return {spec.spec_id: len(descendants(spec.spec_id)) if spec.spec_id in valid_specs else 0 for spec in specs}
+
+
+def spec_graph_skip_reasons(
+    repo_root: Path,
+    specs: list[SpecMetadata],
+    *,
+    merged_specs: frozenset[str] | set[str] | None = None,
+    hidden_specs: set[str] | None = None,
+    config: SpecRuntimeConfig | None = None,
+) -> dict[str, str]:
+    """Map each dispatchable spec with an invalid ``depends_on`` graph to a skip reason.
+
+    ``specs`` must be every discovered spec (including obsolete ones) so that a
+    dependency on an obsolete spec is not mistaken for an unknown id.
+    """
+    merged = set(merged_specs or ())
+    hidden = hidden_specs or set()
+    problems = validate_spec_graph(
+        specs,
+        merged_spec_ids=merged,
+        external_spec_ids=task_spec_ids(repo_root, config=config),
+    )
+    return {
+        spec.spec_id: format_spec_graph_problems(problems[spec.spec_id])
+        for spec in specs
+        if spec.spec_id in problems
+        and not spec.superseded_by
+        and not spec.obsolete
+        and spec.spec_id not in hidden
+        and spec.spec_id not in merged
+    }
 
 
 def _block_debugger_auto_resume_available(run_record: dict) -> bool:
@@ -1331,13 +1376,21 @@ def build_dispatch_queue(
         else repo_config.autopilot.operator_grace_seconds
     )
     hidden_specs = hidden_spec_ids(repo_root)
+    all_specs = iter_spec_metadata(repo_root)
     specs = [
         spec
-        for spec in iter_spec_metadata(repo_root)
+        for spec in all_specs
         if not spec.superseded_by and not spec.obsolete and spec.spec_id not in hidden_specs
     ]
     git_state = git_state or collect_git_spec_state(repo_root, config=repo_config)
     unlock_counts = compute_unlock_counts(specs, merged_specs=git_state.merged_specs)
+    graph_skip_reasons = spec_graph_skip_reasons(
+        repo_root,
+        all_specs,
+        merged_specs=git_state.merged_specs,
+        hidden_specs=hidden_specs,
+        config=repo_config,
+    )
     backend_policy = resolve_autopilot_backend_policy(repo_config)
 
     queue: list[DispatchCandidate] = []
@@ -1396,6 +1449,10 @@ def build_dispatch_queue(
             if canonical_projection.status is _Canonical.ACTIVE and not reason.startswith("resume"):
                 continue
         if status == "in-progress" and not reason.startswith("resume"):
+            continue
+        # An unknown or cyclic dependency can never merge; the dispatcher logs
+        # the reason via ``spec_graph_skip_reasons`` instead of waiting silently.
+        if spec.spec_id in graph_skip_reasons:
             continue
         if not dependencies_are_merged(repo_root, spec.depends_on, git_state=git_state):
             continue
@@ -2586,6 +2643,7 @@ def run_loop(args: argparse.Namespace) -> int:
             Path(recovered.ready_path).unlink(missing_ok=True)
     last_queue_signature: tuple[tuple[str, str, str], ...] = ()
     last_refresh_error = ""
+    last_graph_skip_reasons: dict[str, str] = {}
     low_memory_active = False
     lease_backoff_until: dict[str, float] = {}
     dispatch_breaker = DispatchCircuitBreaker()
@@ -2784,6 +2842,22 @@ def run_loop(args: argparse.Namespace) -> int:
                     last_refresh_error = ""
 
                 git_state = collect_git_spec_state(repo_root)
+                graph_skip_reasons = spec_graph_skip_reasons(
+                    repo_root,
+                    iter_spec_metadata(repo_root),
+                    merged_specs=git_state.merged_specs,
+                    hidden_specs=hidden_spec_ids(repo_root),
+                )
+                for skipped_spec_id, skip_reason in sorted(graph_skip_reasons.items()):
+                    if last_graph_skip_reasons.get(skipped_spec_id) != skip_reason:
+                        print(
+                            format_status_line(
+                                "skip",
+                                f"{skipped_spec_id} has invalid depends_on and will not be dispatched: "
+                                f"{skip_reason}",
+                            )
+                        )
+                last_graph_skip_reasons = graph_skip_reasons
                 run_index = load_run_record_index(repo_root)
                 coordinator_snapshot = fetch_coordinator_lease_snapshot(repo_root)
                 full_queue = [
