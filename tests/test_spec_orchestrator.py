@@ -40943,6 +40943,44 @@ class TestInfrastructureFailureBackoff:
         assert run.last_failure_retryable is True
         assert spec_status.get_spec_status(repo, "my-feature") == "retryable"
 
+    def test_transient_push_failure_with_phase_metadata_stays_dispatchable(self, repo: Path):
+        # publish.push_failed is classified by the phase classifier first; a
+        # transient outage must still not project to needs-attention.
+        run = self._make_run()
+        run.phase = "verify"
+        run.status = "passed"
+        run.save(repo)
+
+        def failing_publish(r, root):
+            del root
+            r.last_error = "git push failed: error: RPC failed; HTTP 500 curl 22"
+            return "failed"
+
+        with patch.dict(orch.PHASE_HANDLERS, {"publish": failing_publish}):
+            assert orch.run_single_phase(run, "publish", repo) == "failed"
+
+        assert run.last_failure_subtype == "push_failed"
+        assert run.last_failure_retryable is True
+        assert spec_status.get_spec_status(repo, "my-feature") == "retryable"
+
+    def test_diverged_push_still_needs_attention(self, repo: Path):
+        run = self._make_run()
+        run.phase = "verify"
+        run.status = "passed"
+        run.save(repo)
+
+        def failing_publish(r, root):
+            del root
+            r.last_error = "git push failed: ! [rejected] code/x -> code/x (fetch first)"
+            return "failed"
+
+        with patch.dict(orch.PHASE_HANDLERS, {"publish": failing_publish}):
+            assert orch.run_single_phase(run, "publish", repo) == "failed"
+
+        assert run.last_failure_subtype == "remote_diverged"
+        assert run.last_failure_retryable is False
+        assert spec_status.get_spec_status(repo, "my-feature") == "needs-attention"
+
     def test_operator_infrastructure_failure_needs_attention(self, repo: Path):
         run = self._make_run()
         run.phase = "implement"
