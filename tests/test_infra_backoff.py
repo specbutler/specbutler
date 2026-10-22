@@ -11,6 +11,7 @@ import argparse
 import json
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -266,12 +267,17 @@ def _run_storm(tmp_path: Path, monkeypatch, *, errors, hours: float, specs=("alp
     monkeypatch.setattr(autopilot, "cleanup_unadopted_container_runs", lambda *_a: None)
     monkeypatch.setattr(autopilot, "write_active_state", lambda *_a: None)
     monkeypatch.setattr(autopilot, "refresh_runtime_git_refs", lambda _repo_root: (True, ""))
-    monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: object())
+    monkeypatch.setattr(
+        autopilot, "collect_git_spec_state", lambda _repo_root: SimpleNamespace(merged_specs=frozenset())
+    )
     monkeypatch.setattr(autopilot, "load_run_record_index", lambda _repo_root: autopilot.RunRecordIndex())
     monkeypatch.setattr(
         autopilot, "fetch_coordinator_lease_snapshot", lambda _repo_root: autopilot.CoordinatorLeaseSnapshot()
     )
     monkeypatch.setattr(autopilot, "build_dispatch_queue", queue)
+    monkeypatch.setattr(autopilot, "spec_graph_skip_reasons", lambda *_a, **_k: {})
+    monkeypatch.setattr(autopilot, "iter_spec_metadata", lambda _repo_root: [])
+    monkeypatch.setattr(autopilot, "hidden_spec_ids", lambda _repo_root: set())
     monkeypatch.setattr(autopilot, "apply_container_capacity_gate", lambda items, _result: (items, []))
     monkeypatch.setattr(autopilot.ContainerCapacityPreflight, "evaluate", lambda self, _items: None)
     monkeypatch.setattr(autopilot, "SourceStalenessWatch", _QuietWatch)
