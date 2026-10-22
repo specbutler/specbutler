@@ -8383,7 +8383,7 @@ class TestSpecAutopilot:
         start_mock = MagicMock(side_effect=AssertionError("dry-run should not launch specs"))
 
         monkeypatch.setattr(autopilot, "available_memory_bytes", lambda: 0)
-        monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: object())
+        monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: SimpleNamespace(merged_specs=frozenset()))
         monkeypatch.setattr(
             autopilot,
             "load_run_record_index",
@@ -8478,7 +8478,7 @@ class TestSpecAutopilot:
         monkeypatch.setattr(autopilot, "adopt_active_processes", lambda _repo_root: {})
         monkeypatch.setattr(autopilot, "write_active_state", lambda *a, **k: None)
         monkeypatch.setattr(autopilot, "refresh_runtime_git_refs", lambda _repo_root: (True, ""))
-        monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: object())
+        monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: SimpleNamespace(merged_specs=frozenset()))
         monkeypatch.setattr(autopilot, "load_run_record_index", lambda _repo_root: autopilot.RunRecordIndex())
         monkeypatch.setattr(
             autopilot,
@@ -8556,7 +8556,7 @@ class TestSpecAutopilot:
             "refresh_runtime_git_refs",
             lambda _repo_root: (True, ""),
         )
-        monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: object())
+        monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: SimpleNamespace(merged_specs=frozenset()))
         monkeypatch.setattr(
             autopilot,
             "load_run_record_index",
@@ -8690,7 +8690,7 @@ class TestSpecAutopilot:
             "refresh_runtime_git_refs",
             lambda _repo_root: (True, ""),
         )
-        monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: object())
+        monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda _repo_root: SimpleNamespace(merged_specs=frozenset()))
         monkeypatch.setattr(
             autopilot,
             "load_run_record_index",
@@ -22852,10 +22852,91 @@ class TestAcceptanceChecklist:
             "1. inspect generated audit metadata",
         ]
 
-    def test_acceptance_checklist_items_empty_when_no_checkboxes(self, tmp_path: Path):
+    def test_acceptance_checklist_items_empty_when_no_list_items(self, tmp_path: Path):
         spec = tmp_path / "spec.md"
         spec.write_text("## Acceptance Criteria\nNarrative only.\n")
         assert orch._extract_acceptance_checklist_items(spec) == []
+
+    def test_extracts_numbered_criteria_with_wrapped_lines(self, tmp_path: Path):
+        spec = tmp_path / "spec.md"
+        spec.write_text(
+            textwrap.dedent("""\
+            ## Acceptance Criteria
+
+            1. The CLI accepts numbered criteria and keeps wrapped
+               continuation lines with their item.
+            2. Second criterion.
+            10) Parenthesised numbering also counts.
+
+            ## Out of Scope
+            1. Not a criterion
+        """)
+        )
+        assert orch._extract_acceptance_checklist_items(spec) == [
+            "- [ ] The CLI accepts numbered criteria and keeps wrapped continuation lines with their item.",
+            "- [ ] Second criterion.",
+            "- [ ] Parenthesised numbering also counts.",
+        ]
+
+    def test_extracts_checkbox_criteria_preserving_state(self, tmp_path: Path):
+        spec = tmp_path / "spec.md"
+        spec.write_text(
+            textwrap.dedent("""\
+            ## Acceptance Criteria
+            - [x] Done already
+            - [X] Upper-case mark
+            - [ ] Still open
+        """)
+        )
+        assert orch._extract_acceptance_checklist_items(spec) == [
+            "- [x] Done already",
+            "- [x] Upper-case mark",
+            "- [ ] Still open",
+        ]
+
+    def test_extracts_mixed_criteria_and_skips_prose_and_code(self, tmp_path: Path):
+        spec = tmp_path / "spec.md"
+        spec.write_text(
+            textwrap.dedent("""\
+            ## Acceptance Criteria
+
+            Intro prose that is not a criterion.
+
+            1. Numbered criterion with details:
+               - first detail
+               - second detail
+            - [x] Checked bullet
+            * Star bullet
+            + Plus bullet
+              - [ ] Nested checkbox stays separate
+
+            ```bash
+            - not a criterion inside a fence
+            ```
+
+            Closing prose.
+              indented prose after a paragraph break is still not a criterion
+        """)
+        )
+        assert orch._extract_acceptance_checklist_items(spec) == [
+            "- [ ] Numbered criterion with details: first detail; second detail",
+            "- [x] Checked bullet",
+            "- [ ] Star bullet",
+            "- [ ] Plus bullet",
+            "- [ ] Nested checkbox stays separate",
+        ]
+
+    def test_numbered_criteria_render_in_prompt_pr_body_and_evidence(self, tmp_path: Path):
+        spec = tmp_path / "spec.md"
+        spec.write_text("## Acceptance Criteria\n1. First numbered\n2. Second numbered\n")
+
+        contract = orch._format_spec_contract_for_prompt(orch._extract_acceptance_checklist_items(spec), [])
+        assert "- [ ] First numbered\n- [ ] Second numbered" in contract
+        assert "No checklist items found" not in contract
+
+        pr_checklist = orch._extract_acceptance_checklist(spec)
+        assert pr_checklist == "- [ ] First numbered\n- [ ] Second numbered"
+        assert orch._normalize_acceptance_checklist_item(pr_checklist.splitlines()[0]) == "First numbered"
 
     def test_missing_file(self, tmp_path: Path):
         result = orch._extract_acceptance_checklist(tmp_path / "nope.md")
@@ -28803,6 +28884,25 @@ class TestRetryCap:
 
         assert lines[0].startswith("- [x] Users can receive push notifications on mobile devices")
         assert "implementation commit preserved" in lines[0]
+
+    def test_retry_cap_checklist_includes_numbered_acceptance_criteria(self, repo: Path):
+        run = self._make_run(repo)
+        run.save(repo)
+        (repo / "specs" / "my-feature.md").write_text(
+            textwrap.dedent("""\
+            ## Acceptance Criteria
+            1. Users can export reports
+               as CSV files
+            2. Exports respect permissions
+        """)
+        )
+
+        lines = orch._acceptance_checklist_with_evidence(run, repo, pr_number=None)
+
+        assert len(lines) == 2
+        assert lines[0].startswith("- [ ] Users can export reports as CSV files (evidence: ")
+        assert lines[1].startswith("- [ ] Exports respect permissions (evidence: ")
+        assert not any("No checklist items found" in line for line in lines)
 
     def test_post_retry_cap_escalation_comment_uses_github_token_env(self, repo: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.delenv("GH_TOKEN", raising=False)

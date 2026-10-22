@@ -918,3 +918,43 @@ def test_cli_doctor_bypasses_normal_config_loading(
 
     assert result == 7
     assert captured["repo_root"] == str(tmp_path)
+
+
+def _write_doctor_spec(repo: Path, spec_id: str, depends_on: str, *, subdir: str = "specs") -> None:
+    spec_dir = repo / subdir
+    spec_dir.mkdir(parents=True, exist_ok=True)
+    (spec_dir / f"{spec_id}.md").write_text(f"---\nid: {spec_id}\ndepends_on: [{depends_on}]\n---\n# {spec_id}\n")
+
+
+def test_spec_graph_check_reports_unknown_dependencies_and_cycles(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, _config_text())
+    config = load_repo_spec_runtime_config(repo, require=True)
+    _write_doctor_spec(repo, "healthy", "some-task")
+    _write_doctor_spec(repo, "some-task", "", subdir="specs/tasks")
+    _write_doctor_spec(repo, "ghost-dep", "missing-spec")
+    _write_doctor_spec(repo, "loop-a", "loop-b")
+    _write_doctor_spec(repo, "loop-b", "loop-a")
+
+    checks = doctor._spec_graph_checks(repo, config)
+
+    assert all(check.name == "spec dependencies" and check.status == "warning" for check in checks)
+    details = [check.detail for check in checks]
+    assert details == [
+        "ghost-dep: depends on unknown spec 'missing-spec'; autopilot will not dispatch it",
+        "loop-a: dependency cycle loop-a -> loop-b -> loop-a; autopilot will not dispatch it",
+        "loop-b: dependency cycle loop-b -> loop-a -> loop-b; autopilot will not dispatch it",
+    ]
+    assert any("merge tag" in item for item in checks[0].remediation)
+    assert not any("merge tag" in item for item in checks[1].remediation)
+
+
+def test_spec_graph_check_ok_for_valid_specs_and_wired_into_doctor(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, _config_text())
+    _write_doctor_spec(repo, "base", "")
+    _write_doctor_spec(repo, "child", "base")
+
+    report = doctor.run_doctor_checks(repo, runner=_Runner(), which=_resolver())
+
+    check = _checks_by_name(report)["spec dependencies"]
+    assert check.status == "ok"
+    assert "2 specs" in check.detail

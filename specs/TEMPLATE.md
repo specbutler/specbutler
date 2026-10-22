@@ -6,7 +6,7 @@ depends_on: []
 description: Short one-line description of the feature
 ---
 
-To permanently exclude a spec from dispatch, add `obsolete: true` to the frontmatter.
+To permanently exclude a spec from dispatch, add `obsolete: true` to frontmatter.
 
 # Example Feature
 
@@ -16,9 +16,9 @@ Describe what this spec achieves and why it matters. Keep it to 2-3 sentences.
 
 ## Acceptance Criteria
 
-1. First concrete, testable requirement
-2. Second requirement
-3. Third requirement
+- [ ] First concrete, testable requirement
+- [ ] Second requirement
+- [ ] Third requirement
 
 ## Out of Scope
 
