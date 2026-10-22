@@ -25424,6 +25424,13 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
             # every container/toolchain/push failure was an empty bucket.
             metadata["failure_type"] = classification.category.value
             metadata["failure_subtype"] = classification.kind
+            if classification.is_infrastructure:
+                # A transient outage must stay dispatchable: a non-retryable
+                # hint projects the spec to needs-attention, and autopilot
+                # would skip it before its infrastructure backoff and breaker
+                # ever see the repeat. Operator-fix kinds (credentials,
+                # toolchain) stay non-retryable and surface as needs-attention.
+                metadata["retryable"] = classification.transient
         metadata["failure_category"] = classification.category.value
         metadata["failure_signature"] = classification.signature
         if classification.is_infrastructure:

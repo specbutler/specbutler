@@ -40923,6 +40923,44 @@ class TestInfrastructureFailureBackoff:
             "infrastructure.container_service_startup": len(audits)
         }
 
+    def test_transient_infrastructure_failure_stays_dispatchable(self, repo: Path):
+        # A non-retryable hint projects needs-attention and autopilot would
+        # skip the spec before its infrastructure backoff/breaker sees it.
+        run = self._make_run()
+        run.phase = "verify"
+        run.status = "passed"
+        run.save(repo)
+
+        def failing_publish(r, root):
+            del root
+            r.last_error = self.SERVICE_STARTUP_ERROR
+            return "failed"
+
+        with patch.dict(orch.PHASE_HANDLERS, {"publish": failing_publish}):
+            assert orch.run_single_phase(run, "publish", repo) == "failed"
+
+        assert run.last_failure_type == "infrastructure"
+        assert run.last_failure_retryable is True
+        assert spec_status.get_spec_status(repo, "my-feature") == "retryable"
+
+    def test_operator_infrastructure_failure_needs_attention(self, repo: Path):
+        run = self._make_run()
+        run.phase = "implement"
+        run.status = "passed"
+        run.save(repo)
+
+        def failing_verify(r, root):
+            del root
+            r.last_error = "make setup failed: Missing uv; see docs/setup.md"
+            return "failed"
+
+        with patch.dict(orch.PHASE_HANDLERS, {"verify": failing_verify}):
+            assert orch.run_single_phase(run, "verify", repo) == "failed"
+
+        assert run.last_failure_subtype == "toolchain_missing"
+        assert run.last_failure_retryable is False
+        assert spec_status.get_spec_status(repo, "my-feature") == "needs-attention"
+
     def test_relaunched_run_gets_no_fresh_inprocess_retries(self, repo: Path):
         run = self._make_run()
         run.phase = "verify"
