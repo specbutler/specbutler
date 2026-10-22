@@ -16,9 +16,10 @@ from pathlib import Path
 from typing import Literal
 
 from .command_runtime import CommandSpec, looks_posix_script
-from .config import SpecRuntimeConfig, load_repo_spec_runtime_config
+from .config import SpecRuntimeConfig, load_repo_spec_runtime_config, resolve_spec_path
 from .git_common import subprocess_text_kwargs
 from .platform import is_unc_path, is_windows
+from .spec_metadata import format_spec_graph_problems, iter_spec_metadata, task_spec_ids, validate_spec_graph
 
 DoctorStatus = Literal["ok", "warning", "error"]
 CommandRunner = Callable[[list[str], Path, float], subprocess.CompletedProcess[str]]
@@ -280,6 +281,7 @@ def run_doctor_checks(
     checks.extend(path_checks)
     checks.extend(_runtime_path_overlap_checks(runtime_paths))
     checks.extend(_container_checks(repo_root, config, run, resolve_executable))
+    checks.extend(_spec_graph_checks(repo_root, config))
     return DoctorReport(tuple(checks))
 
 
@@ -1241,6 +1243,37 @@ def _container_checks(
             "read-only checks complete; run `spec container doctor` for the disposable-container smoke check",
         )
     )
+    return checks
+
+
+def _spec_graph_checks(repo_root: Path, config: SpecRuntimeConfig) -> list[DoctorCheck]:
+    specs = iter_spec_metadata(repo_root, config=config)
+    if not specs:
+        return []
+    problems = validate_spec_graph(specs, external_spec_ids=task_spec_ids(repo_root, config=config))
+    checks: list[DoctorCheck] = []
+    for spec in specs:
+        if spec.obsolete or spec.superseded_by or spec.spec_id not in problems:
+            continue
+        spec_problems = problems[spec.spec_id]
+        remediation = [
+            f"Fix `depends_on` in {resolve_spec_path(repo_root, spec.spec_id, config=config)} "
+            "so every id names an existing spec and no dependency chain loops back."
+        ]
+        if any(problem.kind == "unknown-dependency" for problem in spec_problems):
+            remediation.append(
+                "If the dependency already merged and its spec file was removed, autopilot treats its "
+                "merge tag as satisfying it; drop it from `depends_on` to clear this warning."
+            )
+        checks.append(
+            _warning(
+                "spec dependencies",
+                f"{spec.spec_id}: {format_spec_graph_problems(spec_problems)}; autopilot will not dispatch it",
+                *remediation,
+            )
+        )
+    if not checks:
+        checks.append(_ok("spec dependencies", f"{len(specs)} specs; every depends_on id resolves without cycles"))
     return checks
 
 

@@ -136,7 +136,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    from .autopilot import load_run_record_index, resolve_autopilot_backend_policy
+    from .autopilot import load_run_record_index, resolve_autopilot_backend_policy, spec_graph_skip_reasons
     from .container import container_image_source
     from .spec_metadata import iter_spec_metadata
     from .spec_status import collect_git_spec_state, get_spec_status
@@ -212,6 +212,12 @@ def _cmd_list(args: argparse.Namespace) -> int:
                 record.description,
             )
         )
+
+    graph_problems = spec_graph_skip_reasons(repo_root, records, merged_specs=git_state.merged_specs, config=config)
+    if graph_problems:
+        lines.append("")
+        lines.append("Dependency problems (these specs will not be dispatched):")
+        lines.extend(f"  {spec_id}: {reason}" for spec_id, reason in sorted(graph_problems.items()))
 
     print("\n".join(lines))
     return 0
