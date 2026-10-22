@@ -85,10 +85,10 @@ Make `[execution].safety_mode` actually change behaviour:
 
 1. The user runs `spec doctor` in their terminal, and the git probe passes for claude
    and codex in both clone and worktree modes.
-2. A small canary spec in this repo runs end to end through `spec implement`, launched
-   from the user's terminal, and merges with no sandbox or git failure. Do this at
-   least once with Claude implementing (reviewed by Codex) and once with Codex
-   implementing.
+2. Two small canary specs run end to end through `spec implement`, launched from the
+   user's terminal, and merge with no sandbox or git failure:
+   - `canary-ps-test-skip`, implemented by Claude and reviewed by Codex;
+   - `canary-doctor-cli-versions`, implemented by Codex.
 3. The installed `spec` (currently 0.5.0 via pyenv) runs the merged `main`.
 
 ## Phase 2: dogfood (author specs, let Spec Butler implement them)
