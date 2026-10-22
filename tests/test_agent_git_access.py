@@ -155,6 +155,21 @@ def test_symlinked_git_metadata_is_rejected(tmp_path: Path) -> None:
         )
 
 
+def test_repointed_worktree_git_file_is_rejected(tmp_path: Path) -> None:
+    """A rewritten .git pointer must not redirect grants to other metadata."""
+    _repository_root, worktree = _linked_worktree(tmp_path)
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    other_repository = _repository(other_root)
+    other_worktree = other_root / "other-worktree"
+    _git(other_repository, "worktree", "add", "-b", "code/other", str(other_worktree), "main")
+    other_git_dir = other_repository.resolve() / ".git" / "worktrees" / "other-worktree"
+    (worktree / ".git").write_text(f"gitdir: {other_git_dir}\n", encoding="utf-8")
+
+    with pytest.raises(UnsafeAgentGitLayoutError, match="registered to another worktree"):
+        agent_git_access(worktree)
+
+
 def test_workspace_without_git_has_no_git_grants(tmp_path: Path) -> None:
     assert agent_git_access(tmp_path) is None
     assert agent_git_access(tmp_path / "missing") is None
@@ -194,8 +209,11 @@ def test_claude_clone_settings_allow_git_except_config_hooks_and_info(tmp_path: 
     for control in ("config", "config.worktree", "hooks", "info"):
         assert str(git_dir / control) in filesystem["denyWrite"]
     settings = json.loads((clone / ".claude" / "settings.local.json").read_text())
+    hooks_pattern = (git_dir / "hooks").as_posix()
+    if not hooks_pattern.startswith("//"):
+        hooks_pattern = "/" + hooks_pattern
     for tool in ("Write", "Edit"):
-        assert f"{tool}(/{git_dir / 'hooks'}/**)" in settings["permissions"]["deny"]
+        assert f"{tool}({hooks_pattern}/**)" in settings["permissions"]["deny"]
 
 
 # ---------------------------------------------------------------------------
@@ -523,9 +541,11 @@ def test_claude_probe_runs_git_under_srt_with_generated_settings(backend: str) -
 
     assert calls[0][:2] == ["/opt/bin/srt", "--settings"]
     filesystem = settings_seen[0]["filesystem"]
-    assert any(path.endswith(".git") for path in filesystem["allowWrite"])
-    assert any(path.endswith("/hooks") for path in filesystem["denyWrite"])
-    assert any(path.endswith("/config") for path in filesystem["denyWrite"])
+    assert any(Path(path).name == ".git" for path in filesystem["allowWrite"]) or any(
+        Path(path).parent.name == "worktrees" for path in filesystem["allowWrite"]
+    )
+    assert any(Path(path).name == "hooks" for path in filesystem["denyWrite"])
+    assert any(Path(path).name == "config" for path in filesystem["denyWrite"])
     assert result.runner == "srt"
     assert result.git_works
 

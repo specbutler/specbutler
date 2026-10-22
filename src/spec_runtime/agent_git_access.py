@@ -136,6 +136,41 @@ def _real_directory(path: Path, *, label: str) -> Path:
     return path.resolve(strict=True)
 
 
+def _assert_registered_linked_worktree(
+    worktree: Path,
+    git_dir: Path,
+    common_dir: Path,
+) -> None:
+    """Refuse a ``.git`` pointer that does not lead back to this worktree.
+
+    The ``.git`` file sits in the agent-writable checkout, so a previous
+    session could repoint it at another repository's metadata. Git records
+    each linked worktree as ``<common>/worktrees/<name>/gitdir`` naming the
+    worktree's ``.git`` file; that back-pointer lives outside the checkout.
+    """
+    if git_dir.parent != common_dir / "worktrees":
+        raise UnsafeAgentGitLayoutError(
+            f"Refusing linked worktree Git directory outside {common_dir / 'worktrees'}: {git_dir}"
+        )
+    back_pointer = git_dir / "gitdir"
+    try:
+        if back_pointer.is_symlink():
+            raise OSError("symlinked gitdir back-pointer")
+        recorded = back_pointer.read_text(encoding="utf-8").strip()
+        recorded_path = Path(recorded)
+        if not recorded_path.is_absolute():
+            recorded_path = git_dir / recorded_path
+        matches = recorded_path.resolve() == (worktree / ".git").resolve()
+    except OSError as exc:
+        raise UnsafeAgentGitLayoutError(
+            f"Could not verify linked worktree registration for {worktree}: {exc}"
+        ) from exc
+    if not matches:
+        raise UnsafeAgentGitLayoutError(
+            f"Refusing .git pointer in {worktree}: {git_dir} is registered to another worktree"
+        )
+
+
 def agent_git_access(worktree_path: Path) -> AgentGitAccess | None:
     """Describe the Git metadata an agent in *worktree_path* may write.
 
@@ -172,6 +207,7 @@ def agent_git_access(worktree_path: Path) -> AgentGitAccess | None:
         raise UnsafeAgentGitLayoutError(
             f"Linked worktree {worktree} does not have its own Git directory"
         )
+    _assert_registered_linked_worktree(worktree, git_dir, common_dir)
     return AgentGitAccess(
         worktree=worktree,
         git_dir=git_dir,
