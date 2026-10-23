@@ -580,6 +580,10 @@ def test_claude_probe_runs_git_under_srt_with_generated_settings(backend: str) -
     )
 
     assert calls[0][:2] == ["/opt/bin/srt", "--settings"]
+    # The probe script must reach srt as a shell command string, not as a
+    # single positional argv entry (srt would try to exec it as a filename).
+    assert calls[0][3] == "-c"
+    assert len(calls[0]) == 5
     filesystem = settings_seen[0]["filesystem"]
     assert any(Path(path).name == ".git" for path in filesystem["allowWrite"]) or any(
         Path(path).parent.name == "worktrees" for path in filesystem["allowWrite"]
