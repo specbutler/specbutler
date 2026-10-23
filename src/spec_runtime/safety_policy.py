@@ -26,7 +26,8 @@ from pathlib import Path
 
 from .config import ExecutionNetworkConfig
 
-CLAUDE_WRITE_GUARD_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+# Bash is guarded for the deny-listed git commands; the file tools for paths.
+CLAUDE_WRITE_GUARD_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit", "Bash")
 CLAUDE_BYPASS_PERMISSION_MODE = "bypassPermissions"
 CLAUDE_FALLBACK_PERMISSION_MODE = "acceptEdits"
 CODEX_AUTO_REVIEWER = "auto_review"

@@ -48,7 +48,7 @@ from spec_runtime.sandbox_denials import (
 
 NATIVE = LaunchSafety(claude_bypass=True)
 FALLBACK = LaunchSafety(claude_bypass=False)
-GUARD_TOOLS = "Edit|Write|MultiEdit|NotebookEdit"
+GUARD_TOOLS = "Edit|Write|MultiEdit|NotebookEdit|Bash"
 
 
 def _load(tmp_path: Path, body: str, *, local: str = "") -> SpecRuntimeConfig:
@@ -734,8 +734,46 @@ class TestWriteGuardHook:
         assert "hard link" in result.stderr
 
     def test_ignores_other_tools(self, layout) -> None:
-        payload = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}}
+        payload = {"tool_name": "Read", "tool_input": {"file_path": "/etc/hosts"}}
         assert _run_guard(layout["command"], payload, cwd=layout["workspace"]).returncode == 0
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git reset --hard",
+            "git -C sub reset --hard HEAD~1",
+            "cd x && git reset --hard origin/main",
+            "git push --force",
+            "git push origin main -f",
+            "git push --force-with-lease origin HEAD",
+            "git push -fu origin topic",
+            "git push origin +main",
+            "sh -c 'git reset --hard'",
+            "/usr/bin/git reset --hard",
+            "git -c core.x=1 push -f",
+        ],
+    )
+    def test_blocks_deny_listed_git_commands_in_bypass_mode(self, layout, command: str) -> None:
+        payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+        result = _run_guard(layout["command"], payload, cwd=layout["workspace"])
+        assert result.returncode == 2
+        assert "refused" in result.stderr
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "git reset --soft HEAD~1",
+            "git reset HEAD file.py",
+            "git push --follow-tags",
+            "git commit -m 'reset --hard docs' && git log",
+            "rm -rf build",
+            "pytest -q -f",
+        ],
+    )
+    def test_allows_other_bash_commands(self, layout, command: str) -> None:
+        payload = {"tool_name": "Bash", "tool_input": {"command": command}}
+        result = _run_guard(layout["command"], payload, cwd=layout["workspace"])
+        assert result.returncode == 0, result.stderr
 
     def test_fails_closed_on_malformed_input(self, layout) -> None:
         for payload in ("not json", json.dumps({"tool_name": "Write", "tool_input": {}})):

@@ -5,6 +5,10 @@ run in the Claude process itself, and bypassPermissions mode skips their
 protected-path prompts. Spec Butler registers this script for those tools in
 the generated settings of native unattended launches.
 
+Hooks run whatever the permission mode, so the script also refuses the Bash
+commands the settings' deny rules name (``git reset --hard`` and force
+pushes) rather than relying on those rules surviving bypass mode.
+
 It runs as ``python -I claude_write_guard.py --allow ROOT ... --deny PATH ...``
 and must import nothing outside the standard library. It reads the hook
 payload from stdin and exits 2 (block, message on stderr) unless the resolved
@@ -16,11 +20,29 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import sys
 
 GUARDED_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 BLOCK = 2
+# ``git``, its global options (``-C dir``, ``-c key=value``), then the
+# subcommand; the flag must follow within the same simple command.
+_SIMPLE = r"[^;&|\n]*"
+_GIT = r"(?<![\w.-])git(?:\s+-[cC]\s+\S+|\s+-\S+)*\s+"
+_DENIED_COMMANDS = (
+    (
+        re.compile(rf"{_GIT}reset\b{_SIMPLE}(?<!\S)--hard\b"),
+        "`git reset --hard` discards work; commit or stash instead",
+    ),
+    (
+        re.compile(
+            rf"{_GIT}push\b{_SIMPLE}"
+            r"(?:(?<!\S)--force(?:-with-lease|-if-includes)?\b|(?<!\S)-[A-Za-z]*f[A-Za-z]*\b|(?<!\S)\+\S)"
+        ),
+        "force pushes are not allowed; the orchestrator publishes the branch",
+    ),
+)
 
 
 def _block(message: str) -> int:
@@ -53,6 +75,8 @@ def check(payload: object, allowed: list[str], denied: list[str]) -> str:
     if not isinstance(payload, dict):
         return "hook input is not a JSON object"
     tool = payload.get("tool_name")
+    if tool == "Bash":
+        return _check_command(payload.get("tool_input"))
     if tool not in GUARDED_TOOLS:
         return ""
     tool_input = payload.get("tool_input")
@@ -89,6 +113,16 @@ def check(payload: object, allowed: list[str], denied: list[str]) -> str:
             f"{tool} may not modify {target}: it is a hard link and may share "
             "its contents with a file outside the workspace."
         )
+    return ""
+
+
+def _check_command(tool_input: object) -> str:
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
+        return "Bash call has no command"
+    for pattern, reason in _DENIED_COMMANDS:
+        if pattern.search(command):
+            return f"refused `{command.strip()[:200]}`: {reason}."
     return ""
 
 

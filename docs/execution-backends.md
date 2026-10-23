@@ -192,8 +192,9 @@ orchestrator-written settings file (`--setting-sources ""`). Those settings:
   start fails instead of running unconfined;
 - deny reads of provider and operator credential stores, both through the
   sandbox and through the file tools;
-- deny `git push --force`/`-f` and `git reset --hard`;
-- register a PreToolUse hook for Edit, Write, MultiEdit and NotebookEdit.
+- deny `git push --force`/`-f` and `git reset --hard`, both as permission
+  deny rules and in the PreToolUse hook below, which runs in bypass mode too;
+- register a PreToolUse hook for Edit, Write, MultiEdit, NotebookEdit and Bash.
   Those tools run inside the Claude process, not under the OS sandbox, and
   bypass mode skips their protected-path prompts. The hook resolves symlinks
   and blocks (exit code 2, with the reason shown to the model) any target
