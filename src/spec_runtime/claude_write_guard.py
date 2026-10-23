@@ -21,28 +21,26 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 
 GUARDED_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 BLOCK = 2
-# ``git``, its global options (``-C dir``, ``-c key=value``), then the
-# subcommand; the flag must follow within the same simple command.
-_SIMPLE = r"[^;&|\n]*"
-_GIT = r"(?<![\w.-])git(?:\s+-[cC]\s+\S+|\s+-\S+)*\s+"
-_DENIED_COMMANDS = (
-    (
-        re.compile(rf"{_GIT}reset\b{_SIMPLE}(?<!\S)--hard\b"),
-        "`git reset --hard` discards work; commit or stash instead",
-    ),
-    (
-        re.compile(
-            rf"{_GIT}push\b{_SIMPLE}"
-            r"(?:(?<!\S)--force(?:-with-lease|-if-includes)?\b|(?<!\S)-[A-Za-z]*f[A-Za-z]*\b|(?<!\S)\+\S)"
-        ),
-        "force pushes are not allowed; the orchestrator publishes the branch",
-    ),
+_RESET_REASON = "`git reset --hard` discards work; commit or stash instead"
+_PUSH_REASON = "force pushes are not allowed; the orchestrator publishes the branch"
+# Git global options whose value is the next argument.
+_GIT_VALUE_OPTIONS = frozenset(
+    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix",
+     "--config-env", "--exec-path", "--list-cmds"}
 )
+_SHELL_SEPARATORS = frozenset({";", "&&", "||", "|", "&", "|&", "(", ")", "{", "}"})
+_FORCE_LONG = ("--force", "--force-with-lease", "--force-if-includes")
+# Used only when the command cannot be tokenized (unbalanced quotes).
+_FALLBACK_RE = re.compile(
+    r"\bgit\b.*?(?:\breset\b.*?--hard\b|\bpush\b.*?(?:--force|\s-[A-Za-z]*f|\s\+\S))"
+)
+_MAX_NESTING = 4
 
 
 def _block(message: str) -> int:
@@ -120,10 +118,66 @@ def _check_command(tool_input: object) -> str:
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str):
         return "Bash call has no command"
-    for pattern, reason in _DENIED_COMMANDS:
-        if pattern.search(command):
-            return f"refused `{command.strip()[:200]}`: {reason}."
+    reason = _denied_command_reason(command, depth=0)
+    return f"refused `{command.strip()[:200]}`: {reason}." if reason else ""
+
+
+def _simple_commands(command: str) -> list[list[str]]:
+    """Split *command* into the argv of each simple command."""
+    lexer = shlex.shlex(command.replace("\n", ";"), posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    commands: list[list[str]] = [[]]
+    for token in lexer:
+        if token in _SHELL_SEPARATORS or set(token) <= set(";&|()"):
+            commands.append([])
+        else:
+            commands[-1].append(token)
+    return [argv for argv in commands if argv]
+
+
+def _denied_command_reason(command: str, *, depth: int) -> str:
+    try:
+        commands = _simple_commands(command)
+    except ValueError:
+        return _PUSH_REASON if _FALLBACK_RE.search(command) else ""
+    for argv in commands:
+        reason = _denied_git_reason(argv)
+        if reason:
+            return reason
+        if depth < _MAX_NESTING:
+            # ``sh -c '…'``, ``eval "…"`` and similar carry a nested script.
+            for token in argv:
+                if any(ch.isspace() for ch in token) or any(ch in token for ch in ";&|"):
+                    reason = _denied_command_reason(token, depth=depth + 1)
+                    if reason:
+                        return reason
     return ""
+
+
+def _denied_git_reason(argv: list[str]) -> str:
+    for index, token in enumerate(argv):
+        if os.path.basename(token) != "git":
+            continue
+        position = index + 1
+        while position < len(argv) and argv[position].startswith("-"):
+            option = argv[position]
+            position += 2 if option in _GIT_VALUE_OPTIONS else 1
+        if position >= len(argv):
+            continue
+        subcommand, args = argv[position], argv[position + 1 :]
+        if subcommand == "reset" and "--hard" in args:
+            return _RESET_REASON
+        if subcommand == "push" and any(_is_force_push_arg(arg) for arg in args):
+            return _PUSH_REASON
+    return ""
+
+
+def _is_force_push_arg(arg: str) -> bool:
+    if arg.split("=", 1)[0] in _FORCE_LONG:
+        return True
+    if arg.startswith("+") and len(arg) > 1:
+        return True
+    return arg.startswith("-") and not arg.startswith("--") and "f" in arg[1:]
 
 
 def main(argv: list[str] | None = None) -> int:

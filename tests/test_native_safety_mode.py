@@ -762,6 +762,13 @@ class TestWriteGuardHook:
             "sh -c 'git reset --hard'",
             "/usr/bin/git reset --hard",
             "git -c core.x=1 push -f",
+            "git --git-dir .git push --force",
+            "git --work-tree . reset --hard",
+            "git --git-dir=.git --no-pager reset --hard HEAD",
+            "FOO=1 command git push --force-with-lease=main:abc origin",
+            "bash -lc \"cd sub; git reset --hard\"",
+            "git reset --hard\nls",
+            "echo 'unbalanced && git reset --hard",
         ],
     )
     def test_blocks_deny_listed_git_commands_in_bypass_mode(self, layout, command: str) -> None:
@@ -779,6 +786,9 @@ class TestWriteGuardHook:
             "git commit -m 'reset --hard docs' && git log",
             "rm -rf build",
             "pytest -q -f",
+            "git push -u origin topic",
+            "git -C sub status && git push origin topic",
+            "git log --format=%f",
         ],
     )
     def test_allows_other_bash_commands(self, layout, command: str) -> None:
