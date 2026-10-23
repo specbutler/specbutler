@@ -41,6 +41,7 @@ import yaml
 from .config import (
     ALLOWED_EXECUTION_BACKENDS,
     ALLOWED_EXECUTION_SAFETY_MODES,
+    LEGACY_EXECUTION_SAFETY_MODES,
     SUPPORTED_EXECUTION_BACKENDS,
     ExecutionConfig,
     SpecRuntimeConfig,
@@ -9030,9 +9031,17 @@ def get_execution_backend(
     backend = execution.backend
     if backend not in ALLOWED_EXECUTION_BACKENDS:
         raise UnknownExecutionBackendError(backend)
-    if execution.safety_mode not in ALLOWED_EXECUTION_SAFETY_MODES:
-        allowed = ", ".join(sorted(ALLOWED_EXECUTION_SAFETY_MODES))
+    if execution.safety_mode not in (
+        *ALLOWED_EXECUTION_SAFETY_MODES,
+        *LEGACY_EXECUTION_SAFETY_MODES,
+    ):
+        allowed = ", ".join(ALLOWED_EXECUTION_SAFETY_MODES)
         raise ValueError(f"Unknown safety_mode {execution.safety_mode!r}. Allowed: {allowed}")
+    if execution.safety_mode == "isolated" and backend != "container":
+        raise ValueError(
+            'safety_mode "isolated" requires the container backend, '
+            f"not {backend!r}"
+        )
     if backend not in SUPPORTED_EXECUTION_BACKENDS:
         raise ExecutionBackendNotImplementedError(backend)
     if backend == "container":

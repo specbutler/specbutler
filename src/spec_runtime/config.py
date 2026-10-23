@@ -101,7 +101,28 @@ KNOWN_FUTURE_EXECUTION_BACKENDS: tuple[str, ...] = ()
 ALLOWED_EXECUTION_BACKENDS: tuple[str, ...] = (
     SUPPORTED_EXECUTION_BACKENDS + KNOWN_FUTURE_EXECUTION_BACKENDS
 )
-ALLOWED_EXECUTION_SAFETY_MODES: tuple[str, ...] = ("safe", "full-auto", "trusted")
+# ``native`` runs unattended provider sessions under the provider's own
+# sandbox with no approval prompts; ``isolated`` is the container backend.
+ALLOWED_EXECUTION_SAFETY_MODES: tuple[str, ...] = ("native", "isolated")
+# Values from the metadata-only era. They were never enforcement switches and
+# now map to ``native`` with a deprecation note.
+LEGACY_EXECUTION_SAFETY_MODES: tuple[str, ...] = ("safe", "full-auto", "trusted")
+ALLOWED_EXECUTION_NETWORK_MODES: tuple[str, ...] = ("open", "allowlist")
+# Hosts an allowlist-mode session may reach. Also pre-approved for sessions
+# that cannot bypass network prompts (interactive authoring, acceptEdits
+# fallback launches).
+DEFAULT_ALLOWED_NETWORK_DOMAINS: tuple[str, ...] = (
+    "github.com",
+    "api.github.com",
+    "*.blob.core.windows.net",
+    "api.anthropic.com",
+    "*.npmjs.org",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "registry.yarnpkg.com",
+    "localhost",
+    "127.0.0.1",
+)
 
 
 def default_execution_backend(platform: str | None = None) -> str:
@@ -134,6 +155,33 @@ def emit_container_alpha_warning(config: object, stream: TextIO | None = None) -
     message = container_alpha_warning(config)
     if message:
         print(f"Warning: {message}", file=stream or sys.stderr)
+
+
+def safety_mode_deprecation_note(config: object) -> str | None:
+    """Return the note for a legacy ``[execution].safety_mode`` value."""
+    execution = getattr(config, "execution", None)
+    legacy = str(getattr(execution, "legacy_safety_mode", "") or "")
+    if not legacy:
+        return None
+    return (
+        f"[execution].safety_mode = {legacy!r} is deprecated and now means "
+        f"{getattr(execution, 'safety_mode', 'native')!r}. Set safety_mode = "
+        '"native" (or "isolated" with the container backend) to silence this.'
+    )
+
+
+_EMITTED_SAFETY_MODE_NOTES: set[str] = set()
+
+
+def emit_safety_mode_deprecation_note(
+    config: object,
+    stream: TextIO | None = None,
+) -> None:
+    """Print the legacy safety-mode note once per process."""
+    message = safety_mode_deprecation_note(config)
+    if message and message not in _EMITTED_SAFETY_MODE_NOTES:
+        _EMITTED_SAFETY_MODE_NOTES.add(message)
+        print(f"Note: {message}", file=stream or sys.stderr)
 
 
 ALLOWED_CONTAINER_WORKSPACE_MODES: tuple[str, ...] = ("auto", "bind", "volume")
@@ -176,13 +224,39 @@ class ContainerExecutionConfig:
 
 
 @dataclass(frozen=True)
+class ExecutionNetworkConfig:
+    """Network policy for provider-sandboxed agent sessions.
+
+    ``open`` lets unattended sessions reach any host except
+    ``denied_domains``; ``allowlist`` limits them to ``allowed_domains``.
+    ``denied_domains`` always applies.
+    """
+
+    mode: str = "open"
+    allowed_domains: tuple[str, ...] = DEFAULT_ALLOWED_NETWORK_DOMAINS
+    denied_domains: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class CodexExecutionConfig:
+    # Route sandbox escalations to Codex's model-based reviewer instead of
+    # denying them. Off by default: escalations fail and the agent adapts.
+    auto_review: bool = False
+
+
+@dataclass(frozen=True)
 class ExecutionConfig:
     backend: str = field(default_factory=default_execution_backend)
-    safety_mode: str = "safe"
+    safety_mode: str = "native"
     workspace_root: str = ".spec-workspaces"
     container: ContainerExecutionConfig = field(default_factory=ContainerExecutionConfig)
     backend_explicit: bool = False
     safety_mode_explicit: bool = False
+    network: ExecutionNetworkConfig = field(default_factory=ExecutionNetworkConfig)
+    codex: CodexExecutionConfig = field(default_factory=CodexExecutionConfig)
+    # The configured legacy value (``safe``, ``full-auto``, ``trusted``) that
+    # was mapped to ``native``; empty otherwise.
+    legacy_safety_mode: str = ""
 
 
 @dataclass(frozen=True)
@@ -347,6 +421,8 @@ def _parse_execution_section(payload: object) -> ExecutionConfig:
     safety_raw = payload.get("safety_mode", None)
     workspace_raw = payload.get("workspace_root", None)
     container = _parse_container_execution_section(payload.get("container", {}))
+    network = _parse_execution_network_section(payload.get("network", None))
+    codex = _parse_execution_codex_section(payload.get("codex", None))
 
     backend_explicit = backend_raw is not None
     safety_explicit = safety_raw is not None
@@ -354,7 +430,9 @@ def _parse_execution_section(payload: object) -> ExecutionConfig:
     backend = (
         str(backend_raw).strip() if backend_explicit else ""
     ) or default_execution_backend()
-    safety_mode = (str(safety_raw).strip() if safety_explicit else "safe") or "safe"
+    requested_safety = (
+        str(safety_raw).strip() if safety_explicit else ""
+    ) or "native"
     workspace_root = (
         str(workspace_raw).strip() if workspace_raw is not None else ".spec-workspaces"
     ) or ".spec-workspaces"
@@ -364,20 +442,112 @@ def _parse_execution_section(payload: object) -> ExecutionConfig:
         raise SpecConfigError(
             f"Unknown [execution].backend {backend!r}. Allowed: {allowed}"
         )
-    if safety_mode not in ALLOWED_EXECUTION_SAFETY_MODES:
-        allowed = ", ".join(sorted(ALLOWED_EXECUTION_SAFETY_MODES))
+    legacy_safety_mode = ""
+    if requested_safety in LEGACY_EXECUTION_SAFETY_MODES:
+        legacy_safety_mode = requested_safety
+        requested_safety = "native"
+    if requested_safety not in ALLOWED_EXECUTION_SAFETY_MODES:
+        allowed = ", ".join(ALLOWED_EXECUTION_SAFETY_MODES)
         raise SpecConfigError(
-            f"Unknown [execution].safety_mode {safety_mode!r}. Allowed: {allowed}"
+            f"Unknown [execution].safety_mode {requested_safety!r}. Allowed: {allowed}"
         )
+    if requested_safety == "isolated":
+        if backend_explicit and backend != "container":
+            raise SpecConfigError(
+                '[execution].safety_mode = "isolated" requires backend = "container" '
+                f"(alpha), but backend = {backend!r}. Use safety_mode = \"native\" "
+                "for the clone and worktree backends."
+            )
+        backend = "container"
 
     return ExecutionConfig(
         backend=backend,
-        safety_mode=safety_mode,
+        safety_mode=effective_safety_mode(backend),
         workspace_root=workspace_root,
         container=container,
         backend_explicit=backend_explicit,
         safety_mode_explicit=safety_explicit,
+        network=network,
+        codex=codex,
+        legacy_safety_mode=legacy_safety_mode,
     )
+
+
+def effective_safety_mode(backend: str) -> str:
+    """Return the safety mode a backend runs under.
+
+    The container backend is the ``isolated`` mode; the host backends run
+    provider sessions under the provider's own sandbox (``native``).
+    """
+    return "isolated" if backend == "container" else "native"
+
+
+def _parse_domain_list(payload: object, *, key: str) -> tuple[str, ...]:
+    source = f"[execution.network].{key}"
+    if not isinstance(payload, list):
+        raise SpecConfigError(f"{source} must be a list of host names")
+    domains: list[str] = []
+    for item in payload:
+        if not isinstance(item, str) or not item.strip():
+            raise SpecConfigError(f"{source} must contain only non-empty strings")
+        domain = item.strip().lower()
+        if "://" in domain or "/" in domain or any(ch.isspace() for ch in domain):
+            raise SpecConfigError(
+                f"{source} entry {item!r} must be a host name such as "
+                '"example.com" or "*.example.com", not a URL'
+            )
+        if domain == "*" or domain.startswith("*") and not domain.startswith("*."):
+            raise SpecConfigError(
+                f"{source} entry {item!r} is too broad; use mode = \"open\" "
+                "instead of a global wildcard"
+            )
+        if domain not in domains:
+            domains.append(domain)
+    return tuple(domains)
+
+
+def _parse_execution_network_section(payload: object) -> ExecutionNetworkConfig:
+    if payload in (None, {}):
+        return ExecutionNetworkConfig()
+    if not isinstance(payload, dict):
+        raise SpecConfigError("[execution.network] must be a TOML table")
+    mode = str(payload.get("mode", "open")).strip() or "open"
+    if mode not in ALLOWED_EXECUTION_NETWORK_MODES:
+        allowed = ", ".join(ALLOWED_EXECUTION_NETWORK_MODES)
+        raise SpecConfigError(
+            f"Unknown [execution.network].mode {mode!r}. Allowed: {allowed}"
+        )
+    allowed_domains = (
+        _parse_domain_list(payload["allowed_domains"], key="allowed_domains")
+        if "allowed_domains" in payload
+        else DEFAULT_ALLOWED_NETWORK_DOMAINS
+    )
+    denied_domains = (
+        _parse_domain_list(payload["denied_domains"], key="denied_domains")
+        if "denied_domains" in payload
+        else ()
+    )
+    if mode == "allowlist" and not allowed_domains:
+        raise SpecConfigError(
+            '[execution.network].mode = "allowlist" needs at least one '
+            "allowed_domains entry"
+        )
+    return ExecutionNetworkConfig(
+        mode=mode,
+        allowed_domains=allowed_domains,
+        denied_domains=denied_domains,
+    )
+
+
+def _parse_execution_codex_section(payload: object) -> CodexExecutionConfig:
+    if payload in (None, {}):
+        return CodexExecutionConfig()
+    if not isinstance(payload, dict):
+        raise SpecConfigError("[execution.codex] must be a TOML table")
+    auto_review = payload.get("auto_review", False)
+    if not isinstance(auto_review, bool):
+        raise SpecConfigError("[execution.codex].auto_review must be true or false")
+    return CodexExecutionConfig(auto_review=auto_review)
 
 
 def _parse_container_execution_section(payload: object) -> ContainerExecutionConfig:
@@ -577,14 +747,14 @@ def _merge_local_execution_payload(base: object, overlay: object) -> object:
 
     merged = deepcopy(base)
     for key, value in overlay.items():
-        if key == "container" and isinstance(value, dict):
-            base_container = merged.get("container", {})
-            if isinstance(base_container, dict):
-                container = deepcopy(base_container)
-                container.update(deepcopy(value))
-                merged["container"] = container
+        if key in {"container", "network", "codex"} and isinstance(value, dict):
+            base_table = merged.get(key, {})
+            if isinstance(base_table, dict):
+                table = deepcopy(base_table)
+                table.update(deepcopy(value))
+                merged[key] = table
             else:
-                merged["container"] = deepcopy(value)
+                merged[key] = deepcopy(value)
         else:
             merged[key] = deepcopy(value)
     return merged
@@ -662,7 +832,11 @@ def load_spec_runtime_config(
         and autopilot.container_default_enabled
         and not execution.backend_explicit
     ):
-        execution = replace(execution, backend="container")
+        execution = replace(
+            execution,
+            backend="container",
+            safety_mode=effective_safety_mode("container"),
+        )
 
     paths = SpecPathConfig(
         specs_dir=str(paths_payload.get("specs_dir", "specs")).strip() or "specs",

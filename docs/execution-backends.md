@@ -160,16 +160,127 @@ when the repository and orchestrator live inside the WSL Linux filesystem.
 ```toml
 [execution]
 backend = "clone"                # clone, worktree, or container
-safety_mode = "safe"             # compatibility label; see warning below
+safety_mode = "native"           # native, or isolated with backend = "container"
 workspace_root = ".spec-workspaces"
+
+[execution.network]
+mode = "open"                    # open, or allowlist
+# allowed_domains = [...]        # used in allowlist mode; defaults to the built-in list
+denied_domains = []              # always applied
+
+[execution.codex]
+auto_review = false              # route Codex escalations to its model reviewer
 ```
 
-> **Important:** `safety_mode` is currently recorded and displayed as policy
-> metadata; it does not change runtime enforcement. The accepted `safe`,
-> `full-auto`, and `trusted` values are reserved for compatibility and must not
-> be treated as security boundaries. Actual isolation comes from the selected
-> backend, the fixed provider launch policy, credential handling, and the host's
-> own controls. `container` (alpha) provides the strongest process/toolchain boundary.
+## Safety modes
+
+`safety_mode` decides how unattended agent sessions (implement, and the
+automatic recovery launch after a missing completion handshake) are confined.
+No unattended launch waits for an approval: nobody is there to give one.
+
+### `native` (default)
+
+The provider's own sandbox is the boundary, without approval prompts.
+
+**Claude** runs `claude -p --permission-mode bypassPermissions` with only the
+orchestrator-written settings file (`--setting-sources ""`). Those settings:
+
+- keep the Bash sandbox on with `failIfUnavailable: true` and
+  `allowUnsandboxedCommands: false`, so shell commands can write only the
+  workspace, its Git directories (with `config`, `hooks/`, `info/` and protected
+  refs read-only) and the launch outbox, and a session whose sandbox cannot
+  start fails instead of running unconfined;
+- deny reads of provider and operator credential stores, both through the
+  sandbox and through the file tools;
+- deny `git push --force`/`-f` and `git reset --hard`;
+- register a PreToolUse hook for Edit, Write, MultiEdit and NotebookEdit.
+  Those tools run inside the Claude process, not under the OS sandbox, and
+  bypass mode skips their protected-path prompts. The hook resolves symlinks
+  and blocks (exit code 2, with the reason shown to the model) any target
+  outside the workspace, the agent's Git directories and the launch outbox
+  (whose `tmp/` is the session's `TMPDIR`), any protected path, and any
+  hard-linked file.
+
+Review and the blocked-run debugger keep `--restricted`, read-only tools and
+`disableBypassPermissionsMode`. Interactive sessions (`spec create`,
+`spec task` scoping, `spec input`) keep prompting the person at the terminal.
+
+Before each launch Spec Butler checks `claude --help` for `bypassPermissions`
+and the other flags it passes. If one is missing it falls back to the previous
+restricted `acceptEdits` launch (file tools confined to the working
+directories, anything that would prompt is denied, network limited to the
+allowlist) and `spec doctor` warns.
+
+**Codex** runs `codex exec` with a dedicated `CODEX_HOME`, `-a never`, and a
+permission profile built on the workspace profile with network on. A command
+that needs to escalate fails back to the model. With
+`[execution.codex] auto_review = true` the launch uses `approval_policy =
+"on-request"` and `approvals_reviewer = "auto_review"`, so Codex's model-based
+reviewer decides escalations instead of a silent denial. `spec doctor` checks
+that the installed Codex accepts the setting.
+
+### `isolated`
+
+Requires `backend = "container"` (alpha) and keeps its launch policy: the
+container is the boundary, and Claude keeps the restricted `acceptEdits`
+launch inside it. Combining `isolated` with another backend is a
+configuration error; `isolated` without a backend selects `container`.
+`[execution.network]` applies to native mode only.
+
+### Legacy values
+
+`safe`, `full-auto` and `trusted` date from when `safety_mode` was a label.
+They now mean `native`, and the CLI prints a deprecation note once per command.
+
+### Sandbox denials
+
+When a failed session hit a sandbox or permission denial (a write outside the
+workspace, a blocked host, a write-guard block, a Claude permission denial in
+`stream-json`, or Codex's `approval is not supported in exec mode`), the
+failure is classified `sandbox_denied`. `spec status` shows the denied path or
+host. It is handled like an infrastructure failure: it does not spend a code
+retry, it is backed off, and repeats trip autopilot's breaker. Fix the policy
+(or the spec) rather than raising the retry cap.
+
+## Network
+
+Unattended sessions can reach the network by default (`mode = "open"`).
+`mode = "allowlist"` limits them to `allowed_domains`, which defaults to the
+built-in list (GitHub, the Anthropic API, npm, PyPI, Yarn, Azure blob storage,
+and localhost). `denied_domains` always applies.
+
+| | Claude `sandbox.network` | Codex permission profile `network` |
+|---|---|---|
+| `open` | no `allowedDomains`, no `strictAllowlist`; bypass mode reaches unlisted hosts without a prompt | `enabled = true` |
+| `open` + `denied_domains` | `deniedDomains` | proxy `domains` with `deny` entries |
+| `allowlist` | `allowedDomains` with `strictAllowlist = true` | proxy `domains` with `allow` entries |
+
+Interactive Claude sessions and the acceptEdits fallback keep `allowedDomains`
+as their pre-approved hosts in open mode, since they cannot (or must not)
+bypass the prompt for other hosts. Codex's proxy has no "everything else"
+wildcard and refuses hosts it is not told to allow, so `denied_domains` in open
+mode may cost Codex its general network access; `spec doctor` warns. Prefer
+allowlist mode for Codex runs that must exclude hosts.
+
+What open network means:
+
+- **Credential exfiltration.** Anything a session can read, it can send
+  anywhere. The real defence is that it cannot read credentials: provider and
+  operator credential stores (`~/.ssh`, cloud and `gh` configs, provider auth
+  files) are read-denied, forge tokens stay with the host orchestrator, and
+  agent processes start from a minimal environment. A deny list or allowlist
+  only narrows where data could go; GitHub itself is allowed by default.
+- **Prompt injection.** Web pages, issues, package READMEs and API responses
+  can carry instructions. The sandbox bounds what a misled agent can touch, not
+  what it can say or which allowed host it uses.
+- **Package install scripts.** `npm install`, `pip install` and similar run
+  third-party code inside the session with the same file and network access as
+  the agent.
+- **Local sockets.** Services on `localhost` (databases, dev servers, a Docker
+  API on TCP) are reachable. The Claude sandbox blocks Unix sockets such as the
+  Docker socket unless allowed; Codex's profile sets
+  `allow_local_binding = true`. Do not run unattended sessions on a machine
+  whose local services you would not hand to the agent.
 
 ## Worktree mode
 
@@ -206,7 +317,7 @@ it explicitly with:
 ```toml
 [execution]
 backend = "clone"
-safety_mode = "safe"
+safety_mode = "native"
 workspace_root = ".spec-workspaces"
 ```
 
@@ -261,7 +372,7 @@ backend is not selected:
 ```toml
 [execution]
 backend = "container"
-safety_mode = "safe"
+safety_mode = "isolated"
 
 [execution.container]
 engine = "docker"

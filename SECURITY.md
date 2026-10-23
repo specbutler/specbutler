@@ -11,9 +11,12 @@ before reporting a problem that is already fixed there.
 `spec` assumes that the operator trusts the repository and the configuration
 being executed. Repository-defined bootstrap, implement setup/teardown, and
 verify commands run as code. Agent sessions can also act on spec text and other
-repository content. Inspect untrusted pull requests before starting a run;
-`safety_mode = "safe"` is currently a recorded compatibility label, not a
-security boundary.
+repository content. Inspect untrusted pull requests before starting a run.
+The default `safety_mode = "native"` confines unattended sessions with the
+provider's own sandbox (no writes outside the workspace, credential stores
+read-denied) but leaves the network open by default; it is a guard against
+agent mistakes, not a boundary for hostile code. See
+[Safety modes](docs/execution-backends.md#safety-modes).
 
 Built-in Claude and Codex reviewers do not install or execute code from the
 change under review. The host materializes the canonical spec, exact diff, and

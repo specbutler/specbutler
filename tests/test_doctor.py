@@ -658,15 +658,27 @@ def test_legacy_codex_file_collision_is_blocked(tmp_path: Path) -> None:
     assert report.exit_code == 1
 
 
-def test_explicit_safety_mode_warns_that_it_is_not_an_enforcement_switch(tmp_path: Path) -> None:
+def test_legacy_safety_mode_warns_that_it_now_means_native(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path, _config_text(safety_mode="trusted"))
 
     report = doctor.run_doctor_checks(repo, runner=_Runner(), which=_resolver())
 
-    check = _checks_by_name(report)["execution safety label"]
+    check = _checks_by_name(report)["execution safety mode"]
     assert check.status == "warning"
-    assert "metadata only" in check.detail
+    assert "deprecated" in check.detail
+    assert "'native'" in check.detail
     assert report.exit_code == 0
+
+
+def test_native_safety_mode_reports_open_network(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path, _config_text(safety_mode="native"))
+
+    report = doctor.run_doctor_checks(repo, runner=_Runner(), which=_resolver())
+
+    checks = _checks_by_name(report)
+    assert checks["execution safety mode"].status == "ok"
+    assert "native" in checks["execution safety mode"].detail
+    assert checks["agent network"].detail.startswith("open")
 
 
 def test_bootstrap_only_requires_the_initial_launcher_before_first_run(

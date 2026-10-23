@@ -435,10 +435,26 @@ in a command argument.
 
 ### Sandboxing
 
-`spec` configures a fixed launch policy for the agent sessions it starts. The
-`[execution].safety_mode` setting is currently a recorded compatibility label,
-not an enforcement switch. Choose the
-`worktree`, `clone`, or `container` (alpha) execution backend based on the isolation
+`[execution].safety_mode` selects how unattended agent sessions are confined;
+see [Safety modes](docs/execution-backends.md#safety-modes):
+
+- `native` (the default) runs implement and recovery sessions with no approval
+  prompts under the provider's own sandbox. Claude runs in `bypassPermissions`
+  mode with its Bash sandbox on and failing closed, and a PreToolUse hook keeps
+  Edit/Write inside the workspace. Codex runs `codex exec` with a
+  workspace-write permission profile. Shell commands cannot write outside the
+  workspace, its Git directory and the launch outbox, so an `rm -rf /` mistake
+  fails on the sandbox instead of reaching the rest of your files. (With the
+  `worktree` backend the agent's Git directory is the repository's shared
+  `.git`; the default `clone` backend keeps it per run.)
+- `isolated` requires the `container` backend (alpha) and keeps its launch
+  policy.
+
+The network is open by default. `[execution.network]` switches to an allowlist
+or adds a deny list; read the
+[network risks](docs/execution-backends.md#network) before relying on either.
+Legacy values (`safe`, `full-auto`, `trusted`) mean `native`. Choose the
+`clone`, `worktree`, or `container` execution backend based on the isolation
 your project needs; see [Execution backends](docs/execution-backends.md).
 
 - Implementation and authoring run in the provider's own sandbox. Agents can
@@ -451,7 +467,9 @@ your project needs; see [Execution backends](docs/execution-backends.md).
   backend the agent writes only its run's own `.git`; with `worktree` it also
   writes the repository's shared `.git` directory (objects, refs, stash).
   `spec doctor` probes this for each provider and backend.
-- Codex implementation sessions run with workspace-write and network access.
+- Codex implementation sessions run with workspace-write and network access,
+  and never wait for approval: an escalation fails back to the model, or goes
+  to Codex's model reviewer with `[execution.codex] auto_review = true`.
   Interactive authoring keeps workspace edits and local commits available, but
   network commands require approval and the child process receives no forge
   credential. Built-in Codex review and blocked-run debugging disable
@@ -465,9 +483,15 @@ your project needs; see [Execution backends](docs/execution-backends.md).
   legacy detached-checkout bootstrap; package build hooks then run through a
   model-free, no-network Codex sandbox or the install is skipped. There is no
   direct-host fallback.
-- Claude implementation sessions run with the Claude sandbox enabled, network
-  access limited to a built-in allowlist, and a small denylist for dangerous
-  git commands such as force-push and `git reset --hard`. Claude local review
+- Claude implementation sessions run with the Claude sandbox enabled
+  (`failIfUnavailable`, no unsandboxed commands), credential read-denies, and a
+  small denylist for dangerous git commands such as force-push and
+  `git reset --hard`. When the installed Claude CLI lacks the native-mode
+  flags, launches fall back to the restricted `acceptEdits` policy with the
+  built-in network allowlist, and `spec doctor` warns. A denied write, host or
+  escalation is reported as a `sandbox_denied` failure in `spec status`; it is
+  backed off like an infrastructure failure instead of spending a code retry.
+  Claude local review
   requires the CLI's restricted mode and exposes only read-only file tools; it
   cannot run commands, use MCP, or persist a session. The blocked-run debugger
   uses the same boundary with file tools disabled because all evidence is

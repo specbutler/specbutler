@@ -26,7 +26,16 @@ from .agent_git_access import (
     materialize_protected_loose_refs,
 )
 from .agent_git_isolation import AgentGitIsolation
+from .config import ExecutionNetworkConfig
 from .provider_env import PROXY_ENV_KEYS, protected_operator_paths
+from .safety_policy import (
+    CLAUDE_BYPASS_PERMISSION_MODE,
+    CLAUDE_FALLBACK_PERMISSION_MODE,
+    CODEX_AUTO_REVIEWER,
+    LaunchSafety,
+    codex_profile_network,
+    codex_unattended_approval_args,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -437,6 +446,7 @@ def _codex_implement_permission_overrides(
     provider_home: Path | None = None,
     profile_name: str = _CODEX_IMPLEMENT_PERMISSION_PROFILE,
     network_enabled: bool = True,
+    network: ExecutionNetworkConfig | None = None,
     ignore_rules: bool = True,
     strict_config: bool = True,
     additional_protected_paths: tuple[Path, ...] = (),
@@ -529,11 +539,7 @@ def _codex_implement_permission_overrides(
         "-c",
         (
             f"permissions.{profile_name}.network="
-            + (
-                '{enabled=true,mode="full",allow_local_binding=true}'
-                if network_enabled
-                else "{enabled=false}"
-            )
+            + codex_profile_network(network, enabled=network_enabled)
         ),
         "-c",
         f"shell_environment_policy.exclude=[{excluded}]",
@@ -624,8 +630,13 @@ class AgentAdapter(Protocol):
         externally_sandboxed: bool = False,
         provider_home: Path | None = None,
         git_isolation: AgentGitIsolation | None = None,
+        safety: LaunchSafety | None = None,
     ) -> list[str]:
-        """Build the shell command to launch the agent for an implement phase."""
+        """Build the shell command to launch the agent for an implement phase.
+
+        The launch is unattended: the command must never wait for an
+        approval. ``safety`` carries the resolved ``[execution]`` policy.
+        """
         ...
 
     def build_authoring_command(
@@ -639,8 +650,15 @@ class AgentAdapter(Protocol):
         mcp_servers: dict[str, dict[str, object]] | None = None,
         protected_env_keys: set[str] | frozenset[str] | None = None,
         git_isolation: AgentGitIsolation | None = None,
+        interactive: bool = True,
+        safety: LaunchSafety | None = None,
     ) -> list[str]:
-        """Build the shell command to launch the agent for spec authoring."""
+        """Build the shell command to launch the agent for spec authoring.
+
+        Interactive sessions keep the provider's approval prompts for a
+        person at the terminal. With ``interactive=False`` the command must
+        never wait for an approval.
+        """
         ...
 
     def build_review_command(
@@ -672,6 +690,56 @@ class AgentAdapter(Protocol):
 # ---------------------------------------------------------------------------
 
 
+def _claude_unattended_args(
+    worktree_path: Path,
+    *,
+    state_dir: Path | None,
+    mcp_config_path: Path | None,
+    mcp_servers: dict[str, dict[str, object]] | None,
+    safety: LaunchSafety | None,
+) -> list[str]:
+    """Return print-mode Claude flags for a launch nobody can answer.
+
+    Native launches run in bypassPermissions mode: the generated settings
+    keep the Bash sandbox on and fail closed, and their PreToolUse hook keeps
+    the file tools in the workspace. Otherwise (isolated mode, or a CLI
+    without the native controls) restricted mode confines the file tools and
+    acceptEdits denies anything that would prompt.
+    """
+    tools = "Read,Write,Edit,Bash,Glob,Grep"
+    mcp_tools = [
+        f"mcp__{server_name}__*"
+        for server_name in sorted(mcp_servers or {})
+    ]
+    allowed_tools = ",".join((tools, *mcp_tools))
+    if safety is not None and safety.claude_bypass:
+        args = ["--permission-mode", CLAUDE_BYPASS_PERMISSION_MODE]
+    else:
+        args = ["--restricted", "--permission-mode", CLAUDE_FALLBACK_PERMISSION_MODE]
+    args += [
+        "--tools",
+        tools,
+        "--allowedTools",
+        allowed_tools,
+        "--setting-sources",
+        "",
+        "--no-session-persistence",
+    ]
+    # Even when the container supplies the OS sandbox, Claude still owns the
+    # provider-aware credential filtering in this orchestrator-written file.
+    # Setting sources are empty, so repository and user settings are ignored
+    # while this explicit settings source still applies.
+    args += [
+        "--settings",
+        str(worktree_path / ".claude" / "settings.local.json"),
+    ]
+    if state_dir is not None:
+        args += ["--add-dir", str(state_dir)]
+    if mcp_config_path:
+        args += ["--mcp-config", str(mcp_config_path), "--strict-mcp-config"]
+    return args
+
+
 class ClaudeAgent:
     """Agent adapter for Anthropic's Claude Code CLI."""
 
@@ -701,6 +769,7 @@ class ClaudeAgent:
         externally_sandboxed: bool = False,
         provider_home: Path | None = None,
         git_isolation: AgentGitIsolation | None = None,
+        safety: LaunchSafety | None = None,
     ) -> list[str]:
         # Claude consumes MCP via the pre-written mcp_config_path file. The
         # explicit settings guard applies with either host or outer-container
@@ -709,35 +778,13 @@ class ClaudeAgent:
         cmd = ["claude", "-p"]
         if stream_json:
             cmd += ["--output-format", "stream-json", "--verbose"]
-        tools = "Read,Write,Edit,Bash,Glob,Grep"
-        mcp_tools = [
-            f"mcp__{server_name}__*"
-            for server_name in sorted(mcp_servers or {})
-        ]
-        allowed_tools = ",".join((tools, *mcp_tools))
-        cmd += [
-            "--restricted",
-            "--permission-mode",
-            "acceptEdits",
-            "--tools",
-            tools,
-            "--allowedTools",
-            allowed_tools,
-            "--setting-sources",
-            "",
-            "--no-session-persistence",
-        ]
-        # Even when the container supplies the OS sandbox, Claude still owns
-        # the provider-aware credential filtering in this orchestrator-written
-        # file. Restricted/safe mode ignore repository and user settings while
-        # continuing to honor this explicit settings source.
-        cmd += [
-            "--settings",
-            str(worktree_path / ".claude" / "settings.local.json"),
-        ]
-        cmd += ["--add-dir", str(state_dir)]
-        if mcp_config_path:
-            cmd += ["--mcp-config", str(mcp_config_path), "--strict-mcp-config"]
+        cmd += _claude_unattended_args(
+            worktree_path,
+            state_dir=state_dir,
+            mcp_config_path=mcp_config_path,
+            mcp_servers=mcp_servers,
+            safety=safety,
+        )
         cmd += ["--", prompt]
         return cmd
 
@@ -752,8 +799,28 @@ class ClaudeAgent:
         mcp_servers: dict[str, dict[str, object]] | None = None,
         protected_env_keys: set[str] | frozenset[str] | None = None,
         git_isolation: AgentGitIsolation | None = None,
+        interactive: bool = True,
+        safety: LaunchSafety | None = None,
     ) -> list[str]:
-        del mcp_servers, protected_env_keys, git_isolation
+        del protected_env_keys, git_isolation
+        if not interactive:
+            # Nobody can answer a prompt: run in print mode under the same
+            # unattended policy as an implement launch.
+            return [
+                "claude",
+                "-p",
+                *_claude_unattended_args(
+                    worktree_path,
+                    state_dir=state_dir,
+                    mcp_config_path=mcp_config_path,
+                    mcp_servers=mcp_servers,
+                    safety=safety,
+                ),
+                "--append-system-prompt",
+                prompt,
+                "--",
+                initial_prompt or "Begin.",
+            ]
         # Authoring is interactive: edits remain frictionless, while shell and
         # other side effects retain Claude's normal operator approval prompt.
         # The explicit settings file keeps the repository sandbox/credential
@@ -874,6 +941,7 @@ def codex_capability_probe_command(
     codex_path: str = "codex",
     *,
     platform: str | None = None,
+    auto_review: bool = False,
 ) -> list[str]:
     """Build a provider-free strict-config capability probe.
 
@@ -883,6 +951,8 @@ def codex_capability_probe_command(
     successfully parsing the controls; a future CLI may instead exit zero.
     """
     overrides = list(_CODEX_CAPABILITY_PROBE_OVERRIDES)
+    if auto_review:
+        overrides.append(f'approvals_reviewer="{CODEX_AUTO_REVIEWER}"')
     if (platform or sys.platform) == "win32":
         overrides.append(f'windows.sandbox="{CODEX_WINDOWS_SANDBOX_MODE}"')
     return [
@@ -1029,17 +1099,21 @@ class CodexAgent:
         externally_sandboxed: bool = False,
         provider_home: Path | None = None,
         git_isolation: AgentGitIsolation | None = None,
+        safety: LaunchSafety | None = None,
     ) -> list[str]:
         del mcp_config_path, externally_sandboxed
+        policy = safety or LaunchSafety()
         writable_roots = [
             state_dir,
             *_codex_git_metadata_dirs(worktree_path, git_isolation),
         ]
         protected_git_paths, readable_git_paths = _codex_shared_git_paths(git_isolation)
+        # `codex exec` never waits for a person: with `-a never` an
+        # escalation fails back to the model; with auto_review the model
+        # reviewer decides it.
         cmd = [
             "codex",
-            "-a",
-            "never",
+            *codex_unattended_approval_args(policy.codex_auto_review),
             *_codex_add_dir_args(writable_roots),
             "exec",
             "--json",
@@ -1048,6 +1122,7 @@ class CodexAgent:
                 writable_roots,
                 excluded_env_keys=_codex_mcp_secret_env_keys(mcp_servers),
                 provider_home=provider_home,
+                network=policy.network,
                 additional_protected_paths=protected_git_paths,
                 additional_read_only_paths=readable_git_paths,
                 **({"git_read_only_paths": ()} if git_isolation is not None else {}),
@@ -1075,30 +1150,40 @@ class CodexAgent:
         mcp_servers: dict[str, dict[str, object]] | None = None,
         protected_env_keys: set[str] | frozenset[str] | None = None,
         git_isolation: AgentGitIsolation | None = None,
+        interactive: bool = True,
+        safety: LaunchSafety | None = None,
     ) -> list[str]:
         del mcp_config_path  # Codex loads MCP via `-c mcp_servers.*` overrides, not a config file.
-        # Authoring/operator-input sessions are interactive by design: unlike
-        # unattended implement runs, the agent may ask for approval when a
-        # resolution needs writes outside the pre-registered roots.
-        cmd = [
-            "codex",
-            "-a",
-            "on-request",
-            "-s",
-            "workspace-write",
-        ]
+        policy = safety or LaunchSafety()
+        if interactive:
+            # Authoring/operator-input sessions with a person at the terminal
+            # may ask for approval when a resolution needs writes outside the
+            # pre-registered roots or network access.
+            cmd = [
+                "codex",
+                "-a",
+                "on-request",
+                "-s",
+                "workspace-write",
+            ]
+        else:
+            # Nobody can answer: use the unattended implement policy.
+            cmd = ["codex", *codex_unattended_approval_args(policy.codex_auto_review)]
         add_dirs = []
         if state_dir:
             add_dirs.append(state_dir)
         add_dirs.extend(_codex_git_metadata_dirs(worktree_path, git_isolation))
         protected_git_paths, readable_git_paths = _codex_shared_git_paths(git_isolation)
         cmd += _codex_add_dir_args(add_dirs)
+        if not interactive:
+            cmd += ["exec", "--json"]
         cmd += _codex_implement_permission_overrides(
             worktree_path,
             add_dirs,
             excluded_env_keys=set(protected_env_keys or ()),
             profile_name=_CODEX_AUTHORING_PERMISSION_PROFILE,
-            network_enabled=False,
+            network_enabled=not interactive,
+            network=policy.network,
             ignore_rules=False,
             strict_config=False,
             additional_protected_paths=protected_git_paths,

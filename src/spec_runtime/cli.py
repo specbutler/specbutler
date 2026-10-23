@@ -61,14 +61,15 @@ def _lazy_config():
 
 
 def _warn_container_alpha() -> None:
-    """Print the container-alpha warning once when the container backend is selected."""
-    from .config import emit_container_alpha_warning
+    """Print the container-alpha and legacy safety-mode notes when they apply."""
+    from .config import emit_container_alpha_warning, emit_safety_mode_deprecation_note
 
     try:
         config = _lazy_config()
     except Exception:
         return
     emit_container_alpha_warning(config)
+    emit_safety_mode_deprecation_note(config)
 
 
 def _configure_windows_stdio(
