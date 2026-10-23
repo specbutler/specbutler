@@ -168,8 +168,12 @@ def test_repointed_worktree_git_file_is_rejected(tmp_path: Path) -> None:
     _git(other_repository, "worktree", "add", "-b", "code/other", str(other_worktree), "main")
     other_git_dir = other_repository.resolve() / ".git" / "worktrees" / "other-worktree"
     pointer = worktree / ".git"
-    os.chmod(pointer, stat.S_IREAD | stat.S_IWRITE)  # Git for Windows marks it read-only.
-    pointer.write_text(f"gitdir: {other_git_dir}\n", encoding="utf-8")
+    os.chmod(pointer, stat.S_IREAD | stat.S_IWRITE)
+    # Git for Windows marks the pointer hidden; Windows refuses a truncating
+    # open of a hidden file, so rewrite it in place.
+    with open(pointer, "r+", encoding="utf-8") as handle:
+        handle.write(f"gitdir: {other_git_dir}\n")
+        handle.truncate()
 
     with pytest.raises(UnsafeAgentGitLayoutError, match="registered to another worktree"):
         agent_git_access(worktree)
