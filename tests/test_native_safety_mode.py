@@ -769,6 +769,11 @@ class TestWriteGuardHook:
             "bash -lc \"cd sub; git reset --hard\"",
             "git reset --hard\nls",
             "echo 'unbalanced && git reset --hard",
+            "git -c alias.rh='reset --hard' rh",
+            "git -calias.fp='push --force' fp origin",
+            "git -c alias.x='!git reset --hard' x",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.rh GIT_CONFIG_VALUE_0='reset --hard' git rh",
+            "git --config-env alias.rh=RH rh",
         ],
     )
     def test_blocks_deny_listed_git_commands_in_bypass_mode(self, layout, command: str) -> None:
@@ -789,6 +794,8 @@ class TestWriteGuardHook:
             "git push -u origin topic",
             "git -C sub status && git push origin topic",
             "git log --format=%f",
+            "git -c alias.st=status st",
+            "git -c core.editor=true commit --amend --no-edit",
         ],
     )
     def test_allows_other_bash_commands(self, layout, command: str) -> None:

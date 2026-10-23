@@ -154,14 +154,37 @@ def _denied_command_reason(command: str, *, depth: int) -> str:
     return ""
 
 
-def _denied_git_reason(argv: list[str]) -> str:
+def _denied_git_reason(argv: list[str], *, depth: int = 0) -> str:
     for index, token in enumerate(argv):
         if os.path.basename(token) != "git":
             continue
+        # Inline aliases (``-c alias.x=…``, ``GIT_CONFIG_KEY_n``) can rename a
+        # denied command; check their definitions as commands too. Repository
+        # and global Git config are read-only to the agent.
+        aliases = _env_alias_definitions(argv[:index])
         position = index + 1
         while position < len(argv) and argv[position].startswith("-"):
             option = argv[position]
+            value = argv[position + 1] if position + 1 < len(argv) else ""
+            if option.startswith("-c"):
+                # ``-c key=value`` or the attached ``-ckey=value`` form.
+                key, _, alias_value = (value if option == "-c" else option[2:]).partition("=")
+                if key.lower().startswith("alias."):
+                    aliases.append(alias_value)
+            if option.split("=", 1)[0] == "--config-env":
+                spec = option.split("=", 1)[1] if "=" in option else value
+                if spec.lower().startswith("alias."):
+                    return "aliases taken from the environment are not allowed"
             position += 2 if option in _GIT_VALUE_OPTIONS else 1
+        if depth < _MAX_NESTING:
+            for definition in aliases:
+                reason = (
+                    _denied_command_reason(definition[1:], depth=depth + 1)
+                    if definition.startswith("!")
+                    else _denied_git_reason(["git", *_split_words(definition)], depth=depth + 1)
+                )
+                if reason:
+                    return reason
         if position >= len(argv):
             continue
         subcommand, args = argv[position], argv[position + 1 :]
@@ -170,6 +193,23 @@ def _denied_git_reason(argv: list[str]) -> str:
         if subcommand == "push" and any(_is_force_push_arg(arg) for arg in args):
             return _PUSH_REASON
     return ""
+
+
+def _env_alias_definitions(prefix: list[str]) -> list[str]:
+    """Return alias values set through ``GIT_CONFIG_KEY_n`` assignments."""
+    env = dict(token.split("=", 1) for token in prefix if "=" in token and not token.startswith("-"))
+    definitions = []
+    for name, key in env.items():
+        if name.startswith("GIT_CONFIG_KEY_") and key.lower().startswith("alias."):
+            definitions.append(env.get("GIT_CONFIG_VALUE_" + name.removeprefix("GIT_CONFIG_KEY_"), ""))
+    return definitions
+
+
+def _split_words(text: str) -> list[str]:
+    try:
+        return shlex.split(text)
+    except ValueError:
+        return text.split()
 
 
 def _is_force_push_arg(arg: str) -> bool:

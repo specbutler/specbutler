@@ -193,7 +193,11 @@ orchestrator-written settings file (`--setting-sources ""`). Those settings:
 - deny reads of provider and operator credential stores, both through the
   sandbox and through the file tools;
 - deny `git push --force`/`-f` and `git reset --hard`, both as permission
-  deny rules and in the PreToolUse hook below, which runs in bypass mode too;
+  deny rules and in the PreToolUse hook below, which runs in bypass mode too.
+  The hook parses each command, skips Git's global options and checks inline
+  aliases. It catches mistakes, not a determined agent (a script file could
+  still run either command); the sandbox's write confinement is the boundary,
+  and pushing stays with the host;
 - register a PreToolUse hook for Edit, Write, MultiEdit, NotebookEdit and Bash.
   Those tools run inside the Claude process, not under the OS sandbox, and
   bypass mode skips their protected-path prompts. The hook resolves symlinks
