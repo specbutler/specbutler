@@ -302,22 +302,71 @@ def run_doctor_checks(
 
 
 def _execution_policy_checks(config: SpecRuntimeConfig) -> list[DoctorCheck]:
+    from .config import safety_mode_deprecation_note
+
     execution = config.execution
-    if execution.safety_mode_explicit:
-        return [
+    checks: list[DoctorCheck] = []
+    note = safety_mode_deprecation_note(config)
+    if note:
+        checks.append(
             _warning(
-                "execution safety label",
-                f"safety_mode={execution.safety_mode!r} is metadata only and does not change runtime enforcement",
-                "Choose the execution backend based on the isolation you need; container is the strongest boundary but is alpha.",
-                "See docs/execution-backends.md before running untrusted repository code.",
+                "execution safety mode",
+                note,
+                "See docs/execution-backends.md#safety-modes.",
             )
-        ]
-    return [
-        _ok(
-            "execution safety label",
-            "implicit `safe` compatibility label; provider launch policy is fixed",
         )
-    ]
+    elif execution.safety_mode == "isolated":
+        checks.append(
+            _ok(
+                "execution safety mode",
+                "isolated: agents run in the container backend (alpha)",
+            )
+        )
+    else:
+        checks.append(
+            _ok(
+                "execution safety mode",
+                "native: unattended implement and recovery sessions run without "
+                "approval prompts under the provider's own sandbox",
+            )
+        )
+    if execution.safety_mode == "native":
+        network = execution.network
+        denied = (
+            f"; denied: {', '.join(network.denied_domains)}"
+            if network.denied_domains
+            else ""
+        )
+        if network.mode == "open":
+            checks.append(
+                _ok(
+                    "agent network",
+                    "open: unattended sessions may reach any host" + denied
+                    + " (credential read-denies are the defence against exfiltration)",
+                )
+            )
+        else:
+            checks.append(
+                _ok(
+                    "agent network",
+                    f"allowlist: {', '.join(network.allowed_domains)}{denied}",
+                )
+            )
+        if (
+            network.mode == "open"
+            and network.denied_domains
+            and "codex" in config.agents.allowed
+        ):
+            checks.append(
+                _warning(
+                    "agent network (codex)",
+                    "denied_domains routes Codex traffic through its network proxy, "
+                    "which may refuse hosts that are not explicitly allowed",
+                    'Use mode = "allowlist" for Codex runs that must exclude hosts, '
+                    "or confirm general network access with a short Codex run.",
+                )
+            )
+    return checks
 
 
 def _container_alpha_checks(config: SpecRuntimeConfig) -> list[DoctorCheck]:
@@ -580,6 +629,29 @@ def _agent_checks(
                         "restricted read-only review mode is available",
                     )
                 )
+            if config.execution.safety_mode == "native":
+                from .safety_policy import claude_native_unavailability_reason
+
+                native_reason = claude_native_unavailability_reason(
+                    f"{help_result.stdout}\n{help_result.stderr}"
+                    if help_result.returncode == 0
+                    else ""
+                )
+                if native_reason:
+                    checks.append(
+                        _warning(
+                            "agent native launch (claude)",
+                            native_reason,
+                        )
+                    )
+                else:
+                    checks.append(
+                        _ok(
+                            "agent native launch (claude)",
+                            "bypassPermissions launches with the Bash sandbox and "
+                            "write-guard hook are available",
+                        )
+                    )
         elif agent == "codex":
             from .agent_adapter import (
                 codex_capability_probe_command,
@@ -607,6 +679,34 @@ def _agent_checks(
                     capability_probe.returncode,
                     capability_probe.stdout,
                     capability_probe.stderr,
+                )
+            if (
+                not isolation_reason
+                and config.execution.safety_mode == "native"
+                and config.execution.codex.auto_review
+            ):
+                review_probe = run(
+                    codex_capability_probe_command(path, auto_review=True),
+                    repo_root,
+                    10.0,
+                )
+                review_reason = codex_capability_probe_unavailability_reason(
+                    review_probe.returncode,
+                    review_probe.stdout,
+                    review_probe.stderr,
+                )
+                checks.append(
+                    _warning(
+                        "agent auto-review (codex)",
+                        "[execution.codex].auto_review is on, but " + review_reason,
+                        "Upgrade Codex or set auto_review = false; launches with "
+                        "auto_review fail under strict config until then.",
+                    )
+                    if review_reason
+                    else _ok(
+                        "agent auto-review (codex)",
+                        "sandbox escalations go to the auto_review approver",
+                    )
                 )
             if not isolation_reason and is_windows():
                 try:

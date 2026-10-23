@@ -178,7 +178,7 @@ class TestExecutionConfigDefaults:
             config = load_spec_runtime_config(require=True)
 
         assert config.execution.backend == default_execution_backend()
-        assert config.execution.safety_mode == "safe"
+        assert config.execution.safety_mode == "native"
         assert config.execution.workspace_root == ".spec-workspaces"
         # Selection origin: implicit default. Future rollout policy can flip
         # this without overriding an explicit escape hatch.
@@ -501,7 +501,7 @@ class TestBackendFactory:
         )
         assert type(backend) is expected
         assert backend.identity.backend == default_execution_backend()
-        assert backend.identity.safety_mode == "safe"
+        assert backend.identity.safety_mode == "native"
 
     def test_explicit_worktree_returns_worktree_backend(self):
         backend = eb.get_execution_backend(ExecutionConfig(backend="worktree"))

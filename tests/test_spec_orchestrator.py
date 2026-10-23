@@ -30611,7 +30611,7 @@ class TestStatusIntake:
         assert code == 0
         assert "No runs found." in out
         assert "Backend: container (rollout-policy)" in out
-        assert "Safety Mode: safe" in out
+        assert "Safety Mode: isolated" in out
 
     def test_status_shows_reintake_required_for_schema_mismatch(
         self,

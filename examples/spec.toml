@@ -149,7 +149,30 @@ parallel = true
 
 [execution]
 backend = "clone"
+# `native` (the default) runs unattended implement sessions with no approval
+# prompts under the provider's own sandbox: Claude in bypassPermissions mode
+# with its Bash sandbox on and a hook keeping Edit/Write in the workspace,
+# Codex via `codex exec` with a workspace-write profile. `isolated` requires
+# backend = "container" (alpha). See docs/execution-backends.md#safety-modes.
+safety_mode = "native"
 # workspace_root = ".spec-workspaces"
+
+# Network for native sessions. `open` reaches any host except denied_domains;
+# `allowlist` reaches only allowed_domains (default: GitHub, the Anthropic API,
+# npm, PyPI, Yarn, Azure blobs, localhost). Credential read-denies, not the
+# network policy, are the defence against exfiltration; see
+# docs/execution-backends.md#network for the risks of open network.
+#
+# [execution.network]
+# mode = "open"
+# allowed_domains = ["github.com", "api.github.com", "pypi.org"]
+# denied_domains = []
+
+# Send Codex sandbox escalations to its model-based reviewer instead of
+# denying them. Off by default.
+#
+# [execution.codex]
+# auto_review = false
 
 # ---------------------------------------------------------------------------
 # Coordination (optional)

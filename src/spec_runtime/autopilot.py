@@ -26,6 +26,7 @@ from spec_runtime import worktree_process_registry
 from spec_runtime.config import (
     ExecutionConfig,
     SpecRuntimeConfig,
+    effective_safety_mode,
     load_repo_spec_runtime_config,
     load_spec_runtime_config,
     resolve_spec_path,
@@ -653,7 +654,7 @@ def resolve_autopilot_backend_policy(config: SpecRuntimeConfig) -> AutopilotBack
         backend = execution.backend
     return AutopilotBackendPolicy(
         backend=backend,
-        safety_mode=execution.safety_mode,
+        safety_mode=effective_safety_mode(backend),
         source=source,
         backend_explicit=execution.backend_explicit,
     )
@@ -663,13 +664,11 @@ def execution_config_for_autopilot(config: SpecRuntimeConfig) -> ExecutionConfig
     policy = resolve_autopilot_backend_policy(config)
     if policy.backend == config.execution.backend:
         return config.execution
-    return ExecutionConfig(
+    return replace(
+        config.execution,
         backend=policy.backend,
-        safety_mode=config.execution.safety_mode,
-        workspace_root=config.execution.workspace_root,
-        container=config.execution.container,
+        safety_mode=effective_safety_mode(policy.backend),
         backend_explicit=False,
-        safety_mode_explicit=config.execution.safety_mode_explicit,
     )
 
 

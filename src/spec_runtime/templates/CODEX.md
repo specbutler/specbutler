@@ -8,9 +8,10 @@
 `spec` launches Codex implementation sessions with workspace-write and network
 access, interactive authoring with workspace-write and approval-gated network
 access, and local review sessions read-only. Approval prompts are unavailable
-in non-interactive runs. These fixed launch settings—and the selected execution
-backend—are the effective boundary; `[execution].safety_mode` does not change
-them.
+in non-interactive runs: an escalation fails back to you, or goes to Codex's
+model reviewer when `[execution.codex] auto_review` is on. These launch
+settings, `[execution].safety_mode` and `[execution.network]`, and the selected
+execution backend are the effective boundary.
 
 Follow the provided workspace and implement-agent contract. If the requested
 work cannot be completed within the available permissions, report

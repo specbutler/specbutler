@@ -204,6 +204,20 @@ from .review_bootstrap import (
     isolated_review_bootstrap_sandbox,
 )
 from .review_decision import REVIEW_DECISION_VALUES, review_payload_decision
+from .safety_policy import (
+    LaunchSafety,
+    claude_native_unavailability_reason,
+    claude_sandbox_network,
+    claude_write_guard_hooks,
+)
+from .sandbox_denials import (
+    SANDBOX_DENIED_MARKER,
+    SandboxDenial,
+    claude_event_denials,
+    codex_event_denials,
+    is_sandbox_denial_text,
+    sandbox_denial_summary,
+)
 from .spec_identity import (
     SPEC_ID_RE,
     authoring_branch_identity,
@@ -4404,6 +4418,10 @@ class FailureCategory(StrEnum):
     """
 
     INFRASTRUCTURE = "infrastructure"
+    # The provider sandbox or permission policy refused a write, connection
+    # or escalation. Handled as infrastructure: the same policy refuses the
+    # next attempt too.
+    SANDBOX_DENIED = "sandbox_denied"
     CODE = "code"
     UNKNOWN = "unknown"
 
@@ -4428,8 +4446,13 @@ class FailureClassification:
 
     @property
     def is_infrastructure(self) -> bool:
-        return self.category is FailureCategory.INFRASTRUCTURE
+        return self.category in (
+            FailureCategory.INFRASTRUCTURE,
+            FailureCategory.SANDBOX_DENIED,
+        )
 
+
+SANDBOX_DENIED_KIND = SANDBOX_DENIED_MARKER
 
 # "Exception in implement: X" and a bare "X" from bootstrap are one breakage.
 _FAILURE_WRAPPER_PREFIX_RE = re.compile(
@@ -4515,6 +4538,8 @@ def _infrastructure_failure_kind(text: str) -> tuple[str, bool, str] | None:
         return "toolchain_missing", False, "backend"
     if _is_verify_environment_failure_message(text):
         return "verify_environment", True, "backend"
+    if is_sandbox_denial_text(text):
+        return SANDBOX_DENIED_KIND, True, "spec"
     if "git worktree add failed" in text and ("cannot lock" in text or "could not lock" in text):
         return "git_lock", True, "backend"
     if any(marker in text for marker in _FORGE_NETWORK_MARKERS) and not _is_non_fast_forward_push_rejection(text):
@@ -4554,7 +4579,11 @@ def classify_failure(
     if infra is not None:
         kind, transient, scope = infra
         return FailureClassification(
-            category=FailureCategory.INFRASTRUCTURE,
+            category=(
+                FailureCategory.SANDBOX_DENIED
+                if kind == SANDBOX_DENIED_KIND
+                else FailureCategory.INFRASTRUCTURE
+            ),
             kind=kind,
             signature=_failure_signature(kind, raw),
             transient=transient,
@@ -9125,6 +9154,9 @@ class RunState:
     # Drives the in-process infrastructure backoff and never touches
     # ``attempts``.
     infra_failure_streak: int = 0
+    # The path or host the provider sandbox refused, when the last failure
+    # was classified ``sandbox_denied``.
+    last_sandbox_denial: str = ""
     # Durable count of no-progress circuit-breaker trips. Unlike
     # ``no_progress_retries`` (reset when verify next passes) this survives a
     # resumed run, so history shows the breaker fired.
@@ -9645,10 +9677,22 @@ class AgentProgressTracker:
     _last_heartbeat_persist: float = field(default_factory=time.monotonic, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _inflight_items: set[str] = field(default_factory=set, repr=False)
+    _sandbox_denial: SandboxDenial | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if not self.last_event_summary:
             self.last_event_summary = f"{self.agent} launch"
+
+    def record_sandbox_denials(self, denials: list[SandboxDenial]) -> None:
+        """Remember the most recent sandbox or permission denial."""
+        if not denials:
+            return
+        with self._lock:
+            self._sandbox_denial = denials[-1]
+
+    def latest_sandbox_denial(self) -> SandboxDenial | None:
+        with self._lock:
+            return self._sandbox_denial
 
     def command_started(self, item_id: str) -> None:
         """Mark a blocking agent item (shell command, MCP call) as in flight."""
@@ -15909,8 +15953,17 @@ def _write_sandbox_config(
     interactive: bool = False,
     additional_protected_env_keys: set[str] | frozenset[str] = frozenset(),
     git_isolation: AgentGitIsolation | None = None,
+    safety: LaunchSafety | None = None,
+    extra_write_roots: tuple[Path, ...] = (),
 ) -> _ClaudeMcpConfigMaterialization | None:
-    """Write agent-specific sandbox configuration."""
+    """Write agent-specific sandbox configuration.
+
+    ``safety`` is the resolved policy of an unattended launch. When it allows
+    Claude's bypassPermissions mode, the settings omit
+    ``disableBypassPermissionsMode`` and register the PreToolUse write guard,
+    which admits the workspace, ``extra_write_roots`` (the launch outbox and
+    its scratch directory) and the agent's Git directories.
+    """
     if agent == "claude":
         config_dir = worktree_path / ".claude"
         if config_dir.is_symlink() or _is_windows_reparse_point(config_dir) or (
@@ -15974,6 +16027,12 @@ def _write_sandbox_config(
             for path in sorted(protected_git_write_paths, key=str)
             for tool in ("Write", "Edit")
         ]
+        bypass = bool(safety is not None and safety.claude_bypass and not interactive)
+        network_policy = (
+            safety.network
+            if safety is not None
+            else SPEC_RUNTIME_CONFIG.execution.network
+        )
         config = {
             "sandbox": {
                 "enabled": True,
@@ -16001,20 +16060,7 @@ def _write_sandbox_config(
                         for path in protected
                     ],
                 },
-                "network": {
-                    "allowedDomains": [
-                        "github.com",
-                        "api.github.com",
-                        "*.blob.core.windows.net",
-                        "api.anthropic.com",
-                        "*.npmjs.org",
-                        "pypi.org",
-                        "files.pythonhosted.org",
-                        "registry.yarnpkg.com",
-                        "localhost",
-                        "127.0.0.1",
-                    ]
-                },
+                "network": claude_sandbox_network(network_policy, bypass=bypass),
             },
             "permissions": {
                 "disableBypassPermissionsMode": "disable",
@@ -16030,6 +16076,19 @@ def _write_sandbox_config(
                 ],
             },
         }
+        if bypass:
+            # Native unattended launch: no approval prompts. The Bash sandbox
+            # above still confines shell writes; the hook confines the file
+            # tools, which the OS sandbox does not cover.
+            del config["permissions"]["disableBypassPermissionsMode"]
+            config["hooks"] = claude_write_guard_hooks(
+                [
+                    worktree_path.resolve(strict=False),
+                    *(root.resolve(strict=False) for root in extra_write_roots),
+                    *git_writable_paths,
+                ],
+                [*protected_paths, *protected_git_write_paths],
+            )
         _replace_with_exclusive_file(
             config_dir / "settings.local.json",
             (json.dumps(config, indent=2) + "\n").encode("utf-8"),
@@ -16110,6 +16169,62 @@ def _write_external_sandbox_claude_settings(
     _replace_with_exclusive_file(
         config_dir / "settings.local.json",
         (json.dumps(settings, indent=2) + "\n").encode("utf-8"),
+    )
+
+
+# Native-launch capability per resolved Claude executable. One probe per
+# process: every implement and recovery launch would otherwise shell out to
+# ``claude --help``.
+_CLAUDE_NATIVE_PROBE_CACHE: dict[str, str] = {}
+
+
+def _claude_native_launch_unavailability_reason() -> str:
+    """Return why this host's Claude CLI cannot run a native launch."""
+    executable = shutil.which("claude")
+    if not executable:
+        return "Claude CLI not found on PATH."
+    cached = _CLAUDE_NATIVE_PROBE_CACHE.get(executable)
+    if cached is not None:
+        return cached
+    try:
+        result = run_subprocess([executable, "--help"])
+    except OSError as exc:
+        return f"Could not run `claude --help`: {exc}"
+    help_text = (
+        f"{result.stdout or ''}\n{result.stderr or ''}"
+        if result.returncode == 0
+        else ""
+    )
+    reason = claude_native_unavailability_reason(help_text)
+    _CLAUDE_NATIVE_PROBE_CACHE[executable] = reason
+    return reason
+
+
+def _unattended_launch_safety(agent: str, backend: ExecutionBackend) -> LaunchSafety:
+    """Resolve ``[execution]`` safety settings for an implement/recovery launch.
+
+    ``native`` applies to provider sessions sandboxed on this host. The
+    container backend (``isolated``) keeps its fixed launch policy.
+    """
+    execution = SPEC_RUNTIME_CONFIG.execution
+    native = (
+        execution.safety_mode != "isolated"
+        and _backend_launches_agent_on_host(backend)
+        and _backend_uses_provider_sandbox_config(backend)
+    )
+    if not native:
+        return LaunchSafety()
+    claude_bypass = False
+    if agent == "claude":
+        reason = _claude_native_launch_unavailability_reason()
+        if reason:
+            logger.warning("Native Claude launch unavailable: %s", reason)
+        else:
+            claude_bypass = True
+    return LaunchSafety(
+        claude_bypass=claude_bypass,
+        codex_auto_review=execution.codex.auto_review,
+        network=execution.network,
     )
 
 
@@ -16552,6 +16667,7 @@ def _prepare_implement_launch_plan(
 ) -> ImplementLaunchPlan:
     backend = _resolve_execution_backend()
     _require_agent_available_for_backend(run.agent, backend)
+    launch_safety = _unattended_launch_safety(run.agent, backend)
     if setup_manifest is None:
         setup_manifest = _run_implement_setup_command(run, worktree_path)
         # Persist cleanup ownership immediately after setup returns. Later MCP
@@ -16600,6 +16716,15 @@ def _prepare_implement_launch_plan(
     )
     claude_mcp_materialization: _ClaudeMcpConfigMaterialization | None = None
     claude_mcp_secret_source = {**os.environ, **setup_manifest.env}
+    # The launch outbox (and its scratch TMPDIR) is a write root of the
+    # session, so it must exist before the Claude write guard is generated.
+    completion_outbox_path = _container_completion_outbox_path(worktree_path)
+    if completion_outbox_path is None:
+        completion_outbox_path = _prepare_scoped_agent_completion_outbox(
+            repo_root,
+            run.run_id,
+            run.implement_launches,
+        )
     if _backend_uses_provider_sandbox_config(backend):
         if run.agent == "claude":
             written_sandbox = _write_sandbox_config(
@@ -16608,6 +16733,8 @@ def _prepare_implement_launch_plan(
                 extra_mcp_servers=effective_agent_mcp_servers,
                 protect_claude_mcp_secrets=True,
                 claude_mcp_secret_source=claude_mcp_secret_source,
+                safety=launch_safety,
+                extra_write_roots=(completion_outbox_path.parent,),
                 **({"git_isolation": git_isolation} if git_isolation else {}),
             )
             claude_mcp_materialization = written_sandbox
@@ -16643,13 +16770,6 @@ def _prepare_implement_launch_plan(
     for env_key in referenced_mcp_environment:
         if env_key in os.environ:
             agent_env[env_key] = os.environ[env_key]
-    completion_outbox_path = _container_completion_outbox_path(worktree_path)
-    if completion_outbox_path is None:
-        completion_outbox_path = _prepare_scoped_agent_completion_outbox(
-            repo_root,
-            run.run_id,
-            run.implement_launches,
-        )
     agent_env["SPEC_COMPLETION_OUTBOX"] = str(completion_outbox_path)
     agent_env_redactions: tuple[str, ...] = ()
     if admitted_setup_env:
@@ -16818,6 +16938,7 @@ def _prepare_implement_launch_plan(
             backend
         ),
         "provider_home": codex_home if codex_auth_root is not None else None,
+        "safety": launch_safety,
     }
     if git_isolation is not None:
         agent_command_kwargs["git_isolation"] = git_isolation
@@ -17084,6 +17205,44 @@ def _detect_container_lost_implementation(
 
 
 def _interpret_implement_attempt_outcome(
+    run: RunState,
+    repo_root: Path,
+    worktree_path: Path,
+    ctx: ImplementContext,
+    outcome: ImplementAttemptOutcome,
+    *,
+    prefetched_result: tuple[ImplementResult | None, bool] | None = None,
+    allow_legacy_launch: bool = False,
+) -> str:
+    status = _interpret_implement_attempt_result(
+        run,
+        repo_root,
+        worktree_path,
+        ctx,
+        outcome,
+        prefetched_result=prefetched_result,
+        allow_legacy_launch=allow_legacy_launch,
+    )
+    if status in ("failed", "blocked"):
+        _annotate_sandbox_denial(run, outcome)
+    return status
+
+
+def _annotate_sandbox_denial(run: RunState, outcome: ImplementAttemptOutcome) -> None:
+    """Name the sandbox denial a failed session ran into in ``last_error``.
+
+    ``classify_failure`` then treats the failure as ``sandbox_denied``
+    infrastructure instead of spending a code retry on it.
+    """
+    tracker = outcome.progress_tracker
+    denial = tracker.latest_sandbox_denial() if tracker is not None else None
+    if denial is None or SANDBOX_DENIED_MARKER in run.last_error:
+        return
+    note = f"Sandbox denied {denial.describe()} ({SANDBOX_DENIED_MARKER})."
+    run.last_error = f"{run.last_error} {note}".strip()
+
+
+def _interpret_implement_attempt_result(
     run: RunState,
     repo_root: Path,
     worktree_path: Path,
@@ -18045,6 +18204,7 @@ def _attempt_no_handshake_recovery(
             worktree_path,
             git_isolation=recovery_git_isolation,
         )
+        recovery_safety = _unattended_launch_safety(run.agent, backend)
         recovery_outbox_path = _container_completion_outbox_path(worktree_path)
         if recovery_outbox_path is None:
             recovery_outbox_path = _prepare_scoped_agent_completion_outbox(
@@ -18120,6 +18280,8 @@ def _attempt_no_handshake_recovery(
                     extra_mcp_servers=effective_recovery_mcp_servers,
                     protect_claude_mcp_secrets=True,
                     claude_mcp_secret_source=recovery_mcp_secret_source,
+                    safety=recovery_safety,
+                    extra_write_roots=(recovery_outbox_path.parent,),
                     **(
                         {"git_isolation": recovery_git_isolation}
                         if recovery_git_isolation
@@ -18290,6 +18452,7 @@ def _attempt_no_handshake_recovery(
             "provider_home": (
                 codex_home if recovery_codex_auth_root is not None else None
             ),
+            "safety": recovery_safety,
         }
         if recovery_git_isolation is not None:
             recovery_cmd_kwargs["git_isolation"] = recovery_git_isolation
@@ -19060,6 +19223,7 @@ def _handle_claude_stream_line(
     event_type = event.get("type")
     if tracker is not None:
         _track_claude_inflight_tools(event, tracker)
+        tracker.record_sandbox_denials(claude_event_denials(event))
     if event_type == "assistant":
         content = _claude_message_content(event)
         if not content and tracker is not None:
@@ -19261,6 +19425,7 @@ def _handle_codex_stream_line(line: str, tracker: AgentProgressTracker) -> None:
         return
 
     _track_codex_inflight_items(event, tracker)
+    tracker.record_sandbox_denials(codex_event_denials(event))
     summary = _summarize_codex_event(event)
     if summary is None:
         tracker.heartbeat()
@@ -19684,6 +19849,7 @@ def _build_agent_command(
     operator_steering_message: str | None = None,
     operator_steering_provided_by: str = "",
     operator_steering_provided_at: str = "",
+    safety: LaunchSafety | None = None,
 ) -> list[str]:
     """Build the command to launch the agent."""
     acceptance_checklist = list(
@@ -20039,6 +20205,11 @@ def _build_agent_command(
         "git_isolation",
     ):
         implement_kwargs["git_isolation"] = git_isolation
+    if safety is not None and _adapter_method_accepts_kwarg(
+        adapter.build_implement_command,
+        "safety",
+    ):
+        implement_kwargs["safety"] = safety
     return adapter.build_implement_command(**implement_kwargs)
 
 
@@ -25496,6 +25667,7 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.last_failure_subtype = ""
         run.last_failure_category = ""
         run.last_failure_signature = ""
+        run.last_sandbox_denial = ""
         run.infra_failure_streak = 0
     else:
         classification = classify_failure(
@@ -25530,6 +25702,11 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.last_failure_subtype = str(metadata.get("failure_subtype") or "")
         run.last_failure_category = classification.category.value
         run.last_failure_signature = classification.signature
+        run.last_sandbox_denial = (
+            sandbox_denial_summary(run.last_error) or "unknown target"
+            if classification.category is FailureCategory.SANDBOX_DENIED
+            else ""
+        )
     run.save(repo_root)
 
     # Persist audit trail
@@ -27693,6 +27870,8 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  Last Error: {run.last_error}")
         if run.last_failure_category and run.status != "passed":
             print(f"  Failure Category: {run.last_failure_category} ({run.last_failure_signature})")
+            if run.last_sandbox_denial:
+                print(f"  Sandbox Denied: {run.last_sandbox_denial}")
             if run.infra_failure_streak:
                 print(f"  Infrastructure Failure Streak: {run.infra_failure_streak}")
         if run.no_progress_trips:
@@ -28005,7 +28184,10 @@ def _compute_orchestrator_analytics(
                 if not failure_type and legacy.category is not FailureCategory.UNKNOWN:
                     failure_type, failure_subtype = legacy.category.value, legacy.kind
             failures_by_category[category] = failures_by_category.get(category, 0) + 1
-            if category == FailureCategory.INFRASTRUCTURE.value and signature:
+            if signature and category in (
+                FailureCategory.INFRASTRUCTURE.value,
+                FailureCategory.SANDBOX_DENIED.value,
+            ):
                 infrastructure_signatures[signature] = infrastructure_signatures.get(signature, 0) + 1
         if failure_type and failure_subtype:
             key = f"{failure_type}.{failure_subtype}"
