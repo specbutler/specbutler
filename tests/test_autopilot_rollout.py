@@ -34,7 +34,7 @@ def test_autopilot_backend_policy_uses_the_default_backend_before_rollout(tmp_pa
 
     assert policy.backend == default_execution_backend()
     assert policy.source == "legacy-default"
-    assert policy.safety_mode == "safe"
+    assert policy.safety_mode == "native"
 
 
 def test_autopilot_backend_policy_defaults_to_container_after_rollout_gate(tmp_path: Path) -> None:
@@ -53,7 +53,7 @@ def test_autopilot_backend_policy_defaults_to_container_after_rollout_gate(tmp_p
 
     assert policy.backend == "container"
     assert policy.source == "rollout-policy"
-    assert policy.safety_mode == "safe"
+    assert policy.safety_mode == "isolated"
 
 
 def test_autopilot_backend_policy_honors_explicit_worktree_escape_hatch(tmp_path: Path) -> None:
@@ -95,7 +95,7 @@ def test_autopilot_actor_env_flips_implicit_backend_only(tmp_path: Path) -> None
 
     assert manual.execution.backend == default_execution_backend()
     assert unattended.execution.backend == "container"
-    assert unattended.execution.safety_mode == "safe"
+    assert unattended.execution.safety_mode == "isolated"
 
 
 def test_autopilot_actor_env_preserves_explicit_clone_backend(tmp_path: Path) -> None:
