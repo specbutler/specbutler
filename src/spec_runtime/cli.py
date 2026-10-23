@@ -1461,6 +1461,11 @@ def main(argv: list[str] | None = None) -> int:
     p_auto_run.add_argument("--notify-success", action="store_true", help="Also notify on success")
     p_auto_run.add_argument("--dry-run", action="store_true", help="Show what would be dispatched")
     p_auto_run.add_argument("--agent", choices=("claude", "codex"), default=None, help="Agent to use")
+    p_auto_run.add_argument(
+        "--reset-infra-breaker",
+        action="store_true",
+        help="Clear blocked-on-infrastructure state after fixing the environment",
+    )
 
     p_auto_stop = auto_sub.add_parser("stop", help="Graceful shutdown of running dispatcher")
     p_auto_stop.add_argument("--repo-root", default=None, help="Repository root")

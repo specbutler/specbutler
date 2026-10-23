@@ -84,6 +84,16 @@ class AutopilotConfig:
     lock_backoff_base_seconds: float = 30.0
     lock_backoff_max_seconds: float = 1800.0
     operator_grace_seconds: float = 600.0
+    # Infrastructure failures (container build/startup, missing toolchain,
+    # credentials, provider quota, push/PR/CI-wait trouble) back off per spec
+    # and failure signature with jittered exponential delay. After
+    # ``infra_breaker_threshold`` consecutive failures with one signature the
+    # breaker opens: affected work is held as blocked-on-infrastructure and a
+    # single probe dispatch is allowed every ``infra_breaker_cooldown_seconds``.
+    infra_backoff_base_seconds: float = 60.0
+    infra_backoff_max_seconds: float = 1800.0
+    infra_breaker_threshold: int = 3
+    infra_breaker_cooldown_seconds: float = 1800.0
 
 
 SUPPORTED_EXECUTION_BACKENDS: tuple[str, ...] = ("worktree", "clone", "container")
@@ -207,6 +217,13 @@ class SpecRuntimeConfig:
     base_ref: str = "origin/master"
     retry_cap: int = 20
     no_progress_retry_threshold: int = 2
+    # In-process reruns of a phase that failed on a transient infrastructure
+    # problem, waited out with jittered exponential backoff. They never consume
+    # ``retry_cap``; once exhausted the run fails and autopilot's
+    # infrastructure breaker takes over.
+    infra_retry_attempts: int = 2
+    infra_backoff_base_seconds: float = 30.0
+    infra_backoff_max_seconds: float = 600.0
     verify_gates: tuple[VerifyGateConfig, ...] = (
         VerifyGateConfig(name="test", command="make test", parallel=True),
         VerifyGateConfig(name="lint", command="make lint", parallel=True),
@@ -470,6 +487,12 @@ def _parse_autopilot_section(payload: object) -> AutopilotConfig:
         lock_backoff_base_seconds=max(1.0, float(payload.get("lock_backoff_base_seconds", 30.0))),
         lock_backoff_max_seconds=max(1.0, float(payload.get("lock_backoff_max_seconds", 1800.0))),
         operator_grace_seconds=max(0.0, float(payload.get("operator_grace_seconds", 600.0))),
+        infra_backoff_base_seconds=max(1.0, float(payload.get("infra_backoff_base_seconds", 60.0))),
+        infra_backoff_max_seconds=max(1.0, float(payload.get("infra_backoff_max_seconds", 1800.0))),
+        infra_breaker_threshold=max(1, int(payload.get("infra_breaker_threshold", 3))),
+        infra_breaker_cooldown_seconds=max(
+            1.0, float(payload.get("infra_breaker_cooldown_seconds", 1800.0))
+        ),
     )
 
 
@@ -725,6 +748,13 @@ def load_spec_runtime_config(
         no_progress_retry_threshold=max(
             1,
             int(retry_payload.get("no_progress_retry_threshold", 2)),
+        ),
+        infra_retry_attempts=max(0, int(retry_payload.get("infra_retry_attempts", 2))),
+        infra_backoff_base_seconds=max(
+            0.0, float(retry_payload.get("infra_backoff_base_seconds", 30.0))
+        ),
+        infra_backoff_max_seconds=max(
+            0.0, float(retry_payload.get("infra_backoff_max_seconds", 600.0))
         ),
         verify_gates=tuple(gates),
         agents=AgentConfig(
