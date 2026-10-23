@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import locale
+import logging
 import math
 import os
 import platform
@@ -191,6 +192,7 @@ CONTAINER_WORKER_ENV_SECRET_ALLOWLIST = frozenset(
         "CLAUDE_CODE_OAUTH_TOKEN",
     }
 )
+logger = logging.getLogger(__name__)
 _CLAUDE_MCP_RUNTIME_ENV_RE = re.compile(r"SPEC_MCP_RUNTIME_[0-9A-F]{24}")
 CONTAINER_COMPLETION_OUTBOX_ENV = "SPEC_COMPLETION_OUTBOX"
 CONTAINER_COMPLETION_ARTIFACT = "completion-report.json"
@@ -1307,6 +1309,14 @@ class WorktreeExecutionBackend:
 class CloneExecutionBackend:
     """Backend that prepares a full disposable checkout for a run."""
 
+    # The agent may write its clone's whole ``.git``. A plain ``--local`` clone
+    # hardlinks the host's object files, so a write through the clone (after a
+    # chmod) would corrupt the host repository. Borrow host objects through an
+    # alternate instead: nothing is copied or linked, and new objects land in
+    # the clone's own store. Container workers cannot see host paths and
+    # refuse alternates, so they keep the hardlinked clone.
+    _share_host_objects = True
+
     def __init__(self, config: ExecutionConfig):
         self._identity = BackendIdentity(
             backend=config.backend,
@@ -1361,6 +1371,7 @@ class CloneExecutionBackend:
         source_created = not source.exists()
         if source_created:
             source.parent.mkdir(parents=True, exist_ok=True)
+            self._fetch_base_from_origin(repo_root, base_ref or "origin/master")
             self._clone_source_checkout(repo_root, source)
             self._copy_user_git_config(repo_root, source)
         elif not (source / ".git").is_dir():
@@ -2179,9 +2190,45 @@ class CloneExecutionBackend:
             )
         return remote.stdout.strip()
 
+    def _fetch_base_from_origin(self, repo_root: Path, base_ref: str) -> None:
+        """Refresh the host's base ref from origin before a new clone copies it.
+
+        Best effort: an offline host still clones from its existing refs.
+        """
+        remote_name, _, branch_name = base_ref.partition("/")
+        if remote_name != "origin" or not branch_name:
+            return
+        env = dict(os.environ)
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        argv = [
+            "git",
+            "fetch",
+            "--no-tags",
+            "origin",
+            f"+refs/heads/{branch_name}:refs/remotes/origin/{branch_name}",
+        ]
+        try:
+            fetched = subprocess.run(
+                argv,
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                timeout=60,
+                check=False,
+                **subprocess_text_kwargs(argv),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Could not fetch %s before cloning: %s", base_ref, exc)
+            return
+        if fetched.returncode != 0:
+            logger.warning(
+                "Could not fetch %s before cloning: %s", base_ref, self._git_detail(fetched)
+            )
+
     def _clone_source_checkout(self, repo_root: Path, source: Path) -> None:
+        mode = "--shared" if self._share_host_objects else "--local"
         clone = self._run_git(
-            ["clone", "--local", "--no-checkout", str(repo_root), str(source)],
+            ["clone", mode, "--no-checkout", str(repo_root), str(source)],
             cwd=repo_root,
         )
         if clone.returncode == 0:
@@ -3057,6 +3104,8 @@ class ContainerCliRunner:
 
 class ContainerExecutionBackend(CloneExecutionBackend):
     """Preview backend that runs workspace commands in a container worker."""
+
+    _share_host_objects = False
 
     def __init__(
         self,

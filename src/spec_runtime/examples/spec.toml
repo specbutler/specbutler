@@ -139,6 +139,19 @@ parallel = true
 # review_evidence = ["artifacts/native-test-receipt.json"]
 
 # ---------------------------------------------------------------------------
+# Execution backend
+# ---------------------------------------------------------------------------
+# `clone` (the default) gives each run a disposable `git clone --local` with its
+# own `.git`, so the agent can add, commit, stash, branch, and rebase without
+# touching your checkout's Git metadata. `worktree` runs in a linked
+# `git worktree` instead; it also works, but the agent then needs writes to the
+# repository's shared `.git` directory. See docs/execution-backends.md.
+
+[execution]
+backend = "clone"
+# workspace_root = ".spec-workspaces"
+
+# ---------------------------------------------------------------------------
 # Coordination (optional)
 # ---------------------------------------------------------------------------
 # Configure this only when multiple machines share a coordinator. Keep secrets

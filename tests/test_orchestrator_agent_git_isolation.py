@@ -181,7 +181,9 @@ def test_recovery_excludes_modify_only_private_git_metadata(tmp_path: Path) -> N
 
 def test_implement_plan_prepares_and_forwards_private_git_metadata(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("SPEC_PRIVATE_AGENT_GIT", "1")
     repository, worktree = _linked_worktree(tmp_path)
     run = orch.RunState(
         run_id="test-20260101T000000",

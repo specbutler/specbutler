@@ -14,3 +14,7 @@ os.environ["SPEC_CONFIG"] = "/dev/null/nonexistent/.spec.toml"
 # Neutralize it here so tests are hermetic regardless of where the suite runs;
 # tests that need it set it explicitly via monkeypatch.
 os.environ.pop("SPEC_COMPLETION_OUTBOX", None)
+
+# The agent Git probe starts real provider sandboxes (`codex sandbox`, `srt`).
+# Keep doctor and implement-launch tests hermetic; probe tests opt back in.
+os.environ["SPEC_AGENT_GIT_PROBE"] = "0"

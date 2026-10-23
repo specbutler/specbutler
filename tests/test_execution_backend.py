@@ -29,6 +29,7 @@ from spec_runtime.config import (
     ExecutionConfig,
     SpecConfigError,
     SpecRuntimeConfig,
+    default_execution_backend,
     load_spec_runtime_config,
 )
 from spec_runtime.git_publish_guard import apply_host_owned_publication_guard
@@ -45,6 +46,19 @@ def test_link_boundary_detects_windows_reparse_attribute_without_is_junction() -
             return SimpleNamespace(st_file_attributes=0x400)
 
     assert eb.path_is_link_or_junction(ReparsePath()) is True
+
+
+@pytest.fixture
+def pin_worktree_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the orchestrator to the worktree backend (the default is now clone)."""
+    monkeypatch.setattr(
+        orch,
+        "SPEC_RUNTIME_CONFIG",
+        replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            execution=replace(orch.SPEC_RUNTIME_CONFIG.execution, backend="worktree"),
+        ),
+    )
 
 # ---------------------------------------------------------------------------
 # Config defaults & validation
@@ -163,7 +177,7 @@ class TestExecutionConfigDefaults:
         ):
             config = load_spec_runtime_config(require=True)
 
-        assert config.execution.backend == "worktree"
+        assert config.execution.backend == default_execution_backend()
         assert config.execution.safety_mode == "safe"
         assert config.execution.workspace_root == ".spec-workspaces"
         # Selection origin: implicit default. Future rollout policy can flip
@@ -477,12 +491,22 @@ safety_mode = "yolo"
 
 
 class TestBackendFactory:
-    def test_default_returns_worktree_backend(self):
+    def test_default_returns_platform_default_backend(self):
         config = SpecRuntimeConfig()
         backend = eb.get_execution_backend(config)
+        expected = (
+            eb.WorktreeExecutionBackend
+            if default_execution_backend() == "worktree"
+            else eb.CloneExecutionBackend
+        )
+        assert type(backend) is expected
+        assert backend.identity.backend == default_execution_backend()
+        assert backend.identity.safety_mode == "safe"
+
+    def test_explicit_worktree_returns_worktree_backend(self):
+        backend = eb.get_execution_backend(ExecutionConfig(backend="worktree"))
         assert isinstance(backend, eb.WorktreeExecutionBackend)
         assert backend.identity.backend == "worktree"
-        assert backend.identity.safety_mode == "safe"
 
     def test_clone_backend_returns_clone_backend(self):
         config = SpecRuntimeConfig(
@@ -508,7 +532,7 @@ class TestBackendFactory:
             eb.get_execution_backend(config)
 
     def test_factory_accepts_execution_config_directly(self):
-        backend = eb.get_execution_backend(ExecutionConfig())
+        backend = eb.get_execution_backend(ExecutionConfig(backend="worktree"))
         assert isinstance(backend, eb.WorktreeExecutionBackend)
 
 
@@ -548,7 +572,7 @@ def test_agent_monitor_closes_retained_process_after_failure() -> None:
 
 class TestWorktreeBackend:
     def _make(self) -> eb.WorktreeExecutionBackend:
-        return eb.WorktreeExecutionBackend(ExecutionConfig())
+        return eb.WorktreeExecutionBackend(ExecutionConfig(backend="worktree"))
 
     def test_prepare_workspace_returns_existing_path(self, tmp_path: Path):
         backend = self._make()
@@ -1103,6 +1127,8 @@ class TestCloneBackend:
         repo = tmp_path / "repo"
         _init_clone_source(repo)
         backend = self._make()
+        # Only hardlinked clones (the container worker's) can hit EXDEV.
+        monkeypatch.setattr(backend, "_share_host_objects", False)
         original_run_git = eb.CloneExecutionBackend._run_git
         clone_commands: list[list[str]] = []
 
@@ -9932,6 +9958,7 @@ def reset_execution_backend():
     orch.set_execution_backend(None)
 
 
+@pytest.mark.usefixtures("pin_worktree_backend")
 class TestOrchestratorBackendSeam:
     def test_resolve_workspace_handle_uses_factory_default(self, tmp_path: Path):
         run = orch.RunState(
@@ -10647,6 +10674,7 @@ class TestImplementLaunchRoutesThroughBackend:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("pin_worktree_backend")
 class TestPublishHonorsOutboxMetadata:
     def _make_run(self) -> orch.RunState:
         run = orch.RunState(

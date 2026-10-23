@@ -441,15 +441,16 @@ not an enforcement switch. Choose the
 `worktree`, `clone`, or `container` (alpha) execution backend based on the isolation
 your project needs; see [Execution backends](docs/execution-backends.md).
 
-- With the default worktree backend, implementation and authoring run in a
-  per-worktree sandbox. Implementation agents can modify their workspace and
-  a private, per-launch completion outbox; the orchestrator's shared
-  `.spec-state/` control data is not an agent write root. Linked worktrees also
-  receive a disposable private Git directory: agents can stage and commit, but
-  cannot write the real worktree index, repository object database, config, or
-  sibling refs. After the provider ownership boundary is confirmed stopped, the
-  host validates the private history and atomically imports only the expected
-  branch advance.
+- Implementation and authoring run in the provider's own sandbox. Agents can
+  modify their workspace and a private, per-launch completion outbox; the
+  orchestrator's shared `.spec-state/` control data is not an agent write root.
+  Agents use Git as a person would (add, commit, stash, branch, rebase, log,
+  and fetch from origin) with a commit identity supplied by the host. The
+  repository's Git `config`, `config.worktree`, `hooks/` and `info/` stay
+  read-only, and pushing stays with the host. With the default `clone`
+  backend the agent writes only its run's own `.git`; with `worktree` it also
+  writes the repository's shared `.git` directory (objects, refs, stash).
+  `spec doctor` probes this for each provider and backend.
 - Codex implementation sessions run with workspace-write and network access.
   Interactive authoring keeps workspace edits and local commits available, but
   network commands require approval and the child process receives no forge
@@ -494,8 +495,8 @@ your project needs; see [Execution backends](docs/execution-backends.md).
 - Before implementation, authoring, and operator-intervention launches, Spec
   Butler refuses repository-local remote URL userinfo,
   `Authorization`/`Proxy-Authorization` extraheaders, credential helpers, and
-  include directives. Real linked-worktree metadata and global Git config paths
-  are sandbox-denied. Host publication revalidates the captured metadata and
+  include directives. Global Git config paths are sandbox-denied. Host
+  publication revalidates the captured metadata and
   uses the credential-free remote URL and forge repository identity captured
   before the agent starts.
 

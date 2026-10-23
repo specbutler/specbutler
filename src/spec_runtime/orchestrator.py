@@ -79,6 +79,11 @@ from .agent_adapter import (
     get_agent_adapter,
     require_host_agent_available,
 )
+from .agent_git_access import (
+    UnsafeAgentGitLayoutError,
+    agent_git_access,
+    apply_agent_git_identity,
+)
 from .agent_git_isolation import (
     AgentGitIsolation,
     UnsafeAgentGitIsolationError,
@@ -86,6 +91,14 @@ from .agent_git_isolation import (
     cleanup_agent_git_isolation,
     prepare_agent_git_isolation_if_linked,
     reconcile_agent_git_isolation,
+)
+from .agent_git_probe import (
+    PROBE_AGENTS,
+    PROBE_BACKENDS,
+    PROBE_DISABLE_ENV,
+    AgentGitProbeResult,
+    agent_git_probe_disabled,
+    run_agent_git_probe,
 )
 from .command_runtime import CommandSpec, CommandVariants
 from .config import load_spec_runtime_config
@@ -455,7 +468,10 @@ SPEC_PROMPT = (
     "1. Read <spec-path> and AGENTS.md.\n"
     "   This run is pinned to spec revision <spec-revision>.\n"
     "2. Implement only what this attempt requires.\n"
-    "3. Commit any completed code changes.\n"
+    "3. Commit any completed code changes. You may use git freely: add, commit, "
+    "stash, branch, rebase, log, and fetch from origin. Your commit identity is "
+    "already set. Leave this run's branch checked out when you finish; pushing "
+    "and opening pull requests stay with the orchestrator.\n"
     f"4. Run {_format_verify_commands(_non_e2e_verify_commands())} to verify your changes. "
     f"Do NOT run {_format_verify_commands(_e2e_verify_commands())} — "
     "the orchestrator verify phase handles e2e outside the sandbox.\n"
@@ -2607,6 +2623,7 @@ def _apply_agent_git_environment(
     for name in _AGENT_GIT_LAYOUT_ENV_KEYS:
         env.pop(name, None)
     apply_host_owned_publication_guard(env, worktree_path)
+    apply_agent_git_identity(env, worktree_path)
     if git_isolation is not None:
         env.update(git_isolation.env_overrides)
 
@@ -15111,6 +15128,54 @@ def _require_agent_available_for_backend(
         require_host_agent_available(agent_name)
 
 
+_AGENT_GIT_PROBE_RESULTS: dict[tuple[str, str], AgentGitProbeResult] = {}
+
+
+def _agent_git_launch_preflight_error(
+    agent_name: str,
+    backend: ExecutionBackend,
+) -> str:
+    """Return an error when Git demonstrably fails inside the agent sandbox.
+
+    Runs the model-free ``spec doctor`` Git probe once per process for this
+    provider and backend. A probe that ran blocks the launch when add, commit,
+    stash, branch or log failed, or when the sandbox let it write Git config,
+    hooks or outside the workspace. A missing runner or a probe that could not
+    start is logged and the launch goes ahead.
+    """
+    backend_name = getattr(getattr(backend, "identity", None), "backend", "")
+    if (
+        backend_name not in PROBE_BACKENDS
+        or agent_name not in PROBE_AGENTS
+        or not _backend_launches_agent_on_host(backend)
+        or agent_git_probe_disabled()
+    ):
+        return ""
+    key = (agent_name, backend_name)
+    result = _AGENT_GIT_PROBE_RESULTS.get(key)
+    if result is None:
+        result = run_agent_git_probe(agent_name, backend_name)
+        _AGENT_GIT_PROBE_RESULTS[key] = result
+    if result.ran and not result.git_works:
+        return (
+            f"Git does not work inside the {agent_name} sandbox for the "
+            f"{backend_name} backend: {result.summary()}. Run `spec doctor` "
+            f"for details, or set {PROBE_DISABLE_ENV}=0 to skip this check."
+        )
+    if result.ran and result.leaked_writes:
+        return (
+            f"The {agent_name} sandbox did not block writes for the "
+            f"{backend_name} backend ({', '.join(result.leaked_writes)}): "
+            f"{result.summary()}. Run `spec doctor` for details, or set "
+            f"{PROBE_DISABLE_ENV}=0 to skip this check."
+        )
+    if not result.passed:
+        logger.warning(
+            "Agent Git probe (%s, %s): %s", agent_name, backend_name, result.summary()
+        )
+    return ""
+
+
 def _read_slug_from_spec(spec_path: Path) -> str:
     """Read a task slug from frontmatter `id:` or a legacy `slug:` line."""
     if not spec_path.exists():
@@ -15774,12 +15839,10 @@ def _protected_repo_git_metadata_paths(
 ) -> tuple[Path, ...]:
     """Return Git configuration/hook paths a provider must never modify."""
     dot_git = worktree_path / ".git"
+    if git_isolation is None:
+        access = agent_git_access(worktree_path)
+        return access.read_only_paths if access is not None else ()
     if dot_git.is_file() and not dot_git.is_symlink():
-        if git_isolation is None:
-            raise ValueError(
-                "Refusing linked-worktree Git metadata without a prepared "
-                "private Git directory"
-            )
         try:
             resolved_worktree = worktree_path.resolve(strict=True)
         except OSError as exc:
@@ -15787,22 +15850,37 @@ def _protected_repo_git_metadata_paths(
         if git_isolation.worktree != resolved_worktree:
             raise ValueError("Private Git metadata belongs to a different worktree")
         return git_isolation.read_only_paths
-    if dot_git.is_dir() and not dot_git.is_symlink():
-        resolved = dot_git.resolve(strict=True)
-        try:
-            resolved.relative_to(worktree_path.resolve(strict=True))
-        except ValueError as exc:
-            raise ValueError("Repository Git directory escapes the workspace") from exc
-        return (resolved / "config", resolved / "hooks")
-    if dot_git.exists() or dot_git.is_symlink():
-        raise ValueError(f"Refusing unsafe Git metadata entry {dot_git}")
-    return ()
+    access = agent_git_access(worktree_path)
+    return access.read_only_paths if access is not None else ()
+
+
+def _private_agent_git_enabled() -> bool:
+    """Return whether the legacy private-GIT_DIR worktree boundary is requested.
+
+    Linked worktrees now grant the agent the repository's real Git metadata
+    (with config and hooks read-only). The private ``GIT_DIR`` plus bundle
+    import remains available behind ``SPEC_PRIVATE_AGENT_GIT=1`` until it can
+    be deleted.
+    """
+    return os.environ.get("SPEC_PRIVATE_AGENT_GIT", "").strip() == "1"
+
+
+def _agent_git_writable_paths(worktree_path: Path) -> tuple[Path, ...]:
+    """Return the Git directories a provider may write in *worktree_path*."""
+    access = agent_git_access(worktree_path)
+    return access.writable_paths if access is not None else ()
 
 
 def _prepare_agent_git_boundary(
     worktree_path: Path,
 ) -> AgentGitIsolation | None:
-    """Prepare the provider's disposable Git metadata when the checkout is linked."""
+    """Prepare legacy private Git metadata when explicitly enabled."""
+    if not _private_agent_git_enabled():
+        try:
+            agent_git_access(worktree_path)
+        except UnsafeAgentGitLayoutError as exc:
+            raise RuntimeError(f"Could not grant agent Git metadata access: {exc}") from exc
+        return None
     try:
         return prepare_agent_git_isolation_if_linked(worktree_path)
     except UnsafeAgentGitIsolationError as exc:
@@ -15867,7 +15945,9 @@ def _write_sandbox_config(
             _protected_repo_git_metadata_paths(worktree_path, git_isolation)
         )
         git_writable_paths = set(
-            git_isolation.writable_paths if git_isolation is not None else ()
+            git_isolation.writable_paths
+            if git_isolation is not None
+            else _agent_git_writable_paths(worktree_path)
         )
 
         def permission_pattern(path: Path) -> str:
@@ -17460,6 +17540,10 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
         _require_agent_available_for_backend(run.agent, backend)
     except HostAgentUnavailableError as exc:
         run.last_error = str(exc)
+        return "failed"
+    git_probe_error = _agent_git_launch_preflight_error(run.agent, backend)
+    if git_probe_error:
+        run.last_error = git_probe_error
         return "failed"
     workspace = _resolve_workspace_handle(run, repo_root)
     if backend.identity.backend == "container":

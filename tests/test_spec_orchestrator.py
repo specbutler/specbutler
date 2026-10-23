@@ -70,6 +70,23 @@ def _make_host_agent_availability_hermetic(
     monkeypatch.setattr(orch, "require_host_agent_available", lambda _agent: None)
 
 
+@pytest.fixture(autouse=True)
+def _pin_worktree_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Lifecycle tests here build `.worktrees/` layouts; pin that backend.
+
+    The implicit default is now ``clone``. Tests that need another backend
+    patch ``SPEC_RUNTIME_CONFIG`` themselves, which overrides this pin.
+    """
+    monkeypatch.setattr(
+        orch,
+        "SPEC_RUNTIME_CONFIG",
+        replace(
+            orch.SPEC_RUNTIME_CONFIG,
+            execution=replace(orch.SPEC_RUNTIME_CONFIG.execution, backend="worktree"),
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
