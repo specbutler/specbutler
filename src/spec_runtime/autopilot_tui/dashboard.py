@@ -67,6 +67,9 @@ class SpecRow:
     backend_source: str = ""
     container_engine: str = ""
     worker_source: str = ""
+    # Set while an open infrastructure circuit breaker holds this spec.
+    infra_blocked: bool = False
+    infra_signature: str = ""
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,8 @@ class DashboardSnapshot:
     merged_count: int
     passed_count: int = 0
     coordinator_unavailable: str = ""
+    # Payloads of infrastructure breaker entries (open and backing off).
+    infrastructure_breakers: tuple[dict, ...] = ()
 
     @property
     def active_count(self) -> int:
@@ -212,6 +217,8 @@ def load_dashboard_snapshot(repo_root: Path, agent_filter: str = "") -> Dashboar
     )
 
     common_root = autopilot.resolve_common_root(repo_root)
+    infra_entries = autopilot.read_infra_breakers(repo_root)
+    open_infra_entries = [entry for entry in infra_entries if entry.is_open]
     rows: list[SpecRow] = []
     for spec_id, data in _latest_row_records(repo_root, run_index=run_index).items():
         if spec_id in hidden_specs:
@@ -285,6 +292,16 @@ def load_dashboard_snapshot(repo_root: Path, agent_filter: str = "") -> Dashboar
             lease_heartbeat_age = lease_view.heartbeat_age
             lease_expires_at = lease_view.expires_at
 
+        infra_entry = next((entry for entry in open_infra_entries if entry.affects(spec_id)), None)
+        if infra_entry is not None and display_status != "running":
+            requires_human_attention = True
+            diagnosis_summary = infra_entry.describe()
+            diagnosis_next_action = (
+                f"Fix the environment ({infra_entry.kind}); autopilot probes again at "
+                f"{infra_entry.to_payload().get('next_probe_at') or 'the next cooldown'}. "
+                f"Latest error: {(infra_entry.error or '').splitlines()[0][:200] if infra_entry.error else 'unknown'}"
+            )
+
         backend = str(data.get("backend", "")).strip()
         rows.append(
             SpecRow(
@@ -313,6 +330,8 @@ def load_dashboard_snapshot(repo_root: Path, agent_filter: str = "") -> Dashboar
                 backend_source=str(data.get("backend_source", "")).strip(),
                 container_engine=repo_config.execution.container.engine if backend == "container" else "",
                 worker_source=container_image_source(repo_config, repo_root) if backend == "container" else "",
+                infra_blocked=infra_entry is not None and display_status != "running",
+                infra_signature=infra_entry.signature if infra_entry is not None else "",
             )
         )
 
@@ -366,6 +385,7 @@ def load_dashboard_snapshot(repo_root: Path, agent_filter: str = "") -> Dashboar
         merged_count=len(git_state.merged_specs),
         passed_count=passed_count,
         coordinator_unavailable=coordinator_snapshot.unavailable_message,
+        infrastructure_breakers=tuple(entry.to_payload() for entry in infra_entries),
     )
 
 

@@ -59,6 +59,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from urllib import parse as urllib_parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -149,6 +150,8 @@ from .git_publish_guard import (
     github_repo_slug_from_remote_url,
     host_publication_git_environment,
 )
+from .infra_breaker import backoff_seconds as infra_backoff_seconds
+from .infra_breaker import infra_breaker_state_path, open_breakers_for_spec, read_infra_breaker_entries
 from .interactive_authoring import interactive_provider_environment
 from .platform_fs import (
     FileLock,
@@ -271,6 +274,15 @@ RETRY_CAP = SPEC_RUNTIME_CONFIG.retry_cap
 # genuinely unmergeable branch stops rather than retrying forever.
 MERGE_CONFLICT_RETRY_CAP = int(os.environ.get("SPEC_MERGE_CONFLICT_RETRY_CAP", "5"))
 NO_PROGRESS_RETRY_THRESHOLD = SPEC_RUNTIME_CONFIG.no_progress_retry_threshold
+# In-process reruns of a phase after a transient infrastructure failure. They
+# wait with jittered exponential backoff and never consume RETRY_CAP.
+INFRA_RETRY_ATTEMPTS = SPEC_RUNTIME_CONFIG.infra_retry_attempts
+INFRA_BACKOFF_BASE_SECONDS = SPEC_RUNTIME_CONFIG.infra_backoff_base_seconds
+INFRA_BACKOFF_MAX_SECONDS = SPEC_RUNTIME_CONFIG.infra_backoff_max_seconds
+# Phases safe to rerun in place. Bootstrap, scoping and intake build the
+# workspace itself; their infrastructure failures end the process and are
+# backed off by autopilot instead.
+INFRA_INPROCESS_RETRY_PHASES = frozenset(("implement", "verify", "publish", "review", "merge"))
 REQUIRED_GATES = tuple(gate.name for gate in SPEC_RUNTIME_CONFIG.verify_gates)
 PARALLEL_VERIFY_GATES = frozenset(gate.name for gate in SPEC_RUNTIME_CONFIG.verify_gates if gate.parallel)
 VERIFY_GATE_COMMANDS = {gate.name: gate.command for gate in SPEC_RUNTIME_CONFIG.verify_gates}
@@ -4373,6 +4385,216 @@ def _is_auto_merge_graphql_retryable_error(error: str) -> bool:
         return False
     error_lower = error.lower()
     return "graphql:" in error_lower and "enablepullrequestautomerge" in error_lower
+
+
+# ---------------------------------------------------------------------------
+# Failure categories
+# ---------------------------------------------------------------------------
+
+
+class FailureCategory(StrEnum):
+    """Whether a failed phase says something about the code or the environment.
+
+    Infrastructure failures (container builds, missing toolchains, expired
+    credentials, provider quota, forge/network trouble, CI wait timeouts) cannot
+    be fixed by another agent attempt, so they never consume the convergence
+    retry budget and are backed off and circuit-broken instead. Code failures
+    (verify gates, review change requests, merge conflicts) keep the existing
+    retry routing.
+    """
+
+    INFRASTRUCTURE = "infrastructure"
+    CODE = "code"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class FailureClassification:
+    category: FailureCategory
+    # Stable machine-readable kind, e.g. ``container_image_build``.
+    kind: str = ""
+    # ``<kind>:<hash>`` over the error text with paths, run ids, SHAs and
+    # numbers removed. Identical across runs and specs that hit the same
+    # breakage, so a relaunch storm collapses to one signature.
+    signature: str = ""
+    # True when the condition can plausibly clear by itself (network, forge,
+    # container daemon), so rerunning the same phase after a backoff is worth
+    # trying. False when an operator has to act (credentials, toolchain).
+    transient: bool = False
+    # "backend": every spec dispatched on this backend will hit it (image
+    # build, missing toolchain, credentials). "spec": only the failing spec is
+    # affected (its push was rejected, its PR checks timed out).
+    scope: str = "spec"
+
+    @property
+    def is_infrastructure(self) -> bool:
+        return self.category is FailureCategory.INFRASTRUCTURE
+
+
+# "Exception in implement: X" and a bare "X" from bootstrap are one breakage.
+_FAILURE_WRAPPER_PREFIX_RE = re.compile(
+    r"^(?:(?:workflow failed for \S+|exception in [a-z_-]+):\s*)+",
+    re.IGNORECASE,
+)
+_RUN_ID_TOKEN_RE = re.compile(r"[A-Za-z0-9_.-]*\d{8}T\d{6,}[A-Za-z0-9_.-]*")
+_PATH_TOKEN_RE = re.compile(r"(?:[A-Za-z]:)?(?:~|\.{0,2})?(?:[/\\][^\s'\"`:,;()]+)+")
+_TOOLCHAIN_MISSING_RE = re.compile(
+    r"\bmissing (?:uv|node|npm|pnpm|yarn|python3?|docker|podman|make|go|cargo|rustc|java|ruby|bundler)\b"
+    r"|\bagent binary not found\b"
+    r"|\bpostgres binaries not found\b"
+    r"|\b(?:uv|node|npm|pnpm|yarn|python3?|docker|podman|cargo|go): (?:command )?not found\b"
+)
+_FORGE_NETWORK_MARKERS = (
+    "error connecting to",
+    "could not resolve host",
+    "connection reset by peer",
+    "connection refused",
+    "tls handshake timeout",
+    "i/o timeout",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+    "http 502",
+    "http 503",
+    "http 504",
+    "api rate limit exceeded",
+    "secondary rate limit",
+)
+
+
+def failure_signature_text(message: object, *, strip_paths: bool = True) -> str:
+    """Normalize error text so repeats of one breakage compare equal.
+
+    Extends ``_normalize_error_for_fingerprint`` by also dropping filesystem
+    paths and run-id tokens (``<spec>-20260630T004645226547``). Infrastructure
+    errors usually point at a per-run log directory, and without this every
+    relaunch -- which creates a new run -- looked like a brand-new error.
+    ``strip_paths=False`` keeps paths (minus run ids), for callers where two
+    different failing test files must stay two different errors.
+    """
+    text = _FAILURE_WRAPPER_PREFIX_RE.sub("", str(message or "").strip())
+    text = _RUN_ID_TOKEN_RE.sub("<RUN>", text)
+    if strip_paths:
+        text = _PATH_TOKEN_RE.sub("<PATH>", text)
+    return _normalize_error_for_fingerprint(text)
+
+
+def _failure_signature(kind: str, message: object) -> str:
+    # Only the head of the message identifies the breakage; tails carry log
+    # excerpts whose ordering varies between otherwise identical failures.
+    normalized = failure_signature_text(str(message or "")[:400])
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    return f"{kind}:{digest}"
+
+
+def _infrastructure_failure_kind(text: str) -> tuple[str, bool, str] | None:
+    """Return ``(kind, transient, scope)`` for an infrastructure failure."""
+    text = _FAILURE_WRAPPER_PREFIX_RE.sub("", text)
+    if text.startswith("gate '"):
+        # Gate output is the code's own output: only the established
+        # environment markers (dead database, missing executable) make it
+        # infrastructure, never words a test happens to print.
+        if _is_verify_environment_failure_message(text):
+            return "verify_environment", True, "backend"
+        return None
+    if "container backend image build failed" in text:
+        return "container_image_build", True, "backend"
+    if "service startup failed" in text and "container" in text:
+        return "container_service_startup", True, "backend"
+    if "container backend bootstrap install command failed" in text:
+        return "container_bootstrap", True, "backend"
+    if "container codex sandbox preflight failed" in text:
+        return "container_sandbox", False, "backend"
+    if _is_forge_auth_failure_message(text):
+        return "forge_auth", False, "backend"
+    if _is_agent_auth_failure_message(text) or "credentials are not authenticated" in text:
+        return "agent_auth", False, "backend"
+    if _is_agent_capacity_failure_message(text):
+        return "provider_capacity", True, "backend"
+    if _TOOLCHAIN_MISSING_RE.search(text):
+        return "toolchain_missing", False, "backend"
+    if _is_verify_environment_failure_message(text):
+        return "verify_environment", True, "backend"
+    if "git worktree add failed" in text and ("cannot lock" in text or "could not lock" in text):
+        return "git_lock", True, "backend"
+    if any(marker in text for marker in _FORGE_NETWORK_MARKERS) and not _is_non_fast_forward_push_rejection(text):
+        # Checked before the push/PR classifiers: a forge or network outage
+        # hits every spec, so it must open one backend-wide breaker rather
+        # than one per spec.
+        return "forge_network", True, "backend"
+    if text.startswith("git push failed") and not _is_non_fast_forward_push_rejection(text):
+        # A rejected non-fast-forward push is branch divergence, not an
+        # outage: it keeps the actionable remote_diverged classification.
+        return "publish_push", True, "spec"
+    if "gh pr create failed" in text and not _is_no_commits_between_error(text):
+        return "pr_create", True, "spec"
+    if _is_auto_merge_pending_checks_timeout(text) or "timed out waiting for auto-merge" in text:
+        return "ci_wait_timeout", True, "spec"
+    if "timed out waiting for checks" in text or "timed out waiting for pr #" in text:
+        return "ci_wait_timeout", True, "spec"
+    if _is_retryable_merge_race_error(text) or _is_readiness_promotion_forge_failure(text):
+        return "forge_transient", True, "spec"
+    return None
+
+
+def classify_failure(
+    message: object,
+    *,
+    phase: str = "",
+    review_decision_status: str = "",
+) -> FailureClassification:
+    """Classify a failed phase's ``last_error`` as infrastructure or code.
+
+    Thin layer over the ``_is_*`` string classifiers used by retry routing, so
+    routing and categorization cannot drift apart.
+    """
+    raw = str(message or "").strip()
+    text = raw.lower()
+    infra = _infrastructure_failure_kind(text) if text else None
+    if infra is not None:
+        kind, transient, scope = infra
+        return FailureClassification(
+            category=FailureCategory.INFRASTRUCTURE,
+            kind=kind,
+            signature=_failure_signature(kind, raw),
+            transient=transient,
+            scope=scope,
+        )
+    code_kind = ""
+    if phase == "review" and review_decision_status == "request_changes":
+        code_kind = "review_changes"
+    elif _is_merge_conflict(raw) or "merge conflict while merging" in text:
+        code_kind = "merge_conflict"
+    elif _is_required_checks_failure(raw):
+        code_kind = "required_checks"
+    elif "gate '" in text:
+        code_kind = "verify_gate"
+    elif "requested changes" in text:
+        code_kind = "review_changes"
+    elif phase == "implement" and _is_retryable_implement_failure_message(raw):
+        code_kind = "implement"
+    if code_kind:
+        return FailureClassification(
+            category=FailureCategory.CODE,
+            kind=code_kind,
+            signature=_failure_signature(code_kind, raw),
+        )
+    return FailureClassification(
+        category=FailureCategory.UNKNOWN,
+        kind="",
+        signature=_failure_signature("unknown", raw) if raw else "",
+    )
+
+
+def _is_non_fast_forward_push_rejection(error: str) -> bool:
+    """Return True when the remote rejected a push because the branch diverged."""
+    normalized = str(error or "").lower()
+    return (
+        "fetch first" in normalized
+        or "[rejected]" in normalized
+        or "non-fast-forward" in normalized
+        or "tip of your current branch is behind" in normalized
+    )
 
 
 def _required_checks_from_error(error: str) -> list[str]:
@@ -8788,6 +9010,9 @@ class OrchestratorResult:
     nonfatal: bool = False
     gate_name: str = ""
     warnings: list[dict[str, object]] = field(default_factory=list)
+    # FailureCategory value and signature (see ``classify_failure``).
+    failure_category: str = ""
+    failure_signature: str = ""
 
 
 def _default_verify_passed_once(phase: str, status: str) -> bool:
@@ -8891,6 +9116,19 @@ class RunState:
     last_failure_retryable: bool | None = None
     last_failure_type: str = ""
     last_failure_subtype: str = ""
+    # FailureCategory of the most recent failed phase and its signature.
+    # Autopilot keys infrastructure backoff and its circuit breaker on these.
+    last_failure_category: str = ""
+    last_failure_signature: str = ""
+    # Consecutive infrastructure failures of this run with
+    # ``last_failure_signature``; reset by a passing phase or a new signature.
+    # Drives the in-process infrastructure backoff and never touches
+    # ``attempts``.
+    infra_failure_streak: int = 0
+    # Durable count of no-progress circuit-breaker trips. Unlike
+    # ``no_progress_retries`` (reset when verify next passes) this survives a
+    # resumed run, so history shows the breaker fired.
+    no_progress_trips: int = 0
 
     def save(self, repo_root: Path) -> Path:
         p = _run_state_path(repo_root, self.run_id)
@@ -24723,6 +24961,7 @@ def _maybe_trip_no_progress_circuit_breaker(
                 "Produce a new commit that changes the failing tests or "
                 "investigate the stale evidence before retrying."
             )
+            run.no_progress_trips += 1
             run.status = "blocked"
             run.save(repo_root)
             return "blocked"
@@ -25114,12 +25353,7 @@ def _classify_phase_result(
         # remote moved somewhere this run cannot prove it owns. Surface it as
         # a distinct, clearly non-retryable subtype so operators see the
         # divergence rather than a silent retry storm.
-        non_fast_forward = (
-            "fetch first" in normalized
-            or "[rejected]" in normalized
-            or "non-fast-forward" in normalized
-            or "tip of your current branch is behind" in normalized
-        )
+        non_fast_forward = _is_non_fast_forward_push_rejection(normalized)
         metadata.update(
             {
                 "failure_type": "publish",
@@ -25265,10 +25499,42 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.last_failure_retryable = None
         run.last_failure_type = ""
         run.last_failure_subtype = ""
+        run.last_failure_category = ""
+        run.last_failure_signature = ""
+        run.infra_failure_streak = 0
     else:
+        classification = classify_failure(
+            run.last_error,
+            phase=phase,
+            review_decision_status=run.review_decision_status,
+        )
+        if not metadata.get("failure_type") and classification.category is not FailureCategory.UNKNOWN:
+            # Analytics groups by failure_type.failure_subtype; without this
+            # every container/toolchain/push failure was an empty bucket.
+            metadata["failure_type"] = classification.category.value
+            metadata["failure_subtype"] = classification.kind
+        if classification.is_infrastructure:
+            # Also overrides phase metadata (e.g. publish.push_failed): a
+            # transient outage must stay dispatchable, because a non-retryable
+            # hint projects the spec to needs-attention and autopilot would
+            # skip it before its infrastructure backoff and breaker ever see
+            # the repeat. Operator-fix kinds (credentials, toolchain) stay
+            # non-retryable and surface as needs-attention.
+            metadata["retryable"] = classification.transient
+        metadata["failure_category"] = classification.category.value
+        metadata["failure_signature"] = classification.signature
+        if classification.is_infrastructure:
+            if classification.signature == run.last_failure_signature:
+                run.infra_failure_streak += 1
+            else:
+                run.infra_failure_streak = 1
+        else:
+            run.infra_failure_streak = 0
         run.last_failure_retryable = bool(metadata.get("retryable", False))
         run.last_failure_type = str(metadata.get("failure_type") or "")
         run.last_failure_subtype = str(metadata.get("failure_subtype") or "")
+        run.last_failure_category = classification.category.value
+        run.last_failure_signature = classification.signature
     run.save(repo_root)
 
     # Persist audit trail
@@ -25283,6 +25549,8 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         nonfatal=bool(metadata.get("nonfatal", False)),
         gate_name=str(metadata.get("gate_name") or ""),
         warnings=list(metadata.get("warnings") or []),
+        failure_category=str(metadata.get("failure_category") or ""),
+        failure_signature=str(metadata.get("failure_signature") or ""),
     )
     _persist_audit(repo_root, run, phase, audit_result)
 
@@ -25388,7 +25656,12 @@ def _workflow_failure_policy(
         # branch.
         return None
     if phase == "verify":
-        if _is_verify_environment_failure_message(run.last_error):
+        if _is_verify_environment_failure_message(run.last_error) or classify_failure(
+            run.last_error,
+            phase=phase,
+        ).is_infrastructure:
+            # A broken verify environment (missing toolchain, dead container
+            # service) says nothing about the code.
             return None
         return WorkflowFailurePolicy(
             retry_reason="verify_failures",
@@ -25403,7 +25676,10 @@ def _workflow_failure_policy(
     if phase == "implement" and (
         _is_retryable_implement_failure_message(run.last_error)
         or _agent_reported_failure_on_clean_commit(run)
-    ):
+    ) and not classify_failure(run.last_error, phase=phase).is_infrastructure:
+        # An agent that reports failure because its environment is broken
+        # (missing toolchain, dead container service) must not spend the
+        # convergence budget; the infrastructure path backs it off instead.
         return WorkflowFailurePolicy(
             retry_reason="implement_failures",
             next_phase="implement",
@@ -25666,16 +25942,90 @@ def _wait_for_agent_capacity_window(
     delay_seconds: float,
 ) -> None:
     """Wait out a provider quota window without letting the run lease expire."""
-    delay_seconds = max(1.0, min(delay_seconds, AGENT_CAPACITY_MAX_BACKOFF_SECONDS))
-    deadline = time.monotonic() + delay_seconds
+    _wait_holding_run_lease(
+        run,
+        repo_root,
+        "implement",
+        max(1.0, min(delay_seconds, AGENT_CAPACITY_MAX_BACKOFF_SECONDS)),
+    )
+
+
+def _wait_holding_run_lease(
+    run: RunState,
+    repo_root: Path,
+    phase: str,
+    delay_seconds: float,
+) -> None:
     run.status = "running"
     run.save(repo_root)
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        _refresh_active_run_lease(repo_root, run, "implement")
-        _poll_sleep(min(remaining, AGENT_CAPACITY_LEASE_REFRESH_SECONDS))
+    # Count down by the chunks actually requested from _poll_sleep rather than
+    # a monotonic deadline, so the wait is fully driven by that seam.
+    remaining = max(0.0, delay_seconds)
+    while remaining > 0:
+        _refresh_active_run_lease(repo_root, run, phase)
+        chunk = min(remaining, AGENT_CAPACITY_LEASE_REFRESH_SECONDS)
+        _poll_sleep(chunk)
+        remaining -= chunk
+
+
+def _maybe_wait_out_infrastructure_failure(
+    run: RunState,
+    repo_root: Path,
+    phase: str,
+) -> bool:
+    """Back off, then rerun ``phase`` in place after a transient infra failure.
+
+    Returns False when the failure is not a transient infrastructure failure or
+    this run already spent ``INFRA_RETRY_ATTEMPTS`` reruns on the signature; the
+    caller then fails the run as before and autopilot's backoff and circuit
+    breaker take over. The streak is persisted on the run, so a relaunched
+    process does not get a fresh set of in-process reruns.
+    """
+    if phase not in INFRA_INPROCESS_RETRY_PHASES:
+        return False
+    classification = classify_failure(
+        run.last_error,
+        phase=phase,
+        review_decision_status=run.review_decision_status,
+    )
+    if not classification.is_infrastructure or not classification.transient:
+        return False
+    if classification.kind == "provider_capacity":
+        # Quota windows are hours long; the dedicated capacity wait or
+        # autopilot backoff handles them.
+        return False
+    streak = max(1, int(run.infra_failure_streak))
+    if streak > INFRA_RETRY_ATTEMPTS:
+        return False
+    delay = infra_backoff_seconds(
+        streak,
+        base=INFRA_BACKOFF_BASE_SECONDS,
+        maximum=INFRA_BACKOFF_MAX_SECONDS,
+    )
+    logger.warning(
+        "Infrastructure failure (%s) in %s for %s; rerunning %s in %.0fs "
+        "without consuming an attempt (%d/%d): %s",
+        classification.signature,
+        phase,
+        run.spec_id,
+        phase,
+        delay,
+        streak,
+        INFRA_RETRY_ATTEMPTS,
+        run.last_error,
+    )
+    _emit_user_progress(
+        f"[spec] {run.spec_id}: infrastructure failure in {phase} "
+        f"({classification.kind}); retrying in {delay:.0f}s without consuming an attempt"
+    )
+    _wait_holding_run_lease(run, repo_root, phase, delay)
+    # Like the capacity wait: the rerun is the same attempt, so it must not
+    # see the infrastructure error as retry context. last_failure_signature
+    # and infra_failure_streak still carry it.
+    run.last_error = ""
+    run.status = "pending"
+    run.save(repo_root)
+    return True
 
 
 def run_full_workflow(
@@ -25811,6 +26161,8 @@ def run_full_workflow(
                 )
                 policy = _workflow_failure_policy(run, phase)
                 if policy is None:
+                    if _maybe_wait_out_infrastructure_failure(run, repo_root, phase):
+                        continue
                     logger.error("Phase %s failed: %s", phase, run.last_error)
                     return "failed"
 
@@ -27258,6 +27610,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         status = read_spec_status(repo_root, spec_id, spec_path, git_state=git_state)
     print(f"Spec: {spec_id}")
     print(f"  Status: {status}")
+    for breaker in open_breakers_for_spec(infra_breaker_state_path(_state_root(repo_root)), spec_id):
+        print(f"  Dispatch: {breaker.describe()}")
+        print(f"    Next Probe: {breaker.to_payload().get('next_probe_at') or 'unknown'}")
+        if breaker.error:
+            print(f"    Latest Error: {breaker.error.splitlines()[0]}")
+        print("    Reset: fix the environment, then `spec auto run --reset-infra-breaker`")
     deps = fm.get("depends_on", [])
     if deps:
         print(f"  Dependencies: {', '.join(deps) if isinstance(deps, list) else deps}")
@@ -27338,6 +27696,12 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  Actor: {run.requested_by}")
         if run.last_error:
             print(f"  Last Error: {run.last_error}")
+        if run.last_failure_category and run.status != "passed":
+            print(f"  Failure Category: {run.last_failure_category} ({run.last_failure_signature})")
+            if run.infra_failure_streak:
+                print(f"  Infrastructure Failure Streak: {run.infra_failure_streak}")
+        if run.no_progress_trips:
+            print(f"  No-Progress Breaker Trips: {run.no_progress_trips}")
         if run.readiness_status or run.readiness_head_sha or run.readiness_blocker:
             print("  Readiness:")
             print(f"    State: {run.readiness_status or 'unknown'}")
@@ -27587,6 +27951,7 @@ def _compute_orchestrator_analytics(
         if _run_matches_filters(run, spec_id=spec_id, run_id=run_id, since=since_dt)
     ]
     terminal_run_counts: dict[str, int] = {}
+    no_progress_trips = sum(max(0, int(run.no_progress_trips or 0)) for run in runs)
     for run in runs:
         if run.status in {"pending", "running"}:
             continue
@@ -27596,6 +27961,8 @@ def _compute_orchestrator_analytics(
     audit_dir = _state_root(repo_root) / "orchestrator"
     phase_attempt_counts: dict[str, dict[str, int]] = {}
     failures_by_type: dict[str, int] = {}
+    failures_by_category: dict[str, int] = {}
+    infrastructure_signatures: dict[str, int] = {}
     nonfatal_warnings: dict[str, int] = {}
     gate_failures: dict[str, int] = {}
     durations: dict[str, list[float]] = {}
@@ -27632,6 +27999,19 @@ def _compute_orchestrator_analytics(
 
         failure_type = str(result.get("failure_type") or "").strip()
         failure_subtype = str(result.get("failure_subtype") or "").strip()
+        if status != "passed" and not bool(result.get("nonfatal", False)):
+            category = str(result.get("failure_category") or "").strip()
+            signature = str(result.get("failure_signature") or "").strip()
+            if not category:
+                # Audits written before categories existed: classify the
+                # recorded error so history shows infra vs code too.
+                legacy = classify_failure(str(result.get("error_code") or ""), phase=phase)
+                category, signature = legacy.category.value, legacy.signature
+                if not failure_type and legacy.category is not FailureCategory.UNKNOWN:
+                    failure_type, failure_subtype = legacy.category.value, legacy.kind
+            failures_by_category[category] = failures_by_category.get(category, 0) + 1
+            if category == FailureCategory.INFRASTRUCTURE.value and signature:
+                infrastructure_signatures[signature] = infrastructure_signatures.get(signature, 0) + 1
         if failure_type and failure_subtype:
             key = f"{failure_type}.{failure_subtype}"
             if bool(result.get("nonfatal", False)):
@@ -27664,6 +28044,16 @@ def _compute_orchestrator_analytics(
             phase: dict(sorted(counts.items())) for phase, counts in sorted(phase_attempt_counts.items())
         },
         "failures_by_type_subtype": dict(sorted(failures_by_type.items())),
+        "failures_by_category": dict(sorted(failures_by_category.items())),
+        "infrastructure_failures_by_signature": dict(
+            sorted(infrastructure_signatures.items(), key=lambda item: (-item[1], item[0]))
+        ),
+        "infrastructure_breakers": [
+            entry.to_payload()
+            for entry in read_infra_breaker_entries(infra_breaker_state_path(_state_root(repo_root)))
+            if not spec_id or entry.affects(spec_id)
+        ],
+        "no_progress_breaker_trips": no_progress_trips,
         "nonfatal_warnings_by_type_subtype": dict(sorted(nonfatal_warnings.items())),
         "gate_failures_by_gate_name": dict(sorted(gate_failures.items())),
         "durations_seconds_by_phase": duration_summary,
