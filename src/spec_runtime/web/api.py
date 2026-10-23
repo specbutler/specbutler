@@ -534,6 +534,7 @@ def _serialize_snapshot(snapshot: object) -> dict:
         "active_count": snapshot.active_count,
         "failed_count": snapshot.failed_count,
         "queued_count": snapshot.queued_count,
+        "infrastructure_breakers": list(snapshot.infrastructure_breakers),
     }
 
 

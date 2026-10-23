@@ -119,6 +119,7 @@ worktrees_dir = ".worktrees"    # gitignored -- git worktrees
 [retry]
 cap = 20                        # max retries across verify/review/merge failures
 no_progress_retry_threshold = 2 # consecutive no-progress retries before giving up
+infra_retry_attempts = 2        # in-place reruns after a transient infrastructure failure
 
 [agents]
 default = "claude"
@@ -299,8 +300,36 @@ Retries continue until the spec passes all phases or the retry cap is reached
 (default: 20). If the cap is exceeded, a **draft PR** is created so you can
 inspect the state manually.
 
-The `no_progress_retry_threshold` (default: 2) stops retries early if the agent
-makes no new commits on consecutive attempts.
+The `no_progress_retry_threshold` (default: 2) blocks the run early when verify
+keeps failing on the same gate with an unchanged failure fingerprint, even if
+the agent keeps committing. `spec status` and `spec analytics` report how
+often it tripped (`No-Progress Breaker Trips`, `no_progress_breaker_trips`).
+
+### Infrastructure failures
+
+Failures that say nothing about the code -- a container image that will not
+build, an in-worker service that will not start, a missing toolchain such as
+`uv`, expired agent or `gh` credentials, a provider usage limit, a rejected
+push or failed PR creation, a CI or auto-merge wait timeout -- are classified
+as **infrastructure** and handled separately from code failures (verify gates,
+review change requests, merge conflicts):
+
+- They never consume the retry `cap`.
+- A transient one reruns the same phase after a jittered exponential backoff,
+  at most `[retry].infra_retry_attempts` times per run and failure signature.
+- `spec auto run` backs each spec off per failure signature
+  (`[autopilot].infra_backoff_base_seconds`, `infra_backoff_max_seconds`).
+- After `[autopilot].infra_breaker_threshold` consecutive failures with the
+  same signature on the repo's backend, a circuit breaker opens. Affected work
+  (every spec for environment-wide failures such as an image build; only the
+  failing spec for a push rejection) is held as `blocked-on-infrastructure`,
+  the configured notifiers fire once, and one probe dispatch is allowed every
+  `infra_breaker_cooldown_seconds`. A success or a code failure closes it.
+
+The breaker shows up in `spec status`, `spec watch`, the web dashboard, and
+`spec analytics` (`failures_by_category`, `infrastructure_breakers`). After
+fixing the environment, restart with `spec auto run --reset-infra-breaker` to
+resume immediately instead of waiting for the next probe.
 
 ## Execution backends
 
