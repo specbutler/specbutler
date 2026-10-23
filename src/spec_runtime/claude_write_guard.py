@@ -7,7 +7,12 @@ the generated settings of native unattended launches.
 
 Hooks run whatever the permission mode, so the script also refuses the Bash
 commands the settings' deny rules name (``git reset --hard`` and force
-pushes) rather than relying on those rules surviving bypass mode.
+pushes). That check is a best-effort extra layer against mistakes, not a
+security boundary: shell strings have endless indirections (scripts,
+functions, env). The boundaries are elsewhere: the OS sandbox confines Bash
+writes to the workspace, protected branch refs are read-only, the agent has
+no forge credentials and its pushURL is ``specbutler-no-push://``, and
+``git reset --hard`` can only discard the agent's own uncommitted work.
 
 It runs as ``python -I claude_write_guard.py --allow ROOT ... --deny PATH ...``
 and must import nothing outside the standard library. It reads the hook

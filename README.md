@@ -485,8 +485,10 @@ your project needs; see [Execution backends](docs/execution-backends.md).
   direct-host fallback.
 - Claude implementation sessions run with the Claude sandbox enabled
   (`failIfUnavailable`, no unsandboxed commands), credential read-denies, and a
-  small denylist for dangerous git commands such as force-push and
-  `git reset --hard`. When the installed Claude CLI lacks the native-mode
+  small best-effort denylist for git commands such as force-push and
+  `git reset --hard` (also enforced by the hook in bypass mode, but not a
+  security boundary: pushes have no forge credentials and a reset can only
+  touch the agent's own workspace). When the installed Claude CLI lacks the native-mode
   flags, launches fall back to the restricted `acceptEdits` policy with the
   built-in network allowlist, and `spec doctor` warns. A denied write, host or
   escalation is reported as a `sandbox_denied` failure in `spec status`; it is

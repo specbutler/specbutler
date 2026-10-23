@@ -194,10 +194,17 @@ orchestrator-written settings file (`--setting-sources ""`). Those settings:
   sandbox and through the file tools;
 - deny `git push --force`/`-f` and `git reset --hard`, both as permission
   deny rules and in the PreToolUse hook below, which runs in bypass mode too.
-  The hook parses each command, skips Git's global options and checks inline
-  aliases. It catches mistakes, not a determined agent (a script file could
-  still run either command); the sandbox's write confinement is the boundary,
-  and pushing stays with the host;
+  That Bash check is a best-effort extra layer against mistakes, not a
+  security boundary; a script or other shell indirection can get past it. The
+  real limits are: the sandbox confines Bash writes to the workspace (so
+  `git reset --hard` can only discard the agent's own uncommitted work there),
+  protected branch refs are read-only, and a force push has no way out, since
+  the agent environment carries no forge credentials (no `GH_TOKEN`; `gh`
+  config, `~/.git-credentials`, `~/.ssh`, the SSH agent socket and global Git
+  config are read-denied or blanked) and `pushURL` is `specbutler-no-push://`.
+  One residual: a session that names an OS credential store explicitly
+  (`git -c credential.helper=osxkeychain push`) may reach it if the provider
+  sandbox allows that service;
 - register a PreToolUse hook for Edit, Write, MultiEdit, NotebookEdit and Bash.
   Those tools run inside the Claude process, not under the OS sandbox, and
   bypass mode skips their protected-path prompts. The hook resolves symlinks
