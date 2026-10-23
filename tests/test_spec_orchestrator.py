@@ -4749,6 +4749,51 @@ class TestPhaseImplementHandshake:
         assert "AMBIENT_SECRET" not in env
         assert "invalid key" not in env
 
+    def test_build_implement_agent_env_scrubs_only_when_a_credential_is_present(self, repo: Path):
+        run = self._make_run()
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        # Keychain logins leave no credential in the environment. The scrub
+        # would only force Claude back to the default permission mode.
+        with patch.dict(orch.os.environ, {"BASE_ENV": "present"}, clear=True):
+            keychain_env = orch._build_implement_agent_env(run, worktree)
+        assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" not in keychain_env
+
+        with patch.dict(
+            orch.os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret"}, clear=True
+        ):
+            token_env = orch._build_implement_agent_env(run, worktree)
+        assert token_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+
+    @pytest.mark.parametrize(
+        ("platform", "process_env", "launch_env", "expected"),
+        [
+            ("darwin", {}, {}, True),
+            ("darwin", {}, {"CLAUDE_CODE_OAUTH_TOKEN": "token"}, False),
+            ("darwin", {}, {"ANTHROPIC_API_KEY": "key"}, False),
+            ("darwin", {"CLAUDE_CONFIG_DIR": "/custom/claude"}, {}, False),
+            ("linux", {}, {}, False),
+        ],
+    )
+    def test_macos_keychain_login_keeps_operator_home(
+        self, platform: str, process_env: dict[str, str], launch_env: dict[str, str], expected: bool
+    ):
+        with (
+            patch.object(orch.sys, "platform", platform),
+            patch.dict(orch.os.environ, process_env, clear=True),
+        ):
+            assert orch._claude_host_launch_uses_operator_keychain(launch_env) is expected
+
+    def test_progress_tracker_keeps_login_error_seen_before_the_final_event(self):
+        tracker = orch.AgentProgressTracker(agent="claude")
+        tracker.record("Not logged in · Please run /login")
+        tracker.record("Done | 1 turns | 0s | $0.00")
+
+        _, last_event = tracker.snapshot()
+        assert "Done" in last_event
+        assert "Not logged in" in tracker.auth_failure_summary()
+
     def test_no_handshake_recovery_propagates_setup_failure_diagnostics(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
