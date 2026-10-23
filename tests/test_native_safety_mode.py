@@ -46,6 +46,8 @@ from spec_runtime.sandbox_denials import (
     sandbox_denial_summary,
 )
 
+# Captured before the suite-wide conftest stub replaces it for each test.
+REAL_NATIVE_PROBE = orch._claude_native_launch_unavailability_reason
 NATIVE = LaunchSafety(claude_bypass=True)
 FALLBACK = LaunchSafety(claude_bypass=False)
 GUARD_TOOLS = "Edit|Write|MultiEdit|NotebookEdit|Bash"
@@ -387,18 +389,31 @@ class TestClaudeLaunch:
         assert claude_native_unavailability_reason("")
 
     def _launch_safety(self, monkeypatch, *, help_text: str, safety_mode: str = "native"):
+        # Undo the suite-wide stub and exercise the real cached probe.
+        monkeypatch.setattr(
+            orch,
+            "_claude_native_launch_unavailability_reason",
+            REAL_NATIVE_PROBE,
+        )
+        monkeypatch.setattr(orch, "_CLAUDE_NATIVE_PROBE_CACHE", {})
+        monkeypatch.setattr(orch.shutil, "which", lambda name: f"/opt/bin/{name}")
         monkeypatch.setattr(
             orch,
             "SPEC_RUNTIME_CONFIG",
             SpecRuntimeConfig(execution=ExecutionConfig(backend="clone", safety_mode=safety_mode)),
         )
-        monkeypatch.setattr(
-            orch,
-            "run_subprocess",
-            lambda cmd, **_: subprocess.CompletedProcess(cmd, 0, help_text, ""),
-        )
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **_):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, help_text, "")
+
+        monkeypatch.setattr(orch, "run_subprocess", fake_run)
         backend = get_execution_backend(ExecutionConfig(backend="clone"))
-        return orch._unattended_launch_safety("claude", backend)
+        first = orch._unattended_launch_safety("claude", backend)
+        assert orch._unattended_launch_safety("claude", backend) == first
+        assert calls == [["/opt/bin/claude", "--help"]]
+        return first
 
     def test_launch_uses_bypass_when_cli_supports_it(self, monkeypatch) -> None:
         assert self._launch_safety(monkeypatch, help_text=CLAUDE_HELP).claude_bypass is True
@@ -410,11 +425,7 @@ class TestClaudeLaunch:
         assert safety.claude_bypass is False
 
     def test_container_backend_keeps_its_launch_policy(self, monkeypatch) -> None:
-        monkeypatch.setattr(
-            orch,
-            "run_subprocess",
-            lambda cmd, **_: subprocess.CompletedProcess(cmd, 0, CLAUDE_HELP, ""),
-        )
+        monkeypatch.setattr(orch, "_claude_native_launch_unavailability_reason", lambda: "")
 
         class _Identity:
             backend = "container"

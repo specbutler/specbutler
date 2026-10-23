@@ -16172,18 +16172,32 @@ def _write_external_sandbox_claude_settings(
     )
 
 
+# Native-launch capability per resolved Claude executable. One probe per
+# process: every implement and recovery launch would otherwise shell out to
+# ``claude --help``.
+_CLAUDE_NATIVE_PROBE_CACHE: dict[str, str] = {}
+
+
 def _claude_native_launch_unavailability_reason() -> str:
     """Return why this host's Claude CLI cannot run a native launch."""
-    try:
-        result = run_subprocess(["claude", "--help"])
-    except FileNotFoundError:
+    executable = shutil.which("claude")
+    if not executable:
         return "Claude CLI not found on PATH."
+    cached = _CLAUDE_NATIVE_PROBE_CACHE.get(executable)
+    if cached is not None:
+        return cached
+    try:
+        result = run_subprocess([executable, "--help"])
+    except OSError as exc:
+        return f"Could not run `claude --help`: {exc}"
     help_text = (
         f"{result.stdout or ''}\n{result.stderr or ''}"
         if result.returncode == 0
         else ""
     )
-    return claude_native_unavailability_reason(help_text)
+    reason = claude_native_unavailability_reason(help_text)
+    _CLAUDE_NATIVE_PROBE_CACHE[executable] = reason
+    return reason
 
 
 def _unattended_launch_safety(agent: str, backend: ExecutionBackend) -> LaunchSafety:

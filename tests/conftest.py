@@ -54,3 +54,20 @@ def _isolate_process_control_state(
     root = tmp_path_factory.getbasetemp() / f"pc{next(_CONTROL_ROOT_SEQUENCE)}"
     monkeypatch.setenv("SPEC_PROCESS_CONTROL_ROOT", str(root))
     return root
+
+
+@pytest.fixture(autouse=True)
+def _stub_claude_native_launch_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep implement tests from shelling out to ``claude --help``.
+
+    The native-launch capability probe is a seam: tests get the restricted
+    acceptEdits fallback unless they stub the probe to report support (see
+    tests/test_native_safety_mode.py).
+    """
+    from spec_runtime import orchestrator
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_claude_native_launch_unavailability_reason",
+        lambda: "native Claude launch probe is stubbed in tests",
+    )
