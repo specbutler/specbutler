@@ -20,7 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
-from .agent_git_access import UnsafeAgentGitLayoutError, agent_git_access
+from .agent_git_access import (
+    UnsafeAgentGitLayoutError,
+    agent_git_access,
+    materialize_protected_loose_refs,
+)
 from .agent_git_isolation import AgentGitIsolation
 from .provider_env import PROXY_ENV_KEYS, protected_operator_paths
 
@@ -392,7 +396,12 @@ def _codex_git_access(worktree_path: Path) -> _CodexGitAccess:
         return _CodexGitAccess()
     # Codex profile entries must name existing paths; a missing control
     # (usually config.worktree) is still protected by Codex's own .git rules
-    # for clones, and is never read by host publication.
+    # for clones, and is never read by host publication. Packed protected
+    # branches get an equal loose ref so they can be pinned read-only.
+    try:
+        materialize_protected_loose_refs(access)
+    except (OSError, UnsafeAgentGitLayoutError) as exc:
+        raise RuntimeError(f"Refusing agent Git metadata access: {exc}") from exc
     return _CodexGitAccess(
         writable=access.writable_paths,
         read_only=tuple(path for path in access.read_only_paths if path.exists()),

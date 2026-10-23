@@ -705,8 +705,6 @@ def _agent_git_probe_checks(
 
     Failures for the configured backend are blockers. The other backend is
     reported as a warning so switching backends is an informed choice.
-    Worktree mode grants the shared ``.git`` directory by design, so a
-    write that was not blocked there is reported rather than failed.
     """
     if agent_git_probe_disabled():
         return []
@@ -727,10 +725,7 @@ def _agent_git_probe_checks(
             if result.unavailable_reason:
                 checks.append(_warning(name, detail))
                 continue
-            blocking = backend == configured_backend and (
-                not result.git_works or backend != "worktree"
-            )
-            severity = _error if blocking else _warning
+            severity = _error if backend == configured_backend else _warning
             checks.append(
                 severity(
                     name,

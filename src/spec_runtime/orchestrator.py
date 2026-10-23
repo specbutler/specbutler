@@ -15139,9 +15139,9 @@ def _agent_git_launch_preflight_error(
 
     Runs the model-free ``spec doctor`` Git probe once per process for this
     provider and backend. A probe that ran blocks the launch when add, commit,
-    stash, branch or log failed, or when the sandbox let it write outside the
-    workspace (or, for a clone, to Git config or hooks). A missing runner or a
-    probe that could not start is logged and the launch goes ahead.
+    stash, branch or log failed, or when the sandbox let it write Git config,
+    hooks or outside the workspace. A missing runner or a probe that could not
+    start is logged and the launch goes ahead.
     """
     backend_name = getattr(getattr(backend, "identity", None), "backend", "")
     if (
@@ -15162,15 +15162,10 @@ def _agent_git_launch_preflight_error(
             f"{backend_name} backend: {result.summary()}. Run `spec doctor` "
             f"for details, or set {PROBE_DISABLE_ENV}=0 to skip this check."
         )
-    blocking_leaks = [
-        leak
-        for leak in result.leaked_writes
-        if backend_name == "clone" or leak == "outside workspace"
-    ]
-    if result.ran and blocking_leaks:
+    if result.ran and result.leaked_writes:
         return (
             f"The {agent_name} sandbox did not block writes for the "
-            f"{backend_name} backend ({', '.join(blocking_leaks)}): "
+            f"{backend_name} backend ({', '.join(result.leaked_writes)}): "
             f"{result.summary()}. Run `spec doctor` for details, or set "
             f"{PROBE_DISABLE_ENV}=0 to skip this check."
         )

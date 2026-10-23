@@ -60,7 +60,7 @@ class AgentGitAccess:
             # The main checkout's own HEAD and index live in the common dir.
             paths.extend((self.common_dir / "HEAD", self.common_dir / "index"))
             for ref in self.protected_refs:
-                ref_path = self.common_dir.joinpath(*ref.split("/"))
+                ref_path = self.ref_path(ref)
                 paths.extend((ref_path, ref_path.with_name(ref_path.name + ".lock")))
             if self.protected_refs:
                 # A packed protected ref could otherwise be moved by
@@ -69,7 +69,25 @@ class AgentGitAccess:
                 paths.extend(
                     (self.common_dir / "packed-refs", self.common_dir / "packed-refs.lock")
                 )
+            # Parallel runs' worktree metadata (HEAD, index, gitdir) is not
+            # this session's to change.
+            paths.extend(self.sibling_git_dirs)
         return tuple(paths)
+
+    @property
+    def sibling_git_dirs(self) -> tuple[Path, ...]:
+        if self.git_dir == self.common_dir:
+            return ()
+        try:
+            entries = sorted((self.common_dir / "worktrees").iterdir())
+        except OSError:
+            return ()
+        return tuple(
+            entry for entry in entries if entry != self.git_dir and entry.is_dir()
+        )
+
+    def ref_path(self, ref: str) -> Path:
+        return self.common_dir.joinpath(*ref.split("/"))
 
 
 def _git_output(worktree: Path, args: list[str]) -> str:
@@ -176,6 +194,32 @@ def _assert_registered_linked_worktree(
         raise UnsafeAgentGitLayoutError(
             f"Refusing .git pointer in {worktree}: {git_dir} is registered to another worktree"
         )
+
+
+def materialize_protected_loose_refs(access: AgentGitAccess) -> None:
+    """Write packed protected refs as equal loose refs so they can be pinned.
+
+    Sandboxes that only accept rules for existing paths (Codex) cannot
+    otherwise stop an agent from creating a loose ref that shadows a packed
+    protected branch. A loose ref holding the packed value is the state Git
+    itself produces on the next update of that branch.
+    """
+    for ref in access.protected_refs:
+        ref_path = access.ref_path(ref)
+        if os.path.lexists(ref_path):
+            continue
+        oid = _git_output(access.worktree, ["rev-parse", "--verify", "--quiet", ref]).strip()
+        if not oid:
+            continue
+        ref_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = ref_path.with_name(ref_path.name + ".specbutler-tmp")
+        temporary.write_text(oid + "\n", encoding="ascii")
+        try:
+            os.link(temporary, ref_path)
+        except FileExistsError:
+            pass
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def agent_git_access(worktree_path: Path) -> AgentGitAccess | None:

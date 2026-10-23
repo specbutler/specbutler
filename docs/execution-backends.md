@@ -102,8 +102,10 @@ of its own worth committing to: objects, refs, the stash, and the reflog live
 in the repository's shared common directory next to your own checkout's
 metadata. An agent that can commit can therefore write refs and objects that
 your checkout also sees. Spec Butler keeps the branches checked out in other
-worktrees, `packed-refs`, and the main checkout's `HEAD` and `index`
-read-only, but other branches and the stash are shared. Because `packed-refs`
+worktrees, `packed-refs`, other runs' `.git/worktrees/<name>/` directories,
+and the main checkout's `HEAD` and `index` read-only, but other branches and
+the stash are shared. For Codex, whose rules can only name existing files, the
+host first writes a packed protected branch back out as an equal loose ref. Because `packed-refs`
 is read-only, deleting a branch that Git has packed fails inside the session. Spec Butler used to give each worktree launch a
 private `GIT_DIR` and import its commits afterwards, but that import's
 metadata guards failed runs whenever the shared repository changed during a
@@ -129,13 +131,12 @@ npm install -g @anthropic-ai/sandbox-runtime
 Inside the sandbox, `add`, `commit`, `stash`, `branch`, and `log` must
 succeed, and writes to `.git/config`, `.git/hooks/` and a path outside the
 workspace must fail. A failure for the configured backend is a blocker; the
-other backend is a warning. In worktree mode a write that was not blocked is
-reported as a warning rather than failed.
+other backend is a warning.
 
 Implementation launches on the host run the same probe once per process. A
 launch is refused when the probe ran and Git itself failed, or the sandbox let
-it write outside the workspace (or, for a clone, to Git config or hooks). A
-missing runner or a probe that could not start is logged. Run `spec doctor` from a
+it write Git config, hooks or outside the workspace. A missing runner or a
+probe that could not start is logged. Run `spec doctor` from a
 normal terminal: a sandboxed agent session cannot start another sandbox
 (`sandbox_apply: Operation not permitted`). Set `SPEC_AGENT_GIT_PROBE=0` to
 skip the probe.

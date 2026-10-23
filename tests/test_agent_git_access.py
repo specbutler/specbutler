@@ -184,6 +184,36 @@ def test_workspace_without_git_has_no_git_grants(tmp_path: Path) -> None:
     assert agent_git_access(tmp_path / "missing") is None
 
 
+def test_sibling_worktree_metadata_is_read_only(tmp_path: Path) -> None:
+    repository, worktree = _linked_worktree(tmp_path)
+    sibling = tmp_path / "sibling-worktree"
+    _git(repository, "worktree", "add", "-b", "code/sibling", str(sibling), "main")
+    access = agent_git_access(worktree)
+
+    sibling_git_dir = repository / ".git" / "worktrees" / "sibling-worktree"
+    assert access.sibling_git_dirs == (sibling_git_dir,)
+    assert sibling_git_dir in access.read_only_paths
+    assert access.git_dir not in access.read_only_paths
+    assert "refs/heads/code/sibling" in access.protected_refs
+
+
+def test_codex_pins_a_packed_protected_branch_as_a_loose_ref(tmp_path: Path) -> None:
+    repository, worktree = _linked_worktree(tmp_path)
+    _git(repository, "pack-refs", "--all")
+    main_ref = repository / ".git" / "refs" / "heads" / "main"
+    assert not main_ref.exists()
+
+    cmd = CodexAgent().build_implement_command(
+        prompt="Do the work", worktree_path=worktree, state_dir=tmp_path / "state"
+    )
+
+    assert main_ref.read_text(encoding="ascii").strip() == _git(repository, "rev-parse", "main")
+    policy = _codex_filesystem_policy(cmd)
+    assert f'{json.dumps(str(main_ref))}="read"' in policy
+    assert f'{json.dumps(str(repository / ".git" / "packed-refs"))}="read"' in policy
+    assert _git(repository, "status", "--short") == ""
+
+
 # ---------------------------------------------------------------------------
 # Claude settings
 # ---------------------------------------------------------------------------
@@ -686,7 +716,12 @@ def test_launch_preflight_blocks_only_when_git_fails_in_the_sandbox(
 
 @pytest.mark.parametrize(
     ("backend_name", "leak"),
-    [("clone", "git hooks"), ("clone", "outside workspace"), ("worktree", "outside workspace")],
+    [
+        ("clone", "git hooks"),
+        ("clone", "outside workspace"),
+        ("worktree", "git config"),
+        ("worktree", "outside workspace"),
+    ],
 )
 def test_launch_preflight_blocks_writes_the_sandbox_should_deny(
     monkeypatch: pytest.MonkeyPatch,
@@ -707,12 +742,11 @@ def test_launch_preflight_blocks_writes_the_sandbox_should_deny(
 @pytest.mark.parametrize(
     "result",
     [
-        _probe_result("claude", "worktree", leaked_writes=("git config",)),
         probe.AgentGitProbeResult(agent="claude", backend="worktree", unavailable_reason="no srt"),
         probe.AgentGitProbeResult(agent="claude", backend="worktree", error="nested sandbox"),
     ],
 )
-def test_launch_preflight_does_not_block_on_unverified_or_widened_policy(
+def test_launch_preflight_does_not_block_when_the_probe_did_not_run(
     monkeypatch: pytest.MonkeyPatch,
     result: probe.AgentGitProbeResult,
 ) -> None:
