@@ -326,7 +326,10 @@ def claude_probe_command(
         encoding="utf-8",
     )
     inner = [python_path or sys.executable, "-c", _PROBE_SCRIPT, *script_args]
-    return [srt_path, "--settings", str(settings_path), shlex.join(inner)]
+    # srt treats bare positional arguments as an argv to exec, so a single
+    # joined string becomes one over-long executable name. ``-c`` hands it
+    # to the shell, matching how the quoting was built.
+    return [srt_path, "--settings", str(settings_path), "-c", shlex.join(inner)]
 
 
 def parse_probe_output(
