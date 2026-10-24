@@ -2966,6 +2966,16 @@ def _trusted_container_git_guard_environment(env: dict[str, str]) -> dict[str, s
                 and value in allowed_push_prefixes
             )
             or (
+                re.fullmatch(
+                    r"url\.specbutler-no-push://remote/[^\s\x00-\x1f]+/\.pushInsteadOf", key
+                )
+                is not None
+                and value != ""
+                and "\0" not in value
+                and "\n" not in value
+                and "\r" not in value
+            )
+            or (
                 re.fullmatch(r"remote\.[^\s\x00-\x1f]+\.pushurl", key) is not None
                 and value.startswith("specbutler-no-push://remote/")
                 and "\0" not in value
