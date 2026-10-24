@@ -2967,7 +2967,7 @@ def _trusted_container_git_guard_environment(env: dict[str, str]) -> dict[str, s
             )
             or (
                 re.fullmatch(
-                    r"url\.specbutler-no-push://remote/[^\s\x00-\x1f]+/\.pushInsteadOf", key
+                    r"url\.specbutler-no-push://remote/[^\s\x00-\x1f]+/\.(?:push)?[iI]nsteadOf", key
                 )
                 is not None
                 and value != ""

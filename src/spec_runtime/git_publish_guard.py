@@ -482,27 +482,34 @@ def _remote_config_values(repo_root: Path, remote: str, key: str) -> tuple[str, 
     )
 
 
+def _url_variants(url: str) -> list[str]:
+    return [url, f"file://{url}"] if url.startswith("/") else [url]
+
+
 def _remote_push_fences(repo_root: Path) -> list[tuple[str, str]]:
     """Fence pushes to this workspace's own remotes by their exact URLs.
 
     ``pushInsteadOf`` matches URLs, not remote names, so a fixture repository
     with its own ``origin`` elsewhere on disk is unaffected. Git does not
-    rewrite explicitly configured push URLs, so a remote that sets
-    ``remote.<name>.pushurl`` in repository config is overridden by name.
+    rewrite explicitly configured push URLs with ``pushInsteadOf``, so those are
+    fenced with ``insteadOf``.
     """
     entries: list[tuple[str, str]] = []
     for remote in _remote_names(repo_root):
         fence = f"specbutler-no-push://remote/{remote}"
-        push_urls = _remote_config_values(repo_root, remote, "pushurl")
-        # Fence both the fetch URL and any explicit push URL, so a direct
-        # ``git push <url>`` to either is rewritten as well.
-        for url in (*_remote_config_values(repo_root, remote, "url"), *push_urls):
-            variants = [url]
-            if url.startswith("/"):
-                variants.append(f"file://{url}")
-            entries.extend((f"url.{fence}/.pushInsteadOf", variant) for variant in variants)
-        if push_urls:
-            entries.append((f"remote.{remote}.pushurl", fence))
+        for url in _remote_config_values(repo_root, remote, "url"):
+            entries.extend(
+                (f"url.{fence}/.pushInsteadOf", variant) for variant in _url_variants(url)
+            )
+        # Git never applies pushInsteadOf to an explicit pushurl, and a
+        # GIT_CONFIG_* ``remote.<name>.pushurl`` only adds a second push target
+        # beside the repository's own. Plain insteadOf does rewrite explicit
+        # push URLs (and direct pushes to them); it would also rewrite a fetch
+        # from the same URL, which then fails closed.
+        for url in _remote_config_values(repo_root, remote, "pushurl"):
+            entries.extend(
+                (f"url.{fence}/.insteadOf", variant) for variant in _url_variants(url)
+            )
     return entries
 
 
