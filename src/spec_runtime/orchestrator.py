@@ -6361,6 +6361,26 @@ def _write_claude_isolated_home(
     return home
 
 
+# Values that authenticate Claude by themselves, or select a cloud provider
+# whose own credentials replace the claude.ai login. Transport and model
+# settings (proxies, base URLs, model names) are deliberately excluded: they
+# coexist with a Keychain login and must not move the launch off it.
+CLAUDE_AUTH_MATERIAL_ENV_KEYS = (
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
+def _claude_env_has_auth_material(env: dict[str, str]) -> bool:
+    """Whether the launch authenticates from its environment, not the Keychain."""
+    return any(str(env.get(key, "")).strip() for key in CLAUDE_AUTH_MATERIAL_ENV_KEYS)
+
+
 def _claude_env_has_provider_credentials(env: dict[str, str]) -> bool:
     """Whether a Claude launch environment carries any forwarded auth material.
 
@@ -6386,7 +6406,7 @@ def _claude_host_launch_uses_operator_keychain(env: dict[str, str]) -> bool:
         return False
     if str(os.environ.get("CLAUDE_CONFIG_DIR", "")).strip():
         return False
-    return not _claude_env_has_provider_credentials(env)
+    return not _claude_env_has_auth_material(env)
 
 
 def _write_claude_private_host_home(

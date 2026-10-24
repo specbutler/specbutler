@@ -4788,6 +4788,14 @@ class TestPhaseImplementHandshake:
             vertex_env = orch._build_implement_agent_env(run, worktree)
         assert vertex_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
 
+        # Proxy settings may embed credentials, so they keep the scrub on
+        # even though they do not move the launch off the Keychain login.
+        with patch.dict(
+            orch.os.environ, {"HTTPS_PROXY": "http://user:pass@proxy.local:8080"}, clear=True
+        ):
+            proxy_env = orch._build_implement_agent_env(run, worktree)
+        assert proxy_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+
     @pytest.mark.parametrize(
         ("platform", "process_env", "launch_env", "expected"),
         [
@@ -4795,6 +4803,9 @@ class TestPhaseImplementHandshake:
             ("darwin", {}, {"CLAUDE_CODE_OAUTH_TOKEN": "token"}, False),
             ("darwin", {}, {"ANTHROPIC_API_KEY": "key"}, False),
             ("darwin", {}, {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_SECRET_ACCESS_KEY": "s"}, False),
+            # Transport and model settings coexist with a Keychain login.
+            ("darwin", {}, {"HTTPS_PROXY": "http://proxy.local:8080"}, True),
+            ("darwin", {}, {"ANTHROPIC_MODEL": "claude-opus-5-5"}, True),
             ("darwin", {"CLAUDE_CONFIG_DIR": "/custom/claude"}, {}, False),
             ("linux", {}, {}, False),
         ],
