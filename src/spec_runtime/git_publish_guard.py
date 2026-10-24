@@ -482,8 +482,24 @@ def _remote_config_values(repo_root: Path, remote: str, key: str) -> tuple[str, 
     )
 
 
+_WINDOWS_LOCAL_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|//)")
+
+
 def _url_variants(url: str) -> list[str]:
-    return [url, f"file://{url}"] if url.startswith("/") else [url]
+    """Spellings Git accepts for the same remote, so direct pushes match too.
+
+    Local remotes may be POSIX paths or Windows drive/UNC paths; Git accepts
+    each with or without a ``file://`` prefix and, on Windows, with either
+    slash direction.
+    """
+    if not (url.startswith("/") or _WINDOWS_LOCAL_PATH_RE.match(url)):
+        return [url]
+    variants: list[str] = []
+    for path in dict.fromkeys((url, url.replace("\\", "/"))):
+        variants.extend((path, f"file://{path}"))
+        if not path.startswith("/"):
+            variants.append(f"file:///{path}")
+    return list(dict.fromkeys(variants))
 
 
 def _remote_push_fences(repo_root: Path) -> list[tuple[str, str]]:
