@@ -520,15 +520,20 @@ def _remote_push_fences(repo_root: Path) -> list[tuple[str, str]]:
         # Git never applies pushInsteadOf to an explicit pushurl, and a
         # GIT_CONFIG_* ``remote.<name>.pushurl`` only adds a second push target
         # beside the repository's own. Plain insteadOf does rewrite explicit
-        # push URLs (and direct pushes to them), but it rewrites fetches too,
-        # so it is only used for push URLs that are not also fetch URLs. A
-        # pushurl identical to the fetch URL stays reachable through this
-        # layer; it relies on the real boundaries (no forge credentials for
-        # network URLs, OS sandbox write roots for local paths).
+        # push URLs (and direct pushes to them), but it rewrites fetches too.
+        # A pushurl identical to a fetch URL therefore cannot be fenced without
+        # breaking fetch; it is redundant, so refuse the launch instead.
         fetch_set = set(fetch_variants)
         for url in _remote_config_values(repo_root, remote, "pushurl"):
-            variants = [variant for variant in _url_variants(url) if variant not in fetch_set]
-            entries.extend((f"url.{fence}/.insteadOf", variant) for variant in variants)
+            if any(variant in fetch_set for variant in _url_variants(url)):
+                raise UnsafeRepositoryGitConfigError(
+                    f"Remote '{remote}' sets remote.{remote}.pushurl to its fetch URL. "
+                    "Spec Butler cannot block agent pushes to an explicit push URL "
+                    "without also blocking fetches from it. Remove the redundant "
+                    f"setting (`git config --unset-all remote.{remote}.pushurl`) and "
+                    "launch again."
+                )
+            entries.extend((f"url.{fence}/.insteadOf", variant) for variant in _url_variants(url))
     return entries
 
 
