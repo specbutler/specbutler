@@ -4751,6 +4751,55 @@ class TestPhaseImplementHandshake:
         assert "AMBIENT_SECRET" not in env
         assert "invalid key" not in env
 
+    def test_build_implement_agent_env_always_scrubs_claude_subprocess_env(self, repo: Path):
+        run = self._make_run()
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        # Keychain logins carry no credential, but MCP and setup-manifest
+        # values merged later may, so the scrub is unconditional.
+        for environ in (
+            {"BASE_ENV": "present"},
+            {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret"},
+            {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_SECRET_ACCESS_KEY": "aws-secret"},
+            {"HTTPS_PROXY": "http://user:pass@proxy.local:8080"},
+        ):
+            with patch.dict(orch.os.environ, environ, clear=True):
+                env = orch._build_implement_agent_env(run, worktree)
+            assert env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1", environ
+
+    @pytest.mark.parametrize(
+        ("platform", "process_env", "launch_env", "expected"),
+        [
+            ("darwin", {}, {}, True),
+            ("darwin", {}, {"CLAUDE_CODE_OAUTH_TOKEN": "token"}, False),
+            ("darwin", {}, {"ANTHROPIC_API_KEY": "key"}, False),
+            ("darwin", {}, {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_SECRET_ACCESS_KEY": "s"}, False),
+            # Transport and model settings coexist with a Keychain login.
+            ("darwin", {}, {"HTTPS_PROXY": "http://proxy.local:8080"}, True),
+            ("darwin", {}, {"ANTHROPIC_MODEL": "claude-opus-5-5"}, True),
+            ("darwin", {"CLAUDE_CONFIG_DIR": "/custom/claude"}, {}, False),
+            ("linux", {}, {}, False),
+        ],
+    )
+    def test_macos_keychain_login_keeps_operator_home(
+        self, platform: str, process_env: dict[str, str], launch_env: dict[str, str], expected: bool
+    ):
+        with (
+            patch.object(orch.sys, "platform", platform),
+            patch.dict(orch.os.environ, process_env, clear=True),
+        ):
+            assert orch._claude_host_launch_uses_operator_keychain(launch_env) is expected
+
+    def test_progress_tracker_keeps_login_error_seen_before_the_final_event(self):
+        tracker = orch.AgentProgressTracker(agent="claude")
+        tracker.record("Not logged in · Please run /login")
+        tracker.record("Done | 1 turns | 0s | $0.00")
+
+        _, last_event = tracker.snapshot()
+        assert "Done" in last_event
+        assert "Not logged in" in tracker.auth_failure_summary()
+
     def test_no_handshake_recovery_propagates_setup_failure_diagnostics(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
