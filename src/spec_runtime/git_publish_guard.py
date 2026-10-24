@@ -485,17 +485,46 @@ def _remote_config_values(repo_root: Path, remote: str, key: str) -> tuple[str, 
 _WINDOWS_LOCAL_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|//)")
 
 
-def _url_variants(url: str) -> list[str]:
+_SCP_LIKE_RE = re.compile(r"^[^/\\:]+:")
+
+
+def _local_remote_path(url: str, repo_root: Path) -> str | None:
+    """Return the absolute filesystem path a local remote URL refers to.
+
+    Handles plain absolute paths (POSIX, Windows drive, UNC), ``file://`` URLs
+    and paths relative to the repository. Network URLs and scp-like
+    ``host:path`` forms return None.
+    """
+    if url.startswith("file://"):
+        path = url[len("file://"):]
+        if path.startswith("localhost/"):
+            path = path[len("localhost"):]
+        if re.match(r"^/[A-Za-z]:[\\/]", path):
+            path = path[1:]
+        return path
+    if "://" in url:
+        return None
+    if url.startswith("/") or _WINDOWS_LOCAL_PATH_RE.match(url):
+        return url
+    if _SCP_LIKE_RE.match(url):
+        return None
+    return os.path.normpath(os.path.join(str(repo_root), url))
+
+
+def _url_variants(url: str, repo_root: Path) -> list[str]:
     """Spellings Git accepts for the same remote, so direct pushes match too.
 
-    Local remotes may be POSIX paths or Windows drive/UNC paths; Git accepts
-    each with or without a ``file://`` prefix and, on Windows, with either
-    slash direction.
+    Local remotes are normalized to an absolute path and fenced as plain paths
+    and ``file://`` URLs (both slash directions on Windows). This layer is
+    best effort: the OS sandbox's write roots are the boundary for local
+    remotes, and forge credentials (which agents never receive) for network
+    ones.
     """
-    if not (url.startswith("/") or _WINDOWS_LOCAL_PATH_RE.match(url)):
+    local = _local_remote_path(url, repo_root)
+    if local is None:
         return [url]
-    variants: list[str] = []
-    for path in dict.fromkeys((url, url.replace("\\", "/"))):
+    variants: list[str] = [url]
+    for path in dict.fromkeys((local, local.replace("\\", "/"))):
         variants.extend((path, f"file://{path}"))
         if not path.startswith("/"):
             variants.append(f"file:///{path}")
@@ -515,7 +544,7 @@ def _remote_push_fences(repo_root: Path) -> list[tuple[str, str]]:
         fence = f"specbutler-no-push://remote/{remote}"
         fetch_variants: list[str] = []
         for url in _remote_config_values(repo_root, remote, "url"):
-            fetch_variants.extend(_url_variants(url))
+            fetch_variants.extend(_url_variants(url, repo_root))
         entries.extend((f"url.{fence}/.pushInsteadOf", variant) for variant in fetch_variants)
         # Git never applies pushInsteadOf to an explicit pushurl, and a
         # GIT_CONFIG_* ``remote.<name>.pushurl`` only adds a second push target
@@ -525,7 +554,7 @@ def _remote_push_fences(repo_root: Path) -> list[tuple[str, str]]:
         # breaking fetch; it is redundant, so refuse the launch instead.
         fetch_set = set(fetch_variants)
         for url in _remote_config_values(repo_root, remote, "pushurl"):
-            if any(variant in fetch_set for variant in _url_variants(url)):
+            if any(variant in fetch_set for variant in _url_variants(url, repo_root)):
                 raise UnsafeRepositoryGitConfigError(
                     f"Remote '{remote}' sets remote.{remote}.pushurl to its fetch URL. "
                     "Spec Butler cannot block agent pushes to an explicit push URL "
@@ -533,7 +562,9 @@ def _remote_push_fences(repo_root: Path) -> list[tuple[str, str]]:
                     f"setting (`git config --unset-all remote.{remote}.pushurl`) and "
                     "launch again."
                 )
-            entries.extend((f"url.{fence}/.insteadOf", variant) for variant in _url_variants(url))
+            entries.extend(
+                (f"url.{fence}/.insteadOf", variant) for variant in _url_variants(url, repo_root)
+            )
     return entries
 
 

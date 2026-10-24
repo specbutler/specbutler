@@ -154,6 +154,34 @@ def test_guard_refuses_a_pushurl_that_equals_the_fetch_url(tmp_path: Path) -> No
         )
 
 
+@pytest.mark.parametrize("spelling", ["file", "relative"])
+def test_guard_fences_every_spelling_of_a_local_remote(tmp_path: Path, spelling: str) -> None:
+    sink = tmp_path / "origin.git"
+    workspace = tmp_path / "workspace"
+    assert _git(tmp_path, "init", "--bare", str(sink)).returncode == 0
+    assert _git(tmp_path, "init", "-b", "main", str(workspace)).returncode == 0
+    configured = sink.as_uri() if spelling == "file" else "../origin.git"
+    assert _git(workspace, "remote", "add", "origin", configured).returncode == 0
+
+    guarded_env = {"PATH": os.environ.get("PATH", os.defpath)}
+    apply_host_owned_publication_guard(guarded_env, workspace)
+    guarded_env.update(
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@example.invalid",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@example.invalid",
+    )
+    (workspace / "w.txt").write_text("w\n", encoding="utf-8")
+    assert _git(workspace, "add", "w.txt", env=guarded_env).returncode == 0
+    assert _git(workspace, "commit", "-m", "w", env=guarded_env).returncode == 0
+    assert _git(workspace, "fetch", "origin", env=guarded_env).returncode == 0
+    for target in ("origin", configured, str(sink), f"file://{sink}", sink.as_uri()):
+        blocked = _git(workspace, "push", target, "main", env=guarded_env)
+        assert blocked.returncode != 0, target
+        assert "specbutler-no-push" in (blocked.stdout + blocked.stderr), target
+    assert _git(sink, "rev-parse", "--verify", "refs/heads/main").returncode != 0
+
+
 def test_guard_replaces_inherited_inline_git_config_and_setup_cannot_override_it(
     tmp_path: Path,
 ) -> None:
