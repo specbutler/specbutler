@@ -65,6 +65,123 @@ def test_launch_guard_allows_commit_and_fetch_but_blocks_ordinary_push(
     assert _git(sink, "rev-parse", "refs/heads/main").stdout.strip() == before
 
 
+def test_guard_lets_unrelated_fixture_repositories_push_to_their_own_origin(
+    tmp_path: Path,
+) -> None:
+    """Agents run repository test suites whose fixtures push to temporary
+    bare repositories through a remote that is also called ``origin``. The
+    guard travels in GIT_CONFIG_* and applies to every repository the child
+    touches, so it must fence the workspace's remotes by URL, not by name."""
+    workspace_sink = tmp_path / "workspace-origin.git"
+    workspace = tmp_path / "workspace"
+    assert _git(tmp_path, "init", "--bare", str(workspace_sink)).returncode == 0
+    assert _git(tmp_path, "init", "-b", "main", str(workspace)).returncode == 0
+    assert _git(workspace, "remote", "add", "origin", str(workspace_sink)).returncode == 0
+
+    guarded_env = {"PATH": os.environ.get("PATH", os.defpath)}
+    apply_host_owned_publication_guard(guarded_env, workspace)
+    guarded_env.update(
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@example.invalid",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@example.invalid",
+    )
+
+    fixture_sink = tmp_path / "fixture-origin.git"
+    fixture = tmp_path / "fixture"
+    assert _git(tmp_path, "init", "--bare", str(fixture_sink), env=guarded_env).returncode == 0
+    assert _git(tmp_path, "init", "-b", "main", str(fixture), env=guarded_env).returncode == 0
+    (fixture / "f.txt").write_text("f\n", encoding="utf-8")
+    assert _git(fixture, "add", "f.txt", env=guarded_env).returncode == 0
+    assert _git(fixture, "commit", "-m", "f", env=guarded_env).returncode == 0
+    assert _git(fixture, "remote", "add", "origin", str(fixture_sink), env=guarded_env).returncode == 0
+
+    pushed = _git(fixture, "push", "origin", "main", env=guarded_env)
+    assert pushed.returncode == 0, pushed.stderr
+    assert _git(fixture_sink, "rev-parse", "refs/heads/main").returncode == 0
+
+    # The workspace's own remote stays fenced, by plain path and file:// URL.
+    (workspace / "w.txt").write_text("w\n", encoding="utf-8")
+    assert _git(workspace, "add", "w.txt", env=guarded_env).returncode == 0
+    assert _git(workspace, "commit", "-m", "w", env=guarded_env).returncode == 0
+    for target in ("origin", str(workspace_sink), f"file://{workspace_sink}"):
+        blocked = _git(workspace, "push", target, "main", env=guarded_env)
+        assert blocked.returncode != 0, target
+        assert "specbutler-no-push" in (blocked.stdout + blocked.stderr), target
+
+
+def test_guard_fences_direct_pushes_to_an_explicit_local_pushurl(tmp_path: Path) -> None:
+    fetch_sink = tmp_path / "fetch.git"
+    push_sink = tmp_path / "push.git"
+    workspace = tmp_path / "workspace"
+    for sink in (fetch_sink, push_sink):
+        assert _git(tmp_path, "init", "--bare", str(sink)).returncode == 0
+    assert _git(tmp_path, "init", "-b", "main", str(workspace)).returncode == 0
+    assert _git(workspace, "remote", "add", "origin", str(fetch_sink)).returncode == 0
+    assert _git(workspace, "remote", "set-url", "--push", "origin", str(push_sink)).returncode == 0
+
+    guarded_env = {"PATH": os.environ.get("PATH", os.defpath)}
+    apply_host_owned_publication_guard(guarded_env, workspace)
+    guarded_env.update(
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@example.invalid",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@example.invalid",
+    )
+    (workspace / "w.txt").write_text("w\n", encoding="utf-8")
+    assert _git(workspace, "add", "w.txt", env=guarded_env).returncode == 0
+    assert _git(workspace, "commit", "-m", "w", env=guarded_env).returncode == 0
+    for target in ("origin", str(push_sink), f"file://{push_sink}"):
+        blocked = _git(workspace, "push", target, "main", env=guarded_env)
+        assert blocked.returncode != 0, target
+        assert "specbutler-no-push" in (blocked.stdout + blocked.stderr), target
+    assert _git(push_sink, "rev-parse", "--verify", "refs/heads/main").returncode != 0
+
+
+def test_guard_refuses_a_pushurl_that_equals_the_fetch_url(tmp_path: Path) -> None:
+    """Git cannot fence an explicit push URL without also fencing fetches from
+    the same URL, so a redundant pushurl is refused rather than left open."""
+    sink = tmp_path / "origin.git"
+    workspace = tmp_path / "workspace"
+    assert _git(tmp_path, "init", "--bare", str(sink)).returncode == 0
+    assert _git(tmp_path, "init", "-b", "main", str(workspace)).returncode == 0
+    assert _git(workspace, "remote", "add", "origin", str(sink)).returncode == 0
+    assert _git(workspace, "remote", "set-url", "--push", "origin", str(sink)).returncode == 0
+
+    with pytest.raises(UnsafeRepositoryGitConfigError, match="pushurl"):
+        apply_host_owned_publication_guard(
+            {"PATH": os.environ.get("PATH", os.defpath)}, workspace
+        )
+
+
+@pytest.mark.parametrize("spelling", ["file", "relative"])
+def test_guard_fences_every_spelling_of_a_local_remote(tmp_path: Path, spelling: str) -> None:
+    sink = tmp_path / "origin.git"
+    workspace = tmp_path / "workspace"
+    assert _git(tmp_path, "init", "--bare", str(sink)).returncode == 0
+    assert _git(tmp_path, "init", "-b", "main", str(workspace)).returncode == 0
+    configured = sink.as_uri() if spelling == "file" else "../origin.git"
+    assert _git(workspace, "remote", "add", "origin", configured).returncode == 0
+
+    guarded_env = {"PATH": os.environ.get("PATH", os.defpath)}
+    apply_host_owned_publication_guard(guarded_env, workspace)
+    guarded_env.update(
+        GIT_AUTHOR_NAME="t",
+        GIT_AUTHOR_EMAIL="t@example.invalid",
+        GIT_COMMITTER_NAME="t",
+        GIT_COMMITTER_EMAIL="t@example.invalid",
+    )
+    (workspace / "w.txt").write_text("w\n", encoding="utf-8")
+    assert _git(workspace, "add", "w.txt", env=guarded_env).returncode == 0
+    assert _git(workspace, "commit", "-m", "w", env=guarded_env).returncode == 0
+    assert _git(workspace, "fetch", "origin", env=guarded_env).returncode == 0
+    for target in ("origin", configured, str(sink), f"file://{sink}", sink.as_uri()):
+        blocked = _git(workspace, "push", target, "main", env=guarded_env)
+        assert blocked.returncode != 0, target
+        assert "specbutler-no-push" in (blocked.stdout + blocked.stderr), target
+    assert _git(sink, "rev-parse", "--verify", "refs/heads/main").returncode != 0
+
+
 def test_guard_replaces_inherited_inline_git_config_and_setup_cannot_override_it(
     tmp_path: Path,
 ) -> None:
