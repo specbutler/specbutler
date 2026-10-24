@@ -2670,6 +2670,11 @@ def _build_implement_agent_env(
         extra_keys=_adapter_provider_environment_keys(run.agent),
     )
     if run.agent == "claude":
+        # Always scrub: later launch steps merge MCP and setup-manifest values
+        # into this environment, and any of them may carry secrets. Current
+        # Claude Code forces print mode back to the default permission mode
+        # while the scrub is set; with the explicit --allowedTools list that
+        # still runs unattended (anything else is denied, never prompted).
         env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
         env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
     _inject_worktree_venv_into_env(env, worktree_path)
@@ -6354,6 +6359,44 @@ def _write_claude_isolated_home(
     return home
 
 
+# Values that authenticate Claude by themselves, or select a cloud provider
+# whose own credentials replace the claude.ai login. Transport and model
+# settings (proxies, base URLs, model names) are deliberately excluded: they
+# coexist with a Keychain login and must not move the launch off it.
+CLAUDE_AUTH_MATERIAL_ENV_KEYS = (
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+
+
+def _claude_env_has_auth_material(env: dict[str, str]) -> bool:
+    """Whether the launch authenticates from its environment, not the Keychain."""
+    return any(str(env.get(key, "")).strip() for key in CLAUDE_AUTH_MATERIAL_ENV_KEYS)
+
+
+def _claude_host_launch_uses_operator_keychain(env: dict[str, str]) -> bool:
+    """Whether a host Claude launch must keep the operator's HOME and config dir.
+
+    On macOS, Claude Code keeps its claude.ai login in the Keychain under an
+    entry keyed to HOME and CLAUDE_CONFIG_DIR. A launch-private HOME, or even
+    an explicit CLAUDE_CONFIG_DIR pointing at the default directory, looks up
+    a different entry and reports "Not logged in". Without an environment
+    credential (for example a `claude setup-token` CLAUDE_CODE_OAUTH_TOKEN)
+    the only working login is the operator's own Keychain entry, so the
+    launch keeps the operator HOME and leaves CLAUDE_CONFIG_DIR unset.
+    """
+    if sys.platform != "darwin":
+        return False
+    if str(os.environ.get("CLAUDE_CONFIG_DIR", "")).strip():
+        return False
+    return not _claude_env_has_auth_material(env)
+
+
 def _write_claude_private_host_home(
     *,
     source_config: Path | None = None,
@@ -9678,6 +9721,7 @@ class AgentProgressTracker:
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _inflight_items: set[str] = field(default_factory=set, repr=False)
     _sandbox_denial: SandboxDenial | None = field(default=None, repr=False)
+    _auth_failure_summary: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         if not self.last_event_summary:
@@ -9714,8 +9758,16 @@ class AgentProgressTracker:
         with self._lock:
             self.last_progress_at = time.monotonic()
             self.last_event_summary = clean_summary
+            if not self._auth_failure_summary and _is_agent_auth_failure_message(clean_summary):
+                # The CLI prints its login error before a final result event,
+                # so the last event alone would hide it.
+                self._auth_failure_summary = clean_summary
         self._maybe_persist_heartbeat()
         return clean_summary
+
+    def auth_failure_summary(self) -> str:
+        with self._lock:
+            return self._auth_failure_summary
 
     def heartbeat(self) -> None:
         with self._lock:
@@ -16835,7 +16887,13 @@ def _prepare_implement_launch_plan(
         # container backends expose it only through a dedicated bind mount.
     elif run.agent == "claude" and adapter.capabilities.supports_mcp:
         use_provider_sandbox = _backend_uses_provider_sandbox_config(backend)
-        if use_provider_sandbox:
+        use_operator_keychain = use_provider_sandbox and _claude_host_launch_uses_operator_keychain(
+            agent_env
+        )
+        if use_operator_keychain:
+            claude_home = Path.home()
+            canonical_claude_config = None
+        elif use_provider_sandbox:
             (
                 claude_private_home_context,
                 claude_home,
@@ -16854,7 +16912,7 @@ def _prepare_implement_launch_plan(
                 include_auth=False,
             )
         agent_env = _subprocess_env_with_home(agent_env, claude_home)
-        if use_provider_sandbox:
+        if use_provider_sandbox and canonical_claude_config is not None:
             agent_env["CLAUDE_CONFIG_DIR"] = str(canonical_claude_config)
         else:
             agent_env_redactions = tuple(
@@ -17487,10 +17545,13 @@ def _interpret_implement_attempt_result(
 
     if outcome.progress_tracker is not None:
         _, last_event = outcome.progress_tracker.snapshot()
-        if _is_agent_auth_failure_message(last_event):
+        auth_event = outcome.progress_tracker.auth_failure_summary() or (
+            last_event if _is_agent_auth_failure_message(last_event) else ""
+        )
+        if auth_event:
             run.last_error = (
                 f"Agent CLI is not authenticated in this execution environment "
-                f"(no_handshake). Last agent output: {last_event}"
+                f"(no_handshake). Agent output: {auth_event}"
             )
             return "blocked"
         if _is_agent_capacity_failure_message(last_event):
@@ -18364,7 +18425,14 @@ def _attempt_no_handshake_recovery(
             recovery_env = _subprocess_env_with_codex_home(recovery_env, codex_home)
         elif run.agent == "claude" and adapter.capabilities.supports_mcp:
             use_provider_sandbox = _backend_uses_provider_sandbox_config(backend)
-            if use_provider_sandbox:
+            use_operator_keychain = (
+                use_provider_sandbox
+                and _claude_host_launch_uses_operator_keychain(recovery_env)
+            )
+            if use_operator_keychain:
+                claude_home = Path.home()
+                canonical_claude_config = None
+            elif use_provider_sandbox:
                 (
                     recovery_claude_private_home_context,
                     claude_home,
@@ -18379,7 +18447,7 @@ def _attempt_no_handshake_recovery(
                     include_auth=False,
                 )
             recovery_env = _subprocess_env_with_home(recovery_env, claude_home)
-            if use_provider_sandbox:
+            if use_provider_sandbox and canonical_claude_config is not None:
                 recovery_env["CLAUDE_CONFIG_DIR"] = str(canonical_claude_config)
             else:
                 recovery_env_redactions = tuple(
