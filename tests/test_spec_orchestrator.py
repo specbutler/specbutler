@@ -4749,52 +4749,22 @@ class TestPhaseImplementHandshake:
         assert "AMBIENT_SECRET" not in env
         assert "invalid key" not in env
 
-    def test_build_implement_agent_env_scrubs_only_when_a_credential_is_present(self, repo: Path):
+    def test_build_implement_agent_env_always_scrubs_claude_subprocess_env(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
         worktree.mkdir(parents=True, exist_ok=True)
 
-        # Keychain logins leave no credential in the environment. The scrub
-        # would only force Claude back to the default permission mode.
-        with patch.dict(orch.os.environ, {"BASE_ENV": "present"}, clear=True):
-            keychain_env = orch._build_implement_agent_env(run, worktree)
-        assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" not in keychain_env
-
-        with patch.dict(
-            orch.os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret"}, clear=True
+        # Keychain logins carry no credential, but MCP and setup-manifest
+        # values merged later may, so the scrub is unconditional.
+        for environ in (
+            {"BASE_ENV": "present"},
+            {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret"},
+            {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_SECRET_ACCESS_KEY": "aws-secret"},
+            {"HTTPS_PROXY": "http://user:pass@proxy.local:8080"},
         ):
-            token_env = orch._build_implement_agent_env(run, worktree)
-        assert token_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
-
-        # Cloud-provider credentials are forwarded too and must stay scrubbed.
-        with patch.dict(
-            orch.os.environ,
-            {
-                "CLAUDE_CODE_USE_BEDROCK": "1",
-                "AWS_ACCESS_KEY_ID": "AKIAEXAMPLE",
-                "AWS_SECRET_ACCESS_KEY": "aws-secret",
-            },
-            clear=True,
-        ):
-            bedrock_env = orch._build_implement_agent_env(run, worktree)
-        assert bedrock_env["AWS_SECRET_ACCESS_KEY"] == "aws-secret"
-        assert bedrock_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
-
-        with patch.dict(
-            orch.os.environ,
-            {"CLAUDE_CODE_USE_VERTEX": "1", "ANTHROPIC_VERTEX_PROJECT_ID": "proj"},
-            clear=True,
-        ):
-            vertex_env = orch._build_implement_agent_env(run, worktree)
-        assert vertex_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
-
-        # Proxy settings may embed credentials, so they keep the scrub on
-        # even though they do not move the launch off the Keychain login.
-        with patch.dict(
-            orch.os.environ, {"HTTPS_PROXY": "http://user:pass@proxy.local:8080"}, clear=True
-        ):
-            proxy_env = orch._build_implement_agent_env(run, worktree)
-        assert proxy_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+            with patch.dict(orch.os.environ, environ, clear=True):
+                env = orch._build_implement_agent_env(run, worktree)
+            assert env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1", environ
 
     @pytest.mark.parametrize(
         ("platform", "process_env", "launch_env", "expected"),

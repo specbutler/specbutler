@@ -2670,14 +2670,12 @@ def _build_implement_agent_env(
         extra_keys=_adapter_provider_environment_keys(run.agent),
     )
     if run.agent == "claude":
-        # The scrub hides environment credentials from Bash and hooks. Current
-        # Claude Code also forces print mode back to the default permission
-        # mode when it is set, which cancels native bypass launches, so only
-        # enable it when forwarded auth material exists (keychain logins are
-        # not in the environment). Any forwarded provider credential, including
-        # Bedrock/Vertex/Foundry and proxy settings, keeps the scrub on.
-        if _claude_env_has_provider_credentials(env):
-            env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
+        # Always scrub: later launch steps merge MCP and setup-manifest values
+        # into this environment, and any of them may carry secrets. Current
+        # Claude Code forces print mode back to the default permission mode
+        # while the scrub is set; with the explicit --allowedTools list that
+        # still runs unattended (anything else is denied, never prompted).
+        env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
         env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
     _inject_worktree_venv_into_env(env, worktree_path)
     _apply_implement_run_identity(env, run)
@@ -6379,16 +6377,6 @@ CLAUDE_AUTH_MATERIAL_ENV_KEYS = (
 def _claude_env_has_auth_material(env: dict[str, str]) -> bool:
     """Whether the launch authenticates from its environment, not the Keychain."""
     return any(str(env.get(key, "")).strip() for key in CLAUDE_AUTH_MATERIAL_ENV_KEYS)
-
-
-def _claude_env_has_provider_credentials(env: dict[str, str]) -> bool:
-    """Whether a Claude launch environment carries any forwarded auth material.
-
-    Uses the shared provider classification (OAuth/API tokens, Bedrock,
-    Vertex and Foundry credentials, proxy settings, custom headers) so this
-    decision cannot drift from what ``minimal_provider_environment`` forwards.
-    """
-    return any(str(env.get(key, "")).strip() for key in CLAUDE_PROVIDER_CREDENTIAL_ENV_KEYS)
 
 
 def _claude_host_launch_uses_operator_keychain(env: dict[str, str]) -> bool:
