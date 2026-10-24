@@ -524,7 +524,10 @@ def _url_variants(url: str, repo_root: Path) -> list[str]:
     if local is None:
         return [url]
     variants: list[str] = [url]
-    for path in dict.fromkeys((local, local.replace("\\", "/"))):
+    spellings = [local, local.replace("\\", "/")]
+    if _WINDOWS_LOCAL_PATH_RE.match(local):
+        spellings.append(local.replace("/", "\\"))
+    for path in dict.fromkeys(spellings):
         variants.extend((path, f"file://{path}"))
         if not path.startswith("/"):
             variants.append(f"file:///{path}")
