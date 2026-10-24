@@ -262,7 +262,10 @@ def test_missing_agent_on_isolated_path(tmp_path, monkeypatch, agent, default):
     repo = _make_repo(tmp_path, _config_text(default_agent=default, allowed_agents=(agent,)))
     config = load_repo_spec_runtime_config(repo)
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-    checks = doctor._agent_checks(repo, config, doctor.shutil.which, _Runner())
+    runner = _Runner()
+    checks = doctor._agent_checks(repo, config, doctor.shutil.which, runner)
+    assert not any(check.name.startswith("agent version (") for check in checks)
+    assert runner.calls == []
     check = next(check for check in checks if check.name == f"agent binary ({agent})")
     assert check.status == ("error" if agent == default else "warning")
     assert "not found on PATH" in check.detail

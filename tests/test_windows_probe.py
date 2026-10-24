@@ -158,6 +158,9 @@ import sys
 
 def main():
     args = sys.argv[1:]
+    if args == ["--version"]:
+        print("codex-cli 0.156.1")
+        return 0
     if args == ["login", "status"]:
         print("Logged in using fixture credentials")
         return 0
@@ -1033,6 +1036,7 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
     )
     codex_path = fake_bin / "codex.exe"
     for arguments, marker in (
+        (("--version",), "codex-cli 0.156.1"),
         (("login", "status"), "fixture credentials"),
         (("exec", "--help"), "--strict-config"),
         (
@@ -1097,6 +1101,8 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
     )
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
     assert "0 warning(s)" in doctor.stdout
+    assert "agent version (codex)" in doctor.stdout
+    assert "codex-cli 0.156.1" in doctor.stdout
 
 
 def test_foreground_web_bind_and_authenticated_request(tmp_path: Path) -> None:
