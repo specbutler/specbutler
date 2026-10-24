@@ -24,13 +24,19 @@ _PUBLICATION_URL_SCHEMES = frozenset({"file", "git", "http", "https", "ssh"})
 # pushInsteadOf is applied only to push URLs, so fetch/pull keep their normal
 # transport. The synthetic protocol has no registered remote helper and fails
 # before Git can contact a credential helper or remote endpoint.
+# Network transports are fenced by prefix: pushing anywhere over them needs
+# credentials the agent does not have. Local paths are fenced per workspace
+# remote (exact URL) instead of with a global ``file://`` prefix, because these
+# rules travel in GIT_CONFIG_* and apply to every repository the child's Git
+# touches -- including test fixtures that push to their own temporary bare
+# repositories. Writes to any other local repository are already outside the
+# OS sandbox's writable roots.
 _PUSH_PREFIXES = (
     ("https", "https://"),
     ("http", "http://"),
     ("ssh", "ssh://"),
     ("git", "git://"),
     ("scp", "git@"),
-    ("file", "file://"),
 )
 
 
@@ -454,6 +460,114 @@ def _remote_names(repo_root: Path) -> tuple[str, ...]:
     )
 
 
+def _remote_config_values(repo_root: Path, remote: str, key: str) -> tuple[str, ...]:
+    try:
+        completed = subprocess.run(
+            ["git", "config", "--get-all", f"remote.{remote}.{key}"],
+            cwd=repo_root,
+            env=_git_inspection_environment(),
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    if completed.returncode != 0 or not isinstance(completed.stdout, str):
+        return ()
+    return tuple(
+        line
+        for raw in completed.stdout.splitlines()
+        if (line := raw.strip()) and not any(ord(character) < 32 for character in line)
+    )
+
+
+_WINDOWS_LOCAL_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\|//)")
+
+
+_SCP_LIKE_RE = re.compile(r"^[^/\\:]+:")
+
+
+def _local_remote_path(url: str, repo_root: Path) -> str | None:
+    """Return the absolute filesystem path a local remote URL refers to.
+
+    Handles plain absolute paths (POSIX, Windows drive, UNC), ``file://`` URLs
+    and paths relative to the repository. Network URLs and scp-like
+    ``host:path`` forms return None.
+    """
+    if url.startswith("file://"):
+        path = url[len("file://"):]
+        if path.startswith("localhost/"):
+            path = path[len("localhost"):]
+        if re.match(r"^/[A-Za-z]:[\\/]", path):
+            path = path[1:]
+        return path
+    if "://" in url:
+        return None
+    if url.startswith("/") or _WINDOWS_LOCAL_PATH_RE.match(url):
+        return url
+    if _SCP_LIKE_RE.match(url):
+        return None
+    return os.path.normpath(os.path.join(str(repo_root), url))
+
+
+def _url_variants(url: str, repo_root: Path) -> list[str]:
+    """Spellings Git accepts for the same remote, so direct pushes match too.
+
+    Local remotes are normalized to an absolute path and fenced as plain paths
+    and ``file://`` URLs (both slash directions on Windows). This layer is
+    best effort: the OS sandbox's write roots are the boundary for local
+    remotes, and forge credentials (which agents never receive) for network
+    ones.
+    """
+    local = _local_remote_path(url, repo_root)
+    if local is None:
+        return [url]
+    variants: list[str] = [url]
+    for path in dict.fromkeys((local, local.replace("\\", "/"))):
+        variants.extend((path, f"file://{path}"))
+        if not path.startswith("/"):
+            variants.append(f"file:///{path}")
+    return list(dict.fromkeys(variants))
+
+
+def _remote_push_fences(repo_root: Path) -> list[tuple[str, str]]:
+    """Fence pushes to this workspace's own remotes by their exact URLs.
+
+    ``pushInsteadOf`` matches URLs, not remote names, so a fixture repository
+    with its own ``origin`` elsewhere on disk is unaffected. Git does not
+    rewrite explicitly configured push URLs with ``pushInsteadOf``, so those are
+    fenced with ``insteadOf``.
+    """
+    entries: list[tuple[str, str]] = []
+    for remote in _remote_names(repo_root):
+        fence = f"specbutler-no-push://remote/{remote}"
+        fetch_variants: list[str] = []
+        for url in _remote_config_values(repo_root, remote, "url"):
+            fetch_variants.extend(_url_variants(url, repo_root))
+        entries.extend((f"url.{fence}/.pushInsteadOf", variant) for variant in fetch_variants)
+        # Git never applies pushInsteadOf to an explicit pushurl, and a
+        # GIT_CONFIG_* ``remote.<name>.pushurl`` only adds a second push target
+        # beside the repository's own. Plain insteadOf does rewrite explicit
+        # push URLs (and direct pushes to them), but it rewrites fetches too.
+        # A pushurl identical to a fetch URL therefore cannot be fenced without
+        # breaking fetch; it is redundant, so refuse the launch instead.
+        fetch_set = set(fetch_variants)
+        for url in _remote_config_values(repo_root, remote, "pushurl"):
+            if any(variant in fetch_set for variant in _url_variants(url, repo_root)):
+                raise UnsafeRepositoryGitConfigError(
+                    f"Remote '{remote}' sets remote.{remote}.pushurl to its fetch URL. "
+                    "Spec Butler cannot block agent pushes to an explicit push URL "
+                    "without also blocking fetches from it. Remove the redundant "
+                    f"setting (`git config --unset-all remote.{remote}.pushurl`) and "
+                    "launch again."
+                )
+            entries.extend(
+                (f"url.{fence}/.insteadOf", variant) for variant in _url_variants(url, repo_root)
+            )
+    return entries
+
+
 def apply_host_owned_publication_guard(
     env: MutableMapping[str, str],
     repo_root: Path,
@@ -478,12 +592,9 @@ def apply_host_owned_publication_guard(
             (f"url.specbutler-no-push://{label}/.pushInsteadOf", prefix)
             for label, prefix in _PUSH_PREFIXES
         ),
-        # Existing relative and absolute local remotes are fenced explicitly;
-        # the prefix rules above cover direct network/file URL pushes.
-        *(
-            (f"remote.{remote}.pushurl", f"specbutler-no-push://remote/{remote}")
-            for remote in _remote_names(repo_root)
-        ),
+        # The workspace's own remotes are fenced by exact URL; the prefix
+        # rules above cover direct network URL pushes.
+        *_remote_push_fences(repo_root),
     ]
     env["GIT_CONFIG_COUNT"] = str(len(entries))
     for index, (key, value) in enumerate(entries):
