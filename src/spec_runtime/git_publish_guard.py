@@ -493,12 +493,15 @@ def _remote_push_fences(repo_root: Path) -> list[tuple[str, str]]:
     entries: list[tuple[str, str]] = []
     for remote in _remote_names(repo_root):
         fence = f"specbutler-no-push://remote/{remote}"
-        for url in _remote_config_values(repo_root, remote, "url"):
+        push_urls = _remote_config_values(repo_root, remote, "pushurl")
+        # Fence both the fetch URL and any explicit push URL, so a direct
+        # ``git push <url>`` to either is rewritten as well.
+        for url in (*_remote_config_values(repo_root, remote, "url"), *push_urls):
             variants = [url]
             if url.startswith("/"):
                 variants.append(f"file://{url}")
             entries.extend((f"url.{fence}/.pushInsteadOf", variant) for variant in variants)
-        if _remote_config_values(repo_root, remote, "pushurl"):
+        if push_urls:
             entries.append((f"remote.{remote}.pushurl", fence))
     return entries
 
