@@ -138,6 +138,22 @@ def test_guard_fences_direct_pushes_to_an_explicit_local_pushurl(tmp_path: Path)
     assert _git(push_sink, "rev-parse", "--verify", "refs/heads/main").returncode != 0
 
 
+def test_guard_keeps_fetch_working_when_pushurl_equals_fetch_url(tmp_path: Path) -> None:
+    sink = tmp_path / "origin.git"
+    workspace = tmp_path / "workspace"
+    assert _git(tmp_path, "init", "--bare", str(sink)).returncode == 0
+    assert _git(tmp_path, "init", "-b", "main", str(workspace)).returncode == 0
+    assert _git(workspace, "remote", "add", "origin", str(sink)).returncode == 0
+    assert _git(workspace, "remote", "set-url", "--push", "origin", str(sink)).returncode == 0
+
+    guarded_env = {"PATH": os.environ.get("PATH", os.defpath)}
+    apply_host_owned_publication_guard(guarded_env, workspace)
+
+    fetched = _git(workspace, "fetch", "origin", env=guarded_env)
+    assert fetched.returncode == 0, fetched.stderr
+    assert "specbutler-no-push" not in (fetched.stdout + fetched.stderr)
+
+
 def test_guard_replaces_inherited_inline_git_config_and_setup_cannot_override_it(
     tmp_path: Path,
 ) -> None:
