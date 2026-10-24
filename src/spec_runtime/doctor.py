@@ -516,6 +516,32 @@ def _provider_auth_check(
     )
 
 
+def _agent_version_check(
+    agent: str,
+    path: str,
+    repo_root: Path,
+    run: CommandRunner,
+    *,
+    required: bool,
+) -> DoctorCheck:
+    """Keep vendor output intact while recognizing common version tokens."""
+    result = run([path, "--version"], repo_root, 10)
+    severity = _error if required else _warning
+    name = f"agent version ({agent})"
+    if result.returncode:
+        return severity(name, f"{path}: {_result_detail(result)} (exit {result.returncode})")
+    lines = (result.stdout or result.stderr or "").splitlines()
+    if not lines or not lines[0].strip():
+        return severity(name, f"{path}: version command returned no version output")
+    first_line = lines[0]
+    token = re.search(
+        r"(?<![\w.])\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?",
+        first_line,
+    )
+    suffix = f"; version={token.group(0)}" if token else ""
+    return _ok(name, f"{path}: {first_line}{suffix}")
+
+
 def _agent_checks(
     repo_root: Path,
     config: SpecRuntimeConfig,
@@ -575,6 +601,10 @@ def _agent_checks(
         if not path:
             continue
 
+        if agent in {"claude", "codex"}:
+            checks.append(
+                _agent_version_check(agent, path, repo_root, run, required=agent in required)
+            )
         severity = _error if agent in required else _warning
         auth_check = _provider_auth_check(
             agent,
