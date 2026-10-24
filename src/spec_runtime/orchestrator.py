@@ -2673,9 +2673,10 @@ def _build_implement_agent_env(
         # The scrub hides environment credentials from Bash and hooks. Current
         # Claude Code also forces print mode back to the default permission
         # mode when it is set, which cancels native bypass launches, so only
-        # enable it when there is an environment credential to hide (keychain
-        # logins are not in the environment).
-        if any(str(env.get(key, "")).strip() for key in CLAUDE_ENV_CREDENTIAL_KEYS):
+        # enable it when forwarded auth material exists (keychain logins are
+        # not in the environment). Any forwarded provider credential, including
+        # Bedrock/Vertex/Foundry and proxy settings, keeps the scrub on.
+        if _claude_env_has_provider_credentials(env):
             env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
         env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
     _inject_worktree_venv_into_env(env, worktree_path)
@@ -6360,11 +6361,14 @@ def _write_claude_isolated_home(
     return home
 
 
-CLAUDE_ENV_CREDENTIAL_KEYS = (
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-)
+def _claude_env_has_provider_credentials(env: dict[str, str]) -> bool:
+    """Whether a Claude launch environment carries any forwarded auth material.
+
+    Uses the shared provider classification (OAuth/API tokens, Bedrock,
+    Vertex and Foundry credentials, proxy settings, custom headers) so this
+    decision cannot drift from what ``minimal_provider_environment`` forwards.
+    """
+    return any(str(env.get(key, "")).strip() for key in CLAUDE_PROVIDER_CREDENTIAL_ENV_KEYS)
 
 
 def _claude_host_launch_uses_operator_keychain(env: dict[str, str]) -> bool:
@@ -6382,7 +6386,7 @@ def _claude_host_launch_uses_operator_keychain(env: dict[str, str]) -> bool:
         return False
     if str(os.environ.get("CLAUDE_CONFIG_DIR", "")).strip():
         return False
-    return not any(str(env.get(key, "")).strip() for key in CLAUDE_ENV_CREDENTIAL_KEYS)
+    return not _claude_env_has_provider_credentials(env)
 
 
 def _write_claude_private_host_home(

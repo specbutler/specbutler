@@ -4766,12 +4766,35 @@ class TestPhaseImplementHandshake:
             token_env = orch._build_implement_agent_env(run, worktree)
         assert token_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
 
+        # Cloud-provider credentials are forwarded too and must stay scrubbed.
+        with patch.dict(
+            orch.os.environ,
+            {
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "AWS_ACCESS_KEY_ID": "AKIAEXAMPLE",
+                "AWS_SECRET_ACCESS_KEY": "aws-secret",
+            },
+            clear=True,
+        ):
+            bedrock_env = orch._build_implement_agent_env(run, worktree)
+        assert bedrock_env["AWS_SECRET_ACCESS_KEY"] == "aws-secret"
+        assert bedrock_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+
+        with patch.dict(
+            orch.os.environ,
+            {"CLAUDE_CODE_USE_VERTEX": "1", "ANTHROPIC_VERTEX_PROJECT_ID": "proj"},
+            clear=True,
+        ):
+            vertex_env = orch._build_implement_agent_env(run, worktree)
+        assert vertex_env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] == "1"
+
     @pytest.mark.parametrize(
         ("platform", "process_env", "launch_env", "expected"),
         [
             ("darwin", {}, {}, True),
             ("darwin", {}, {"CLAUDE_CODE_OAUTH_TOKEN": "token"}, False),
             ("darwin", {}, {"ANTHROPIC_API_KEY": "key"}, False),
+            ("darwin", {}, {"CLAUDE_CODE_USE_BEDROCK": "1", "AWS_SECRET_ACCESS_KEY": "s"}, False),
             ("darwin", {"CLAUDE_CONFIG_DIR": "/custom/claude"}, {}, False),
             ("linux", {}, {}, False),
         ],
