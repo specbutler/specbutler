@@ -149,6 +149,8 @@ class _Runner:
         timeout: float,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(argv)
+        if Path(argv[0]).name in {"claude", "codex"} and argv[1:] == ["--version"]:
+            return subprocess.CompletedProcess(argv, 0, "vendor-cli 1.2.3\n", "")
         if Path(argv[0]).name == "gh":
             if argv[1:] == ["auth", "status"]:
                 if self.gh_auth_ok:
@@ -208,6 +210,65 @@ class _Runner:
 
 def _checks_by_name(report: doctor.DoctorReport) -> dict[str, doctor.DoctorCheck]:
     return {check.name: check for check in report.checks}
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable fixture")
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+@pytest.mark.parametrize(
+    ("output", "token"),
+    [("2.1.296 (Claude Code)", "2.1.296"), ("codex-cli 0.156.1", "0.156.1"),
+     ("development build", None)],
+)
+def test_agent_version_preserves_first_line(tmp_path, monkeypatch, agent, output, token):
+    binary = tmp_path / agent
+    binary.write_text(f"#!{sys.executable}\nprint({output!r})\nprint('ignored second line')\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    path = doctor.shutil.which(agent)
+    assert path == str(binary)
+    check = doctor._agent_version_check(agent, path, tmp_path, doctor._run_command, required=True)
+    assert check.status == "ok"
+    assert f"{path}: {output}" in check.detail
+    assert "ignored second line" not in check.detail
+    assert (f"version={token}" in check.detail) if token else "version=" not in check.detail
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable fixture")
+@pytest.mark.parametrize("required", [False, True])
+@pytest.mark.parametrize("failure", ["exit", "timeout", "empty"])
+def test_agent_version_failures(tmp_path, monkeypatch, required, failure):
+    binary = tmp_path / "codex"
+    body = {
+        "exit": "import sys\nprint('version unavailable', file=sys.stderr)\nsys.exit(3)",
+        "timeout": "import time\ntime.sleep(20)",
+        "empty": "pass",
+    }[failure]
+    binary.write_text(f"#!{sys.executable}\n{body}\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    check = doctor._agent_version_check(
+        "codex", doctor.shutil.which("codex"), tmp_path, doctor._run_command, required=required,
+    )
+    assert check.status == ("error" if required else "warning")
+    assert str(binary) in check.detail
+    expected = {"exit": "version unavailable", "timeout": "timed out after 10s",
+                "empty": "no version output"}[failure]
+    assert expected in check.detail
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+@pytest.mark.parametrize("default", ["claude", "codex"])
+def test_missing_agent_on_isolated_path(tmp_path, monkeypatch, agent, default):
+    repo = _make_repo(tmp_path, _config_text(default_agent=default, allowed_agents=(agent,)))
+    config = load_repo_spec_runtime_config(repo)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    runner = _Runner()
+    checks = doctor._agent_checks(repo, config, doctor.shutil.which, runner)
+    assert not any(check.name.startswith("agent version (") for check in checks)
+    assert runner.calls == []
+    check = next(check for check in checks if check.name == f"agent binary ({agent})")
+    assert check.status == ("error" if agent == default else "warning")
+    assert "not found on PATH" in check.detail
 
 
 def test_windows_command_checks_enumerate_bootstrap_hooks_and_all_gates(

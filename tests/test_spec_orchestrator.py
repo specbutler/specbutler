@@ -2537,6 +2537,8 @@ class TestPhaseImplementHandshake:
             patch.object(orch, "_run_implement_setup_command", side_effect=fake_run_setup_command),
             patch.object(orch, "_run_implement_teardown_command", side_effect=fake_run_teardown_command),
             patch.object(orch, "_register_setup_manifest_processes") as register_setup_processes,
+            # This test exercises setup propagation, not the host sandbox probe.
+            patch.object(orch, "_agent_git_launch_preflight_error", return_value=""),
             patch.object(orch, "_write_sandbox_config") as write_sandbox_config,
             patch.object(orch, "_build_agent_command", return_value=["agent"]) as build_cmd,
             patch.object(orch, "_claude_supports_stream_json", return_value=False),
