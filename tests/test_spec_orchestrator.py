@@ -20719,16 +20719,20 @@ class TestLocalReviewPhase:
         )
 
     @pytest.mark.parametrize(
-        ("review_agent", "summary", "allowed", "host_ok", "expected"),
+        ("review_agent", "summary", "allowed", "host_ok", "on_path", "restricted_ok", "expected"),
         [
-            ("codex", "Local Codex reviewer timed out after 450s. Diagnostics …", ("claude", "codex"), True, "claude"),
-            ("codex", "Local Codex reviewer timed out after 450s.", ("codex",), True, ""),
-            ("codex", "Local Codex reviewer timed out after 450s.", ("claude", "codex"), False, ""),
-            ("codex", "Missing review output artifact.", ("claude", "codex"), True, ""),
-            ("claude", "Local Claude reviewer timed out after 900s.", ("claude", "codex"), True, ""),
+            ("codex", "Local Codex reviewer timed out after 450s. Diagnostics …", ("claude", "codex"), True, True, True, "claude"),
+            ("codex", "Local Codex reviewer timed out after 450s.", ("codex",), True, True, True, ""),
+            ("codex", "Local Codex reviewer timed out after 450s.", ("claude", "codex"), False, True, True, ""),
+            ("codex", "Local Codex reviewer timed out after 450s.", ("claude", "codex"), True, False, True, ""),
+            ("codex", "Local Codex reviewer timed out after 450s.", ("claude", "codex"), True, True, False, ""),
+            ("codex", "Missing review output artifact.", ("claude", "codex"), True, True, True, ""),
+            ("claude", "Local Claude reviewer timed out after 900s.", ("claude", "codex"), True, True, True, ""),
         ],
     )
-    def test_review_stall_fallback_agent(self, review_agent, summary, allowed, host_ok, expected):
+    def test_review_stall_fallback_agent(
+        self, repo: Path, review_agent, summary, allowed, host_ok, on_path, restricted_ok, expected
+    ):
         run = self._make_run()
         run.review_agent = review_agent
         result = orch.ReviewResult(status="failed", summary=summary)
@@ -20738,6 +20742,17 @@ class TestLocalReviewPhase:
                 raise orch.HostAgentUnavailableError(agent)
 
         with (
+            patch.object(orch.shutil, "which", return_value="/usr/local/bin/claude" if on_path else None),
+            patch.object(
+                orch,
+                "run_subprocess",
+                return_value=subprocess.CompletedProcess(["claude", "--help"], 0, "help", ""),
+            ),
+            patch.object(
+                orch,
+                "claude_restricted_mode_unavailability_reason",
+                return_value="" if restricted_ok else "restricted mode unavailable",
+            ),
             patch.object(
                 orch,
                 "SPEC_RUNTIME_CONFIG",
@@ -20748,7 +20763,7 @@ class TestLocalReviewPhase:
             ),
             patch.object(orch, "require_host_agent_available", side_effect=host_check),
         ):
-            assert orch._review_stall_fallback_agent(run, result) == expected
+            assert orch._review_stall_fallback_agent(run, result, repo) == expected
 
     def test_hung_process_snapshot_ignores_missing_pid(self):
         assert orch._hung_process_snapshot(0) == ""

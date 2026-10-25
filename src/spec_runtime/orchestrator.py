@@ -12987,11 +12987,17 @@ def _configured_review_agent_default() -> str:
     return str(SPEC_RUNTIME_CONFIG.agents.review_default or "").strip()
 
 
-def _review_stall_fallback_agent(run: RunState, review_result: ReviewResult) -> str:
+def _review_stall_fallback_agent(
+    run: RunState,
+    review_result: ReviewResult,
+    repo_root: Path,
+) -> str:
     """Return the reviewer to use after the configured one stalled, or "".
 
     Only a Codex review that timed out on both its attempts falls back, and
-    only to an allowed Claude CLI that is available on this host.
+    only to an allowed Claude CLI that passes the same launch checks the
+    review phase applies to its primary reviewer (host availability, PATH,
+    restricted-mode support). Otherwise the timeout result stands.
     """
     if _effective_review_agent(run) != "codex":
         return ""
@@ -13002,6 +13008,17 @@ def _review_stall_fallback_agent(run: RunState, review_result: ReviewResult) -> 
     try:
         require_host_agent_available("claude")
     except Exception:  # noqa: BLE001 - fallback is best effort
+        return ""
+    if not shutil.which("claude"):
+        return ""
+    try:
+        help_result = run_subprocess(["claude", "--help"], cwd=repo_root, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    help_text = (
+        f"{help_result.stdout}\n{help_result.stderr}" if help_result.returncode == 0 else ""
+    )
+    if claude_restricted_mode_unavailability_reason(help_text):
         return ""
     return "claude"
 
@@ -23653,7 +23670,7 @@ def _phase_review_local(
             expected_head_sha=expected_head_sha,
             expected_base_sha=expected_base_sha,
         )
-        fallback_agent = _review_stall_fallback_agent(run, review_result)
+        fallback_agent = _review_stall_fallback_agent(run, review_result, repo_root)
         if fallback_agent:
             _emit_user_progress(
                 f"[spec] {run.spec_id}: {_effective_review_agent(run)} reviewer stalled twice; "
