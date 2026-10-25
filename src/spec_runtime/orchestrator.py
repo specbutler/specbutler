@@ -23496,6 +23496,12 @@ def _run_local_review(
                         f"[spec] {run.spec_id}: {review_agent} reviewer produced no result in "
                         f"{attempt_timeout}s; retrying once with a fresh provider home"
                     )
+                    # The stalled process may have written partial output;
+                    # the retry must be judged only on its own result.
+                    for artifact_key in ("raw_review", "raw_review_partial"):
+                        stale_artifact = artifact_paths.get(artifact_key)
+                        if stale_artifact is not None:
+                            stale_artifact.unlink(missing_ok=True)
                     if review_codex_home is not None and codex_auth_root is not None:
                         _remove_codex_isolated_auth(codex_auth_root)
                         review_codex_home = _write_codex_isolated_home(

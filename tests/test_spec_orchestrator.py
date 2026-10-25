@@ -20662,8 +20662,24 @@ class TestLocalReviewPhase:
         def mock_review_exec(repo_root, cmd, *, cwd, env, timeout, artifact_paths=None, input_text=None):  # noqa: ARG001
             timeouts.append(timeout)
             outcome = outcomes[len(timeouts) - 1]
+            output_path = Path(cmd[cmd.index("-o") + 1])
+            if outcome == "stall-after-writing":
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "decision": "approved",
+                            "summary": "stale",
+                            "reviewed_head_sha": "a" * 40,
+                            "reviewed_base_sha": "b" * 40,
+                            "findings": [],
+                        }
+                    )
+                )
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=0.01)
             if outcome == "stall":
                 raise subprocess.TimeoutExpired(cmd=cmd, timeout=0.01)
+            if outcome == "exit-without-output":
+                return subprocess.CompletedProcess(cmd, 0, "", "")
             Path(cmd[cmd.index("-o") + 1]).write_text(
                 json.dumps(
                     {
@@ -20717,6 +20733,17 @@ class TestLocalReviewPhase:
             f"Local Codex reviewer timed out after {orch.CODEX_REVIEW_STALL_RETRY_TIMEOUT_SECONDS}s."
             in review_result.summary
         )
+
+    def test_codex_review_retry_ignores_output_left_by_the_stalled_attempt(
+        self, repo: Path, tmp_path: Path
+    ):
+        review_result, timeouts, _ = self._codex_stall_review(
+            repo, tmp_path, ["stall-after-writing", "exit-without-output"]
+        )
+
+        assert len(timeouts) == 2
+        assert review_result.status == "failed"
+        assert "stale" not in review_result.summary
 
     @pytest.mark.parametrize(
         ("review_agent", "summary", "allowed", "host_ok", "on_path", "restricted_ok", "expected"),
