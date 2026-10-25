@@ -1130,6 +1130,57 @@ class TestRetryFailurePackageStaleReview:
         assert package.review_feedback_active is False
         assert package.mergeability_issue == "Pull request has merge conflict with base branch"
 
+    def test_required_check_failure_includes_host_fetched_ci_log_lines(self, repo: Path):
+        run = self._make_run()
+        run.last_error = (
+            "Required checks failing: ci "
+            "(https://github.com/o/r/actions/runs/40008555849/job/120610045218)"
+        )
+        log = "\n".join(
+            [
+                "windows-probe (3.12, wheel)\tRun tests\t2026-10-23T19:08:09.0611587Z collected 16 items",
+                "windows-probe (3.12, wheel)\tRun tests\t2026-10-23T19:08:12.5219747Z "
+                "E       AssertionError: [ok] local filesystem: C:\\ is a fixed NTFS volume",
+                "windows-probe (3.12, wheel)\tRun tests\t2026-10-23T19:08:12.5336572Z "
+                "FAILED tests/test_windows_probe.py::test_spec_init_output_is_accepted_by_doctor",
+                "ci\tAggregate\t2026-10-23T19:20:00.0000000Z ##[error]Process completed with exit code 1.",
+            ]
+        )
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout=log, stderr="")
+
+        with (
+            patch.object(orch, "_trusted_publication_repo_slug", return_value="o/r"),
+            patch.object(orch, "run_subprocess", side_effect=fake_run),
+        ):
+            package = orch._build_retry_failure_package(run, repo)
+
+        assert ["gh", "run", "view", "40008555849", "--repo", "o/r", "--log-failed"] in calls
+        excerpt = "\n".join(package.gate_output_parts)
+        assert "windows-probe (3.12, wheel)" in excerpt
+        assert "FAILED tests/test_windows_probe.py::test_spec_init_output_is_accepted_by_doctor" in excerpt
+        assert "AssertionError: [ok] local filesystem" in excerpt
+        assert "collected 16 items" not in excerpt
+        assert package.active_gates_or_checks[0].startswith("required check: ci")
+
+    def test_required_check_failure_excerpt_is_best_effort(self, repo: Path):
+        run = self._make_run()
+        run.last_error = "Required checks failing: ci (https://github.com/o/r/actions/runs/1/job/2)"
+        with (
+            patch.object(orch, "_trusted_publication_repo_slug", return_value="o/r"),
+            patch.object(
+                orch,
+                "run_subprocess",
+                return_value=subprocess.CompletedProcess(["gh"], 1, stdout="", stderr="HTTP 404"),
+            ),
+        ):
+            package = orch._build_retry_failure_package(run, repo)
+        assert package.gate_output_parts == []
+        assert run.last_error in package.summary_parts
+
     def test_rescue_snapshot_surfaced_in_failure_package(self, repo: Path):
         run = self._make_run()
         backend = eb.CloneExecutionBackend(
