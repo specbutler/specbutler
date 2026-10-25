@@ -11071,6 +11071,71 @@ def _rescue_snapshot_fields(run: RunState, repo_root: Path) -> tuple[str, str]:
     return path, ", ".join(parts)
 
 
+_CI_LOG_SIGNAL_RE = re.compile(
+    r"(FAILED |^E\s|Error|error:|##\[error\]|AssertionError|Traceback|\d+ failed|failed, )"
+)
+_CI_LOG_TIMESTAMP_RE = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z ")
+CI_FAILURE_EXCERPT_MAX_LINES_PER_JOB = 25
+CI_FAILURE_EXCERPT_MAX_CHARS = 8000
+
+
+def _required_check_failure_excerpts(run: RunState, repo_root: Path, error: str) -> list[str]:
+    """Fetch failing CI job logs on the host so a retry sees what actually broke.
+
+    Implementation agents never hold forge credentials, so a bare check name
+    and link ("Required checks failing: ci (<url>)") gives them nothing to
+    act on. For each failing check that links to a GitHub Actions job, read
+    the whole workflow run's failed-job logs (aggregate checks such as ``ci``
+    only report that other jobs failed) and keep the failure lines.
+    """
+    try:
+        slug = _trusted_publication_repo_slug(run)
+    except Exception:  # noqa: BLE001 - excerpts are best effort
+        return []
+    if not slug:
+        return []
+    run_ids: list[str] = []
+    for label in _required_checks_from_error(error):
+        _, link = _split_check_label(label)
+        match = re.search(r"/actions/runs/(\d+)", link or "")
+        if match and match.group(1) not in run_ids:
+            run_ids.append(match.group(1))
+    excerpts: list[str] = []
+    budget = CI_FAILURE_EXCERPT_MAX_CHARS
+    for run_id in run_ids:
+        try:
+            result = run_subprocess(
+                ["gh", "run", "view", run_id, "--repo", slug, "--log-failed"],
+                cwd=repo_root,
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode != 0 or not result.stdout:
+            continue
+        per_job: dict[str, list[str]] = {}
+        for raw in str(result.stdout).splitlines():
+            job, _, rest = raw.partition("\t")
+            _, _, line = rest.partition("\t")
+            line = _CI_LOG_TIMESTAMP_RE.sub("", line or rest).rstrip()
+            if line and _CI_LOG_SIGNAL_RE.search(line):
+                per_job.setdefault(job.strip() or "job", []).append(line)
+        for job, lines in per_job.items():
+            body = "\n".join(dict.fromkeys(lines[-CI_FAILURE_EXCERPT_MAX_LINES_PER_JOB:]))
+            text = redact_sensitive(
+                f"CI job '{job}' failure lines (host-fetched from GitHub Actions run {run_id}):\n{body}"
+            )
+            if len(text) > budget:
+                text = text[:budget]
+            if not text:
+                break
+            excerpts.append(text)
+            budget -= len(text)
+            if budget <= 0:
+                return excerpts
+    return excerpts
+
+
 def _build_retry_failure_package(run: RunState, repo_root: Path) -> RetryFailurePackage:
     package = RetryFailurePackage(
         run_id=run.run_id,
@@ -11149,6 +11214,9 @@ def _build_retry_failure_package(run: RunState, repo_root: Path) -> RetryFailure
         )
         if run.last_error:
             package.summary_parts.append(run.last_error)
+            package.gate_output_parts.extend(
+                _required_check_failure_excerpts(run, repo_root, run.last_error)
+            )
 
     review_attempt_number = package.previous_implement_attempt_number
     review_result, review_result_path = _load_review_result_for_attempt_or_legacy_latest(
