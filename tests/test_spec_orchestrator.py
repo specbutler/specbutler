@@ -20637,6 +20637,122 @@ class TestLocalReviewPhase:
         assert not observed_scratch[0].exists()
         assert "[spec] my-feature: review running with codex for PR #42" in capsys.readouterr().err
 
+    def _codex_stall_review(self, repo: Path, tmp_path: Path, outcomes: list[str]):
+        run = self._make_run()
+        run.agent = "claude"
+        run.review_agent = "codex"
+        schema_dir = repo / ".github" / "schemas"
+        schema_dir.mkdir(parents=True, exist_ok=True)
+        (schema_dir / "codex-review.schema.json").write_text("{}\n")
+        review_worktree = tmp_path / "review"
+        review_worktree.mkdir(exist_ok=True)
+        homes_written: list[Path] = []
+        timeouts: list[int] = []
+
+        def fake_write_codex_home(root: Path, **kwargs) -> Path:  # noqa: ARG001
+            home = root / ".spec-codex-home"
+            home.mkdir(parents=True, exist_ok=True)
+            homes_written.append(home)
+            return home
+
+        @contextmanager
+        def fake_review_worktree(repo_root: Path, *, head_sha: str, branch=None):  # noqa: ARG001
+            yield review_worktree
+
+        def mock_review_exec(repo_root, cmd, *, cwd, env, timeout, artifact_paths=None, input_text=None):  # noqa: ARG001
+            timeouts.append(timeout)
+            outcome = outcomes[len(timeouts) - 1]
+            if outcome == "stall":
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=0.01)
+            Path(cmd[cmd.index("-o") + 1]).write_text(
+                json.dumps(
+                    {
+                        "decision": "approved",
+                        "summary": "Looks good.",
+                        "reviewed_head_sha": "a" * 40,
+                        "reviewed_base_sha": "b" * 40,
+                        "findings": [],
+                    }
+                )
+            )
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with (
+            patch.object(orch, "_run_local_review_subprocess", side_effect=mock_review_exec),
+            patch.object(orch, "_render_local_review_prompt", return_value="prompt"),
+            patch.object(orch, "_temporary_review_worktree", side_effect=fake_review_worktree),
+            patch.object(orch, "_write_codex_isolated_home", side_effect=fake_write_codex_home),
+            patch.object(orch, "_remove_codex_isolated_auth"),
+        ):
+            review_result, _ = orch._run_local_review(
+                run,
+                repo,
+                repo_name="acme/repo",
+                pr_number=42,
+                pr_body="## Review\nReview-Owner: local\n",
+                expected_head_sha="a" * 40,
+                expected_base_sha="b" * 40,
+            )
+        return review_result, timeouts, homes_written
+
+    def test_codex_review_stall_retries_once_with_a_fresh_provider_home(
+        self, repo: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ):
+        review_result, timeouts, homes = self._codex_stall_review(repo, tmp_path, ["stall", "ok"])
+
+        assert review_result.status == "approved"
+        assert timeouts == [orch.REVIEW_TIMEOUT_SECONDS, orch.CODEX_REVIEW_STALL_RETRY_TIMEOUT_SECONDS]
+        assert len(homes) == 2
+        assert "retrying once with a fresh provider home" in capsys.readouterr().err
+
+    def test_codex_review_stalling_twice_reports_the_configured_timeout(
+        self, repo: Path, tmp_path: Path
+    ):
+        review_result, timeouts, _ = self._codex_stall_review(repo, tmp_path, ["stall", "stall"])
+
+        assert len(timeouts) == 2
+        assert review_result.status == "failed"
+        # Not the remaining budget carried by TimeoutExpired ("after 0s").
+        assert (
+            f"Local Codex reviewer timed out after {orch.CODEX_REVIEW_STALL_RETRY_TIMEOUT_SECONDS}s."
+            in review_result.summary
+        )
+
+    @pytest.mark.parametrize(
+        ("review_agent", "summary", "allowed", "host_ok", "expected"),
+        [
+            ("codex", "Local Codex reviewer timed out after 450s. Diagnostics …", ("claude", "codex"), True, "claude"),
+            ("codex", "Local Codex reviewer timed out after 450s.", ("codex",), True, ""),
+            ("codex", "Local Codex reviewer timed out after 450s.", ("claude", "codex"), False, ""),
+            ("codex", "Missing review output artifact.", ("claude", "codex"), True, ""),
+            ("claude", "Local Claude reviewer timed out after 900s.", ("claude", "codex"), True, ""),
+        ],
+    )
+    def test_review_stall_fallback_agent(self, review_agent, summary, allowed, host_ok, expected):
+        run = self._make_run()
+        run.review_agent = review_agent
+        result = orch.ReviewResult(status="failed", summary=summary)
+
+        def host_check(agent: str) -> None:
+            if not host_ok:
+                raise orch.HostAgentUnavailableError(agent)
+
+        with (
+            patch.object(
+                orch,
+                "SPEC_RUNTIME_CONFIG",
+                replace(
+                    orch.SPEC_RUNTIME_CONFIG,
+                    agents=replace(orch.SPEC_RUNTIME_CONFIG.agents, allowed=tuple(allowed)),
+                ),
+            ),
+            patch.object(orch, "require_host_agent_available", side_effect=host_check),
+        ):
+            assert orch._review_stall_fallback_agent(run, result) == expected
+
+    def test_hung_process_snapshot_ignores_missing_pid(self):
+        assert orch._hung_process_snapshot(0) == ""
+
     def test_run_local_review_timeout_preserves_partial_output(
         self,
         repo: Path,

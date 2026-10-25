@@ -341,6 +341,9 @@ REVIEW_GATE_ARTIFACT_NAME = review_feedback.REVIEW_GATE_ARTIFACT_NAME
 REVIEW_GATE_ARTIFACT_FILE = review_feedback.REVIEW_GATE_ARTIFACT_FILE
 REVIEW_POLL_INTERVAL_SECONDS = 10
 REVIEW_TIMEOUT_SECONDS = 900
+# A Codex review that stalls with no output is retried once with a fresh
+# provider home before the phase gives up (and may fall back to Claude).
+CODEX_REVIEW_STALL_RETRY_TIMEOUT_SECONDS = max(60, REVIEW_TIMEOUT_SECONDS // 2)
 LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT = "high"
 LOCAL_REVIEW_REASONING_EFFORT = "low"
 LOCAL_REVIEW_TIMEOUT_STDIO_MAX_LINES = 40
@@ -5125,6 +5128,37 @@ def run_subprocess(
             continue
 
 
+def _hung_process_snapshot(pid: int) -> str:
+    """Best-effort stack and open-file snapshot of a stalled reviewer process.
+
+    Captured before the process tree is terminated so the next stall can be
+    diagnosed from the run artifacts instead of a bare "no output" timeout.
+    """
+    if pid <= 0:
+        return ""
+    commands: list[list[str]] = []
+    if sys.platform == "darwin":
+        commands = [["sample", str(pid), "2"], ["lsof", "-nP", "-p", str(pid)]]
+    elif sys.platform.startswith("linux"):
+        commands = [
+            ["cat", f"/proc/{pid}/wchan"],
+            ["cat", f"/proc/{pid}/status"],
+            ["ls", "-l", f"/proc/{pid}/fd"],
+        ]
+    parts: list[str] = []
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, timeout=20, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            parts.append(f"$ {' '.join(command)}\n<unavailable: {exc}>")
+            continue
+        output = (completed.stdout or completed.stderr or "").strip().splitlines()
+        parts.append(f"$ {' '.join(command)}\n" + "\n".join(output[:120]))
+    return redact_sensitive("\n\n".join(parts))
+
+
 def _run_local_review_subprocess(
     repo_root: Path,
     cmd: list[str],
@@ -5249,6 +5283,7 @@ def _run_local_review_subprocess(
                     "timed_out": True,
                     "timeout_detected_at": _now_iso(),
                     "timeout_seconds": timeout,
+                    "process_snapshot": _hung_process_snapshot(pid),
                     "stderr_tail": _sanitize_gate_stream(
                         _coerce_subprocess_stream_text(getattr(exc, "stderr", None)),
                         max_lines=LOCAL_REVIEW_TIMEOUT_STDIO_MAX_LINES,
@@ -12952,6 +12987,25 @@ def _configured_review_agent_default() -> str:
     return str(SPEC_RUNTIME_CONFIG.agents.review_default or "").strip()
 
 
+def _review_stall_fallback_agent(run: RunState, review_result: ReviewResult) -> str:
+    """Return the reviewer to use after the configured one stalled, or "".
+
+    Only a Codex review that timed out on both its attempts falls back, and
+    only to an allowed Claude CLI that is available on this host.
+    """
+    if _effective_review_agent(run) != "codex":
+        return ""
+    if "reviewer timed out after" not in str(review_result.summary or ""):
+        return ""
+    if "claude" not in tuple(SPEC_RUNTIME_CONFIG.agents.allowed or ()):
+        return ""
+    try:
+        require_host_agent_available("claude")
+    except Exception:  # noqa: BLE001 - fallback is best effort
+        return ""
+    return "claude"
+
+
 def _effective_review_agent(run: RunState) -> str:
     explicit = str(run.review_agent or "").strip()
     if explicit:
@@ -13381,6 +13435,7 @@ def _summarize_local_review_timeout(
     cmd: list[str],
     cwd: Path,
     timeout_exc: subprocess.TimeoutExpired,
+    timeout_seconds: int | None = None,
 ) -> str:
     debug_path, partial_path = _write_local_review_timeout_diagnostics(
         repo_root,
@@ -13390,7 +13445,9 @@ def _summarize_local_review_timeout(
         cwd=cwd,
         timeout_exc=timeout_exc,
     )
-    timeout_seconds = timeout_exc.timeout
+    # ``TimeoutExpired.timeout`` can carry the remaining budget rather than
+    # the configured limit (reported as "timed out after 0s"), so prefer the
+    # timeout the caller actually applied.
     if timeout_seconds is None:
         timeout_seconds = REVIEW_TIMEOUT_SECONDS
     summary = (
@@ -23229,11 +23286,12 @@ def _run_local_review(
     pr_body: str,
     expected_head_sha: str,
     expected_base_sha: str,
+    review_agent_override: str = "",
 ) -> tuple[ReviewResult, Path]:
     _normalize_logger_state()
     artifact_paths = _local_review_artifact_paths(repo_root, run.run_id)
     _clear_local_review_artifacts(artifact_paths)
-    review_agent = _effective_review_agent(run)
+    review_agent = review_agent_override or _effective_review_agent(run)
     require_host_agent_available(review_agent)
     reasoning_effort = (
         LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT if run.review_changes == 0 else LOCAL_REVIEW_REASONING_EFFORT
@@ -23393,16 +23451,42 @@ def _run_local_review(
         review_process_cwd = (
             review_scratch_dir if agent.name == "codex" else review_worktree
         )
+        review_timeouts: tuple[int, ...] = (
+            (REVIEW_TIMEOUT_SECONDS, CODEX_REVIEW_STALL_RETRY_TIMEOUT_SECONDS)
+            if agent.name == "codex"
+            else (REVIEW_TIMEOUT_SECONDS,)
+        )
         try:
-            review_exec = _run_local_review_subprocess(
-                repo_root,
-                review_cmd,
-                cwd=review_process_cwd,
-                env=review_env,
-                timeout=REVIEW_TIMEOUT_SECONDS,
-                artifact_paths=artifact_paths,
-                input_text=prompt,
-            )
+            for attempt_index, attempt_timeout in enumerate(review_timeouts):
+                try:
+                    review_exec = _run_local_review_subprocess(
+                        repo_root,
+                        review_cmd,
+                        cwd=review_process_cwd,
+                        env=review_env,
+                        timeout=attempt_timeout,
+                        artifact_paths=artifact_paths,
+                        input_text=prompt,
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    if attempt_index + 1 >= len(review_timeouts):
+                        raise
+                    # Silent Codex stalls have not reproduced in isolation;
+                    # the stalled process snapshot is in the diagnostics.
+                    # Retry once with a fresh isolated provider home.
+                    _emit_user_progress(
+                        f"[spec] {run.spec_id}: {review_agent} reviewer produced no result in "
+                        f"{attempt_timeout}s; retrying once with a fresh provider home"
+                    )
+                    if review_codex_home is not None and codex_auth_root is not None:
+                        _remove_codex_isolated_auth(codex_auth_root)
+                        review_codex_home = _write_codex_isolated_home(
+                            codex_auth_root,
+                            mcp_servers={},
+                            copy_auth=None,
+                        )
+                        review_env = _subprocess_env_with_codex_home(review_env, review_codex_home)
         except subprocess.TimeoutExpired as exc:
             review_exec_failed_summary = _summarize_local_review_timeout(
                 repo_root,
@@ -23411,6 +23495,7 @@ def _run_local_review(
                 cmd=review_cmd,
                 cwd=review_process_cwd,
                 timeout_exc=exc,
+                timeout_seconds=review_timeouts[-1],
             )
         except FileNotFoundError as exc:
             review_exec_failed_summary = f"Review agent CLI not found: {exc}"
@@ -23568,6 +23653,28 @@ def _phase_review_local(
             expected_head_sha=expected_head_sha,
             expected_base_sha=expected_base_sha,
         )
+        fallback_agent = _review_stall_fallback_agent(run, review_result)
+        if fallback_agent:
+            _emit_user_progress(
+                f"[spec] {run.spec_id}: {_effective_review_agent(run)} reviewer stalled twice; "
+                f"falling back to the {fallback_agent} reviewer for this round"
+            )
+            logger.warning(
+                "Local %s review stalled twice for %s; falling back to %s",
+                _effective_review_agent(run),
+                run.run_id,
+                fallback_agent,
+            )
+            review_result, review_result_path = _run_local_review(
+                run,
+                repo_root,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                pr_body=str(pr_data.get("body", "")),
+                expected_head_sha=expected_head_sha,
+                expected_base_sha=expected_base_sha,
+                review_agent_override=fallback_agent,
+            )
     except ValueError as exc:
         run.last_error = str(exc)
         return "failed"
