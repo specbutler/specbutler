@@ -1237,6 +1237,7 @@ def test_old_run_lease_can_be_validated_for_adoption() -> None:
     assert outcome.decision is AdoptionDecision.LEASE_EXPIRED
 
 
+@pytest.mark.requires_ps
 def test_fetch_timeout_kills_whole_process_group(tmp_path):
     """A hung transport child must die with the fetch, not become orphaned."""
     import time as _time

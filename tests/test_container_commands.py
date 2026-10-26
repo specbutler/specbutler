@@ -1587,6 +1587,7 @@ dockerfile = ".spec/worker.Dockerfile"
     assert dockerfile.read_text() == "custom\n"
 
 
+@pytest.mark.requires_ps
 def test_container_init_installs_only_configured_agents(tmp_path: Path) -> None:
     (tmp_path / ".spec.toml").write_text(
         """
@@ -1609,6 +1610,7 @@ dockerfile = ".spec/worker.Dockerfile"
     assert "@anthropic-ai/claude-code" not in dockerfile_text
 
 
+@pytest.mark.requires_ps
 def test_container_init_reserves_build_ssh_for_project_dependencies(tmp_path: Path) -> None:
     (tmp_path / ".spec.toml").write_text(
         """
@@ -1635,6 +1637,7 @@ build_ssh = "default"
     assert "git+ssh://" not in dockerfile_text
 
 
+@pytest.mark.requires_ps
 def test_container_init_can_skip_agent_installs(tmp_path: Path) -> None:
     (tmp_path / ".spec.toml").write_text(
         """
@@ -1812,6 +1815,7 @@ def test_smoke_no_bootstrap_clears_backend_bootstrap_commands(tmp_path: Path) ->
     assert run_smoke.call_args.kwargs["run_bootstrap"] is False
 
 
+@pytest.mark.requires_ps
 def test_smoke_invokes_backend_and_cleans_up() -> None:
     backend = FakeBackend()
     config = _config(
@@ -1881,6 +1885,7 @@ def test_smoke_rejects_worker_spec_version_drift(capsys: pytest.CaptureFixture[s
     assert "spec version mismatch" in capsys.readouterr().err
 
 
+@pytest.mark.requires_ps
 def test_smoke_rejects_same_version_from_different_source(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1976,6 +1981,7 @@ def test_autopilot_container_backend_error_points_to_doctor() -> None:
     assert "spec container doctor" in message
 
 
+@pytest.mark.requires_ps
 def test_worker_dockerfile_spec_install_layer_cache_busts_on_version() -> None:
     """The pip layer must reference SPEC_BUTLER_VERSION so
     Docker's layer cache keys on the host spec version."""
@@ -1992,6 +1998,7 @@ def test_worker_dockerfile_spec_install_layer_cache_busts_on_version() -> None:
         assert rendered.index("specbutler @ git+", run_start) == install_pos
 
 
+@pytest.mark.requires_ps
 def test_worker_dockerfile_can_pin_detected_agent_cli_versions() -> None:
     rendered = container.render_worker_dockerfile(
         ("claude", "codex"),

@@ -162,6 +162,7 @@ class TestDispatchSkipsInvalidGraph:
         assert not spec_ids & {"ghost-dep", "cycle-a", "cycle-b"}
 
 
+    @pytest.mark.requires_ps
     def test_run_loop_logs_skip_reason(self, repo: Path, monkeypatch, capsys):
         _write_invalid_graph(repo)
         args = argparse.Namespace(

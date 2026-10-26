@@ -65,6 +65,7 @@ def test_live_launch_is_occupied_before_ready(tmp_path):
     assert read_supervision_token(tmp_path) is None
 
 
+@pytest.mark.requires_ps
 def test_payload_does_not_recover_own_launch(tmp_path):
     from spec_runtime.process_supervisor import inspect_process
 

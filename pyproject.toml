@@ -82,6 +82,7 @@ markers = [
   "linux_claude_real_provider: opt-in Linux web chat proof using an authenticated real Claude provider",
   "linux_codex_real_provider: opt-in Linux web chat proof using an authenticated real Codex provider",
   "windows_real_provider: opt-in Windows 11 lab proof using real Codex and a disposable GitHub repository",
+  "requires_ps: needs a working ps; skipped with the probe error when ps cannot run (for example in a sandbox)",
 ]
 
 [tool.ruff]

@@ -1226,6 +1226,7 @@ def test_external_evidence_import_requires_one_exact_revision_bundle(tmp_path: P
     assert not (secret_destination / "linux-claude-web-result.json").exists()
 
 
+@pytest.mark.requires_ps
 def test_windows_runtime_timeout_probe_kills_a_real_tree(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence"
     subprocess.run(
