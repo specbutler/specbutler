@@ -1553,6 +1553,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_input.add_argument("--spec", required=True, help="Spec ID")
     p_input.add_argument("--agent", default=None, help="Agent: claude|codex")
+    p_input.add_argument(
+        "--accept",
+        action="store_true",
+        help="Review round cap: accept the change as-is (findings become follow-ups)",
+    )
+    p_input.add_argument(
+        "--message",
+        default="",
+        help="Review round cap: guidance for one more implement and review round",
+    )
 
     p_steer = subparsers.add_parser(
         "steer",

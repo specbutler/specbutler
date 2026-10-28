@@ -121,6 +121,10 @@ cap = 20                        # max retries across verify/review/merge failure
 no_progress_retry_threshold = 2 # consecutive no-progress retries before giving up
 infra_retry_attempts = 2        # in-place reruns after a transient infrastructure failure
 
+[review]
+max_rounds = 3                  # request_changes rounds before the run waits for operator input
+rereview_reasoning_effort = ""  # empty keeps the first review's reasoning effort
+
 [agents]
 default = "claude"
 review_default = "codex"

@@ -39,6 +39,20 @@ cap = 20
 # makes no progress).
 no_progress_retry_threshold = 2
 
+# ---------------------------------------------------------------------------
+# Local review convergence
+# ---------------------------------------------------------------------------
+[review]
+
+# Review rounds one run may spend. The max_rounds-th "request changes" moves the
+# run to waiting-for-input (resolve with `spec input`: accept as-is, or send one
+# more implement round with guidance) instead of starting another retry.
+max_rounds = 3
+
+# Reasoning effort for re-reviews. Empty keeps the first pass's effort.
+# One of: minimal, low, medium, high, xhigh.
+rereview_reasoning_effort = ""
+
 # Infrastructure failures (container image build or service startup, missing
 # toolchain, expired credentials, provider usage limits, push/PR-create
 # failures, CI or auto-merge wait timeouts) never consume `cap`. A transient
