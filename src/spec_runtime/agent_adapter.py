@@ -891,6 +891,10 @@ CODEX_AMBIENT_CAPABILITY_OVERRIDES = (
     "features.browser_use_external=false",
     "features.browser_use_full_cdp_access=false",
     "features.code_mode=false",
+    # Codex 0.164 still starts the V8 code-mode host for exec sessions unless
+    # it is disabled explicitly; in implement runs it deadlocked with the
+    # parent (both idle on semaphores for hours). Reviews already disable it.
+    "features.code_mode_host=false",
     "features.computer_use=false",
     "features.enable_mcp_apps=false",
     "features.hooks=false",
