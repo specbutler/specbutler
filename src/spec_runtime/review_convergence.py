@@ -125,7 +125,9 @@ def _write_ledger(run_dir: Path, rounds: list[ReviewRound], *, extra_rounds_gran
 
 
 def append_review_round(run_dir: Path, review_round: ReviewRound) -> Path:
-    rounds = load_review_rounds(run_dir)
+    # A re-run of the same round (same number) replaces the earlier record
+    # so one review round is never counted twice toward the cap.
+    rounds = [r for r in load_review_rounds(run_dir) if r.round_number != review_round.round_number]
     rounds.append(review_round)
     return _write_ledger(run_dir, rounds, extra_rounds_granted=load_extra_rounds_granted(run_dir))
 
@@ -201,7 +203,8 @@ def render_prior_findings_section(
         "these findings open. Classify EVERY one of them in `prior_findings` "
         "(by id) as `resolved` (the code now addresses it), `unresolved` (still "
         "present) or `withdrawn` (on reflection it was not a real defect). Do not "
-        "repeat a prior finding in `findings`; classify it instead.",
+        "repeat a prior finding in `findings`; classify it instead. Give every new "
+        "finding an id that differs from all prior finding ids listed here.",
         "",
     ]
     if not prior_findings:
@@ -275,7 +278,7 @@ def changed_line_ranges(unified_zero_diff: str) -> dict[str, list[tuple[int, int
 
 
 def finding_touches_ranges(finding: dict, ranges: dict[str, list[tuple[int, int]]]) -> bool:
-    file_path = str(finding.get("file", "") or "").strip().lstrip("./")
+    file_path = str(finding.get("file", "") or "").strip().removeprefix("./")
     spans = ranges.get(file_path)
     if not spans:
         return False

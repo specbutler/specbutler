@@ -390,6 +390,12 @@ def _parse_review_section(payload: object) -> ReviewConfig:
         return ReviewConfig()
     if not isinstance(payload, dict):
         raise SpecConfigError("[review] must be a table")
+    unknown = sorted(set(payload) - {"max_rounds", "rereview_reasoning_effort"})
+    if unknown:
+        raise SpecConfigError(
+            "Unknown [review] key(s): " + ", ".join(unknown)
+            + ". Allowed: max_rounds, rereview_reasoning_effort"
+        )
     max_rounds = payload.get("max_rounds", ReviewConfig.max_rounds)
     if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1:
         raise SpecConfigError("[review].max_rounds must be an integer >= 1")

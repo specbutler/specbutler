@@ -204,6 +204,71 @@ def test_rereview_new_p1_blocks_only_when_it_touches_changed_lines():
     assert new_p0.decision == "request_changes"
 
 
+def test_new_finding_reusing_a_resolved_prior_id_still_blocks():
+    computed = compute_review_decision(
+        model_decision="approved",
+        findings=[_finding("F1", "P0", file="src/other.py", line=3)],
+        prior_findings=[_finding("F1", "P1")],
+        prior_classifications=[{"id": "F1", "status": "resolved"}],
+        changed_ranges={},
+    )
+
+    assert computed.decision == "request_changes"
+    assert computed.blocking_ids == ["F1-new"]
+    (new,) = computed.outstanding_findings
+    assert new["id"] == "F1-new" and new["reported_id"] == "F1" and new["origin"] == "new"
+
+
+def test_new_finding_colliding_with_unresolved_prior_id_is_kept_when_it_differs():
+    prior = [_finding("F1", "P2")]
+    computed = compute_review_decision(
+        model_decision="approved",
+        findings=[_finding("F1", "P0", file="src/other.py"), _finding("F1", "P1", line=40)],
+        prior_findings=prior,
+        prior_classifications=[{"id": "F1", "status": "unresolved"}],
+        changed_ranges={"src/app.py": [(40, 40)]},
+    )
+
+    assert computed.decision == "request_changes"
+    assert [f["id"] for f in computed.outstanding_findings] == ["F1", "F1-new", "F1-new2"]
+    assert computed.blocking_ids == ["F1-new", "F1-new2"]
+
+
+def test_restated_unresolved_prior_finding_is_not_double_counted():
+    computed = compute_review_decision(
+        model_decision="request_changes",
+        findings=[_finding("F1", "P1")],
+        prior_findings=[_finding("F1", "P1")],
+        prior_classifications=[{"id": "F1", "status": "unresolved"}],
+        changed_ranges={},
+    )
+
+    assert computed.blocking_ids == ["F1"]
+    assert len(computed.outstanding_findings) == 1
+
+
+def test_prior_findings_prompt_asks_for_ids_distinct_from_prior_ones():
+    section = review_convergence.render_prior_findings_section(
+        [_finding("F1", "P1")], round_number=2, implementer_summary=""
+    )
+
+    assert "differs from all prior finding ids" in section
+
+
+@pytest.mark.parametrize("path", [".github/workflows/ci.yml", "./.github/workflows/ci.yml", ".spec.toml"])
+def test_new_p1_on_dot_prefixed_path_touching_changed_lines_blocks(path: str):
+    key = path.removeprefix("./")
+    computed = compute_review_decision(
+        model_decision="approved",
+        findings=[_finding("N1", "P1", file=path, line=5)],
+        prior_findings=[],
+        changed_ranges={key: [(4, 6)]},
+    )
+
+    assert computed.decision == "request_changes"
+    assert review_convergence.finding_touches_ranges({"file": path, "start_line": 5}, {key: [(5, 5)]})
+
+
 def _gate_evaluation(tmp_path: Path, *, decision: str, findings: list[dict], **extra) -> GateEvaluation:
     from spec_runtime.review_gate import evaluate_review_gate
 
@@ -234,7 +299,7 @@ def _gate_evaluation(tmp_path: Path, *, decision: str, findings: list[dict], **e
     )
 
 
-def test_model_decision_disagreement_is_logged_ignored_and_round_recorded(
+def test_model_decision_disagreement_is_logged_and_ignored(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ):
     run = _run()
@@ -258,9 +323,10 @@ def test_model_decision_disagreement_is_logged_ignored_and_round_recorded(
     assert result.result_payload["model_decision"] == "request_changes"
     assert result.exit_code == 0
     assert "Ignoring reviewer decision request_changes" in caplog.text
-    rounds = review_convergence.load_review_rounds(run_dir)
-    assert [(r.round_number, r.decision, r.reviewed_head_sha) for r in rounds] == [(1, "approved", HEAD)]
-    assert rounds[0].outstanding_findings[0]["id"] == "N1"
+    assert result.result_payload["review_round"] == 1
+    assert result.result_payload["outstanding_findings"][0]["id"] == "N1"
+    # The round is recorded by the phase once it reaches _apply_review_result.
+    assert review_convergence.load_review_rounds(run_dir) == []
 
 
 def test_older_review_output_without_prior_findings_still_parses(tmp_path: Path):
@@ -419,6 +485,95 @@ def test_operator_accept_at_cap_approves_and_records_followups(tmp_path: Path):
     assert any(call[:3] == ["gh", "pr", "edit"] for call in gh_calls)
 
 
+def test_completed_review_round_is_recorded_once_per_round_number(tmp_path: Path):
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    result = _request_changes_result()
+    result.review_round = 1
+
+    assert _run_phase(tmp_path, run, result, []) == "failed"
+    assert _run_phase(tmp_path, run, result, []) == "failed"
+
+    rounds = review_convergence.load_review_rounds(run_dir)
+    assert [(r.round_number, r.decision, r.reviewed_head_sha) for r in rounds] == [
+        (1, "request_changes", HEAD)
+    ]
+
+
+def test_review_round_is_not_recorded_when_phase_fails_after_review(tmp_path: Path):
+    run = _run()
+    result = _request_changes_result()
+    result.review_round = 1
+    moved_pr = {"number": 42, "url": "u", "headRefOid": "c" * 40, "mergeStateStatus": "CLEAN"}
+
+    with (
+        patch.object(orch, "_find_open_pr_for_branch", return_value=(moved_pr, moved_pr)),
+        patch.object(orch, "_remote_branch_head_sha", return_value="c" * 40),
+    ):
+        patches, pr = _patch_local_review_phase(tmp_path, result, tmp_path / "review-result.json")
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patches[6], patches[7], patches[8],
+        ):
+            outcome = orch._phase_review_local(
+                run, tmp_path, pr_data=pr, expected_head_sha=HEAD, expected_base_sha=BASE
+            )
+
+    assert outcome == "failed" and "PR head changed" in run.last_error
+    assert review_convergence.load_review_rounds(_run_dir(tmp_path, run)) == []
+
+
+def test_operator_accept_at_cap_reviews_again_when_head_moved(tmp_path: Path):
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    _record_rounds(run_dir, orch.SPEC_RUNTIME_CONFIG.review.max_rounds)
+    _run_phase(tmp_path, run, _request_changes_result(), [])
+    stale = _request_changes_result()
+    stale.reviewed_head_sha = "c" * 40
+    stale.save(tmp_path, run.run_id)
+    with patch.object(orch, "cmd_run", return_value=0):
+        orch._cmd_input_review_round_cap(
+            tmp_path, argparse.Namespace(spec=run.spec_id), accept=True, message=""
+        )
+    approved = orch.ReviewResult(
+        status="approved", summary="Fine.", reviewed_head_sha=HEAD, reviewed_base_sha=BASE
+    )
+
+    result_path = tmp_path / "review-result.json"
+    patches, pr = _patch_local_review_phase(tmp_path, approved, result_path)
+    with (
+        patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6],
+        patches[7] as run_review, patches[8], patches[9], patches[10], patches[11], patches[12],
+        patch.object(orch, "run_subprocess", return_value=subprocess.CompletedProcess([], 0, "", "")),
+    ):
+        outcome = orch._phase_review_local(
+            run, tmp_path, pr_data=pr, expected_head_sha=HEAD, expected_base_sha=BASE
+        )
+
+    assert run_review.called
+    assert outcome == "passed"
+    assert "Accepted by the operator" not in run.review_decision_summary
+    assert orch.OperatorRequest.load(tmp_path, run.run_id).status == "consumed"
+
+
+def test_operator_accept_at_cap_without_saved_review_runs_a_review(tmp_path: Path):
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    _record_rounds(run_dir, orch.SPEC_RUNTIME_CONFIG.review.max_rounds)
+    _run_phase(tmp_path, run, _request_changes_result(), [])
+    with patch.object(orch, "cmd_run", return_value=0):
+        orch._cmd_input_review_round_cap(
+            tmp_path, argparse.Namespace(spec=run.spec_id), accept=True, message=""
+        )
+    (run_dir / "review-result.json").unlink()
+    assert orch.ReviewResult.load(tmp_path, run.run_id) is None
+
+    approved = orch.ReviewResult(status="approved", summary="Fine.", reviewed_head_sha=HEAD)
+    assert _run_phase(tmp_path, run, approved, []) == "passed"
+
+    assert "Accepted by the operator" not in run.review_decision_summary
+
+
 def test_round_cap_input_rejects_runs_without_cap_request(tmp_path: Path, capsys):
     run = _run()
     run.save(tmp_path)
@@ -557,3 +712,26 @@ def test_doctor_reports_review_prompt_in_effect(tmp_path: Path):
 
     assert check.name == "review prompt"
     assert check.detail == review_convergence.BUNDLED_REVIEW_PROMPT_LABEL
+
+
+def test_codex_review_prompt_text_describes_read_only_command_access(tmp_path: Path):
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    run_dir.mkdir(parents=True)
+    (run_dir / "gate-status.json").write_text(
+        json.dumps({"gates": {"test": {"last_status": "passed", "last_command": "make test"}}})
+    )
+    run.spec_path = "specs/my-feature.md"
+    (tmp_path / "specs").mkdir()
+    (tmp_path / "specs" / "my-feature.md").write_text("# Spec\n")
+
+    codex_evidence = orch._format_gate_evidence_for_review(tmp_path, run, review_agent="codex")
+    claude_evidence = orch._format_gate_evidence_for_review(tmp_path, run, review_agent="claude")
+    codex_spec = orch._host_materialized_review_spec_note(run, tmp_path, review_agent="codex")
+    claude_spec = orch._host_materialized_review_spec_note(run, tmp_path, review_agent="claude")
+
+    assert "may run read-only commands" in codex_evidence
+    assert "cannot run additional commands" not in codex_evidence
+    assert "cannot run additional commands" in claude_evidence
+    assert "model tools are unavailable" not in codex_spec
+    assert "model tools are unavailable" in claude_spec

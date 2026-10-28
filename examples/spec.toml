@@ -39,6 +39,16 @@ cap = 20
 # makes no progress).
 no_progress_retry_threshold = 2
 
+# Infrastructure failures (container image build or service startup, missing
+# toolchain, expired credentials, provider usage limits, push/PR-create
+# failures, CI or auto-merge wait timeouts) never consume `cap`. A transient
+# one reruns the same phase in place after a jittered exponential backoff
+# (base * 2^(n-1), capped at max), at most `infra_retry_attempts` times per
+# run and failure signature; then the run fails and autopilot takes over.
+infra_retry_attempts = 2
+infra_backoff_base_seconds = 30
+infra_backoff_max_seconds = 600
+
 # ---------------------------------------------------------------------------
 # Local review convergence
 # ---------------------------------------------------------------------------
@@ -52,16 +62,6 @@ max_rounds = 3
 # Reasoning effort for re-reviews. Empty keeps the first pass's effort.
 # One of: minimal, low, medium, high, xhigh.
 rereview_reasoning_effort = ""
-
-# Infrastructure failures (container image build or service startup, missing
-# toolchain, expired credentials, provider usage limits, push/PR-create
-# failures, CI or auto-merge wait timeouts) never consume `cap`. A transient
-# one reruns the same phase in place after a jittered exponential backoff
-# (base * 2^(n-1), capped at max), at most `infra_retry_attempts` times per
-# run and failure signature; then the run fails and autopilot takes over.
-infra_retry_attempts = 2
-infra_backoff_base_seconds = 30
-infra_backoff_max_seconds = 600
 
 # ---------------------------------------------------------------------------
 # Autopilot infrastructure backoff and circuit breaker

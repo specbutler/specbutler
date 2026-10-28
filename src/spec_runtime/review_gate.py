@@ -429,6 +429,36 @@ def _severity(finding: dict[str, Any]) -> str:
     return str(finding.get("severity", "") or "").strip().upper()
 
 
+_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+
+
+def _normalized_file(finding: dict[str, Any]) -> str:
+    return str(finding.get("file", "") or "").strip().removeprefix("./")
+
+
+def _restates_prior(finding: dict[str, Any], prior: dict[str, Any], status: str) -> bool:
+    """A same-id finding restates the prior one only if nothing about it is new.
+
+    It must be on the same file, no more severe, and the prior finding must
+    still be unresolved; otherwise it is a distinct defect that reused an id.
+    """
+    if status != "unresolved":
+        return False
+    if _normalized_file(finding) != _normalized_file(prior):
+        return False
+    rank = _SEVERITY_RANK.get(_severity(finding), 2)
+    return rank >= _SEVERITY_RANK.get(_severity(prior), 2)
+
+
+def _unique_id(finding_id: str, used_ids: set[str]) -> str:
+    candidate = f"{finding_id}-new"
+    suffix = 2
+    while candidate in used_ids:
+        candidate = f"{finding_id}-new{suffix}"
+        suffix += 1
+    return candidate
+
+
 def compute_review_decision(
     *,
     model_decision: str,
@@ -472,11 +502,11 @@ def compute_review_decision(
 
     outstanding: list[dict[str, Any]] = []
     blocking_ids: list[str] = []
-    prior_ids: set[str] = set()
+    prior_by_id: dict[str, dict[str, Any]] = {}
     for prior in prior_findings or []:
         finding_id = str(prior.get("id", "") or "").strip()
         if finding_id:
-            prior_ids.add(finding_id)
+            prior_by_id[finding_id] = prior
         status = statuses.get(finding_id, "unresolved")
         if finding_id:
             statuses[finding_id] = status
@@ -487,11 +517,21 @@ def compute_review_decision(
         if blocking:
             blocking_ids.append(finding_id)
 
+    used_ids = set(prior_by_id)
     for finding in findings:
         finding_id = str(finding.get("id", "") or "").strip()
-        if finding_id and finding_id in prior_ids:
-            # A restated prior finding is governed by its classification.
-            continue
+        prior = prior_by_id.get(finding_id) if finding_id else None
+        if prior is not None:
+            if _restates_prior(finding, prior, statuses.get(finding_id, "unresolved")):
+                # A restated, still-unresolved prior finding is already counted.
+                continue
+            # Reviewers mint ids per round, so a new finding can reuse a prior
+            # id. Give it a distinct id so it is neither dropped nor confused
+            # with the prior finding in later rounds.
+            finding = {**finding, "id": _unique_id(finding_id, used_ids), "reported_id": finding_id}
+            finding_id = finding["id"]
+        if finding_id:
+            used_ids.add(finding_id)
         severity = _severity(finding)
         if severity == "P0":
             blocking = True

@@ -13292,6 +13292,7 @@ def _format_gate_evidence_for_review(
     run: "RunState",
     *,
     expected_head_sha: str = "",
+    review_agent: str = "",
 ) -> str:
     """Summarize the orchestrator's own gate run for the reviewer.
 
@@ -13347,15 +13348,26 @@ def _format_gate_evidence_for_review(
             attachments.extend(rendered)
     if not lines:
         return ""
+    if review_agent == "codex":
+        capability_note = (
+            "The Codex reviewer may run read-only commands against the review "
+            "checkout, but cannot install packages or reach the network, so do not "
+            "rerun these gates. Do not report that limitation as a product finding."
+        )
+    else:
+        capability_note = (
+            "Built-in reviewers do not receive executable shell capabilities and "
+            "cannot run additional commands. Do not report that limitation as a "
+            "product finding."
+        )
     return (
         "## Verification already performed by the orchestrator\n\n"
         "These gates were run against this exact head commit by the orchestrator, "
         "outside your sandbox, before review started:\n\n"
         + "\n".join(lines)
-        + "\n\nTreat these as authoritative. Built-in reviewers do not receive executable "
-        "shell capabilities and cannot run additional commands. Do not report that "
-        "limitation as a product finding. Judge the supplied diff on correctness "
-        "against the spec and rely on the results above for required-gate status.\n"
+        + f"\n\nTreat these as authoritative. {capability_note} Judge the supplied diff "
+        "on correctness against the spec and rely on the results above for "
+        "required-gate status.\n"
         + (
             "\n## Host-materialized gate attachments\n\n"
             "The orchestrator read only configured, bounded receipt paths; verified "
@@ -23322,6 +23334,8 @@ def _codex_review_sandbox_prompt_note(
 def _host_materialized_review_spec_note(
     run: RunState,
     review_worktree: Path,
+    *,
+    review_agent: str = "",
 ) -> str:
     """Inline the canonical spec required by the review contract."""
     relative_spec_path = Path(_spec_path_for_run(run))
@@ -23337,8 +23351,13 @@ def _host_materialized_review_spec_note(
             f"Could not host-materialize canonical review spec {relative_spec_path}: {exc}"
         ) from exc
 
+    availability = (
+        "it is also readable in the review checkout"
+        if review_agent == "codex"
+        else "model tools are unavailable"
+    )
     return (
-        "\n\nCanonical spec (host materialized; model tools are unavailable): "
+        f"\n\nCanonical spec (host materialized; {availability}): "
         f"`{relative_spec_path.as_posix()}`.\n\n"
         "<BEGIN_HOST_MATERIALIZED_SPEC>\n"
         f"{content}"
@@ -23517,6 +23536,7 @@ def _run_local_review(
             repo_root,
             run,
             expected_head_sha=expected_head_sha,
+            review_agent=review_agent,
         ),
     )
     artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
@@ -23586,7 +23606,7 @@ def _run_local_review(
             else _review_env_prompt_note(review_worktree)
         )
         spec_note = (
-            _host_materialized_review_spec_note(run, review_worktree)
+            _host_materialized_review_spec_note(run, review_worktree, review_agent=agent.name)
             if agent.name in {"claude", "codex"}
             else ""
         )
@@ -23912,6 +23932,16 @@ def _accepted_review_round_cap_request(repo_root: Path, run: RunState) -> Operat
     return request
 
 
+def _round_cap_accept_matches_head(
+    accepted_result: ReviewResult | None,
+    rounds: list[review_convergence.ReviewRound],
+    expected_head_sha: str,
+) -> bool:
+    if accepted_result is None or not rounds or not expected_head_sha:
+        return False
+    return accepted_result.reviewed_head_sha == expected_head_sha == rounds[-1].reviewed_head_sha
+
+
 def _apply_computed_local_review_decision(
     run: RunState,
     evaluation,
@@ -23923,7 +23953,13 @@ def _apply_computed_local_review_decision(
     expected_head_sha: str,
     expected_base_sha: str,
 ):
-    """Replace the reviewer's own decision with the computed one and record the round."""
+    """Replace the reviewer's own decision with the computed one.
+
+    The round itself is recorded by ``_record_local_review_round`` only once
+    the review phase reaches ``_apply_review_result``, so a phase that fails
+    afterwards (closed PR, moved head, unsafe transition) does not count
+    toward ``[review] max_rounds``.
+    """
     from .review_gate import apply_computed_decision, compute_review_decision
 
     payload = evaluation.result_payload
@@ -23951,19 +23987,25 @@ def _apply_computed_local_review_decision(
         )
     evaluation = apply_computed_decision(evaluation, computed)
     evaluation.result_payload["review_round"] = round_number
+    return evaluation
+
+
+def _record_local_review_round(review_run_dir: Path, review_result: ReviewResult) -> None:
+    """Append a completed review to the round ledger used by the round cap."""
+    if review_result.status not in {"approved", "request_changes"} or review_result.review_round < 1:
+        return
     review_convergence.append_review_round(
         review_run_dir,
         review_convergence.ReviewRound(
-            round_number=round_number,
-            reviewed_head_sha=expected_head_sha,
-            reviewed_base_sha=expected_base_sha,
-            decision=computed.decision,
-            model_decision=computed.model_decision,
+            round_number=review_result.review_round,
+            reviewed_head_sha=review_result.reviewed_head_sha,
+            reviewed_base_sha=review_result.reviewed_base_sha,
+            decision=review_result.status,
+            model_decision=review_result.model_decision,
             recorded_at=_now_iso(),
-            outstanding_findings=computed.outstanding_findings,
+            outstanding_findings=review_result.outstanding_findings,
         ),
     )
-    return evaluation
 
 
 def _phase_review_local(
@@ -24017,8 +24059,30 @@ def _phase_review_local(
     repo_slug = _trusted_publication_repo_slug(run)
 
     accepted_request = _accepted_review_round_cap_request(repo_root, run)
-    if accepted_request is not None:
-        rounds = review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+    accepted_result = ReviewResult.load(repo_root, run.run_id) if accepted_request is not None else None
+    rounds = (
+        review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+        if accepted_request is not None
+        else []
+    )
+    if accepted_request is not None and not _round_cap_accept_matches_head(
+        accepted_result, rounds, expected_head_sha
+    ):
+        # "Accept as-is" covers only the head the operator saw at the cap.
+        # A moved head (or a missing review) gets a normal review round.
+        logger.warning(
+            "Operator accepted %s at the review round cap, but the reviewed head "
+            "does not match current head %s; running a normal review round",
+            run.run_id,
+            _short_sha(expected_head_sha),
+        )
+        accepted_request.status = "consumed"
+        accepted_request.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+        accepted_request.consumed_at = _now_iso()
+        accepted_request.response_consumed_attempt_number = _current_attempt_number(run)
+        accepted_request.save(repo_root, run.run_id)
+        accepted_request = None
+    if accepted_request is not None and accepted_result is not None:
         outstanding = rounds[-1].outstanding_findings if rounds else []
         _publish_review_followups(
             run,
@@ -24029,27 +24093,25 @@ def _phase_review_local(
             repo_slug=repo_slug,
             accepted_at_cap=True,
         )
-        accepted_result = ReviewResult.load(repo_root, run.run_id)
-        if accepted_result is not None:
-            accepted_result.status = "approved"
-            accepted_result.summary = (
-                f"{accepted_result.summary} [Accepted by the operator at the review round cap.]"
-            ).strip()
-            accepted_result.save(repo_root, run.run_id)
-            try:
-                if review_transition_is_safe("review status publication"):
-                    _publish_local_review_status(
+        accepted_result.status = "approved"
+        accepted_result.summary = (
+            f"{accepted_result.summary} [Accepted by the operator at the review round cap.]"
+        ).strip()
+        accepted_result.save(repo_root, run.run_id)
+        try:
+            if review_transition_is_safe("review status publication"):
+                _publish_local_review_status(
+                    repo_root,
+                    repo_name=_repo_name_with_owner(
                         repo_root,
-                        repo_name=_repo_name_with_owner(
-                            repo_root,
-                            trusted_remote_url=run.publish_remote_url,
-                        ),
-                        expected_head_sha=expected_head_sha,
-                        review_result=accepted_result,
-                        target_url=accepted_result.source_check_url,
-                    )
-            except ValueError as exc:
-                logger.warning("Could not publish operator-accepted review status: %s", exc)
+                        trusted_remote_url=run.publish_remote_url,
+                    ),
+                    expected_head_sha=expected_head_sha,
+                    review_result=accepted_result,
+                    target_url=accepted_result.source_check_url,
+                )
+        except ValueError as exc:
+            logger.warning("Could not publish operator-accepted review status: %s", exc)
         now = _now_iso()
         accepted_request.status = "consumed"
         accepted_request.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
@@ -24236,6 +24298,7 @@ def _phase_review_local(
         conclusion=conclusion,
     )
     review_run_dir = _state_root(repo_root) / "runs" / run.run_id
+    _record_local_review_round(review_run_dir, review_result)
     if review_result.status == "approved":
         if review_transition_is_safe("review follow-up publication"):
             _publish_review_followups(
