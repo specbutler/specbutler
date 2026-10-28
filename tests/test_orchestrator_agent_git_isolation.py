@@ -45,6 +45,7 @@ def _linked_worktree(tmp_path: Path) -> tuple[Path, Path]:
     return repository, worktree
 
 
+@pytest.mark.requires_ps
 def test_implement_launch_imports_private_commit_before_return(tmp_path: Path) -> None:
     repository, worktree = _linked_worktree(tmp_path)
     isolation = prepare_agent_git_isolation(worktree)

@@ -446,6 +446,7 @@ class TestServerLifecycle:
         legacy_live.assert_not_called()
         assert supervision_path.read_text(encoding="utf-8") == "not json"
 
+    @pytest.mark.requires_ps
     def test_is_server_running_true_for_own_process(self, tmp_path):
         from spec_runtime.web.server import _read_process_started_at
 
@@ -621,6 +622,7 @@ class TestServerLifecycle:
             captured = capsys.readouterr()
             assert "not running" in captured.out
 
+    @pytest.mark.requires_ps
     def test_server_status_running_with_port(self, tmp_path, capsys):
         from spec_runtime.web.server import _read_process_started_at
 
@@ -847,6 +849,7 @@ class TestServerLifecycle:
             assert "failed" in captured.err.lower()
         managed.terminate.assert_called_once_with(grace_seconds=0.5)
 
+    @pytest.mark.requires_ps
     def test_foreground_banner_prints_after_bind(self, tmp_path, capsys):
         """Foreground banner must fire after Server.startup() (post-bind)."""
         import asyncio
@@ -901,6 +904,7 @@ class TestServerLifecycle:
         assert uvicorn_config.call_args.kwargs["proxy_headers"] is False
         assert uvicorn_config.call_args.kwargs["forwarded_allow_ips"] == ""
 
+    @pytest.mark.requires_ps
     def test_foreground_no_banner_when_bind_fails(self, tmp_path, capsys):
         """Foreground suppresses banner when Server.startup() fails to bind."""
         import asyncio
@@ -1006,6 +1010,7 @@ class TestServerLifecycle:
         assert "must-not-reach-server-log" not in captured.err
         assert uvicorn_config.call_args.kwargs["access_log"] is False
 
+    @pytest.mark.requires_ps
     def test_foreground_ctrl_c_exits_cleanly(self, tmp_path):
         """A normal foreground Ctrl-C must return success without a traceback."""
         fake_server = MagicMock()
