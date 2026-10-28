@@ -296,6 +296,17 @@ def evaluate_review_gate(
             check_url=check_url,
         )
 
+    schema_properties = schema_payload.get("properties")
+    if (
+        isinstance(schema_properties, dict)
+        and "prior_findings" in schema_properties
+        and "prior_findings" not in review_payload
+    ):
+        # Outputs written before re-review classification existed omit the
+        # field. The schema lists it as required for strict structured output,
+        # so default it rather than rejecting older payloads.
+        review_payload["prior_findings"] = []
+
     schema_error = _validate_against_schema(review_payload, schema_payload)
     if schema_error is not None:
         return _build_failed_evaluation(
@@ -372,6 +383,9 @@ def evaluate_review_gate(
         "source_check_url": check_url,
         "reviewed_at": str(review_payload.get("reviewed_at", _utc_now_iso())).strip() or _utc_now_iso(),
     }
+    prior_findings = review_payload.get("prior_findings")
+    if isinstance(prior_findings, list):
+        result_payload["prior_findings"] = [item for item in prior_findings if isinstance(item, dict)]
 
     gate_passed = decision == "approved"
     machine_summary = {
@@ -388,6 +402,203 @@ def evaluate_review_gate(
         result_payload=result_payload,
         machine_summary=machine_summary,
         human_summary=human_summary,
+        exit_code=0 if gate_passed else 1,
+    )
+
+
+BLOCKING_SEVERITIES = frozenset({"P0", "P1"})
+
+
+@dataclass
+class ComputedReviewDecision:
+    decision: str
+    model_decision: str
+    # Findings still open after this review, each annotated with ``origin``
+    # (prior|new) and ``blocking``. Blocking ones drive request_changes;
+    # the rest become follow-ups at approval.
+    outstanding_findings: list[dict[str, Any]]
+    blocking_ids: list[str]
+    prior_statuses: dict[str, str]
+
+    @property
+    def overrides_model(self) -> bool:
+        return self.decision != self.model_decision
+
+
+def _severity(finding: dict[str, Any]) -> str:
+    return str(finding.get("severity", "") or "").strip().upper()
+
+
+_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+
+
+def _normalized_file(finding: dict[str, Any]) -> str:
+    return str(finding.get("file", "") or "").strip().removeprefix("./")
+
+
+def _restates_prior(finding: dict[str, Any], prior: dict[str, Any], status: str) -> bool:
+    """A same-id finding restates the prior one only if nothing about it is new.
+
+    It must be on the same file, no more severe, and the prior finding must
+    still be unresolved; otherwise it is a distinct defect that reused an id.
+    """
+    if status != "unresolved":
+        return False
+    if _normalized_file(finding) != _normalized_file(prior):
+        return False
+    rank = _SEVERITY_RANK.get(_severity(finding), 2)
+    return rank >= _SEVERITY_RANK.get(_severity(prior), 2)
+
+
+def _prior_blocking(prior: dict[str, Any]) -> bool:
+    """Keep the eligibility a prior finding was given when it was first raised.
+
+    A re-review P1 outside the incremental diff is recorded non-blocking and
+    must stay so in later rounds. Legacy ledger entries without the flag fall
+    back to severity.
+    """
+    stored = prior.get("blocking")
+    if isinstance(stored, bool):
+        return stored
+    return _severity(prior) in BLOCKING_SEVERITIES
+
+
+def _unique_id(finding_id: str, used_ids: set[str]) -> str:
+    candidate = f"{finding_id}-new"
+    suffix = 2
+    while candidate in used_ids:
+        candidate = f"{finding_id}-new{suffix}"
+        suffix += 1
+    return candidate
+
+
+def compute_review_decision(
+    *,
+    model_decision: str,
+    findings: list[dict[str, Any]],
+    prior_findings: list[dict[str, Any]] | None = None,
+    prior_classifications: list[dict[str, Any]] | None = None,
+    changed_ranges: dict[str, list[tuple[int, int]]] | None = None,
+) -> ComputedReviewDecision:
+    """Decide approved vs request_changes from findings, not the model's word.
+
+    ``request_changes`` iff a prior P0/P1 finding is unresolved, or a new
+    finding is eligible to block. On the first review (``prior_findings`` is
+    None) every new P0/P1 is eligible. On a re-review a new P0 is always
+    eligible and a new P1 only when it touches ``changed_ranges`` (the lines
+    changed since the last reviewed head); ``changed_ranges=None`` means the
+    incremental diff is unknown, so P1s stay eligible. A prior finding the
+    model did not classify counts as unresolved.
+
+    ``blocked``/``failed`` model decisions describe a review that did not
+    complete and pass through unchanged.
+    """
+    from .review_convergence import finding_touches_ranges
+
+    model_decision = str(model_decision or "").strip().lower()
+    if model_decision not in {"approved", "request_changes"}:
+        return ComputedReviewDecision(
+            decision=model_decision,
+            model_decision=model_decision,
+            outstanding_findings=[dict(f) for f in findings],
+            blocking_ids=[],
+            prior_statuses={},
+        )
+
+    rereview = prior_findings is not None
+    statuses: dict[str, str] = {}
+    for item in prior_classifications or []:
+        finding_id = str(item.get("id", "") or "").strip()
+        status = str(item.get("status", "") or "").strip().lower()
+        if finding_id and status in {"resolved", "unresolved", "withdrawn"}:
+            statuses[finding_id] = status
+
+    outstanding: list[dict[str, Any]] = []
+    blocking_ids: list[str] = []
+    prior_by_id: dict[str, dict[str, Any]] = {}
+    for prior in prior_findings or []:
+        finding_id = str(prior.get("id", "") or "").strip()
+        if finding_id:
+            prior_by_id[finding_id] = prior
+        status = statuses.get(finding_id, "unresolved")
+        if finding_id:
+            statuses[finding_id] = status
+        if status != "unresolved":
+            continue
+        blocking = _prior_blocking(prior)
+        outstanding.append({**prior, "origin": "prior", "blocking": blocking})
+        if blocking:
+            blocking_ids.append(finding_id)
+
+    used_ids = set(prior_by_id)
+    for finding in findings:
+        finding_id = str(finding.get("id", "") or "").strip()
+        prior = prior_by_id.get(finding_id) if finding_id else None
+        if prior is not None:
+            if _restates_prior(finding, prior, statuses.get(finding_id, "unresolved")):
+                # A restated, still-unresolved prior finding is already counted.
+                continue
+            # Reviewers mint ids per round, so a new finding can reuse a prior
+            # id. Give it a distinct id so it is neither dropped nor confused
+            # with the prior finding in later rounds.
+            finding = {**finding, "id": _unique_id(finding_id, used_ids), "reported_id": finding_id}
+            finding_id = finding["id"]
+        if finding_id:
+            used_ids.add(finding_id)
+        severity = _severity(finding)
+        if severity == "P0":
+            blocking = True
+        elif severity == "P1":
+            blocking = (
+                not rereview
+                or changed_ranges is None
+                or finding_touches_ranges(finding, changed_ranges)
+            )
+        else:
+            blocking = False
+        outstanding.append({**finding, "origin": "new", "blocking": blocking})
+        if blocking:
+            blocking_ids.append(finding_id)
+
+    decision = "request_changes" if blocking_ids else "approved"
+    return ComputedReviewDecision(
+        decision=decision,
+        model_decision=model_decision,
+        outstanding_findings=outstanding,
+        blocking_ids=blocking_ids,
+        prior_statuses=statuses,
+    )
+
+
+def apply_computed_decision(
+    evaluation: GateEvaluation,
+    computed: ComputedReviewDecision,
+) -> GateEvaluation:
+    """Rewrite a gate evaluation so it carries the orchestrator's decision."""
+    result_payload = dict(evaluation.result_payload)
+    machine_summary = dict(evaluation.machine_summary)
+    result_payload["model_decision"] = computed.model_decision
+    result_payload["outstanding_findings"] = computed.outstanding_findings
+    result_payload["blocking_finding_ids"] = computed.blocking_ids
+    result_payload["status"] = computed.decision
+    result_payload["decision"] = computed.decision
+    gate_passed = computed.decision == "approved"
+    machine_summary["decision"] = computed.decision
+    machine_summary["model_decision"] = computed.model_decision
+    machine_summary["conclusion"] = "success" if gate_passed else "failure"
+    if computed.overrides_model:
+        note = (
+            f"Orchestrator decision {computed.decision} overrides reviewer decision "
+            f"{computed.model_decision}"
+        )
+        if computed.blocking_ids:
+            note += f" (blocking: {', '.join(i or '(no id)' for i in computed.blocking_ids)})"
+        result_payload["summary"] = f"{result_payload.get('summary', '')} [{note}.]".strip()
+        machine_summary["summary"] = result_payload["summary"]
+    return GateEvaluation(
+        result_payload=result_payload,
+        machine_summary=machine_summary,
+        human_summary=_render_human_summary(result_payload, machine_summary),
         exit_code=0 if gate_passed else 1,
     )
 

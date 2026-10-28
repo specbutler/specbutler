@@ -64,7 +64,7 @@ from pathlib import Path, PurePosixPath
 from urllib import parse as urllib_parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import review_feedback, worktree_process_registry
+from . import review_convergence, review_feedback, worktree_process_registry
 from .agent_adapter import (
     HostAgentUnavailableError,
     _render_codex_mcp_toml,
@@ -345,7 +345,10 @@ REVIEW_TIMEOUT_SECONDS = 900
 # provider home before the phase gives up (and may fall back to Claude).
 CODEX_REVIEW_STALL_RETRY_TIMEOUT_SECONDS = max(60, REVIEW_TIMEOUT_SECONDS // 2)
 LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT = "high"
-LOCAL_REVIEW_REASONING_EFFORT = "low"
+# Re-reviews keep the first pass's effort unless [review]
+# rereview_reasoning_effort overrides it: a cheaper re-review was a source of
+# goalpost-moving findings.
+LOCAL_REVIEW_REASONING_EFFORT = LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT
 LOCAL_REVIEW_TIMEOUT_STDIO_MAX_LINES = 40
 LOCAL_REVIEW_TIMEOUT_STDIO_MAX_CHARS = 4000
 LOCAL_REVIEW_TIMEOUT_RAW_REVIEW_MAX_CHARS = 4000
@@ -9918,6 +9921,13 @@ class ReviewResult:
     source_check_name: str = REVIEW_GATE_CHECK_NAME
     source_check_url: str = ""
     reviewed_at: str = field(default_factory=_now_iso)
+    # Convergence bookkeeping. ``status`` is the orchestrator-computed
+    # decision; ``model_decision`` is what the reviewer itself returned.
+    model_decision: str = ""
+    review_round: int = 0
+    prior_findings: list[dict] = field(default_factory=list)
+    outstanding_findings: list[dict] = field(default_factory=list)
+    blocking_finding_ids: list[str] = field(default_factory=list)
 
     def save(self, repo_root: Path, run_id: str) -> Path:
         d = _state_root(repo_root) / "runs" / run_id
@@ -13323,6 +13333,7 @@ def _format_gate_evidence_for_review(
     run: "RunState",
     *,
     expected_head_sha: str = "",
+    review_agent: str = "",
 ) -> str:
     """Summarize the orchestrator's own gate run for the reviewer.
 
@@ -13378,15 +13389,26 @@ def _format_gate_evidence_for_review(
             attachments.extend(rendered)
     if not lines:
         return ""
+    if review_agent == "codex":
+        capability_note = (
+            "The Codex reviewer may run read-only commands against the review "
+            "checkout, but cannot install packages or reach the network, so do not "
+            "rerun these gates. Do not report that limitation as a product finding."
+        )
+    else:
+        capability_note = (
+            "Built-in reviewers do not receive executable shell capabilities and "
+            "cannot run additional commands. Do not report that limitation as a "
+            "product finding."
+        )
     return (
         "## Verification already performed by the orchestrator\n\n"
         "These gates were run against this exact head commit by the orchestrator, "
         "outside your sandbox, before review started:\n\n"
         + "\n".join(lines)
-        + "\n\nTreat these as authoritative. Built-in reviewers do not receive executable "
-        "shell capabilities and cannot run additional commands. Do not report that "
-        "limitation as a product finding. Judge the supplied diff on correctness "
-        "against the spec and rely on the results above for required-gate status.\n"
+        + f"\n\nTreat these as authoritative. {capability_note} Judge the supplied diff "
+        "on correctness against the spec and rely on the results above for "
+        "required-gate status.\n"
         + (
             "\n## Host-materialized gate attachments\n\n"
             "The orchestrator read only configured, bounded receipt paths; verified "
@@ -13412,12 +13434,11 @@ def _render_local_review_prompt(
     pr_body: str,
     review_changes: int = 0,
     gate_evidence: str = "",
+    rereview_context: str = "",
 ) -> str:
     # Look for repo-level override, then bundled template
-    template_path = repo_root / ".github" / "prompts" / "review.md"
-    if not template_path.is_file():
-        template_path = repo_root / ".github" / "prompts" / "codex-review.md"
-    if template_path.is_file():
+    template_path = review_convergence.resolve_review_prompt_path(repo_root)
+    if template_path is not None:
         # Current ``spec init`` writes repository templates as UTF-8. Older
         # native-Windows releases used the active ANSI code page, though, and
         # the bundled em dash therefore became an invalid UTF-8 byte. Keep
@@ -13449,7 +13470,11 @@ def _render_local_review_prompt(
             rendered = f"{rendered.rstrip()}\n\n{gate_evidence}"
     else:
         rendered = rendered.replace("${GATE_RESULTS}", "")
-    if review_changes == 0:
+    if rereview_context:
+        # Appended rather than templated so repo-level prompts that predate
+        # re-review context still receive it.
+        rendered = f"{rendered.rstrip()}\n\n{rereview_context}"
+    elif review_changes == 0:
         rendered = f"{LOCAL_REVIEW_FIRST_PASS_EXHAUSTIVE_INSTRUCTION}\n\n{rendered}"
     return rendered
 
@@ -13645,6 +13670,8 @@ def _build_local_review_command(
     reasoning_effort: str = LOCAL_REVIEW_REASONING_EFFORT,
     mcp_config_path: Path | None = None,
     writable_temp_dir: Path | None = None,
+    review_checkout: Path | None = None,
+    provider_home: Path | None = None,
 ) -> list[str]:
     from .agent_adapter import get_agent_adapter
 
@@ -13658,6 +13685,14 @@ def _build_local_review_command(
         review_kwargs["mcp_config_path"] = mcp_config_path
     if _adapter_method_accepts_kwarg(agent.build_review_command, "writable_temp_dir"):
         review_kwargs["writable_temp_dir"] = writable_temp_dir
+    optional_kwargs = {
+        "review_checkout": review_checkout,
+        "provider_home": provider_home,
+        "reasoning_effort": reasoning_effort,
+    }
+    for key, value in optional_kwargs.items():
+        if value and _adapter_method_accepts_kwarg(agent.build_review_command, key):
+            review_kwargs[key] = value
     return agent.build_review_command(**review_kwargs)
 
 
@@ -13872,6 +13907,17 @@ def _load_review_result_from_gate_output(result_path: Path) -> ReviewResult:
         source_check_name=str(payload.get("source_check_name", REVIEW_GATE_CHECK_NAME)).strip()
         or REVIEW_GATE_CHECK_NAME,
         source_check_url=str(payload.get("source_check_url", "")).strip(),
+        model_decision=str(payload.get("model_decision", "") or "").strip(),
+        review_round=_coerce_optional_int(payload.get("review_round")) or 0,
+        prior_findings=[
+            item for item in payload.get("prior_findings", None) or [] if isinstance(item, dict)
+        ],
+        outstanding_findings=[
+            item for item in payload.get("outstanding_findings", None) or [] if isinstance(item, dict)
+        ],
+        blocking_finding_ids=[
+            str(item) for item in payload.get("blocking_finding_ids", None) or []
+        ],
         reviewed_at=str(payload.get("reviewed_at", _now_iso())).strip(),
     )
 
@@ -20289,6 +20335,11 @@ def _build_agent_command(
                     sort_keys=True,
                 )
             )
+            prompt_lines.append(
+                "The next review sees your `spec report` summary as your response to "
+                "these findings. Address each one by its id in that summary (for example "
+                "`<id>: fixed by ...` or `<id>: disagree because ...`)."
+            )
 
         instruction_lines: list[str] = []
         if retry_context.targeted_test_not_executed:
@@ -23313,18 +23364,21 @@ def _codex_review_sandbox_prompt_note(
     base_sha: str,
     head_sha: str,
 ) -> str:
-    """Inline host-materialized evidence for a Codex session with no tools."""
-    del scratch_dir
+    """Inline host-materialized evidence plus the read-only checkout layout."""
     diff_text = _local_review_diff_text(
         review_worktree,
         base_sha=base_sha,
         head_sha=head_sha,
     )
     return (
-        "\n\nCodex restricted-review boundary: all model-controlled shell, code, "
-        "subagent, hook, user-config, and MCP capabilities are disabled. The "
-        "orchestrator materialized the authoritative diff on the host. Review only "
-        "the evidence below and the gate results already in this prompt.\n\n"
+        "\n\nCodex review boundary: you may run read-only shell commands (for "
+        "example `cat`, `rg`, `git log`, `git show`) against the PR checkout pinned "
+        f"to the reviewed head at `{review_worktree}`. The filesystem is read-only "
+        f"except the scratch dir `{scratch_dir}`; the network, credentials, MCP, "
+        "subagents and hooks are unavailable, so do not try to install packages or "
+        "rerun the test suite. The orchestrator materialized the authoritative diff "
+        "on the host below; the gate results already in this prompt are "
+        "authoritative.\n\n"
         "<BEGIN_HOST_MATERIALIZED_DIFF>\n"
         f"{diff_text}"
         "\n<END_HOST_MATERIALIZED_DIFF>"
@@ -23334,6 +23388,8 @@ def _codex_review_sandbox_prompt_note(
 def _host_materialized_review_spec_note(
     run: RunState,
     review_worktree: Path,
+    *,
+    review_agent: str = "",
 ) -> str:
     """Inline the canonical spec required by the review contract."""
     relative_spec_path = Path(_spec_path_for_run(run))
@@ -23349,8 +23405,13 @@ def _host_materialized_review_spec_note(
             f"Could not host-materialize canonical review spec {relative_spec_path}: {exc}"
         ) from exc
 
+    availability = (
+        "it is also readable in the review checkout"
+        if review_agent == "codex"
+        else "model tools are unavailable"
+    )
     return (
-        "\n\nCanonical spec (host materialized; model tools are unavailable): "
+        f"\n\nCanonical spec (host materialized; {availability}): "
         f"`{relative_spec_path.as_posix()}`.\n\n"
         "<BEGIN_HOST_MATERIALIZED_SPEC>\n"
         f"{content}"
@@ -23383,6 +23444,72 @@ def _local_review_diff_text(
             f"`git diff --unified=80 {base_sha}...{head_sha}`: {detail}"
         )
     return diff_result.stdout
+
+
+def _local_review_incremental_diff(
+    review_worktree: Path,
+    *,
+    last_reviewed_head_sha: str,
+    head_sha: str,
+) -> tuple[str, dict[str, list[tuple[int, int]]] | None]:
+    """Return the diff since the last reviewed head and its changed line ranges.
+
+    ``None`` ranges mean the previous head is unknown or unreachable (for
+    example after a force push), so the incremental change cannot be bounded.
+    """
+    if not last_reviewed_head_sha:
+        return "(the previous reviewed head was not recorded)\n", None
+    if last_reviewed_head_sha == head_sha:
+        return "", {}
+    revision_range = f"{last_reviewed_head_sha}..{head_sha}"
+    full = run_subprocess(
+        ["git", "diff", "--unified=20", "--no-ext-diff", "--no-textconv", revision_range],
+        cwd=review_worktree,
+    )
+    zero = run_subprocess(
+        ["git", "diff", "--unified=0", "--no-ext-diff", "--no-textconv", revision_range],
+        cwd=review_worktree,
+    )
+    if full.returncode != 0 or zero.returncode != 0:
+        detail = (full.stderr or zero.stderr or "").strip() or "unknown error"
+        return (
+            f"(could not diff {revision_range}: {detail}; the previous head may have "
+            "been rewritten, so treat the full diff as the change under review)\n",
+            None,
+        )
+    return full.stdout, review_convergence.changed_line_ranges(zero.stdout)
+
+
+def _local_review_rereview_context(
+    repo_root: Path,
+    run: RunState,
+    review_worktree: Path,
+    *,
+    last_round: review_convergence.ReviewRound,
+    round_number: int,
+    head_sha: str,
+) -> tuple[str, dict[str, list[tuple[int, int]]] | None]:
+    implement_result = ImplementResult.load(repo_root, run.run_id)
+    implementer_summary = implement_result.summary if implement_result is not None else ""
+    incremental_diff, changed_ranges = _local_review_incremental_diff(
+        review_worktree,
+        last_reviewed_head_sha=last_round.reviewed_head_sha,
+        head_sha=head_sha,
+    )
+    context = "\n\n".join(
+        [
+            review_convergence.render_prior_findings_section(
+                last_round.outstanding_findings,
+                round_number=round_number,
+                implementer_summary=implementer_summary,
+            ),
+            review_convergence.render_rereview_rules_section(
+                last_reviewed_head_sha=last_round.reviewed_head_sha,
+                incremental_diff=incremental_diff,
+            ),
+        ]
+    )
+    return context, changed_ranges
 
 
 def _claude_review_evidence_prompt_note(
@@ -23432,8 +23559,16 @@ def _run_local_review(
     _clear_local_review_artifacts(artifact_paths)
     review_agent = review_agent_override or _effective_review_agent(run)
     require_host_agent_available(review_agent)
+    review_run_dir = _state_root(repo_root) / "runs" / run.run_id
+    prior_rounds = review_convergence.load_review_rounds(review_run_dir)
+    last_round = prior_rounds[-1] if prior_rounds else None
+    round_number = len(prior_rounds) + 1
+    changed_ranges: dict[str, list[tuple[int, int]]] | None = None
+    is_rereview = last_round is not None or run.review_changes > 0
     reasoning_effort = (
-        LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT if run.review_changes == 0 else LOCAL_REVIEW_REASONING_EFFORT
+        (SPEC_RUNTIME_CONFIG.review.rereview_reasoning_effort or LOCAL_REVIEW_REASONING_EFFORT)
+        if is_rereview
+        else LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT
     )
     logger.info(
         "Running local review for %s with reasoning effort=%s (review_changes=%d)",
@@ -23455,6 +23590,7 @@ def _run_local_review(
             repo_root,
             run,
             expected_head_sha=expected_head_sha,
+            review_agent=review_agent,
         ),
     )
     artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
@@ -23524,7 +23660,7 @@ def _run_local_review(
             else _review_env_prompt_note(review_worktree)
         )
         spec_note = (
-            _host_materialized_review_spec_note(run, review_worktree)
+            _host_materialized_review_spec_note(run, review_worktree, review_agent=agent.name)
             if agent.name in {"claude", "codex"}
             else ""
         )
@@ -23550,8 +23686,19 @@ def _run_local_review(
                 head_sha=expected_head_sha,
             )
         )
-        if env_note or sandbox_note:
-            prompt = f"{prompt}{env_note}{sandbox_note}"
+        rereview_note = ""
+        if last_round is not None:
+            rereview_context, changed_ranges = _local_review_rereview_context(
+                repo_root,
+                run,
+                review_worktree,
+                last_round=last_round,
+                round_number=round_number,
+                head_sha=expected_head_sha,
+            )
+            rereview_note = f"\n\n{rereview_context}"
+        if env_note or sandbox_note or rereview_note:
+            prompt = f"{prompt}{env_note}{sandbox_note}{rereview_note}"
             artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
         if agent.capabilities.supports_mcp:
             # Built-in reviews are MCP-free. Codex still needs an isolated
@@ -23576,6 +23723,8 @@ def _run_local_review(
             reasoning_effort=reasoning_effort,
             mcp_config_path=review_mcp_config_path,
             writable_temp_dir=review_scratch_dir,
+            review_checkout=review_worktree if agent.name == "codex" else None,
+            provider_home=review_codex_home,
         )
         review_env = _build_local_review_env(
             temp_dir=review_scratch_dir,
@@ -23697,6 +23846,16 @@ def _run_local_review(
         expected_base_sha=expected_base_sha,
         check_name=REVIEW_GATE_CHECK_NAME,
     )
+    evaluation = _apply_computed_local_review_decision(
+        run,
+        evaluation,
+        review_run_dir=review_run_dir,
+        last_round=last_round,
+        round_number=round_number,
+        changed_ranges=changed_ranges,
+        expected_head_sha=expected_head_sha,
+        expected_base_sha=expected_base_sha,
+    )
     artifact_paths["review_result"].parent.mkdir(parents=True, exist_ok=True)
     artifact_paths["review_result"].write_text(
         json.dumps(evaluation.result_payload, indent=2, sort_keys=True) + "\n",
@@ -23720,6 +23879,186 @@ def _run_local_review(
     return (
         review_result,
         artifact_paths["review_result"],
+    )
+
+
+def _publish_review_followups(
+    run: RunState,
+    repo_root: Path,
+    findings: list[dict],
+    *,
+    pr_number: int,
+    pr_body: str,
+    repo_slug: str,
+    accepted_at_cap: bool = False,
+) -> None:
+    """Write ``review-followups.md`` and the PR body's Follow-ups section."""
+    run_dir = _state_root(repo_root) / "runs" / run.run_id
+    followups_path = run_dir / review_convergence.REVIEW_FOLLOWUPS_FILENAME
+    if findings:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        followups_path.write_text(
+            review_convergence.render_followups_markdown(
+                findings,
+                spec_id=run.spec_id,
+                accepted_at_cap=accepted_at_cap,
+            ),
+            encoding="utf-8",
+        )
+    else:
+        followups_path.unlink(missing_ok=True)
+    new_body = review_convergence.pr_body_with_followups(
+        pr_body,
+        review_convergence.render_pr_followups_section(findings),
+    )
+    if new_body.strip() == str(pr_body or "").strip():
+        return
+    body_path = run_dir / "review-followups-pr-body.md"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    body_path.write_text(new_body, encoding="utf-8")
+    result = run_subprocess(
+        ["gh", "pr", "edit", str(pr_number), "--body-file", str(body_path)],
+        cwd=repo_root,
+        env=_gh_repo_environment(repo_slug),
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "Could not update the Follow-ups section of PR #%s (non-blocking): %s",
+            pr_number,
+            (result.stderr or result.stdout or "unknown error").strip(),
+        )
+
+
+def _review_round_cap_operator_request(
+    run: RunState,
+    outstanding: list[dict],
+    *,
+    rounds_used: int,
+    max_rounds: int,
+) -> OperatorRequest:
+    return OperatorRequest(
+        kind=review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND,
+        prompt=review_convergence.render_round_cap_summary(
+            outstanding,
+            rounds_used=rounds_used,
+            max_rounds=max_rounds,
+        ),
+        context={
+            "spec_id": run.spec_id,
+            "run_id": run.run_id,
+            "rounds_used": rounds_used,
+            "max_rounds": max_rounds,
+            "outstanding_findings": outstanding,
+        },
+        suggested_action=(
+            f"Run `spec input --spec {run.spec_id} --accept` to accept as-is, or "
+            f"`spec input --spec {run.spec_id} --message '<guidance>'` for one more round."
+        ),
+        options=[
+            {
+                "value": review_convergence.REVIEW_ROUND_CAP_ACCEPT,
+                "label": "Accept as-is",
+                "description": "Approve the change; outstanding findings become follow-ups.",
+            },
+            {
+                "value": review_convergence.REVIEW_ROUND_CAP_ANOTHER_ROUND,
+                "label": "One more round",
+                "description": "Send the guidance to one more implement attempt and re-review.",
+            },
+        ],
+        status="pending",
+        requested_by_phase="review",
+        requested_at=_now_iso(),
+        request_attempt_number=_current_attempt_number(run),
+    )
+
+
+def _accepted_review_round_cap_request(repo_root: Path, run: RunState) -> OperatorRequest | None:
+    request = OperatorRequest.load(repo_root, run.run_id)
+    if (
+        request is None
+        or request.kind != review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND
+        or request.status != "resolved"
+        or review_convergence.parse_round_cap_response(request.response)
+        != review_convergence.REVIEW_ROUND_CAP_ACCEPT
+    ):
+        return None
+    return request
+
+
+def _round_cap_accept_matches_head(
+    accepted_result: ReviewResult | None,
+    rounds: list[review_convergence.ReviewRound],
+    expected_head_sha: str,
+) -> bool:
+    if accepted_result is None or not rounds or not expected_head_sha:
+        return False
+    return accepted_result.reviewed_head_sha == expected_head_sha == rounds[-1].reviewed_head_sha
+
+
+def _apply_computed_local_review_decision(
+    run: RunState,
+    evaluation,
+    *,
+    review_run_dir: Path,
+    last_round: review_convergence.ReviewRound | None,
+    round_number: int,
+    changed_ranges: dict[str, list[tuple[int, int]]] | None,
+    expected_head_sha: str,
+    expected_base_sha: str,
+):
+    """Replace the reviewer's own decision with the computed one.
+
+    The round itself is recorded by ``_record_local_review_round`` only once
+    the review phase reaches ``_apply_review_result``, so a phase that fails
+    afterwards (closed PR, moved head, unsafe transition) does not count
+    toward ``[review] max_rounds``.
+    """
+    from .review_gate import apply_computed_decision, compute_review_decision
+
+    payload = evaluation.result_payload
+    model_decision = str(payload.get("status", "") or "").strip()
+    if model_decision not in {"approved", "request_changes"}:
+        # Blocked/failed reviews did not complete; there is no round to record.
+        return evaluation
+    computed = compute_review_decision(
+        model_decision=model_decision,
+        findings=[f for f in payload.get("findings", []) or [] if isinstance(f, dict)],
+        prior_findings=last_round.outstanding_findings if last_round is not None else None,
+        prior_classifications=[
+            item for item in payload.get("prior_findings", []) or [] if isinstance(item, dict)
+        ],
+        changed_ranges=changed_ranges,
+    )
+    if computed.overrides_model:
+        logger.warning(
+            "Ignoring reviewer decision %s for %s round %d: computed %s (blocking findings: %s)",
+            computed.model_decision,
+            run.run_id,
+            round_number,
+            computed.decision,
+            ", ".join(i or "(no id)" for i in computed.blocking_ids) or "none",
+        )
+    evaluation = apply_computed_decision(evaluation, computed)
+    evaluation.result_payload["review_round"] = round_number
+    return evaluation
+
+
+def _record_local_review_round(review_run_dir: Path, review_result: ReviewResult) -> None:
+    """Append a completed review to the round ledger used by the round cap."""
+    if review_result.status not in {"approved", "request_changes"} or review_result.review_round < 1:
+        return
+    review_convergence.append_review_round(
+        review_run_dir,
+        review_convergence.ReviewRound(
+            round_number=review_result.review_round,
+            reviewed_head_sha=review_result.reviewed_head_sha,
+            reviewed_base_sha=review_result.reviewed_base_sha,
+            decision=review_result.status,
+            model_decision=review_result.model_decision,
+            recorded_at=_now_iso(),
+            outstanding_findings=review_result.outstanding_findings,
+        ),
     )
 
 
@@ -23772,6 +24111,72 @@ def _phase_review_local(
     if not review_transition_is_safe("review preparation"):
         return "failed"
     repo_slug = _trusted_publication_repo_slug(run)
+
+    accepted_request = _accepted_review_round_cap_request(repo_root, run)
+    accepted_result = ReviewResult.load(repo_root, run.run_id) if accepted_request is not None else None
+    rounds = (
+        review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+        if accepted_request is not None
+        else []
+    )
+    if accepted_request is not None and not _round_cap_accept_matches_head(
+        accepted_result, rounds, expected_head_sha
+    ):
+        # "Accept as-is" covers only the head the operator saw at the cap.
+        # A moved head (or a missing review) gets a normal review round.
+        logger.warning(
+            "Operator accepted %s at the review round cap, but the reviewed head "
+            "does not match current head %s; running a normal review round",
+            run.run_id,
+            _short_sha(expected_head_sha),
+        )
+        accepted_request.status = "consumed"
+        accepted_request.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+        accepted_request.consumed_at = _now_iso()
+        accepted_request.response_consumed_attempt_number = _current_attempt_number(run)
+        accepted_request.save(repo_root, run.run_id)
+        accepted_request = None
+    if accepted_request is not None and accepted_result is not None:
+        outstanding = rounds[-1].outstanding_findings if rounds else []
+        _publish_review_followups(
+            run,
+            repo_root,
+            outstanding,
+            pr_number=pr_number,
+            pr_body=str(pr_data.get("body", "") or ""),
+            repo_slug=repo_slug,
+            accepted_at_cap=True,
+        )
+        accepted_result.status = "approved"
+        accepted_result.summary = (
+            f"{accepted_result.summary} [Accepted by the operator at the review round cap.]"
+        ).strip()
+        accepted_result.save(repo_root, run.run_id)
+        try:
+            if review_transition_is_safe("review status publication"):
+                _publish_local_review_status(
+                    repo_root,
+                    repo_name=_repo_name_with_owner(
+                        repo_root,
+                        trusted_remote_url=run.publish_remote_url,
+                    ),
+                    expected_head_sha=expected_head_sha,
+                    review_result=accepted_result,
+                    target_url=accepted_result.source_check_url,
+                )
+        except ValueError as exc:
+            logger.warning("Could not publish operator-accepted review status: %s", exc)
+        now = _now_iso()
+        accepted_request.status = "consumed"
+        accepted_request.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+        accepted_request.consumed_at = now
+        accepted_request.response_consumed_attempt_number = _current_attempt_number(run)
+        accepted_request.save(repo_root, run.run_id)
+        run.review_decision_status = "approved"
+        run.review_decision_summary = "Accepted by the operator at the review round cap."
+        run.last_error = ""
+        return "passed"
+
     disable_error = _disable_pr_auto_merge(
         repo_root,
         pr_number,
@@ -23940,12 +24345,46 @@ def _phase_review_local(
         )
 
     conclusion = "success" if review_result.status == "approved" else "failure"
-    return _apply_review_result(
+    outcome = _apply_review_result(
         run,
         repo_root,
         review_result,
         conclusion=conclusion,
     )
+    review_run_dir = _state_root(repo_root) / "runs" / run.run_id
+    _record_local_review_round(review_run_dir, review_result)
+    if review_result.status == "approved":
+        if review_transition_is_safe("review follow-up publication"):
+            _publish_review_followups(
+                run,
+                repo_root,
+                review_convergence.non_blocking_followups(review_result.outstanding_findings),
+                pr_number=pr_number,
+                pr_body=str(latest_pr.get("body", pr_data.get("body", "")) or ""),
+                repo_slug=repo_slug,
+            )
+    elif review_result.status == "request_changes":
+        max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
+        if review_convergence.round_cap_reached(review_run_dir, max_rounds=max_rounds):
+            rounds_used = review_convergence.request_changes_round_count(
+                review_convergence.load_review_rounds(review_run_dir)
+            )
+            request = _review_round_cap_operator_request(
+                run,
+                review_result.outstanding_findings,
+                rounds_used=rounds_used,
+                max_rounds=max_rounds,
+            )
+            request.save(repo_root, run.run_id)
+            _emit_user_progress(
+                f"[spec] {run.spec_id}: review round cap reached ({rounds_used}/{max_rounds}); "
+                f"waiting for input. Run: spec input --spec {run.spec_id} --accept | --message ..."
+            )
+            run.last_error = request.prompt
+            run.status = "waiting-for-input"
+            run.save(repo_root)
+            return "waiting-for-input"
+    return outcome
 
 
 def _phase_review_action(
@@ -27022,10 +27461,80 @@ def cmd_steer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_input_review_round_cap(
+    repo_root: Path,
+    args: argparse.Namespace,
+    *,
+    accept: bool,
+    message: str,
+) -> int:
+    """Resolve a review round-cap request without an agent session."""
+    spec_id = args.spec
+    if accept and message:
+        print("Error: pass either --accept or --message, not both.", file=sys.stderr)
+        return 1
+    run = RunState.find_latest(repo_root, spec_id)
+    if run is None:
+        print(f"Error: No run found for spec {spec_id}", file=sys.stderr)
+        return 1
+    request = OperatorRequest.load(repo_root, run.run_id)
+    if (
+        request is None
+        or request.kind != review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND
+        or request.status != "pending"
+    ):
+        print(
+            f"Error: Latest run for {spec_id} has no pending review round-cap request; "
+            "--accept and --message only resolve that request.",
+            file=sys.stderr,
+        )
+        return 1
+    if accept:
+        now = _now_iso()
+        request.response = review_convergence.REVIEW_ROUND_CAP_ACCEPT
+        request.response_source = "spec input --accept"
+        request.status = "resolved"
+        request.resolved_at = now
+        request.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+        request.continuation_source = "spec input --accept"
+        request.continuation_selected_at = now
+        request.save(repo_root, run.run_id)
+        # The review phase sees the accepted request and approves the
+        # current head without another reviewer round.
+        run.status = "pending"
+        run.phase = "review"
+        run.save(repo_root)
+        print(f"Accepted {spec_id} at the review round cap. Resuming workflow...")
+    else:
+        review_convergence.grant_extra_review_round(_state_root(repo_root) / "runs" / run.run_id)
+        try:
+            resolve_operator_request(repo_root, run, message, source="spec input --message")
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Granted {spec_id} one more review round. Resuming implement with guidance...")
+    resume_args = argparse.Namespace(
+        spec=spec_id,
+        agent=run.agent or SPEC_RUNTIME_CONFIG.agents.default,
+        review_agent=run.review_agent or _configured_review_agent_default() or run.agent,
+        base=run.base_ref or BASE_REF,
+        run=run.run_id,
+        new=False,
+        retry_cap=run.retry_cap,
+        reset_intake=False,
+    )
+    return cmd_run(resume_args)
+
+
 def cmd_input(args: argparse.Namespace) -> int:
     """Launch an interactive session to resolve an operator intervention."""
     repo_root = resolve_repo_root()
     spec_id = args.spec
+
+    accept = bool(getattr(args, "accept", False))
+    message = str(getattr(args, "message", "") or "").strip()
+    if accept or message:
+        return _cmd_input_review_round_cap(repo_root, args, accept=accept, message=message)
 
     if not sys.stdin.isatty():
         print(
@@ -27048,6 +27557,13 @@ def cmd_input(args: argparse.Namespace) -> int:
     if request is None:
         print(
             f"Error: Latest run for {spec_id} has status '{run.status}' and no active operator intervention.",
+            file=sys.stderr,
+        )
+        return 1
+    if request.kind == review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND:
+        print(
+            f"{request.prompt}\n\nResolve with `spec input --spec {spec_id} --accept` or "
+            f"`spec input --spec {spec_id} --message '<guidance>'`.",
             file=sys.stderr,
         )
         return 1
@@ -28825,6 +29341,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_input.add_argument("--spec", required=True, help="Spec ID")
     p_input.add_argument("--agent", default=None, help="Agent: claude|codex")
+    p_input.add_argument("--accept", action="store_true", help="Review round cap: accept as-is")
+    p_input.add_argument("--message", default="", help="Review round cap: guidance for one more round")
 
     p_steer = subparsers.add_parser(
         "steer",

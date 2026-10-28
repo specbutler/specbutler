@@ -548,6 +548,63 @@ def _codex_implement_permission_overrides(
     ]
 
 
+_CODEX_REVIEW_PERMISSION_PROFILE = "specbutler-review"
+
+
+def codex_review_permission_overrides(
+    review_checkout: Path,
+    *,
+    scratch_dir: Path | None = None,
+    provider_home: Path | None = None,
+) -> list[str]:
+    """Build the read-only inspection profile for a local Codex review.
+
+    The pinned review checkout is readable (so the reviewer can run ``cat``,
+    ``grep`` and ``git log``/``git show``); only the scratch dir is writable.
+    The provider home and every operator credential path are denied, and the
+    network is off.
+    """
+    protected = {path.resolve(strict=False) for path in protected_operator_paths()}
+    if provider_home is not None:
+        protected.add(provider_home.resolve(strict=False))
+    checkout = review_checkout.resolve(strict=False)
+    # A deny on an ancestor would hide the checkout; never emit one.
+    protected = {
+        path
+        for path in protected
+        if not checkout.is_relative_to(path)
+        and not any(parent != path and path.is_relative_to(parent) for parent in protected)
+    }
+    filesystem_entries = [
+        '":root"="read"',
+        f'{_toml_quote(str(checkout))}="read"',
+    ]
+    if scratch_dir is not None:
+        filesystem_entries.append(f'{_toml_quote(str(scratch_dir.resolve(strict=False)))}="write"')
+    filesystem_entries.extend(
+        f'{_toml_quote(str(path))}="deny"' for path in sorted(protected, key=str)
+    )
+    excluded = ", ".join(
+        _toml_quote(key) for key in sorted({*_CODEX_PROVIDER_AUTH_ENV_KEYS, *PROXY_ENV_KEYS})
+    )
+    return [
+        "-c",
+        f'default_permissions="{_CODEX_REVIEW_PERMISSION_PROFILE}"',
+        "-c",
+        (
+            f"permissions.{_CODEX_REVIEW_PERMISSION_PROFILE}.filesystem="
+            "{" + ",".join(filesystem_entries) + "}"
+        ),
+        "-c",
+        f"permissions.{_CODEX_REVIEW_PERMISSION_PROFILE}.network="
+        + codex_profile_network(None, enabled=False),
+        "-c",
+        f"shell_environment_policy.exclude=[{excluded}]",
+        "-c",
+        "allow_login_shell=false",
+    ]
+
+
 def _codex_mcp_secret_env_keys(
     mcp_servers: dict[str, dict[str, object]] | None,
 ) -> set[str]:
@@ -1209,6 +1266,9 @@ class CodexAgent:
         schema_path: Path | None = None,
         mcp_config_path: Path | None = None,
         writable_temp_dir: Path | None = None,
+        review_checkout: Path | None = None,
+        provider_home: Path | None = None,
+        reasoning_effort: str = "",
     ) -> list[str]:
         del prompt, mcp_config_path  # Prompt arrives on stdin; review is MCP-free.
         cmd = [
@@ -1218,24 +1278,49 @@ class CodexAgent:
             "--ignore-user-config",
             "--ignore-rules",
             "--strict-config",
-            "-s",
-            "read-only",
         ]
+        if review_checkout is None:
+            # No checkout to inspect: keep the legacy no-tool boundary.
+            cmd += ["-s", "read-only"]
         if writable_temp_dir is not None:
+            # The scratch dir, not the PR checkout, is the working root so
+            # PR-controlled AGENTS.md/.codex config never load as instructions.
             cmd += ["-C", str(writable_temp_dir), "--skip-git-repo-check"]
-        # Provider credentials are required by the Codex parent process, but
-        # must be unreachable from model-controlled tools. Disable every
-        # local-execution path and make a future accidental shell re-enable
-        # inherit no environment. Strict config turns an older CLI that does
-        # not recognize a boundary control into a fail-closed launch error.
-        for override in (
-            "features.shell_tool=false",
-            "features.unified_exec=false",
-            "features.code_mode_host=false",
-            *CODEX_AMBIENT_CAPABILITY_OVERRIDES,
-            "shell_environment_policy.inherit=none",
-        ):
+        if review_checkout is None:
+            # Provider credentials are required by the Codex parent process,
+            # but must be unreachable from model-controlled tools. Disable
+            # every local-execution path and make a future accidental shell
+            # re-enable inherit no environment. Strict config turns an older
+            # CLI that does not recognize a boundary control into a
+            # fail-closed launch error.
+            overrides: tuple[str, ...] = (
+                "features.shell_tool=false",
+                "features.unified_exec=false",
+                "features.code_mode_host=false",
+                *CODEX_AMBIENT_CAPABILITY_OVERRIDES,
+                "shell_environment_policy.inherit=none",
+            )
+        else:
+            # Read-only inspection (cat, grep, git log/show) of the pinned
+            # checkout. The permission profile, not the prompt, is the
+            # boundary: the filesystem is read-only except the scratch dir,
+            # credential stores and the provider home are denied, and the
+            # network is off. Shell children get only core variables.
+            overrides = (
+                "features.code_mode_host=false",
+                *CODEX_AMBIENT_CAPABILITY_OVERRIDES,
+                "shell_environment_policy.inherit=core",
+            )
+        for override in overrides:
             cmd += ["-c", override]
+        if review_checkout is not None:
+            cmd += codex_review_permission_overrides(
+                review_checkout,
+                scratch_dir=writable_temp_dir,
+                provider_home=provider_home,
+            )
+        if reasoning_effort:
+            cmd += ["-c", f"model_reasoning_effort={_toml_quote(reasoning_effort)}"]
         cmd += _codex_linux_sandbox_overrides()
         if schema_path:
             cmd += ["--output-schema", str(schema_path)]

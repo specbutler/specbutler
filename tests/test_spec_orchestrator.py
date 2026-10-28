@@ -19228,13 +19228,15 @@ class TestLocalReviewHelpers:
         ).read_text()
 
         assert prompt == bundled_prompt
-        assert "Review evidence access is provider-specific." in prompt
-        assert "intentionally have no shell" in prompt
+        assert "Review evidence access is provider-specific" in prompt
+        assert "The Codex reviewer may run read-only inspection commands" in prompt
+        assert "Do not execute pull-request code" in prompt
         assert "Local shell command execution is available" not in prompt
         assert (
-            "Intentionally disabled command execution\nor test reruns in a built-in review are not missing tools"
+            "Intentionally disabled test reruns or\ncommand execution are not missing tools"
             in prompt
         )
+        assert "Classify every prior finding in `prior_findings`" in prompt
         assert (
             "If you return `blocked` or `failed`, the summary must name the exact evidence"
         ) in prompt
@@ -20669,7 +20671,11 @@ class TestLocalReviewPhase:
             observed_scratch.append(scratch_dir)
             assert scratch_dir.is_dir()
             assert scratch_dir != review_worktree
-            assert cmd[cmd.index("-s") + 1] == "read-only"
+            # The pinned checkout is readable through the review profile.
+            assert "-s" not in cmd
+            assert 'default_permissions="specbutler-review"' in cmd
+            filesystem = next(c for c in cmd if c.startswith("permissions.specbutler-review.filesystem="))
+            assert f'"{review_worktree.resolve()}"="read"' in filesystem
             assert "--skip-git-repo-check" in cmd
             assert "--add-dir" not in cmd
             assert env["TMPDIR"] == str(scratch_dir)

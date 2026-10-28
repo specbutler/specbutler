@@ -28,6 +28,22 @@ def test_starter_config_is_valid_runtime_configuration(tmp_path: Path) -> None:
     assert {gate.name for gate in config.verify_gates} == {"test", "lint"}
 
 
+def test_starter_config_keeps_retry_keys_in_retry_table() -> None:
+    raw = tomllib.loads(PUBLIC_EXAMPLE.read_text())
+
+    assert {"infra_retry_attempts", "infra_backoff_base_seconds", "infra_backoff_max_seconds"} <= set(
+        raw["retry"]
+    )
+    assert set(raw["review"]) == {"max_rounds", "rereview_reasoning_effort"}
+
+
+def test_review_section_rejects_unknown_keys(tmp_path: Path) -> None:
+    (tmp_path / ".spec.toml").write_text("[review]\ninfra_retry_attempts = 5\n", encoding="utf-8")
+
+    with pytest.raises(SpecConfigError, match="Unknown \\[review\\] key"):
+        load_repo_spec_runtime_config(tmp_path)
+
+
 def test_gate_review_evidence_paths_are_parsed_as_an_exact_allowlist(
     tmp_path: Path,
 ) -> None:

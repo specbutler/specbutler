@@ -6,11 +6,22 @@ Base SHA: ${BASE_SHA}
 Head SHA: ${HEAD_SHA}
 Head branch: ${HEAD_REF}
 
-Review evidence access is provider-specific. Follow the environment appendix
-that the orchestrator adds to this prompt. Built-in reviewers receive
-host-materialized diff, spec, and gate evidence and intentionally have no shell.
-Custom adapters may instead expose a disposable checkout and inspection tools.
-Do not modify files, create commits, or publish changes in either environment.
+Review evidence access is provider-specific; the environment appendix the
+orchestrator adds to this prompt is authoritative. In every environment:
+- The orchestrator supplies the canonical spec, the full PR diff, and the
+  verify gate results. On a re-review it also supplies the previous round's
+  findings, the implementer's response, and the diff since the last reviewed
+  head.
+- A read-only checkout pinned to the reviewed head is available for context.
+  The Codex reviewer may run read-only inspection commands against it (for
+  example `cat`, `grep`, `rg`, `ls`, `git log`, `git show`, `git diff`). The
+  Claude reviewer uses Read, Glob and Grep. Custom adapters expose their own
+  inspection tools.
+- Do not execute pull-request code: no tests, builds, installs, or scripts
+  from the checkout. Rely on the orchestrator's gate results instead; the
+  inability to rerun tests is not a finding and not a reason for `blocked`.
+- Do not modify files, create commits, or publish changes. Provider and
+  operator credential locations are deliberately unreadable.
 
 Review only the changes introduced by this PR (base...head). Treat the exact
 diff identified by the environment appendix as the source of truth for changed
@@ -51,9 +62,18 @@ Decision policy:
 - blocked: cannot complete review because required evidence is absent or unreadable
 - failed: internal/tooling failure prevented reliable review
 
+Re-reviews (when a "Prior review findings" section is present):
+- Classify every prior finding in `prior_findings` as `resolved`, `unresolved`
+  or `withdrawn`, with a short `note`. On a first review, return an empty
+  `prior_findings` array.
+- A new blocking finding must be P0, or a P1 introduced by the changes since
+  the last review. Report other new concerns as P2/P3.
+- The orchestrator computes the final decision from these classifications and
+  findings; keep `decision` consistent with them.
+
 Use `blocked` only when critical evidence required by the applicable environment
-appendix is absent or cannot be read. Intentionally disabled command execution
-or test reruns in a built-in review are not missing tools and are not findings.
+appendix is absent or cannot be read. Intentionally disabled test reruns or
+command execution are not missing tools and are not findings.
 If you return `blocked` or `failed`, the summary must name the exact evidence or
 permitted access that failed and why.
 
