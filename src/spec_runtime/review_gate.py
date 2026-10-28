@@ -450,6 +450,19 @@ def _restates_prior(finding: dict[str, Any], prior: dict[str, Any], status: str)
     return rank >= _SEVERITY_RANK.get(_severity(prior), 2)
 
 
+def _prior_blocking(prior: dict[str, Any]) -> bool:
+    """Keep the eligibility a prior finding was given when it was first raised.
+
+    A re-review P1 outside the incremental diff is recorded non-blocking and
+    must stay so in later rounds. Legacy ledger entries without the flag fall
+    back to severity.
+    """
+    stored = prior.get("blocking")
+    if isinstance(stored, bool):
+        return stored
+    return _severity(prior) in BLOCKING_SEVERITIES
+
+
 def _unique_id(finding_id: str, used_ids: set[str]) -> str:
     candidate = f"{finding_id}-new"
     suffix = 2
@@ -512,7 +525,7 @@ def compute_review_decision(
             statuses[finding_id] = status
         if status != "unresolved":
             continue
-        blocking = _severity(prior) in BLOCKING_SEVERITIES
+        blocking = _prior_blocking(prior)
         outstanding.append({**prior, "origin": "prior", "blocking": blocking})
         if blocking:
             blocking_ids.append(finding_id)

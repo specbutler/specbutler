@@ -204,6 +204,59 @@ def test_rereview_new_p1_blocks_only_when_it_touches_changed_lines():
     assert new_p0.decision == "request_changes"
 
 
+def test_non_blocking_rereview_p1_stays_non_blocking_in_later_rounds():
+    # Round 2: N1 is a P1 outside the incremental diff (non-blocking); N2 is a
+    # P0 that forces another round.
+    round_two = compute_review_decision(
+        model_decision="request_changes",
+        findings=[_finding("N1", "P1", line=10), _finding("N2", "P0", line=42)],
+        prior_findings=[],
+        changed_ranges={"src/app.py": [(40, 45)]},
+    )
+    assert round_two.blocking_ids == ["N2"]
+
+    # Round 3 carries round 2's outstanding findings forward; N2 is fixed but
+    # N1 is still unresolved and must keep its non-blocking eligibility.
+    round_three = compute_review_decision(
+        model_decision="request_changes",
+        findings=[],
+        prior_findings=round_two.outstanding_findings,
+        prior_classifications=[{"id": "N1", "status": "unresolved"}, {"id": "N2", "status": "resolved"}],
+        changed_ranges={"src/app.py": [(10, 10)]},
+    )
+
+    assert round_three.decision == "approved"
+    assert round_three.blocking_ids == []
+    assert [(f["id"], f["blocking"]) for f in round_three.outstanding_findings] == [("N1", False)]
+
+    # Round 4 restates N1 under its own id; it is still counted once, non-blocking.
+    round_four = compute_review_decision(
+        model_decision="request_changes",
+        findings=[_finding("N1", "P1", line=10)],
+        prior_findings=round_three.outstanding_findings,
+        prior_classifications=[{"id": "N1", "status": "unresolved"}],
+        changed_ranges={"src/app.py": [(10, 10)]},
+    )
+    assert round_four.decision == "approved"
+    assert [(f["id"], f["blocking"]) for f in round_four.outstanding_findings] == [("N1", False)]
+
+
+def test_legacy_prior_finding_without_blocking_flag_falls_back_to_severity():
+    legacy_p1 = _finding("F1", "P1")
+    legacy_p2 = _finding("F2", "P2")
+    assert "blocking" not in legacy_p1 and "blocking" not in legacy_p2
+
+    computed = compute_review_decision(
+        model_decision="approved",
+        findings=[],
+        prior_findings=[legacy_p1, legacy_p2],
+        prior_classifications=[],
+        changed_ranges={},
+    )
+
+    assert computed.blocking_ids == ["F1"]
+
+
 def test_new_finding_reusing_a_resolved_prior_id_still_blocks():
     computed = compute_review_decision(
         model_decision="approved",
