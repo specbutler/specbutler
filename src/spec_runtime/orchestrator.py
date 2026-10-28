@@ -4475,6 +4475,28 @@ _TOOLCHAIN_MISSING_RE = re.compile(
     r"|\bpostgres binaries not found\b"
     r"|\b(?:uv|node|npm|pnpm|yarn|python3?|docker|podman|cargo|go): (?:command )?not found\b"
 )
+# Provider CLI output when the model API cannot be reached at all (offline
+# host, DNS failure, sleeping laptop). The session ends after one turn with no
+# work done, so it must not consume a code retry.
+_AGENT_NETWORK_FAILURE_MARKERS = (
+    "can't reach the api server",
+    "cannot reach the api server",
+    "enotfound",
+    "eai_again",
+    "getaddrinfo",
+    "econnrefused",
+    "econnreset",
+    "network is unreachable",
+    "stream disconnected before completion",
+    "error sending request for url",
+)
+
+
+def _is_agent_network_failure_message(message: object) -> bool:
+    text = str(message or "").lower()
+    return "provider_network" in text or any(marker in text for marker in _AGENT_NETWORK_FAILURE_MARKERS)
+
+
 _FORGE_NETWORK_MARKERS = (
     "error connecting to",
     "could not resolve host",
@@ -4542,6 +4564,8 @@ def _infrastructure_failure_kind(text: str) -> tuple[str, bool, str] | None:
         return "agent_auth", False, "backend"
     if _is_agent_capacity_failure_message(text):
         return "provider_capacity", True, "backend"
+    if _is_agent_network_failure_message(text):
+        return "provider_network", True, "backend"
     if _TOOLCHAIN_MISSING_RE.search(text):
         return "toolchain_missing", False, "backend"
     if _is_verify_environment_failure_message(text):
@@ -9750,6 +9774,9 @@ class AgentProgressTracker:
     repo_root: Path | None = None
     started_at: float = field(default_factory=time.monotonic)
     last_progress_at: float = field(default_factory=time.monotonic)
+    # Only summarized events count here; keepalive/heartbeat events do not, so
+    # a stream of keepalives cannot hide a stuck agent from the watchdog.
+    last_meaningful_progress_at: float = field(default_factory=time.monotonic)
     last_event_summary: str = ""
     timeout_message: str = ""
     _last_heartbeat_persist: float = field(default_factory=time.monotonic, repr=False)
@@ -9757,6 +9784,7 @@ class AgentProgressTracker:
     _inflight_items: set[str] = field(default_factory=set, repr=False)
     _sandbox_denial: SandboxDenial | None = field(default=None, repr=False)
     _auth_failure_summary: str = field(default="", repr=False)
+    _network_failure_summary: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         if not self.last_event_summary:
@@ -9791,14 +9819,22 @@ class AgentProgressTracker:
         if len(clean_summary) > 160:
             clean_summary = f"{clean_summary[:157]}..."
         with self._lock:
-            self.last_progress_at = time.monotonic()
+            now = time.monotonic()
+            self.last_progress_at = now
+            self.last_meaningful_progress_at = now
             self.last_event_summary = clean_summary
             if not self._auth_failure_summary and _is_agent_auth_failure_message(clean_summary):
                 # The CLI prints its login error before a final result event,
                 # so the last event alone would hide it.
                 self._auth_failure_summary = clean_summary
+            if not self._network_failure_summary and _is_agent_network_failure_message(clean_summary):
+                self._network_failure_summary = clean_summary
         self._maybe_persist_heartbeat()
         return clean_summary
+
+    def network_failure_summary(self) -> str:
+        with self._lock:
+            return self._network_failure_summary
 
     def auth_failure_summary(self) -> str:
         with self._lock:
@@ -9835,12 +9871,17 @@ class AgentProgressTracker:
         with self._lock:
             return time.monotonic() - self.last_progress_at, self.last_event_summary
 
+    def meaningful_idle_seconds(self) -> float:
+        with self._lock:
+            return time.monotonic() - self.last_meaningful_progress_at
+
     def clear_inflight_commands(self) -> None:
         with self._lock:
             self._inflight_items.clear()
 
     def mark_timeout(self, timeout_seconds: float) -> str:
         idle_for, last_event = self.snapshot()
+        idle_for = max(idle_for, self.meaningful_idle_seconds() if idle_for < timeout_seconds else 0.0)
         message = (
             f"Agent became inactive for {timeout_seconds:.0f}s during implement; "
             f"last progress was '{last_event}' {idle_for:.0f}s ago. "
@@ -17702,6 +17743,13 @@ def _interpret_implement_attempt_result(
                 f"(provider_capacity, no_handshake). Last agent output: {last_event}"
             )
             return "failed"
+        network_event = outcome.progress_tracker.network_failure_summary()
+        if network_event:
+            run.last_error = (
+                "Agent provider API was unreachable "
+                f"(provider_network, no_handshake). Agent output: {network_event}"
+            )
+            return "failed"
 
     run.last_error = (
         f"Agent exited with code {outcome.exit_code} (no_handshake). "
@@ -19849,6 +19897,12 @@ def _wait_for_agent_exit(
             )
             if idle_timeout is not None:
                 idle_for, last_event = progress_tracker.snapshot()
+                stalled_for = progress_tracker.meaningful_idle_seconds()
+                if stalled_for >= AGENT_COMMAND_IDLE_TIMEOUT_SECONDS and idle_for < idle_timeout:
+                    # Keepalive events kept the idle clock fresh, but nothing
+                    # summarizable happened for the whole command ceiling.
+                    idle_for = stalled_for
+                    idle_timeout = AGENT_COMMAND_IDLE_TIMEOUT_SECONDS
                 if idle_for >= idle_timeout:
                     timeout_message = progress_tracker.mark_timeout(
                         idle_timeout,

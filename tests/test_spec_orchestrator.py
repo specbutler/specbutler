@@ -4842,6 +4842,39 @@ class TestPhaseImplementHandshake:
         ):
             assert orch._claude_host_launch_uses_operator_keychain(launch_env) is expected
 
+    def test_progress_tracker_keepalives_do_not_count_as_meaningful_progress(self):
+        tracker = orch.AgentProgressTracker(agent="codex")
+        tracker.record("Codex: > shell: pytest")
+        tracker.last_meaningful_progress_at -= 5000
+        tracker.heartbeat()
+
+        idle_for, _ = tracker.snapshot()
+        assert idle_for < 1
+        assert tracker.meaningful_idle_seconds() >= 5000
+        assert "5000s ago" in tracker.mark_timeout(orch.AGENT_COMMAND_IDLE_TIMEOUT_SECONDS) or (
+            "ago" in tracker.timeout_message
+        )
+
+    def test_progress_tracker_keeps_provider_network_error_seen_before_the_final_event(self):
+        tracker = orch.AgentProgressTracker(agent="claude")
+        tracker.record("API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)")
+        tracker.record("Done | 1 turns | 40s | $0.00")
+
+        assert "ENOTFOUND" in tracker.network_failure_summary()
+        classification = orch.classify_failure(
+            "Agent provider API was unreachable (provider_network, no_handshake). "
+            f"Agent output: {tracker.network_failure_summary()}",
+            phase="implement",
+        )
+        assert classification.category == orch.FailureCategory.INFRASTRUCTURE
+        assert classification.kind == "provider_network"
+        assert classification.transient is True
+
+    def test_codex_launches_disable_the_code_mode_host(self):
+        from spec_runtime import agent_adapter
+
+        assert "features.code_mode_host=false" in agent_adapter.CODEX_AMBIENT_CAPABILITY_OVERRIDES
+
     def test_progress_tracker_keeps_login_error_seen_before_the_final_event(self):
         tracker = orch.AgentProgressTracker(agent="claude")
         tracker.record("Not logged in · Please run /login")
