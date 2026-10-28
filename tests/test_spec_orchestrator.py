@@ -4870,10 +4870,12 @@ class TestPhaseImplementHandshake:
         assert classification.kind == "provider_network"
         assert classification.transient is True
 
-    def test_codex_launches_disable_the_code_mode_host(self):
+    def test_codex_implement_launches_keep_the_code_mode_host_for_tools(self):
         from spec_runtime import agent_adapter
 
-        assert "features.code_mode_host=false" in agent_adapter.CODEX_AMBIENT_CAPABILITY_OVERRIDES
+        # The shell tool runs through the code-mode host in Codex 0.164.
+        assert "features.code_mode_host=false" not in agent_adapter.CODEX_AMBIENT_CAPABILITY_OVERRIDES
+        assert "features.code_mode=false" in agent_adapter.CODEX_AMBIENT_CAPABILITY_OVERRIDES
 
     def test_progress_tracker_keeps_login_error_seen_before_the_final_event(self):
         tracker = orch.AgentProgressTracker(agent="claude")
