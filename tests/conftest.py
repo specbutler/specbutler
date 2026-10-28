@@ -51,16 +51,27 @@ def probe_ps(env: Mapping[str, str] | None = None) -> str | None:
     return None
 
 
+def ps_unavailability_reason(os_name: str, env: Mapping[str, str] | None = None) -> str | None:
+    """Return why ``requires_ps`` tests must skip on ``os_name``, or ``None``.
+
+    Only POSIX inspects processes through ``ps``; Windows uses kernel32, so a
+    missing ``ps`` there says nothing about whether those tests can run.
+    """
+    if os_name != "posix":
+        return None
+    return probe_ps(env)
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Skip ``requires_ps`` tests, with the probe's error, when ``ps`` cannot run.
 
-    The probe runs at most once per session, and only when a collected test
-    actually needs ``ps``.
+    The probe runs at most once per session, only on POSIX, and only when a
+    collected test actually needs ``ps``.
     """
     needs_ps = [item for item in items if item.get_closest_marker("requires_ps")]
     if not needs_ps:
         return
-    reason = probe_ps()
+    reason = ps_unavailability_reason(os.name)
     config.stash[_ps_unavailability_key] = reason
     if reason is None:
         return
