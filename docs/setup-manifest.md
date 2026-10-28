@@ -175,3 +175,41 @@ agent is launched:
 - Branch sync failure.
 - Agent binary missing (`FileNotFoundError` from `Popen`).
 - Unusable workspace (e.g., required intake missing).
+
+### Repository-owned database teardown
+
+Postgres shutdown is no longer built into worktree cleanup. Repositories that
+previously relied on automatic pg_ctl shutdown must configure their teardown hook:
+
+```toml
+[implement]
+teardown_command = "scripts/stop-local-postgres.sh"
+```
+
+The repository script can select its own binary and data directory, for example:
+
+```sh
+#!/bin/sh
+set -eu
+pg_ctl="${SIM_LOCAL_PG_BIN:-/opt/homebrew/opt/postgresql@16/bin}/pg_ctl"
+data_dir="$PWD/.local/postgres/data"
+if [ -f "$data_dir/postmaster.pid" ]; then
+    "$pg_ctl" -D "$data_dir" stop -m fast
+fi
+```
+
+### Gate diagnostics
+
+Any verify gate may set a diagnostic command, which runs once after failure:
+
+```toml
+[[verify.gates]]
+name = "test"
+command = "npm test"
+diagnostic_command = "npm test -- --verbose"
+```
+
+Commands are split into arguments without a shell. If omitted, only commands
+that invoke pytest receive the default pytest diagnostic rerun. Other commands,
+including opaque wrappers such as make test, skip diagnostic reruns unless
+configured explicitly. Pytest node isolation is reserved for pytest commands.

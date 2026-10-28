@@ -29,6 +29,7 @@ class VerifyGateConfig:
     parallel: bool = False
     role: str = ""  # Semantic role: "test", "lint", "e2e". Defaults to name.
     command_variants: CommandVariants = CommandVariants()
+    diagnostic_command: str = ""
     review_evidence: tuple[str, ...] = ()
 
     @property
@@ -870,6 +871,7 @@ def load_spec_runtime_config(
                 name=name,
                 command=command,
                 parallel=bool(gate.get("parallel", False)),
+                diagnostic_command=str(gate.get("diagnostic_command", "")).strip(),
                 role=str(gate.get("role", "")).strip(),
                 command_variants=variants,
                 review_evidence=_parse_review_evidence_paths(

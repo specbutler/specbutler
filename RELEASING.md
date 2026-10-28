@@ -71,3 +71,11 @@ stable-channel contract above.
 After the repository is public, also enable and verify GitHub private
 vulnerability reporting so the primary path in [SECURITY.md](SECURITY.md) is
 available; the documented email address remains the fallback.
+
+## Migration note: repository-owned cleanup
+
+Worktree cleanup no longer discovers pg_ctl or stops a local Postgres cluster.
+Repositories relying on that behavior must add an [implement] teardown_command;
+see [the teardown example](docs/setup-manifest.md#repository-owned-database-teardown).
+Gates wrapping pytest (for example make test) should set diagnostic_command
+explicitly to retain their diagnostic rerun.
