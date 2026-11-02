@@ -474,10 +474,18 @@ your project needs; see [Execution backends](docs/execution-backends.md).
   Interactive authoring keeps workspace edits and local commits available, but
   network commands require approval and the child process receives no forge
   credential. Built-in Codex review and blocked-run debugging disable
-  model-controlled shell, code, browser, plugin, subagent, user-config, and MCP
+  model-controlled code, browser, plugin, subagent, user-config, and MCP
   capabilities. The provider receives the canonical spec, exact diff, and
-  completed gate evidence materialized by the host, and runs in a read-only
-  sandbox from an external scratch directory.
+  completed gate evidence materialized by the host, and runs from an external
+  scratch directory. When a pinned review checkout exists, the Codex reviewer
+  keeps a shell for inspection only: the `specbutler-review` permission
+  profile makes the filesystem read-only except the scratch directory, denies
+  the provider home and operator credential paths, and turns the network off;
+  `approval_policy="untrusted"` lets only Codex's known-safe inspection
+  commands (`cat`, `ls`, `grep`/`rg`, `sed -n`, `find` without `-exec`,
+  `git log`/`show`/`diff`/`status`) run, and every other command is rejected
+  because exec mode cannot approve it. Without a checkout the shell is
+  disabled and the sandbox is read-only.
 - Built-in Claude and Codex reviewers do not install or execute pull-request
   code. They rely on the verification gates already run by the orchestrator and
   on host-materialized review evidence. Custom review adapters may retain the
