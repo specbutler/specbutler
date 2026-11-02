@@ -16935,6 +16935,71 @@ def _copy_provider_sessions(
         logger.warning("Could not copy provider sessions %s -> %s: %s", source, destination, exc)
 
 
+def _merge_operator_session_file(source: Path, target: Path) -> str:
+    """Place one session file into an operator-owned store without losing history.
+
+    The operator may have resumed the session interactively since an earlier
+    attach, so an existing file is only replaced when the incoming copy
+    extends it (provider transcripts are append-only). Returns ``restored``,
+    ``current`` (already identical), ``kept-newer`` (the operator's copy
+    extends the incoming one, or a non-transcript file already exists) or
+    ``kept-diverged`` (both gained different records, or the target is a link).
+    """
+    if target.is_symlink():
+        return "kept-diverged"
+    if target.exists():
+        if not target.is_file():
+            return "kept-diverged"
+        if source.suffix != ".jsonl":
+            return "kept-newer"
+        incoming = source.read_bytes()
+        existing = target.read_bytes()
+        if incoming == existing:
+            return "current"
+        if existing.startswith(incoming):
+            return "kept-newer"
+        if not incoming.startswith(existing):
+            return "kept-diverged"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(f".{target.name}.spec-restore")
+    shutil.copyfile(source, staging)
+    os.replace(staging, target)
+    return "restored"
+
+
+def _merge_operator_sessions(source: Path, destination: Path) -> dict[str, list[Path]]:
+    """Merge a provider session tree into the operator's own provider home.
+
+    Unlike :func:`_copy_provider_sessions` (which refreshes run-owned launch
+    homes and archives), this never overwrites operator progress; see
+    :func:`_merge_operator_session_file`. Returns the targets per outcome.
+    """
+    outcomes: dict[str, list[Path]] = {}
+    if not source.is_dir() or source.is_symlink():
+        return outcomes
+    for directory, dirnames, filenames in os.walk(source, followlinks=False):
+        current = Path(directory)
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        for name in filenames:
+            path = current / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            target = destination / path.relative_to(source)
+            try:
+                outcome = _merge_operator_session_file(path, target)
+            except OSError as exc:
+                logger.warning("Could not restore session file %s -> %s: %s", path, target, exc)
+                continue
+            outcomes.setdefault(outcome, []).append(target)
+    for target in outcomes.get("kept-diverged", []):
+        print(
+            f"Warning: Kept your existing {target} instead of the run's copy; "
+            "both have history the other lacks.",
+            file=sys.stderr,
+        )
+    return outcomes
+
+
 def _export_workspace_sessions(
     backend: ExecutionBackend,
     worktree_path: Path,
@@ -17051,7 +17116,8 @@ def _install_claude_session(source: Path, session_id: str, worktree_path: Path) 
 
     Transcripts are filed per working directory; a container worker's copy is
     filed under the container path, so it is re-filed under the host
-    workspace the attach command runs in. Returns the installed transcript.
+    workspace the attach command runs in. An operator transcript that already
+    has newer interactive turns is kept. Returns the installed transcript.
     """
     if not source.is_dir() or source.is_symlink():
         return None
@@ -17068,11 +17134,15 @@ def _install_claude_session(source: Path, session_id: str, worktree_path: Path) 
         / "projects"
         / _claude_project_dir_name(worktree_path.resolve())
     )
-    target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / transcript.name
-    shutil.copyfile(transcript, target)
+    if _merge_operator_session_file(transcript, target) == "kept-diverged":
+        print(
+            f"Warning: Kept your existing {target} instead of the run's copy; "
+            "both have history the other lacks.",
+            file=sys.stderr,
+        )
     # Subagent transcripts and tool results live beside the main transcript.
-    _copy_provider_sessions(transcript.parent / session_id, target_dir / session_id)
+    _merge_operator_sessions(transcript.parent / session_id, target_dir / session_id)
     return target
 
 
@@ -27897,6 +27967,8 @@ def _expose_run_sessions_to_operator(
     restored into the operator's home first; the printed command then works on
     its own as well. While the launch still runs (``--fork``) its live
     sessions are newer than the archive, so a snapshot of them is laid on top.
+    Files already in the operator's home are only replaced by copies that
+    extend them, so turns added in an earlier attach are never lost.
     """
     archive = (
         _codex_session_archive_dir(repo_root, run.run_id)
@@ -27913,7 +27985,9 @@ def _expose_run_sessions_to_operator(
         if agent == "codex":
             operator_sessions = _operator_codex_home() / "sessions"
             for source in sources:
-                _copy_codex_sessions(source, operator_sessions)
+                # Never the plain copy: the operator's home may hold turns
+                # added interactively since an earlier attach.
+                _merge_operator_sessions(source, operator_sessions)
             if any(
                 any(source.rglob(f"*{run.agent_session_id}*.jsonl")) for source in sources
             ):

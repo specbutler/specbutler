@@ -861,6 +861,36 @@ def test_container_claude_session_survives_the_isolated_home(
     assert f"Restored Claude session {session_id}" in out
 
 
+def test_reattach_keeps_interactive_claude_turns(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Turns the operator added after the first attach survive a second one."""
+    _use_isolated_home_container(monkeypatch, tmp_path)
+    fake = FakeProvider(tmp_path, "claude")
+    fake.scenario(structured=OK_COMPLETION, transcripts=True)
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, "claude")
+    with patch.object(orch, "_worktree_dirty_files", return_value=[]):
+        assert _implement(run, repo, worktree) == "passed"
+    session_id = run.agent_session_id
+    assert _attach(repo, worktree, capsys, exec_=False)[0] == 0
+    installed = _claude_transcript(tmp_path / "operator-home" / ".claude", worktree, session_id)
+    sidecar = installed.parent / session_id / "subagents" / "agent-1.jsonl"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_text("{\"operator-subagent\": 1}\n", encoding="utf-8")
+    interactive = installed.read_text(encoding="utf-8") + "{\"operator\": 1}\n"
+    installed.write_text(interactive, encoding="utf-8")
+
+    code, _, _ = _attach(repo, worktree, capsys, exec_=False)
+
+    assert code == 0
+    assert installed.read_text(encoding="utf-8") == interactive
+    assert sidecar.read_text(encoding="utf-8") == "{\"operator-subagent\": 1}\n"
+
+
 def test_attach_exec_resumes_container_claude_session_from_operator_home(
     repo: Path,
     tmp_path: Path,
@@ -1372,6 +1402,70 @@ def test_attach_fork_prefers_live_codex_rollout_over_stale_archive(
     assert restored.read_text(encoding="utf-8") == "turn-1\nturn-2\n"
     # The archive itself is left for the launch to finalize.
     assert (archive / "rollout-thread-1.jsonl").read_text(encoding="utf-8") == "turn-1\n"
+
+
+def test_reattach_keeps_interactive_codex_turns(
+    repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A second attach must not roll the operator's rollout back to the archive."""
+    run, worktree = _make_run(repo, "codex")
+    run.agent_session_id = "thread-1"
+    run.agent_session_agent = "codex"
+    run.save(repo)
+    _archive_codex_rollout(repo, run, "thread-1")
+    assert _attach(repo, worktree, capsys)[0] == 0
+    restored = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "rollout-thread-1.jsonl"
+    # The operator resumed interactively and added a turn.
+    restored.write_text("{}\n{\"operator\": 1}\n", encoding="utf-8")
+
+    code, out, _ = _attach(repo, worktree, capsys)
+
+    assert code == 0
+    assert "codex resume thread-1" in out
+    assert restored.read_text(encoding="utf-8") == "{}\n{\"operator\": 1}\n"
+
+
+def test_reattach_restores_rollout_that_extends_operator_copy(
+    repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A later retry that grew the thread is still brought to the operator."""
+    run, worktree = _make_run(repo, "codex")
+    run.agent_session_id = "thread-1"
+    run.agent_session_agent = "codex"
+    run.save(repo)
+    _archive_codex_rollout(repo, run, "thread-1")
+    assert _attach(repo, worktree, capsys)[0] == 0
+    archived = orch._codex_session_archive_dir(repo, run.run_id) / "2026" / "rollout-thread-1.jsonl"
+    archived.write_text("{}\n{\"retry\": 2}\n", encoding="utf-8")
+
+    assert _attach(repo, worktree, capsys)[0] == 0
+
+    restored = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "rollout-thread-1.jsonl"
+    assert restored.read_text(encoding="utf-8") == "{}\n{\"retry\": 2}\n"
+
+
+def test_reattach_keeps_diverged_operator_rollout_and_warns(
+    repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run, worktree = _make_run(repo, "codex")
+    run.agent_session_id = "thread-1"
+    run.agent_session_agent = "codex"
+    run.save(repo)
+    _archive_codex_rollout(repo, run, "thread-1")
+    assert _attach(repo, worktree, capsys)[0] == 0
+    restored = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "rollout-thread-1.jsonl"
+    restored.write_text("{}\n{\"operator\": 1}\n", encoding="utf-8")
+    archived = orch._codex_session_archive_dir(repo, run.run_id) / "2026" / "rollout-thread-1.jsonl"
+    archived.write_text("{}\n{\"retry\": 2}\n", encoding="utf-8")
+
+    code, _, err = _attach(repo, worktree, capsys)
+
+    assert code == 0
+    assert restored.read_text(encoding="utf-8") == "{}\n{\"operator\": 1}\n"
+    assert "Kept your existing" in err
 
 
 # ---------------------------------------------------------------------------
