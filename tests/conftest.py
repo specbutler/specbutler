@@ -57,6 +57,29 @@ def _isolate_process_control_state(
 
 
 @pytest.fixture(autouse=True)
+def _scope_orchestrator_jobs_to_this_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep fixed test run ids from sharing a machine-global Windows Job.
+
+    The orchestrator claims ``orchestrator-<run_id>`` as a ``Global\\`` named
+    Job and joins it for life.  Tests reuse fixed run ids, so a second pytest
+    process (an xdist worker) claiming the same id would open the first
+    process's Job and be refused with ERROR_ACCESS_DENIED.  Suffixing this
+    process's pid keeps the real claim while making the name ours alone.
+    """
+    if os.name != "nt":
+        return
+    from spec_runtime import orchestrator
+
+    claim = orchestrator.claim_current_process
+    suffix = f"pytest{os.getpid()}"
+    monkeypatch.setattr(
+        orchestrator,
+        "claim_current_process",
+        lambda supervision_id: claim(f"{supervision_id}-{suffix}"),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _stub_claude_native_launch_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep implement tests from shelling out to ``claude --help``.
 

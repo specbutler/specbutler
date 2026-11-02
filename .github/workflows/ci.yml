@@ -524,9 +524,6 @@ jobs:
         run: |
           Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force artifacts/ci-evidence | Out-Null
-          Write-Host "Logical processors: $([Environment]::ProcessorCount)"
-          Get-MpComputerStatus | Select-Object RealTimeProtectionEnabled, AMRunningMode | Format-List | Out-Host
-          Get-PSDrive C, D | Format-Table Name, Used, Free | Out-Host
           # The suite is dominated by per-test process and git spawns, which are
           # several times slower on Windows than on Linux; spread them across
           # every runner core and keep pytest's temp tree on the runner's D: drive.
