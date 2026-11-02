@@ -304,8 +304,25 @@ class TestSpecIdReferenced:
 
 
 @pytest.fixture()
-def repo(tmp_path: Path) -> Path:
-    """Set up a minimal git repo under tmp_path with spec files and origin/master."""
+def repo(tmp_path: Path, _repo_template: Path) -> Path:
+    """Copy a minimal git repo with spec files and origin/master under tmp_path.
+
+    Building the repository costs ten git processes, which dominates most
+    tests in this module on Windows; copying a per-session template costs two.
+    """
+    shutil.copytree(_repo_template / "remote.git", tmp_path / "remote.git", symlinks=True)
+    work = tmp_path / "work"
+    shutil.copytree(_repo_template / "work", work, symlinks=True)
+    _run_git("remote", "set-url", "origin", str(tmp_path / "remote.git"), cwd=work)
+    # Copies carry new inode and ctime stat data; refresh so plumbing such as
+    # diff-index sees the same clean tree a freshly committed checkout has.
+    _run_git("update-index", "-q", "--refresh", cwd=work)
+    return work
+
+
+@pytest.fixture(scope="session")
+def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    tmp_path = tmp_path_factory.mktemp("repo-template")
     work = tmp_path / "work"
     work.mkdir()
     specs = work / "specs"
@@ -439,7 +456,7 @@ def repo(tmp_path: Path) -> Path:
     _run_git("push", "-u", "origin", "HEAD:refs/heads/master", cwd=work)
     _create_annotated_merge_tag(cwd=work, spec_id="dep-a")
 
-    return work
+    return tmp_path
 
 
 # ---------------------------------------------------------------------------
