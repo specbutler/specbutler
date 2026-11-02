@@ -20563,8 +20563,12 @@ def _fetch_origin_master(
     if (
         backend is not None
         and backend.identity.backend == "clone"
+        and not remote_url
         and _resolve_git_ref_sha(worktree_path, ref)
     ):
+        # A clone workspace may keep its bootstrap base. A host-side fetch
+        # with an explicit remote (the merge-phase base sync) must refresh
+        # it, or the sync merges a stale base and the forge refuses again.
         return ""
     remote_name, branch_name = ref.split("/", 1) if "/" in ref else ("origin", ref)
     fetch_args = [remote_name, branch_name]

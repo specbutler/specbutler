@@ -27512,6 +27512,35 @@ class TestMergeBehindBranchUpdate:
         assert "5ac0ed1234567" in merge_commands[-1], merge_commands
 
     @pytest.mark.parametrize(
+        ("remote_url", "expect_fetch"),
+        [
+            ("", False),
+            ("https://github.com/o/r.git", True),
+        ],
+    )
+    def test_clone_backend_refreshes_base_for_host_syncs(
+        self, repo: Path, remote_url: str, expect_fetch: bool
+    ):
+        # A clone workspace keeps its bootstrap base for agent-side checks, but
+        # the merge-phase sync passes the publication remote and must fetch,
+        # or it merges a stale base and the forge refuses the merge again.
+        clone_backend = SimpleNamespace(identity=SimpleNamespace(backend="clone"))
+        fetches: list[list[str]] = []
+
+        def fake_fetch(args, **kwargs):  # noqa: ARG001
+            fetches.append(list(args))
+            return SimpleNamespace(is_success=True, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=clone_backend),
+            patch.object(orch, "_resolve_git_ref_sha", return_value="stalebase"),
+            patch.object(orch, "run_git_fetch_with_timeout", side_effect=fake_fetch),
+        ):
+            orch._fetch_origin_master(repo, remote_url=remote_url)
+
+        assert bool(fetches) is expect_fetch, fetches
+
+    @pytest.mark.parametrize(
         ("message", "expected"),
         [
             ("X Pull request o/r#60 is not mergeable: the head branch is not up to date with the base branch.", True),
