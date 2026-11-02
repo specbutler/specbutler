@@ -38,6 +38,11 @@ class VerifyGateConfig:
 
 
 @dataclass(frozen=True)
+class SpecsConfig:
+    require_merged_spec: bool = True
+
+
+@dataclass(frozen=True)
 class SpecPathConfig:
     specs_dir: str = "specs"
     task_specs_dir: str = "specs/tasks"
@@ -300,6 +305,7 @@ class McpConfig:
 
 @dataclass(frozen=True)
 class SpecRuntimeConfig:
+    specs: SpecsConfig = SpecsConfig()
     paths: SpecPathConfig = SpecPathConfig()
     base_ref: str = "origin/master"
     retry_cap: int = 20
@@ -931,7 +937,11 @@ def load_spec_runtime_config(
     )
     coordination = _finalize_coordination(coordination)
 
+    specs_payload = raw.get("specs", {})
+    if not isinstance(specs_payload, dict) or not isinstance(specs_payload.get("require_merged_spec", True), bool):
+        raise SpecConfigError("specs.require_merged_spec must be a boolean")
     return SpecRuntimeConfig(
+        specs=SpecsConfig(require_merged_spec=specs_payload.get("require_merged_spec", True)),
         paths=paths,
         base_ref=str(raw.get("base_ref", "origin/master")).strip() or "origin/master",
         retry_cap=max(1, int(retry_payload.get("cap", 20))),
