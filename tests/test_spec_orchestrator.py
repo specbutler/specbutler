@@ -30,7 +30,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spec_runtime import autopilot, git_common, process_supervisor, spec_status, spec_table
+from spec_runtime import (
+    autopilot,
+    git_common,
+    interactive_authoring,
+    process_supervisor,
+    spec_status,
+    spec_table,
+)
 from spec_runtime import backfill_merge_tags as spec_backfill
 from spec_runtime import execution_backend as eb
 from spec_runtime import orchestrator as orch
@@ -38,6 +45,7 @@ from spec_runtime import spec_merge_tags as merge_tags
 from spec_runtime import worktree_process_registry as process_registry
 from spec_runtime.agent_adapter import (
     HostAgentUnavailableError,
+    _toml_quote,
     host_agent_unavailability_reason,
 )
 from spec_runtime.command_runtime import CommandVariants
@@ -19535,13 +19543,15 @@ class TestLocalReviewHelpers:
         ).read_text()
 
         assert prompt == bundled_prompt
-        assert "Review evidence access is provider-specific." in prompt
-        assert "intentionally have no shell" in prompt
+        assert "Review evidence access is provider-specific" in prompt
+        assert "The Codex reviewer may run read-only inspection commands" in prompt
+        assert "Do not execute pull-request code" in prompt
         assert "Local shell command execution is available" not in prompt
         assert (
-            "Intentionally disabled command execution\nor test reruns in a built-in review are not missing tools"
+            "Intentionally disabled test reruns or\ncommand execution are not missing tools"
             in prompt
         )
+        assert "Classify every prior finding in `prior_findings`" in prompt
         assert (
             "If you return `blocked` or `failed`, the summary must name the exact evidence"
         ) in prompt
@@ -21000,7 +21010,13 @@ class TestLocalReviewPhase:
             observed_scratch.append(scratch_dir)
             assert scratch_dir.is_dir()
             assert scratch_dir != review_worktree
-            assert cmd[cmd.index("-s") + 1] == "read-only"
+            # The pinned checkout is readable through the review profile.
+            assert "-s" not in cmd
+            assert 'default_permissions="specbutler-review"' in cmd
+            filesystem = next(c for c in cmd if c.startswith("permissions.specbutler-review.filesystem="))
+            assert _toml_quote(str(review_worktree.resolve())) + '="read"' in filesystem
+            assert 'approval_policy="untrusted"' in cmd
+            assert 'approvals_reviewer="user"' in cmd
             assert "--skip-git-repo-check" in cmd
             assert "--add-dir" not in cmd
             assert env["TMPDIR"] == str(scratch_dir)
@@ -32716,6 +32732,12 @@ class TestSpecAuthoring:
 
         monkeypatch.setattr(orch, "_run_interactive_agent_owned", run_interactive)
         monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
+        # Keep the operator's user-level MCP config out of protected-env keys.
+        monkeypatch.setattr(
+            interactive_authoring,
+            "user_mcp_environment_keys",
+            lambda *_args, **_kwargs: frozenset(),
+        )
         monkeypatch.setattr(
             orch,
             "capture_repository_publication_baseline",
@@ -35191,6 +35213,12 @@ class TestWaitingForInputWorkflow:
 
         monkeypatch.setattr(orch, "_run_interactive_agent_owned", run_interactive)
         monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
+        # Keep the operator's user-level MCP config out of protected-env keys.
+        monkeypatch.setattr(
+            interactive_authoring,
+            "user_mcp_environment_keys",
+            lambda *_args, **_kwargs: frozenset(),
+        )
         monkeypatch.setattr(
             orch,
             "_capture_or_validate_run_publication_baseline",

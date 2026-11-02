@@ -298,7 +298,14 @@ def run_doctor_checks(
     checks.extend(_runtime_path_overlap_checks(runtime_paths))
     checks.extend(_container_checks(repo_root, config, run, resolve_executable))
     checks.extend(_spec_graph_checks(repo_root, config))
+    checks.append(_review_prompt_check(repo_root))
     return DoctorReport(tuple(checks))
+
+
+def _review_prompt_check(repo_root: Path) -> DoctorCheck:
+    from .review_convergence import review_prompt_source_label
+
+    return _ok("review prompt", review_prompt_source_label(repo_root))
 
 
 def _execution_policy_checks(config: SpecRuntimeConfig) -> list[DoctorCheck]:
