@@ -70,6 +70,8 @@ class SpecRow:
     # Set while an open infrastructure circuit breaker holds this spec.
     infra_blocked: bool = False
     infra_signature: str = ""
+    # Provider session (Claude session id / Codex thread id) of the run.
+    agent_session_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -332,6 +334,7 @@ def load_dashboard_snapshot(repo_root: Path, agent_filter: str = "") -> Dashboar
                 worker_source=container_image_source(repo_config, repo_root) if backend == "container" else "",
                 infra_blocked=infra_entry is not None and display_status != "running",
                 infra_signature=infra_entry.signature if infra_entry is not None else "",
+                agent_session_id=str(data.get("agent_session_id", "") or "").strip(),
             )
         )
 

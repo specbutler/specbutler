@@ -296,6 +296,22 @@ context:
   agent.
 - **Merge conflict** -- the agent is asked to resolve conflicts only.
 
+Each run keeps one provider session (a Claude session id or a Codex thread
+id). Retries resume that session and send only the failure package, so the
+agent keeps the context of its earlier attempts. If the session cannot be
+resumed (it is missing, or the CLI errors before starting), the attempt falls
+back to a fresh session with the full prompt and the reason is logged and
+shown by `spec status`. Provider CLIs without the session flags keep the older
+behaviour of a fresh session per attempt; `spec doctor` warns about them.
+
+The agent's final response is schema-constrained structured output (`status`,
+`summary`, optional `question`), which is the primary completion signal.
+`spec report` from inside the session still works as a fallback.
+
+Guidance from `spec steer` takes effect at attempt boundaries: it is delivered
+through the resumed session when the next attempt starts. Injecting guidance
+into a turn that is already running is not supported.
+
 Retries continue until the spec passes all phases or the retry cap is reached
 (default: 20). If the cap is exceeded, a **draft PR** is created so you can
 inspect the state manually.
@@ -363,7 +379,20 @@ Check the status of a specific spec run:
 spec status --spec my-first-feature
 ```
 
-This shows the current phase, gate results, retry count, and any errors.
+This shows the current phase, gate results, retry count, any errors, and the
+provider session id of each run.
+
+To take over a run interactively, resume its agent session in its workspace:
+
+```bash
+spec attach --spec my-first-feature          # print the resume command
+spec attach --spec my-first-feature --exec   # run it
+```
+
+This runs `claude --resume <id>` or `codex resume <id>`. It refuses while the
+run's agent is still running, because one session must not be driven headless
+and interactively at once; `--fork` branches the session instead
+(`--fork-session` for Claude, `codex fork` for Codex).
 
 List all specs with their status:
 
@@ -443,6 +472,7 @@ spec create --spec <id>                    # author a spec
 spec implement --spec <id>                 # run full lifecycle
 spec stop --spec <id>                      # stop a live run, preserving work
 spec status --spec <id>                    # check run state
+spec attach --spec <id> [--exec] [--fork]  # resume the run's agent session
 spec list                                  # list all specs
 spec show --spec <id>                      # display spec content
 spec task                                  # quick task (no spec file needed)

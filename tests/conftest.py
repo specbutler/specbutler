@@ -71,3 +71,20 @@ def _stub_claude_native_launch_probe(monkeypatch: pytest.MonkeyPatch) -> None:
         "_claude_native_launch_unavailability_reason",
         lambda: "native Claude launch probe is stubbed in tests",
     )
+
+
+@pytest.fixture(autouse=True)
+def _stub_provider_session_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep implement tests from shelling out to provider ``--help`` probes.
+
+    Tests get stateless launches (no persisted session, no structured
+    output) unless they stub the probe to report support (see
+    tests/test_agent_sessions.py).
+    """
+    from spec_runtime import orchestrator
+
+    monkeypatch.setattr(
+        orchestrator,
+        "_provider_session_support",
+        lambda _agent: orchestrator.ProviderSessionSupport(),
+    )
