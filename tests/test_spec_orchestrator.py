@@ -27339,6 +27339,10 @@ class TestMergeBehindBranchUpdate:
             "mergeStateStatus": "BEHIND",
         }
         push_called = False
+        merge_commands: list[list[str]] = []
+
+        def mock_head_sha(_path):
+            return "5ac0ed1234567" if push_called else "deadbeef1234567"
 
         def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
             nonlocal push_called
@@ -27348,6 +27352,7 @@ class TestMergeBehindBranchUpdate:
                 push_called = True
                 return subprocess.CompletedProcess(cmd, 0, "pushed", "")
             if cmd[:3] == ["gh", "pr", "merge"]:
+                merge_commands.append(list(cmd))
                 return subprocess.CompletedProcess(cmd, 0, "merged", "")
             if cmd[:3] == ["git", "worktree", "list"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -27380,7 +27385,7 @@ class TestMergeBehindBranchUpdate:
                 return_value=orch.MergeOriginMasterResult(status="success"),
             ) as merge_master_mock,
             patch.object(orch, "_resolve_git_ref_sha", return_value="mastersha"),
-            patch.object(orch, "_head_sha", return_value="deadbeef1234567"),
+            patch.object(orch, "_head_sha", side_effect=mock_head_sha),
             patch.object(orch, "_required_checks_green", return_value=(True, "")),
             patch.object(orch, "run_or_fail", return_value=True),
             patch.object(orch, "_poll_sleep"),
@@ -27394,6 +27399,9 @@ class TestMergeBehindBranchUpdate:
         merge_master_mock.assert_called_once()
         assert push_called
         assert run.last_merged_master_sha == "mastersha"
+        # The final merge pins the post-sync head, not the head readiness saw.
+        assert merge_commands, "merge was never attempted"
+        assert all("5ac0ed1234567" in cmd for cmd in merge_commands), merge_commands
 
     def test_phase_merge_fails_when_master_merge_fails(self, repo: Path):
         """When local origin/master merge fails, phase_merge returns failed."""

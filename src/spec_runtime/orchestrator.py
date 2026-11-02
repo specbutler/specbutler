@@ -24521,6 +24521,10 @@ def _manual_merge(
             return "failed"
 
         current_head_sha = _head_sha(worktree_path) or _remote_branch_head_sha(repo_root, branch)
+        if current_head_sha:
+            # The sync push moved the branch; the final merge must pin the new
+            # head or GitHub rejects --match-head-commit.
+            pr_head_sha = current_head_sha
         pr_body = str((latest_pr or pr_data).get("body", "") or "")
         if _mark_local_review_for_rerun_after_sync(
             run,
