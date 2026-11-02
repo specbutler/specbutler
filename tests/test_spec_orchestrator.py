@@ -322,6 +322,9 @@ def repo(tmp_path: Path) -> Path:
         description: A test spec
         ---
 
+        ## Goal
+        Deliver the requested feature.
+
         ## Acceptance Criteria
         - [ ] First criterion
         - [ ] Second criterion
@@ -355,6 +358,9 @@ def repo(tmp_path: Path) -> Path:
               required: true
         ---
 
+        ## Goal
+        Deliver the requested feature.
+
         ## Acceptance Criteria
         - [ ] Intake collects answers
     """)
@@ -368,6 +374,13 @@ def repo(tmp_path: Path) -> Path:
         description: Intake optional spec
         intake: optional
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "dep-a.md").write_text(
@@ -378,6 +391,13 @@ def repo(tmp_path: Path) -> Path:
         depends_on: []
         description: Merged dep
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "dep-b.md").write_text(
@@ -388,6 +408,13 @@ def repo(tmp_path: Path) -> Path:
         depends_on: []
         description: Unmerged dep
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "depends-on-both.md").write_text(
@@ -398,6 +425,13 @@ def repo(tmp_path: Path) -> Path:
         depends_on: [dep-a, dep-b]
         description: Depends on two
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "old-spec.md").write_text(
@@ -409,6 +443,13 @@ def repo(tmp_path: Path) -> Path:
         depends_on: []
         description: Superseded spec
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "new-spec.md").write_text(
@@ -419,6 +460,13 @@ def repo(tmp_path: Path) -> Path:
         depends_on: []
         description: Replacement spec
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "depends-on-superseded.md").write_text(
@@ -429,6 +477,13 @@ def repo(tmp_path: Path) -> Path:
         depends_on: [old-spec]
         description: Invalid dependency
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
 
@@ -7609,6 +7664,10 @@ class TestSpecAutopilot:
 
             ## Goal
             Build a responsive React modal for the frontend.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         heuristic = next(spec for spec in autopilot.iter_spec_metadata(repo) if spec.spec_id == "ui-helper")
@@ -7628,6 +7687,10 @@ class TestSpecAutopilot:
 
             ## Goal
             Implement a batch data pipeline.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         spec = next(s for s in autopilot.iter_spec_metadata(repo) if s.spec_id == "plain-spec")
@@ -7648,6 +7711,13 @@ class TestSpecAutopilot:
             area: backend
             description: Should stay out of the dispatch queue
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "main-queued.txt").write_text("queued on main\n")
@@ -7681,6 +7751,10 @@ class TestSpecAutopilot:
 
             ## Goal
             Implement a batch data pipeline.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         spec = next(s for s in autopilot.iter_spec_metadata(repo) if s.spec_id == "plain-spec")
@@ -7701,6 +7775,10 @@ class TestSpecAutopilot:
 
             ## Goal
             Implement a batch data pipeline.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         # Write a .spec.toml in the repo with a custom default agent
@@ -7721,6 +7799,13 @@ class TestSpecAutopilot:
             priority: 40
             description: Unblocks two specs
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "hub-b.md").write_text(
@@ -7733,6 +7818,13 @@ class TestSpecAutopilot:
             priority: 10
             description: Same unlock count, higher priority
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-1.md").write_text(
@@ -7743,6 +7835,13 @@ class TestSpecAutopilot:
             depends_on: [hub-a]
             description: Depends on hub-a
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-2.md").write_text(
@@ -7753,6 +7852,13 @@ class TestSpecAutopilot:
             depends_on: [hub-a]
             description: Depends on hub-a
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-3.md").write_text(
@@ -7763,6 +7869,13 @@ class TestSpecAutopilot:
             depends_on: [hub-b]
             description: Depends on hub-b
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
 
@@ -8279,6 +8392,13 @@ class TestSpecAutopilot:
             priority: 40
             description: Historically unblocked two specs
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "hub-b.md").write_text(
@@ -8290,6 +8410,13 @@ class TestSpecAutopilot:
             priority: 10
             description: Currently unblocks one spec
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-1.md").write_text(
@@ -8300,6 +8427,13 @@ class TestSpecAutopilot:
             depends_on: [hub-a]
             description: Already merged dependent
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-2.md").write_text(
@@ -8310,6 +8444,13 @@ class TestSpecAutopilot:
             depends_on: [hub-a]
             description: Pending dependent
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-3.md").write_text(
@@ -8320,6 +8461,13 @@ class TestSpecAutopilot:
             depends_on: [hub-b]
             description: Pending dependent
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         _run_git("tag", "spec/merged/leaf-1", cwd=repo)
@@ -8339,6 +8487,13 @@ class TestSpecAutopilot:
             priority: 0
             description: Highest explicit priority
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "priority-ten.md").write_text(
@@ -8350,6 +8505,13 @@ class TestSpecAutopilot:
             priority: 10
             description: Lower than priority zero
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
 
@@ -8369,6 +8531,13 @@ class TestSpecAutopilot:
             depends_on: []
             description: An obsolete spec that should be skipped
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         queue = autopilot.build_dispatch_queue(repo)
@@ -8384,6 +8553,13 @@ class TestSpecAutopilot:
             depends_on: []
             description: A legacy draft spec that should be dispatched
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         queue = autopilot.build_dispatch_queue(repo)
@@ -8397,6 +8573,13 @@ class TestSpecAutopilot:
             depends_on: []
             description: Template file
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         specs = autopilot.iter_spec_metadata(repo)
@@ -9339,6 +9522,13 @@ class TestSpecAutopilot:
             area: backend
             description: Hidden from legacy watch output
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         runs_dir = repo / ".spec-state" / "runs"
@@ -10953,6 +11143,13 @@ class TestSpecAutopilot:
             area: backend
             description: Hidden from legacy watch rows
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         runs_dir = repo / ".spec-state" / "runs"
@@ -31549,6 +31746,7 @@ class TestBaseOverride:
         assert observed == {"status": "failed", "phase": "implement"}
 
     def test_cmd_run_sets_base_ref_on_new_run(self, repo: Path):
+        _run_git("update-ref", "refs/remotes/origin/feature-branch", "origin/master", cwd=repo)
         captured: dict[str, str] = {}
 
         def fake_run_full_workflow(run: orch.RunState, _repo_root: Path, **_kw: object) -> str:
@@ -39730,7 +39928,7 @@ class TestConsumedRequestDispatch:
         )
         (repo / "specs" / "stranded-spec.md").write_text(
             "---\nid: stranded-spec\nstatus: not-started\ndepends_on: []\n"
-            "description: stranded\n---\n\n## Goal\nx\n"
+            "description: stranded\n---\n\n## Goal\nx\n\n## Acceptance Criteria\n- [ ] Resume the saved run.\n"
         )
 
         queue = autopilot.build_dispatch_queue(repo)
@@ -39759,7 +39957,7 @@ class TestConsumedRequestDispatch:
         )
         (repo / "specs" / "asking-spec.md").write_text(
             "---\nid: asking-spec\nstatus: not-started\ndepends_on: []\n"
-            "description: asking\n---\n\n## Goal\nx\n"
+            "description: asking\n---\n\n## Goal\nx\n\n## Acceptance Criteria\n- [ ] Await operator input.\n"
         )
 
         queue = autopilot.build_dispatch_queue(repo)
