@@ -2528,6 +2528,22 @@ def _unconfirmed_process_tree_error(process: Any, context: str) -> RuntimeError:
     return error
 
 
+def _write_stdin_and_close(stream: Any, data: Any) -> None:
+    """Write all of ``data`` to a child's stdin, then close it so the child sees EOF."""
+    try:
+        if data:
+            stream.write(data)
+            stream.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        # The child exited or was killed before reading everything.
+        pass
+    finally:
+        try:
+            stream.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+
 class ManagedProcess:
     def __init__(
         self,
@@ -2542,6 +2558,7 @@ class ManagedProcess:
         self._cgroup = cgroup
         self._close_lock = threading.Lock()
         self._pipe_closer_started = False
+        self._stdin_writer: threading.Thread | None = None
 
     def terminate(self, grace_seconds: float = 5.0) -> bool:
         """Stop the owned tree and report whether exit was confirmed."""
@@ -2599,6 +2616,25 @@ class ManagedProcess:
         deadline = None if timeout is None else started + max(0.0, timeout)
         drain_deadline: float | None = None
         communicate_input = input
+        if self._stdin_writer is not None:
+            communicate_input = None
+        elif input is not None and getattr(self.process, "stdin", None) is not None:
+            # Popen.communicate only keeps writing input on a call that passes
+            # it, and refuses input once communication has started. The short
+            # polls below retry without input, so whatever the first poll
+            # could not fit into the pipe was stranded and stdin never closed:
+            # a reader that drains stdin to EOF (Codex reading its prompt)
+            # then waited forever. Hand stdin to a writer thread instead.
+            stdin = self.process.stdin
+            self.process.stdin = None
+            self._stdin_writer = threading.Thread(
+                target=_write_stdin_and_close,
+                args=(stdin, input),
+                name=f"stdin-writer-{getattr(self.process, 'pid', '?')}",
+                daemon=True,
+            )
+            self._stdin_writer.start()
+            communicate_input = None
         while True:
             # Once the owned tree has exited, use its bounded drain window.
             # Reusing an expired caller poll passes timeout=0 to Popen, which
