@@ -13109,6 +13109,45 @@ def _local_review_agent_label(agent_name: str) -> str:
     return aliases.get(normalized.lower(), normalized)
 
 
+def _bundled_review_schema_path() -> Path:
+    import importlib.resources
+
+    return Path(str(importlib.resources.files("spec_runtime") / "templates" / "review-schema.json"))
+
+
+def _resolve_local_review_schema_path(repo_root: Path, output_dir: Path) -> Path:
+    """Return the review schema used for both the launch and validation.
+
+    A repo-level ``.github/schemas/codex-review.schema.json`` wins over the
+    bundled schema. Repositories initialised before re-review classification
+    existed keep a copy whose ``additionalProperties: false`` forbids
+    ``prior_findings``, so the reviewer could never classify prior findings.
+    Such schemas are upgraded with the bundled ``prior_findings`` definition
+    into a run-local copy; the repository file itself is left untouched.
+    """
+    repo_schema_path = repo_root / ".github" / "schemas" / "codex-review.schema.json"
+    if not repo_schema_path.is_file():
+        return _bundled_review_schema_path()
+    try:
+        repo_schema = json.loads(repo_schema_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        # Leave malformed schemas to the review gate, which reports them.
+        return repo_schema_path
+    from .review_gate import upgrade_legacy_review_schema
+
+    upgraded = upgrade_legacy_review_schema(repo_schema) if isinstance(repo_schema, dict) else None
+    if upgraded is None:
+        return repo_schema_path
+    logger.info(
+        "Upgrading legacy review schema %s with prior_findings for this review",
+        repo_schema_path,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    upgraded_path = output_dir / "review-schema.effective.json"
+    upgraded_path.write_text(json.dumps(upgraded, indent=2) + "\n", encoding="utf-8")
+    return upgraded_path
+
+
 def _configured_review_agent_default() -> str:
     return str(SPEC_RUNTIME_CONFIG.agents.review_default or "").strip()
 
@@ -23632,13 +23671,10 @@ def _run_local_review(
     )
     artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
 
-    # Resolve schema: repo-level override, then bundled
-    schema_path = repo_root / ".github" / "schemas" / "codex-review.schema.json"
-    if not schema_path.is_file():
-        import importlib.resources
-
-        bundled = importlib.resources.files("spec_runtime") / "templates" / "review-schema.json"
-        schema_path = Path(str(bundled))
+    # Resolve schema: repo-level override (upgraded if legacy), then bundled
+    schema_path = _resolve_local_review_schema_path(
+        repo_root, artifact_paths["prompt"].parent
+    )
 
     # Determine review agent
     from .agent_adapter import get_agent_adapter

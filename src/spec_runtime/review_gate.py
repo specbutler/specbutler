@@ -24,6 +24,43 @@ class GateEvaluation:
     exit_code: int
 
 
+# The ``prior_findings`` property added for re-review classification. Kept in
+# sync with ``templates/review-schema.json``; legacy repository schemas that
+# predate it are upgraded with this definition.
+PRIOR_FINDINGS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "required": ["id", "status", "note"],
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "status": {"type": "string", "enum": ["resolved", "unresolved", "withdrawn"]},
+            "note": {"type": "string"},
+        },
+        "additionalProperties": False,
+    },
+}
+
+
+def upgrade_legacy_review_schema(schema: dict[str, Any]) -> dict[str, Any] | None:
+    """Return ``schema`` with ``prior_findings`` merged in, or None if unchanged.
+
+    Repositories initialised before re-review classification keep a review
+    schema whose ``additionalProperties: false`` forbids ``prior_findings``.
+    The upgrade lists the field as required, as strict structured output needs
+    every property listed; the gate defaults it for outputs that omit it.
+    """
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or "prior_findings" in properties:
+        return None
+    upgraded = json.loads(json.dumps(schema))
+    upgraded["properties"]["prior_findings"] = json.loads(json.dumps(PRIOR_FINDINGS_SCHEMA))
+    required = upgraded.get("required")
+    if isinstance(required, list) and "prior_findings" not in required:
+        required.append("prior_findings")
+    return upgraded
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -296,6 +333,7 @@ def evaluate_review_gate(
             check_url=check_url,
         )
 
+    schema_payload = upgrade_legacy_review_schema(schema_payload) or schema_payload
     schema_properties = schema_payload.get("properties")
     if (
         isinstance(schema_properties, dict)

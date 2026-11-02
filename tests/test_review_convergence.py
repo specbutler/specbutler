@@ -685,10 +685,17 @@ def test_legacy_ledger_findings_without_or_with_duplicate_ids_get_classifiable_i
     assert computed.decision == "approved"
 
 
-def _gate_evaluation(tmp_path: Path, *, decision: str, findings: list[dict], **extra) -> GateEvaluation:
+def _gate_evaluation(
+    tmp_path: Path,
+    *,
+    decision: str,
+    findings: list[dict],
+    schema: Path | None = None,
+    **extra,
+) -> GateEvaluation:
     from spec_runtime.review_gate import evaluate_review_gate
 
-    schema = Path(orch.__file__).parent / "templates" / "review-schema.json"
+    schema = schema or Path(orch.__file__).parent / "templates" / "review-schema.json"
     raw = tmp_path / "raw.json"
     raw.write_text(
         json.dumps(
@@ -756,6 +763,146 @@ def test_older_review_output_without_prior_findings_still_parses(tmp_path: Path)
         prior_findings=[{"id": "F1", "status": "resolved", "note": "fixed"}],
     )
     assert classified.result_payload["prior_findings"][0]["status"] == "resolved"
+
+
+def _legacy_bundled_review_schema() -> dict:
+    """The bundled review schema as shipped before prior_findings existed."""
+    schema = json.loads((Path(orch.__file__).parent / "templates" / "review-schema.json").read_text())
+    del schema["properties"]["prior_findings"]
+    schema["required"].remove("prior_findings")
+    assert schema["additionalProperties"] is False
+    return schema
+
+
+def _write_legacy_repo_schema(repo: Path) -> Path:
+    path = repo / ".github" / "schemas" / "codex-review.schema.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_legacy_bundled_review_schema(), indent=2) + "\n")
+    return path
+
+
+def test_legacy_repo_schema_is_upgraded_for_launch_without_touching_the_repo(tmp_path: Path):
+    repo_schema = _write_legacy_repo_schema(tmp_path)
+    original = repo_schema.read_text()
+    out_dir = tmp_path / "review-out"
+
+    resolved = orch._resolve_local_review_schema_path(tmp_path, out_dir)
+
+    assert resolved.parent == out_dir
+    upgraded = json.loads(resolved.read_text())
+    assert "prior_findings" in upgraded["properties"]
+    assert "prior_findings" in upgraded["required"]
+    assert upgraded["additionalProperties"] is False
+    assert repo_schema.read_text() == original
+
+
+def test_current_or_missing_repo_schema_is_used_as_is(tmp_path: Path):
+    bundled = Path(orch.__file__).parent / "templates" / "review-schema.json"
+    assert orch._resolve_local_review_schema_path(tmp_path, tmp_path / "out").resolve() == bundled.resolve()
+    repo_schema = tmp_path / ".github" / "schemas" / "codex-review.schema.json"
+    repo_schema.parent.mkdir(parents=True)
+    repo_schema.write_text(bundled.read_text())
+    assert orch._resolve_local_review_schema_path(tmp_path, tmp_path / "out") == repo_schema
+    assert not (tmp_path / "out").exists()
+
+
+def test_rereview_under_previous_bundled_schema_accepts_classifications(tmp_path: Path):
+    legacy_path = _write_legacy_repo_schema(tmp_path)
+    resolved = orch._resolve_local_review_schema_path(tmp_path, tmp_path / "out")
+    prior = [{**_finding("F1", "P1"), "blocking": True}]
+    last_round = review_convergence.ReviewRound(
+        round_number=1,
+        reviewed_head_sha=BASE,
+        decision="request_changes",
+        outstanding_findings=prior,
+    )
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+
+    # Both the run-local upgraded schema and the legacy file itself (as used
+    # by direct gate callers) accept the classification.
+    for schema in (resolved, legacy_path):
+        evaluation = _gate_evaluation(
+            tmp_path,
+            decision="request_changes",
+            findings=[],
+            schema=schema,
+            prior_findings=[{"id": "F1", "status": "resolved", "note": "fixed"}],
+        )
+        assert evaluation.result_payload["status"] == "request_changes", evaluation.human_summary
+        result = orch._apply_computed_local_review_decision(
+            run,
+            evaluation,
+            review_run_dir=run_dir,
+            last_round=last_round,
+            round_number=2,
+            changed_ranges={},
+            expected_head_sha=HEAD,
+            expected_base_sha=BASE,
+        )
+        assert result.result_payload["status"] == "approved", result.human_summary
+
+
+def test_claude_review_launch_with_legacy_repo_schema_embeds_and_validates_classifications(
+    tmp_path: Path,
+):
+    from contextlib import contextmanager
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write_legacy_repo_schema(repo)
+    review_worktree = tmp_path / "review-worktree"
+    review_worktree.mkdir()
+    run = orch.RunState(
+        run_id="review-run",
+        spec_id="feature",
+        branch="code/feature--run",
+        review_agent="claude",
+    )
+    raw_review = json.dumps(
+        {
+            "schema_version": "1",
+            "decision": "approved",
+            "summary": "Fixed.",
+            "reviewed_head_sha": HEAD,
+            "reviewed_base_sha": BASE,
+            "findings": [],
+            "reviewer_role": "independent-review",
+            "reviewer_agent": "claude",
+            "reviewed_at": "2026-01-01T00:00:00Z",
+            "prior_findings": [{"id": "F1", "status": "resolved", "note": "fixed"}],
+        }
+    )
+    prompts: list[str] = []
+
+    @contextmanager
+    def fake_review_worktree(*_args: object, **_kwargs: object):
+        yield review_worktree
+
+    def fake_review_exec(_repo_root: Path, cmd: list[str], **kwargs: object):
+        prompts.append(str(kwargs["input_text"]))
+        return subprocess.CompletedProcess(cmd, 0, raw_review, "")
+
+    with (
+        patch.object(orch, "_temporary_review_worktree", side_effect=fake_review_worktree),
+        patch.object(orch, "_render_local_review_prompt", return_value="review"),
+        patch.object(orch, "_host_materialized_review_spec_note", return_value=""),
+        patch.object(orch, "_claude_review_evidence_prompt_note", return_value=""),
+        patch.object(orch, "require_host_agent_available"),
+        patch.object(orch, "_run_local_review_subprocess", side_effect=fake_review_exec),
+    ):
+        result, _path = orch._run_local_review(
+            run,
+            repo,
+            repo_name="owner/repo",
+            pr_number=1,
+            pr_body="",
+            expected_head_sha=HEAD,
+            expected_base_sha=BASE,
+        )
+
+    assert result.status == "approved", result.summary
+    assert '"prior_findings"' in prompts[0]
 
 
 # ---------------------------------------------------------------------------
