@@ -2226,6 +2226,30 @@ class TestPhaseImplementHandshake:
         assert consumed_attempt.continuation == orch.OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
         assert consumed_attempt.response_consumed_attempt_number == 2
 
+    def test_build_implement_attempt_context_drops_operator_response_consumed_by_earlier_attempt(
+        self, repo: Path
+    ):
+        run = self._make_run()
+        run.status = "failed"
+        run.phase = "merge"
+        run.attempts = 3
+        run.save(repo)
+        orch.OperatorRequest(
+            kind="debugger_guidance",
+            prompt="Sandbox-only failures?",
+            status="consumed",
+            response="Do not change code for those failures.",
+            response_source="spec input",
+            request_attempt_number=2,
+            response_consumed_attempt_number=3,
+        ).save(repo, run.run_id)
+
+        bundle = orch._build_implement_attempt_context(run, repo)
+
+        assert bundle.context.attempt_number == 4
+        assert bundle.context.operator_request_response == ""
+        assert bundle.context.operator_request_kind == ""
+
     def test_build_implement_attempt_context_keeps_active_operator_steering_pending_until_launch(self, repo: Path):
         run = self._make_run()
         run.status = "passed"
@@ -20039,6 +20063,30 @@ class TestReviewPhaseRouting:
         assert pr["number"] == 42
         assert pr["headRefOid"] == "a" * 40
 
+    def test_required_checks_from_error_ignores_appended_log_summary(self):
+        error = (
+            "Readiness promotion refused for ac5e5d43dca8: Required checks failing: "
+            "ci (https://github.com/o/r/actions/runs/40729739012/job/1), lint"
+            "\nRequired check log summary:\n- ci: ##[error]Process completed with exit code 1."
+        )
+
+        labels = orch._required_checks_from_error(error)
+
+        assert labels == ["ci (https://github.com/o/r/actions/runs/40729739012/job/1)", "lint"]
+        assert orch._split_check_label(labels[0]) == ("ci", "https://github.com/o/r/actions/runs/40729739012/job/1")
+
+    def test_find_pr_for_branch_raises_when_no_forge_frontend_answers(self, repo: Path):
+        def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
+            return subprocess.CompletedProcess(cmd, 1, "", "error connecting to api.github.com")
+
+        with (
+            patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_repo_name_with_owner", return_value="acme/repo"),
+        ):
+            assert orch._find_pr_for_branch(repo, "code/x", state="all") is None
+            with pytest.raises(orch.PrLookupUnavailable, match="error connecting to"):
+                orch._find_pr_for_branch(repo, "code/x", state="all", raise_on_error=True)
+
     def test_find_pr_for_branch_falls_back_to_rest_after_graphql_failure(
         self,
         repo: Path,
@@ -26314,6 +26362,81 @@ class TestAutoMerge:
 
         assert result == "passed"
 
+    def test_auto_merge_wait_survives_forge_outage(self, repo: Path):
+        """A failed PR lookup mid-wait is an outage, not a vanished PR."""
+        run = self._make_run()
+        run.save(repo)
+
+        auto_ok = subprocess.CompletedProcess(
+            args=["gh", "pr", "merge", "12", "--squash", "--auto"],
+            returncode=0,
+            stdout="auto-merge enabled",
+            stderr="",
+        )
+
+        def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
+            if cmd[:3] == ["gh", "auth", "status"]:
+                return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                return auto_ok
+            if cmd[:3] == ["git", "worktree", "list"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:3] == ["git", "worktree", "prune"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:3] == ["git", "tag", "--list"]:
+                return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, "master\n", "")
+            if cmd[:4] == ["git", "merge", "--ff-only", "origin/master"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        pr_open = {
+            "number": 12,
+            "state": "OPEN",
+            "headRefOid": "deadbeef1234567",
+            "mergeStateStatus": "BLOCKED",
+        }
+        pr_merged = {
+            "number": 12,
+            "state": "MERGED",
+            "headRefOid": "deadbeef1234567",
+        }
+
+        with (
+            patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(
+                orch,
+                "_find_pr_for_branch",
+                side_effect=[
+                    pr_open,
+                    pr_open,
+                    pr_open,
+                    # The first lookup inside the auto-merge wait hits an outage.
+                    orch.PrLookupUnavailable("error connecting to api.github.com"),
+                    pr_merged,
+                ],
+            ),
+            patch.object(
+                orch,
+                "_required_checks_green",
+                side_effect=[
+                    (True, ""),
+                    (False, "Required checks still pending: ci"),
+                ],
+            ),
+            patch.object(orch, "run_or_fail", return_value=True),
+            patch.object(orch, "_poll_sleep"),
+        ):
+            result = orch.phase_merge(run, repo)
+
+        assert result == "passed", run.last_error
+        assert "disappeared" not in run.last_error
+
     def test_auto_merge_unavailable_falls_back_to_manual(self, repo: Path):
         """When auto-merge is not enabled on the repo, fall back to manual merge."""
         run = self._make_run()
@@ -26869,22 +26992,15 @@ class TestAutoMerge:
         assert run.readiness_status == "draft-published"
         assert "current head has not passed independent verify" in run.readiness_blocker
 
-    def test_draft_pr_refuses_ready_promotion_when_branch_is_behind(self, repo: Path):
+    def test_draft_pr_behind_base_is_promoted_and_left_to_merge_sync(self, repo: Path):
+        # BEHIND is mechanical: the merge phase merges the base itself, so
+        # readiness must not refuse promotion over it.
         run = self._make_run()
         run.verify_passed_once = True
         run.verify_head_sha = "deadbeef1234567"
         run.review_expected_head_sha = "deadbeef1234567"
         run.review_decision_status = "approved"
         run.save(repo)
-
-        def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
-            if cmd[:3] == ["gh", "auth", "status"]:
-                return subprocess.CompletedProcess(cmd, 0, "ok", "")
-            if cmd[:3] == ["gh", "pr", "ready"]:
-                raise AssertionError("behind branches must not be promoted before sync")
-            if cmd[:3] == ["git", "tag", "--list"]:
-                return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            raise AssertionError(f"Unexpected command: {cmd}")
 
         pr_draft = {
             "number": 12,
@@ -26893,22 +27009,29 @@ class TestAutoMerge:
             "isDraft": True,
             "mergeStateStatus": "BEHIND",
         }
+        forge = MagicMock()
+        forge.mark_pr_ready.return_value = True
 
         with (
-            patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "run_subprocess", return_value=subprocess.CompletedProcess([], 0, "ok", "")),
             patch.object(orch, "refresh_merge_completion_state", return_value=("git fetch", "", "origin/master")),
             patch.object(orch, "is_spec_merged", return_value=False),
             patch.object(orch, "_find_pr_for_branch", return_value=pr_draft),
             patch.object(orch, "_head_sha", return_value="deadbeef1234567"),
             patch.object(orch, "_required_checks_green", return_value=(True, "")),
+            patch.object(orch, "_revalidate_readiness_pr_head", return_value=None),
+            patch.object(orch, "_assert_publication_transition_safe"),
+            patch.object(orch, "_forge", return_value=forge),
+            patch.object(orch, "_try_auto_merge", return_value="failed") as auto_merge_mock,
         ):
-            result = orch.phase_merge(run, repo)
+            orch.phase_merge(run, repo)
 
-        assert result == "failed"
-        assert run.readiness_status == "merge-blocked"
-        assert "mergeStateStatus=BEHIND" in run.readiness_blocker
+        forge.mark_pr_ready.assert_called_once()
+        auto_merge_mock.assert_called_once()
+        assert run.readiness_status == "ready"
+        assert "BEHIND" not in run.readiness_blocker
 
-    def test_ready_pr_refuses_merge_when_branch_is_behind(self, repo: Path):
+    def test_ready_pr_behind_base_proceeds_to_merge_sync(self, repo: Path):
         run = self._make_run()
         run.verify_passed_once = True
         run.verify_head_sha = "deadbeef1234567"
@@ -26931,14 +27054,14 @@ class TestAutoMerge:
             patch.object(orch, "_find_pr_for_branch", return_value=pr_ready),
             patch.object(orch, "_head_sha", return_value="deadbeef1234567"),
             patch.object(orch, "_required_checks_green", return_value=(True, "")),
-            patch.object(orch, "_try_auto_merge") as auto_merge_mock,
+            patch.object(orch, "_revalidate_readiness_pr_head", return_value=None),
+            patch.object(orch, "_try_auto_merge", return_value="failed") as auto_merge_mock,
         ):
-            result = orch.phase_merge(run, repo)
+            orch.phase_merge(run, repo)
 
-        assert result == "failed"
-        assert run.readiness_status == "merge-blocked"
-        assert "mergeStateStatus=BEHIND" in run.readiness_blocker
-        auto_merge_mock.assert_not_called()
+        auto_merge_mock.assert_called_once()
+        assert run.readiness_status == "ready"
+        assert "BEHIND" not in run.readiness_blocker
 
     def test_readiness_uses_post_verify_head_instead_of_implement_head(self, repo: Path):
         run = self._make_run()
@@ -26993,6 +27116,39 @@ class TestAutoMerge:
 
         assert decision.ready is False
         assert "verify head is unavailable" in decision.blocker
+
+    @pytest.mark.parametrize(("merge_state", "ready"), [("BEHIND", True), ("DIRTY", False)])
+    def test_readiness_leaves_behind_branches_to_the_merge_phase_sync(
+        self, repo: Path, merge_state: str, ready: bool
+    ):
+        run = self._make_run()
+        run.verify_passed_once = True
+        run.verify_head_sha = "deadbeef1234567"
+        run.review_expected_head_sha = "deadbeef1234567"
+        run.review_decision_status = "approved"
+        pr = {
+            "number": 12,
+            "state": "OPEN",
+            "headRefOid": "deadbeef1234567",
+            "isDraft": False,
+            "mergeStateStatus": merge_state,
+        }
+        with (
+            patch.object(orch, "_required_checks_green", return_value=(True, "")),
+            patch.object(orch, "_find_pr_for_branch", return_value=pr),
+            patch.object(orch, "_poll_sleep"),
+        ):
+            decision = orch._evaluate_readiness_for_promotion(
+                run,
+                repo,
+                pr_number=12,
+                pr_data=pr,
+                current_head_sha="deadbeef1234567",
+            )
+
+        assert decision.ready is ready
+        if not ready:
+            assert "mergeStateStatus=DIRTY" in decision.blocker
 
     def test_draft_pr_refuses_ready_promotion_with_pending_operator_request(self, repo: Path):
         run = self._make_run()
@@ -27178,8 +27334,35 @@ class TestMergeBehindBranchUpdate:
             branch="spec/my-feature",
         ))
 
-    def test_phase_merge_blocks_initial_behind_checkpoint(self, repo: Path):
-        """Initial BEHIND checkpoints must fail readiness before merge mutations."""
+    @pytest.mark.parametrize(
+        ("pr_body", "expect_rerun"),
+        [
+            ("## Review\nReview-Owner: local\n", True),
+            # phase_review always reviews locally, so an unmarked body (for
+            # example one an agent supplied) must not skip the rerun.
+            ("Agent-written summary without a review section.", True),
+            ("## Review\nReview-Owner: platform-team\n", False),
+        ],
+    )
+    def test_post_sync_review_rerun_follows_review_owner(self, repo: Path, pr_body: str, expect_rerun: bool):
+        run = self._make_run()
+        run.review_decision_status = "approved"
+        run.review_expected_head_sha = "deadbeef1234567"
+
+        with patch.object(orch, "_reset_local_review_gate_for_head", return_value=True):
+            rerun = orch._mark_local_review_for_rerun_after_sync(
+                run,
+                repo,
+                pr_body=pr_body,
+                current_head_sha="5ac0ed1234567",
+            )
+
+        assert rerun is expect_rerun
+        if expect_rerun:
+            assert run.last_error.startswith(orch.LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX)
+
+    def test_phase_merge_syncs_initial_behind_checkpoint(self, repo: Path):
+        """Initial BEHIND checkpoints pass readiness and reach the merge-phase base sync."""
         run = self._make_run()
         run.save(repo)
         worktree = repo / ".worktrees" / run.spec_id
@@ -27188,11 +27371,18 @@ class TestMergeBehindBranchUpdate:
         pr_open = {
             "number": 12,
             "state": "OPEN",
+            # A non-local review owner merges straight after the sync; local
+            # review reruns first (test_post_sync_review_rerun_follows_review_owner).
+            "body": "## Review\nReview-Owner: platform-team\n",
             "headRefOid": "deadbeef1234567",
             "baseRefOid": "base1234",
             "mergeStateStatus": "BEHIND",
         }
         push_called = False
+        merge_commands: list[list[str]] = []
+
+        def mock_head_sha(_path):
+            return "5ac0ed1234567" if push_called else "deadbeef1234567"
 
         def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
             nonlocal push_called
@@ -27202,6 +27392,7 @@ class TestMergeBehindBranchUpdate:
                 push_called = True
                 return subprocess.CompletedProcess(cmd, 0, "pushed", "")
             if cmd[:3] == ["gh", "pr", "merge"]:
+                merge_commands.append(list(cmd))
                 return subprocess.CompletedProcess(cmd, 0, "merged", "")
             if cmd[:3] == ["git", "worktree", "list"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -27234,18 +27425,23 @@ class TestMergeBehindBranchUpdate:
                 return_value=orch.MergeOriginMasterResult(status="success"),
             ) as merge_master_mock,
             patch.object(orch, "_resolve_git_ref_sha", return_value="mastersha"),
-            patch.object(orch, "_head_sha", return_value="deadbeef1234567"),
+            patch.object(orch, "_head_sha", side_effect=mock_head_sha),
             patch.object(orch, "_required_checks_green", return_value=(True, "")),
             patch.object(orch, "run_or_fail", return_value=True),
             patch.object(orch, "_poll_sleep"),
+            patch.object(orch, "refresh_merge_completion_state", return_value=("git fetch", "", "origin/master")),
+            # Stop right after the merge command; post-merge cleanup is covered elsewhere.
+            patch.object(orch, "_wait_for_pr_merged", return_value=(False, "stopped after merge")),
         ):
-            result = orch.phase_merge(run, repo)
+            orch.phase_merge(run, repo)
 
-        assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
-        merge_master_mock.assert_not_called()
-        assert not push_called
-        assert run.last_merged_master_sha == ""
+        assert run.last_error == "stopped after merge"
+        merge_master_mock.assert_called_once()
+        assert push_called
+        assert run.last_merged_master_sha == "mastersha"
+        # The final merge pins the post-sync head, not the head readiness saw.
+        assert merge_commands, "merge was never attempted"
+        assert all("5ac0ed1234567" in cmd for cmd in merge_commands), merge_commands
 
     def test_phase_merge_fails_when_master_merge_fails(self, repo: Path):
         """When local origin/master merge fails, phase_merge returns failed."""
@@ -27289,7 +27485,7 @@ class TestMergeBehindBranchUpdate:
             result = orch.phase_merge(run, repo)
 
         assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
+        assert "Failed to merge origin/master before merge phase" in run.last_error
 
     def test_phase_merge_sets_conflict_context_when_master_merge_conflicts(self, repo: Path):
         run = self._make_run()
@@ -27329,8 +27525,8 @@ class TestMergeBehindBranchUpdate:
             result = orch.phase_merge(run, repo)
 
         assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
-        assert run.merge_conflict_error == ""
+        assert "Merge conflict while merging origin/master" in run.last_error
+        assert run.merge_conflict_error == run.last_error
 
     def test_phase_merge_checks_fail_after_sync(self, repo: Path):
         """When required checks fail after syncing with origin/master, phase fails."""
@@ -27382,7 +27578,7 @@ class TestMergeBehindBranchUpdate:
             result = orch.phase_merge(run, repo)
 
         assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
+        assert "Required checks failing" in run.last_error
 
     def test_phase_merge_restarts_local_review_after_sync_push(self, repo: Path):
         run = self._make_run()
@@ -27434,13 +27630,11 @@ class TestMergeBehindBranchUpdate:
             result = orch.phase_merge(run, repo)
 
         assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
-        assert run.last_merged_master_sha == ""
-        assert run.review_decision_status == "approved"
-        assert run.review_decision_summary == "Approved on prior head"
-        assert run.review_decision_check_url == "https://example.com/pr/12"
-        assert run.review_expected_head_sha == "deadbeef1234567"
-        checks_mock.assert_called_once()
+        assert run.last_error.startswith(orch.LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX)
+        assert run.last_merged_master_sha == "mastersha"
+        assert run.review_decision_status != "approved"
+        # Readiness and the pre-sync merge gate each read the checks once.
+        assert checks_mock.call_count == 2
 
     def test_phase_merge_restarts_local_review_when_pr_head_is_stale(self, repo: Path):
         run = self._make_run()
@@ -30388,6 +30582,23 @@ class TestWaitForPrMerged:
         assert merged is True
         assert wait_error == ""
         sleep_mock.assert_called_once()
+
+    def test_wait_for_pr_merged_retries_through_forge_outage(self, repo: Path):
+        outage = orch.PrLookupUnavailable("error connecting to api.github.com")
+
+        with (
+            patch.object(
+                orch,
+                "_find_pr_for_branch",
+                side_effect=[outage, outage, {"number": 12, "state": "MERGED"}],
+            ),
+            patch.object(orch, "_poll_sleep") as sleep_mock,
+        ):
+            merged, wait_error = orch._wait_for_pr_merged(repo, "spec/my-feature", 12)
+
+        assert merged is True
+        assert wait_error == ""
+        assert sleep_mock.call_count == 2
 
     def test_wait_for_pr_merged_times_out_while_open(self, repo: Path):
         pr_open = {"number": 12, "state": "OPEN"}
