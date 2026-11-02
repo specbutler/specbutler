@@ -683,6 +683,7 @@ class TestWorktreeBackend:
         assert result.returncode == 0
         assert result.stdout.strip() == "ok"
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX setup service handoff")
     def test_descendant_preserving_command_returns_while_service_stays_live(
         self,
@@ -731,6 +732,7 @@ class TestWorktreeBackend:
             if process_supervisor.is_process_group_alive(child_pgid):
                 os.killpg(child_pgid, signal.SIGKILL)
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX setup keeper release")
     def test_descendant_preserving_command_releases_empty_keeper(
         self,
@@ -750,6 +752,7 @@ class TestWorktreeBackend:
         assert result.stdout.strip() == "ready"
         assert result.ownership_token is None
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX setup keeper timeout")
     def test_descendant_preserving_timeout_reaps_keeper_and_child(
         self,
@@ -776,6 +779,7 @@ class TestWorktreeBackend:
         child_pid = int(str(raised.value.stdout).strip())
         assert process_supervisor.inspect_process(child_pid) is None
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX setup keeper launch error")
     def test_descendant_preserving_command_preserves_launch_error(
         self,
@@ -796,6 +800,7 @@ class TestWorktreeBackend:
 
         assert Path(str(raised.value.filename)) == missing
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX parent-death pipe")
     def test_retained_setup_group_dies_when_orchestrator_exits_without_atexit(
         self,
@@ -851,6 +856,7 @@ class TestWorktreeBackend:
             if process_supervisor.identity_matches(token.identity):
                 process_supervisor.terminate(token, grace_seconds=0)
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX live parent-death pipe")
     def test_running_setup_group_dies_when_orchestrator_crashes_before_status(
         self,
@@ -1225,6 +1231,7 @@ class TestCloneBackend:
                 base_ref="master",
             )
 
+    @pytest.mark.requires_ps
     def test_run_command_and_agent_write_backend_logs(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -1262,6 +1269,7 @@ class TestCloneBackend:
         assert agent_payload["returncode"] == 0
         assert "agent ok" in agent_payload["stdout"]
 
+    @pytest.mark.requires_ps
     def test_agent_completion_writes_patch_and_commit_metadata(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -1300,6 +1308,7 @@ class TestCloneBackend:
         assert "agent.txt" in patch_text
         assert "+done" in patch_text
 
+    @pytest.mark.requires_ps
     def test_agent_completion_patch_includes_committed_work(self, tmp_path: Path):
         # Regression: when the agent *commits* its work,
         # ``git diff HEAD`` is empty, so final.patch must instead diff against the
@@ -2988,6 +2997,7 @@ def _docker_label_filter_values(argv: Sequence[str]) -> dict[str, str]:
 
 
 class TestContainerBackend:
+    @pytest.mark.requires_ps
     def test_nested_worker_controls_and_profile_drift_fail_closed(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -3085,6 +3095,7 @@ class TestContainerBackend:
         )
         assert first_playwright != second_playwright
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize("payload", ["[]", "{}", "null", "1"])
     @pytest.mark.parametrize("source_present", [True, False])
     def test_retry_refuses_invalid_existing_state_before_engine_or_mutation(
@@ -3145,6 +3156,7 @@ class TestContainerBackend:
         assert source_sentinel.read_text(encoding="utf-8") == "operator data\n"
         assert state_path.read_text(encoding="utf-8") == payload
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize(
         "corruption",
         [
@@ -3251,6 +3263,7 @@ class TestContainerBackend:
         assert runner.ps_container_ids == resources_before
         assert state_path.is_file()
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize("drift", ["service", "workspace", "playwright"])
     def test_retry_refuses_runtime_topology_drift_before_engine_or_mutation(
         self,
@@ -3332,6 +3345,7 @@ class TestContainerBackend:
         if pinned_before is not None:
             assert pinned_path.read_bytes() == pinned_before
 
+    @pytest.mark.requires_ps
     def test_retry_refuses_engine_drift_before_contacting_either_engine(
         self,
         tmp_path: Path,
@@ -3376,6 +3390,7 @@ class TestContainerBackend:
         assert docker_runner.ps_container_ids == docker_containers_before
         assert state_path.read_bytes() == state_before
 
+    @pytest.mark.requires_ps
     def test_retry_accepts_persisted_disabled_playwright_topology(
         self,
         tmp_path: Path,
@@ -3410,6 +3425,7 @@ class TestContainerBackend:
         assert state["playwright_mcp"]["topology"] == "disabled"
         assert state["runtime_generation_status"] == "running"
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name == "nt", reason="requires POSIX FIFO support")
     def test_retry_refuses_special_existing_state_before_engine_or_mutation(
         self,
@@ -3453,6 +3469,7 @@ class TestContainerBackend:
         assert runner.ps_container_ids == resources_before
         assert state_path.is_fifo()
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize(
         ("replacement", "message"),
         [
@@ -3493,6 +3510,7 @@ class TestContainerBackend:
         assert state_path.read_bytes() == original
         assert backend._read_container_state(run_root)
 
+    @pytest.mark.requires_ps
     def test_retry_adopts_saved_development_compose_and_playwright_names(
         self,
         tmp_path: Path,
@@ -3675,6 +3693,7 @@ class TestContainerBackend:
         assert runner.owned_volume_ids == {"spec-v040-project_data"}
         assert runner.owned_network_ids == {"spec-v040-project_default"}
 
+    @pytest.mark.requires_ps
     def test_codex_provider_home_is_external_and_mounted_after_source(
         self,
         tmp_path: Path,
@@ -3732,6 +3751,7 @@ class TestContainerBackend:
         assert "/workspace/provider-homes/codex" in " ".join(exec_call)
         assert runner.envs[exec_index]["CODEX_HOME"] == "/workspace/provider-homes/codex"
 
+    @pytest.mark.requires_ps
     def test_prepare_rejects_credential_bearing_origin_before_worker_start(
         self,
         tmp_path: Path,
@@ -3778,6 +3798,7 @@ class TestContainerBackend:
                     base_ref="master",
                 )
 
+    @pytest.mark.requires_ps
     def test_prepare_workspace_uses_configured_image_and_writes_state(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -3817,6 +3838,7 @@ class TestContainerBackend:
         assert not (handle.outbox_path / "container-backend-state.json").exists()
         assert any(call[:2] == ["docker", "pull"] for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_empty_compose_file_defaults_to_in_worker_services(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -3838,6 +3860,7 @@ class TestContainerBackend:
         assert state["service_processes"][0]["container_id"] == "container-123"
         assert not any(call[:2] == ["docker", "compose"] for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_in_worker_commands_exec_in_persistent_worker_container(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -3861,6 +3884,7 @@ class TestContainerBackend:
         assert "scripts/local_postgres.sh" in exec_call
         assert not any(call[:2] == ["docker", "run"] and "scripts/local_postgres.sh" in call for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_previous_attempt_containers_removed_on_new_attempt(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -3892,6 +3916,7 @@ class TestContainerBackend:
         assert "old-worker-1" in rm_targets
         assert "old-sidecar-2" in rm_targets
 
+    @pytest.mark.requires_ps
     def test_retry_imports_preexisting_workspace_volume_before_reseed(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -3936,6 +3961,7 @@ class TestContainerBackend:
         assert first.path == retried.path
         assert not (retried.path / ".spec-state").exists()
 
+    @pytest.mark.requires_ps
     def test_retry_import_failure_preserves_host_and_skips_reseed(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -3974,6 +4000,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_retry_rejects_successful_empty_volume_import_before_swap(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -4013,6 +4040,7 @@ class TestContainerBackend:
         state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
         assert state["workspace_volume_seed_state"] == "ready"
 
+    @pytest.mark.requires_ps
     def test_retry_reseeds_interrupted_volume_without_importing_it(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -4053,6 +4081,7 @@ class TestContainerBackend:
         state = json.loads(state_path.read_text())
         assert state["workspace_volume_seed_state"] == "ready"
 
+    @pytest.mark.requires_ps
     def test_retry_refuses_legacy_volume_without_crash_safe_seed_marker(
         self,
         tmp_path: Path,
@@ -4148,6 +4177,7 @@ class TestContainerBackend:
         assert not any(call[:2] == ["docker", "ps"] for call in runner.calls)
         assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_current_attempt_worker_created_after_teardown(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -4202,6 +4232,7 @@ class TestContainerBackend:
         assert "container-123" not in rm_targets
         assert "old-worker-1" in rm_targets
 
+    @pytest.mark.requires_ps
     def test_teardown_leaves_other_runs_untouched(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -4415,6 +4446,7 @@ class TestContainerBackend:
         )
         assert rm_pid_call is None
 
+    @pytest.mark.requires_ps
     def test_volume_postmaster_pid_cleared_after_reseed(self, tmp_path: Path):
         # End-to-end ordering guard for the finding: the volume-mode stale
         # postmaster.pid clear must run *after* the workspace volume is reseeded
@@ -4452,6 +4484,7 @@ class TestContainerBackend:
         clear_call = runner.calls[clear_index]
         assert "/workspace/source/.local/postgres/data/postmaster.pid" in clear_call[-1]
 
+    @pytest.mark.requires_ps
     def test_volume_postmaster_pid_cleared_without_prior_container(self, tmp_path: Path):
         # A stale postmaster.pid can outlive its
         # container (pruned, or the run died with no orchestrator attached), so
@@ -4492,6 +4525,7 @@ class TestContainerBackend:
         )
         assert seed_index < clear_index < worker_index
 
+    @pytest.mark.requires_ps
     def test_teardown_failure_aborts_before_volume_seed_and_new_worker(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -4535,6 +4569,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_teardown_discovery_failure_aborts_before_new_worker(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -4556,6 +4591,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_compose_file_opts_into_host_managed_sidecars(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -4600,6 +4636,7 @@ class TestContainerBackend:
         assert override["volumes"]["postgres-data"]["labels"]["spec.run_id"] == "my-feature-abc"
         assert override["networks"]["default"]["labels"]["spec.spec_id"] == "my-feature"
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize(
         "compose_text",
         [
@@ -4637,6 +4674,7 @@ class TestContainerBackend:
             call[:3] == ["docker", "compose", "-p"] for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_compose_retry_ignores_agent_modified_source_file(
         self,
         tmp_path: Path,
@@ -4681,6 +4719,7 @@ class TestContainerBackend:
         assert compose_calls
         assert str(outside) not in " ".join(" ".join(call) for call in compose_calls)
 
+    @pytest.mark.requires_ps
     def test_compose_retry_with_missing_source_preserves_operator_baseline(
         self,
         tmp_path: Path,
@@ -4732,6 +4771,7 @@ class TestContainerBackend:
         assert all(str(pinned) in call for call in compose_calls)
         assert "postgres:17" not in pinned.read_text(encoding="utf-8")
 
+    @pytest.mark.requires_ps
     def test_compose_preflight_refuses_foreign_same_project_resource(
         self,
         tmp_path: Path,
@@ -4793,6 +4833,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_compose_preflight_refuses_locally_labeled_volume_with_foreign_consumer(
         self,
         tmp_path: Path,
@@ -4862,6 +4903,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_cleanup_preserves_state_when_compose_project_has_foreign_resource(
         self,
         tmp_path: Path,
@@ -4902,6 +4944,7 @@ class TestContainerBackend:
             for call in runner.calls[calls_before_cleanup:]
         )
 
+    @pytest.mark.requires_ps
     def test_compose_refuses_unlabeled_deterministic_volume_collision(
         self,
         tmp_path: Path,
@@ -4938,6 +4981,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize("resource_kind", ["volume", "network"])
     def test_compose_refuses_unlabeled_custom_resource_name_collision(
         self,
@@ -4988,6 +5032,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize(
         "compose_text, expected",
         [
@@ -5040,6 +5085,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize(
         "compose_text, expected",
         [
@@ -5098,6 +5144,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_compose_literal_external_resource_is_not_safety_labeled(
         self,
         tmp_path: Path,
@@ -5127,6 +5174,7 @@ class TestContainerBackend:
         )
         assert "shared" not in override.get("volumes", {})
 
+    @pytest.mark.requires_ps
     def test_playwright_mcp_sidecar_requires_explicit_reachable_target(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5147,6 +5195,7 @@ class TestContainerBackend:
                     base_ref="master",
                 )
 
+    @pytest.mark.requires_ps
     def test_playwright_mcp_sidecar_records_mapping_and_cleans_up(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5213,6 +5262,7 @@ class TestContainerBackend:
             call[:3] == ["docker", "rm", "-f"] and mcp_state["sidecar_container"] in call for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_playwright_sidecar_collision_preserves_foreign_network(
         self,
         tmp_path: Path,
@@ -5262,6 +5312,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_playwright_sidecar_reuses_exact_owned_network_on_retry(
         self,
         tmp_path: Path,
@@ -5366,6 +5417,7 @@ class TestContainerBackend:
         with pytest.raises(RuntimeError, match="not owned by this checkout"):
             backend._require_network_safe_to_use(tmp_path, network, labels)
 
+    @pytest.mark.requires_ps
     def test_playwright_mcp_sidecar_connects_to_service_network(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5403,6 +5455,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_playwright_mcp_version_mismatch_diagnostic(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5432,6 +5485,7 @@ class TestContainerBackend:
         assert failure["actual_version"] == "1.51.1"
         assert "Install browser dependencies" in failure["remediation"]
 
+    @pytest.mark.requires_ps
     def test_playwright_mcp_version_mismatch_detects_worker_runtime(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5469,6 +5523,7 @@ class TestContainerBackend:
         assert "spec.run_id=my-feature-abc" in detection_call
         assert any(item.startswith("spec.workspace_root=") for item in detection_call)
 
+    @pytest.mark.requires_ps
     def test_playwright_mcp_version_detection_normalizes_semver_range(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5499,6 +5554,7 @@ class TestContainerBackend:
             "chromium",
         ]
 
+    @pytest.mark.requires_ps
     def test_sidecar_startup_failure_writes_service_diagnostics(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5524,6 +5580,7 @@ class TestContainerBackend:
         assert failure["failure_subtype"] == "sidecar_compose_failed"
         assert failure["topology"] == "sidecar"
 
+    @pytest.mark.requires_ps
     def test_in_worker_startup_failure_removes_container_and_preserves_diagnostic(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5565,6 +5622,7 @@ class TestContainerBackend:
         assert failure["container_id"] == "container-123"
         assert run_root.exists()
 
+    @pytest.mark.requires_ps
     def test_worker_start_log_failure_still_quiesces_created_container(
         self,
         tmp_path: Path,
@@ -5607,6 +5665,7 @@ class TestContainerBackend:
         assert not state.get("worker_container")
         assert state.get("containers") == []
 
+    @pytest.mark.requires_ps
     def test_prepare_workspace_failure_tears_down_resources_but_keeps_logs(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5636,6 +5695,7 @@ class TestContainerBackend:
         assert run_root.exists()
         assert (run_root / "logs" / "service-startup-failure.json").exists()
 
+    @pytest.mark.requires_ps
     def test_prepare_workspace_removes_worker_visible_spec_state(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5661,6 +5721,7 @@ class TestContainerBackend:
         assert handle.path == source
         assert not (source / ".spec-state").exists()
 
+    @pytest.mark.requires_ps
     def test_prepare_workspace_builds_deterministic_image_from_dockerfile(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5709,6 +5770,7 @@ class TestContainerBackend:
         assert not (handle.outbox_path.parent / "container-build" / ".spec-state").exists()
         assert not (handle.outbox_path.parent / "container-build" / ".spec.local.toml").exists()
 
+    @pytest.mark.requires_ps
     def test_prepare_workspace_preserves_nested_cache_input_paths(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5748,6 +5810,7 @@ class TestContainerBackend:
         assert (dependency_inputs / "frontend" / "package.json").is_file()
         assert (dependency_inputs / "frontend" / "package-lock.json").is_file()
 
+    @pytest.mark.requires_ps
     def test_prepare_workspace_keeps_full_bootstrap_command_out_of_image_build(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5780,6 +5843,7 @@ class TestContainerBackend:
         assert "make install" not in generated_text
         assert "SPEC_BOOTSTRAP_CACHE_COMMAND" not in generated_text
 
+    @pytest.mark.requires_ps
     def test_legacy_dockerfile_without_version_arg_builds_no_cache(self, tmp_path: Path):
         """A Dockerfile that never references SPEC_BUTLER_VERSION cannot
         cache-bust its spec install layer; the build must use --no-cache or a
@@ -5807,6 +5871,7 @@ class TestContainerBackend:
         build_call = next(call for call in runner.calls if call[:2] == ["docker", "build"])
         assert "--no-cache" in build_call
 
+    @pytest.mark.requires_ps
     def test_template_dockerfile_with_version_arg_keeps_layer_cache(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5834,6 +5899,7 @@ class TestContainerBackend:
         assert "--no-cache" not in build_call
         assert any(str(arg).startswith("SPEC_BUTLER_VERSION=") for arg in build_call)
 
+    @pytest.mark.requires_ps
     def test_concurrent_workspace_preparation_builds_deterministic_image_once(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5871,6 +5937,7 @@ class TestContainerBackend:
         assert sum("built" in log for log in logs) == 1
         assert sum("Reused existing deterministic worker image" in log for log in logs) == 1
 
+    @pytest.mark.requires_ps
     def test_deterministic_image_tag_changes_with_cache_input_content(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5892,6 +5959,7 @@ class TestContainerBackend:
 
         assert tag_before != tag_after
 
+    @pytest.mark.requires_ps
     def test_deterministic_image_tag_changes_with_host_spec_version(self, tmp_path: Path):
         """A spec upgrade must produce a new image tag, or the old
         image keeps serving stale spec_runtime behind a current-looking name."""
@@ -5910,6 +5978,7 @@ class TestContainerBackend:
         assert tag_a == tag_a_again
         assert tag_a != tag_b
 
+    @pytest.mark.requires_ps
     def test_prepare_workspace_redacts_bootstrap_cache_command_from_build_log(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5940,6 +6009,7 @@ class TestContainerBackend:
         assert cache_command not in build_log
         assert "SPEC_BOOTSTRAP_CACHE_COMMAND=<redacted>" in build_log
 
+    @pytest.mark.requires_ps
     def test_image_build_uses_buildkit_when_build_ssh_set(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -5976,6 +6046,7 @@ class TestContainerBackend:
         generated = handle.outbox_path.parent / "container-build" / "Dockerfile"
         assert 'RUN --mount=type=ssh if [ -n "$SPEC_BOOTSTRAP_CACHE_COMMAND" ]' in generated.read_text()
 
+    @pytest.mark.requires_ps
     def test_image_build_unchanged_when_build_ssh_empty(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6022,6 +6093,7 @@ class TestContainerBackend:
         assert backend._bootstrap_cache_command == "make deps"
         assert backend._bootstrap_cache_inputs == ("Makefile", "frontend/package-lock.json")
 
+    @pytest.mark.requires_ps
     def test_prepare_workspace_runs_full_bootstrap_install_in_container(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6050,6 +6122,7 @@ class TestContainerBackend:
         assert install_command not in log_text
         assert "<redacted>" in log_text
 
+    @pytest.mark.requires_ps
     def test_prepare_workspace_runs_bootstrap_install_in_sidecar_worker(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6083,6 +6156,7 @@ class TestContainerBackend:
         assert "container-123" in install_call
         assert "--network" in worker_run_call
 
+    @pytest.mark.requires_ps
     def test_run_command_executes_through_container_without_host_sensitive_mounts(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6180,6 +6254,7 @@ class TestContainerBackend:
         state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
         assert "container-123" in state["containers"]
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize("agent", ["claude", "codex"])
     def test_agent_launch_keeps_live_completion_outbox(self, tmp_path: Path, agent: str):
         repo = tmp_path / "repo"
@@ -6237,6 +6312,7 @@ class TestContainerBackend:
             assert f"{key}={value}" not in agent_call
             assert agent_env[key] == value
 
+    @pytest.mark.requires_ps
     def test_agent_log_failure_happens_only_after_runtime_is_quiesced(
         self,
         tmp_path: Path,
@@ -6279,6 +6355,7 @@ class TestContainerBackend:
         assert not state.get("worker_container")
         assert state.get("containers") == []
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name == "nt", reason="requires POSIX FIFO support")
     @pytest.mark.parametrize(
         "poison",
@@ -6429,6 +6506,7 @@ class TestContainerBackend:
 
         assert scandir_calls == [git_dir]
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink support")
     def test_agent_completion_replaces_linked_config_without_touching_target(
         self,
@@ -6463,6 +6541,7 @@ class TestContainerBackend:
         assert external.read_text() == "operator-owned\n"
         assert config.is_file() and not config.is_symlink()
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name == "nt", reason="requires executable POSIX script")
     def test_agent_completion_disables_agent_configured_fsmonitor(
         self,
@@ -6496,6 +6575,7 @@ class TestContainerBackend:
         assert result.returncode == 0
         assert not marker.exists()
 
+    @pytest.mark.requires_ps
     def test_agent_launch_does_not_export_undeclared_ambient_secret(
         self,
         tmp_path: Path,
@@ -6538,6 +6618,7 @@ class TestContainerBackend:
         assert "APP_FEATURE_FLAG" in exported_names
         assert "STRIPE_API_KEY" not in exported_names
 
+    @pytest.mark.requires_ps
     def test_non_agent_path_includes_workspace_venv_bin(self, tmp_path: Path):
         # Gate/prep commands run with the default cache-disabled bootstrap,
         # which creates the venv at /workspace/source/.venv. That bin dir must
@@ -6572,6 +6653,7 @@ class TestContainerBackend:
             "/workspace/source/.venv/bin"
         )
 
+    @pytest.mark.requires_ps
     def test_agent_launch_keeps_bootstrap_path_contract(self, tmp_path: Path):
         # Agent launches must NOT get the workspace venv implicitly injected —
         # their HOME/PATH contract is deliberate.
@@ -6602,6 +6684,7 @@ class TestContainerBackend:
             arg for arg in agent_call if arg.startswith("PATH=")
         )
 
+    @pytest.mark.requires_ps
     def test_codex_agent_uses_container_as_sandbox_boundary(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6641,6 +6724,7 @@ class TestContainerBackend:
         sandbox_index = agent_call.index("-s")
         assert agent_call[sandbox_index + 1] == "danger-full-access"
 
+    @pytest.mark.requires_ps
     def test_run_command_allows_workspace_scoped_home_env(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6670,6 +6754,7 @@ class TestContainerBackend:
         assert runner.envs[-1]["HOME"] == "/workspace/source/.spec-claude-home"
         assert str(handle.path / ".spec-claude-home") not in run_call
 
+    @pytest.mark.requires_ps
     def test_run_command_allows_claude_secret_env_without_argv_values(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6711,6 +6796,7 @@ class TestContainerBackend:
         assert "ANTHROPIC_API_KEY" in command_log_text
         assert "CLAUDE_CODE_OAUTH_TOKEN" in command_log_text
 
+    @pytest.mark.requires_ps
     def test_run_command_redacts_every_forwarded_value_from_output(
         self,
         tmp_path: Path,
@@ -6756,6 +6842,7 @@ class TestContainerBackend:
         assert "CI=<redacted>" in command_log_text
         assert "identifier1 stays readable" in command_log_text
 
+    @pytest.mark.requires_ps
     def test_backend_injects_postgres_env_for_in_worker_topology(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6785,6 +6872,7 @@ class TestContainerBackend:
         assert "postgresql://spec:spec@127.0.0.1:5432/spec" not in command_log_text
         assert "DATABASE_URL" in command_log_text
 
+    @pytest.mark.requires_ps
     def test_backend_injects_postgres_env_and_network_for_sidecar_topology(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6822,6 +6910,7 @@ class TestContainerBackend:
         assert "postgresql://spec:spec@postgres:5432/spec" not in command_log_text
         assert "DATABASE_URL" in command_log_text
 
+    @pytest.mark.requires_ps
     def test_bind_mode_runs_with_host_user_mapping_for_writable_mounts(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -6859,6 +6948,7 @@ class TestContainerBackend:
         assert f"{handle.outbox_path}:/workspace/outbox" in start_call
         assert f"{handle.outbox_path.parent / 'logs'}:/workspace/logs" in start_call
 
+    @pytest.mark.requires_ps
     def test_run_command_translates_workspace_paths_for_worker(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -7071,6 +7161,7 @@ class TestContainerBackend:
         assert loaded.summary == "trusted outbox"
         assert loaded_from_local is False
 
+    @pytest.mark.requires_ps
     def test_auto_workspace_mode_uses_volume_on_macos(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -7102,6 +7193,7 @@ class TestContainerBackend:
         assert "spec.run_id=my-feature-abc" in seed_calls[-1]
         assert "find /workspace/source -mindepth 1 -maxdepth 1 -exec rm -rf {} +" in " ".join(seed_calls[-1])
 
+    @pytest.mark.requires_ps
     def test_volume_seed_refuses_same_named_foreign_volume(
         self,
         tmp_path: Path,
@@ -7149,6 +7241,7 @@ class TestContainerBackend:
         )
         assert not any("/workspace/seed:ro" in " ".join(call) for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_volume_seed_refuses_locally_labeled_volume_with_foreign_consumer(
         self,
         tmp_path: Path,
@@ -7206,6 +7299,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_worker_start_rechecks_workspace_volume_after_seed(self, tmp_path: Path):
         repo = tmp_path / "repo"
         other_repo = tmp_path / "other-repo"
@@ -7255,6 +7349,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_startup_failure_preserves_preexisting_owned_workspace_volume(
         self,
         tmp_path: Path,
@@ -7300,6 +7395,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_ignores_worker_writable_container_state_for_mounts_and_cleanup(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -7341,6 +7437,7 @@ class TestContainerBackend:
         assert "volume rm /:/workspace/source" not in cleanup_text
         assert "network rm attacker-network" not in cleanup_text
 
+    @pytest.mark.requires_ps
     def test_volume_mode_imports_worker_changes_back_to_host(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -7379,6 +7476,7 @@ class TestContainerBackend:
             for child in handle.outbox_path.parent.iterdir()
         )
 
+    @pytest.mark.requires_ps
     def test_volume_mode_import_stages_before_replacing_host_tree(self, tmp_path: Path):
         """Import into a fresh sibling so copy failure cannot partially wipe the
         current host mirror; the bounded source walk still handles dotfiles."""
@@ -7412,6 +7510,7 @@ class TestContainerBackend:
         assert "cp -a -t /workspace/host" not in joined
         assert "cp -a /workspace/source/. /workspace/host/" not in joined
 
+    @pytest.mark.requires_ps
     def test_volume_mode_import_failure_is_typed_with_artifacts(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -7441,6 +7540,7 @@ class TestContainerBackend:
         assert failure["log_path"] == str(log_path)
         assert "copy failed" in log_path.read_text()
 
+    @pytest.mark.requires_ps
     def test_volume_import_failure_preserves_current_host_tree(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -7471,6 +7571,7 @@ class TestContainerBackend:
             for child in handle.outbox_path.parent.iterdir()
         )
 
+    @pytest.mark.requires_ps
     def test_volume_cleanup_syncs_volume_before_deletability_guard(self, tmp_path: Path):
         """Regression: in volume mode the authoritative git state lives inside
         the Docker volume. If a crash (or a cleanup/resume before the post-run
@@ -7520,6 +7621,7 @@ class TestContainerBackend:
         synced_allowed.assert_not_called()
         assert not source.exists()
 
+    @pytest.mark.requires_ps
     def test_volume_cleanup_refuses_foreign_consumer_before_import_or_removal(
         self,
         tmp_path: Path,
@@ -7573,6 +7675,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize("request_kind", ["command", "agent"])
     def test_volume_execution_refuses_foreign_consumer_before_command(
         self,
@@ -7624,6 +7727,7 @@ class TestContainerBackend:
 
         assert not any(call[:2] in (["docker", "exec"], ["docker", "run"]) for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_volume_execution_refuses_runtime_inventory_failure_before_command(
         self,
         tmp_path: Path,
@@ -7652,6 +7756,7 @@ class TestContainerBackend:
 
         assert not any(call[:2] in (["docker", "exec"], ["docker", "run"]) for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_volume_restore_syncs_volume_before_rescuing_unpushed_work(self, tmp_path: Path):
         """Regression: in volume mode the authoritative git state lives inside the
         Docker volume. ``restore`` rescues unpushed work from the host ``source``
@@ -7696,6 +7801,7 @@ class TestContainerBackend:
         assert rescue_index
         assert "volume_only.py" in rescue_index[-1].get("untracked_files", [])
 
+    @pytest.mark.requires_ps
     def test_sync_host_paths_into_workspace_copies_into_volume(self, tmp_path: Path):
         """Orchestrator-written paths (.spec-codex-home, .claude/mcp-servers.json)
         must be pushed into the container volume after seeding so the agent
@@ -7735,6 +7841,7 @@ class TestContainerBackend:
         joined = " ".join(last)
         assert "cp -a /workspace/host/.spec-codex-home /workspace/source/.spec-codex-home" in joined
 
+    @pytest.mark.requires_ps
     def test_sync_host_paths_into_workspace_skips_bind_mode(self, tmp_path: Path):
         """Bind mode binds the host worktree directly; the sync helper has
         nothing to do."""
@@ -7758,6 +7865,7 @@ class TestContainerBackend:
 
         assert runner.calls == []
 
+    @pytest.mark.requires_ps
     def test_sync_host_paths_into_workspace_removes_missing_paths(self, tmp_path: Path):
         """Host absence is propagated so launch-only state leaves the volume."""
         repo = tmp_path / "repo"
@@ -7783,6 +7891,7 @@ class TestContainerBackend:
         assert "rm -rf /workspace/source/.does-not-exist" in joined
         assert "cp -a" not in joined
 
+    @pytest.mark.requires_ps
     def test_export_workspace_path_to_host_reads_volume_read_only(self, tmp_path: Path):
         """Provider state written inside the volume (a container Claude home's
         transcripts) is exported through a read-only volume mount."""
@@ -7821,6 +7930,7 @@ class TestContainerBackend:
         with pytest.raises(ValueError):
             backend.export_workspace_path_to_host(handle.path, "../outside", destination)
 
+    @pytest.mark.requires_ps
     def test_export_workspace_path_to_host_skips_bind_mode(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -7844,6 +7954,7 @@ class TestContainerBackend:
         )
         assert runner.calls == []
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows cannot create file symlinks")
     def test_snapshot_restore_and_cleanup_are_idempotent(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -7907,6 +8018,7 @@ class TestContainerBackend:
         backend.cleanup(restored, allow_unpushed_work=True)
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
+    @pytest.mark.requires_ps
     def test_sidecar_snapshot_stops_services_and_records_volume_scope(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -7940,6 +8052,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_volume_snapshot_copies_only_while_worker_is_paused(
         self,
         tmp_path: Path,
@@ -7978,6 +8091,7 @@ class TestContainerBackend:
         )
         assert pause_index < import_index < unpause_index
 
+    @pytest.mark.requires_ps
     def test_snapshot_rolls_back_pause_when_pause_inspection_fails(
         self,
         tmp_path: Path,
@@ -8026,6 +8140,7 @@ class TestContainerBackend:
         assert any(call[:2] == ["docker", "unpause"] for call in runner.calls)
         assert runner.paused_container_ids == set()
 
+    @pytest.mark.requires_ps
     def test_snapshot_restarts_sidecars_when_stop_verification_fails(
         self,
         tmp_path: Path,
@@ -8060,6 +8175,7 @@ class TestContainerBackend:
         assert any("up" in call for call in compose_calls)
         assert any(call[:2] == ["docker", "unpause"] for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_sidecar_snapshot_aborts_when_services_do_not_stop_cleanly(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -8085,6 +8201,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_snapshot_restart_failure_quiesces_before_next_runtime_generation(
         self,
         tmp_path: Path,
@@ -8143,6 +8260,7 @@ class TestContainerBackend:
         )
         assert compose_up < worker_start < agent_exec
 
+    @pytest.mark.requires_ps
     def test_sidecar_snapshot_fails_closed_when_volume_inventory_fails(
         self,
         tmp_path: Path,
@@ -8199,6 +8317,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_completed_sidecar_snapshot_is_immutable_on_setup_retry(
         self,
         tmp_path: Path,
@@ -8238,6 +8357,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_runtime_generation_accepts_successful_one_shot_compose_job(
         self,
         tmp_path: Path,
@@ -8279,6 +8399,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_runtime_generation_rejects_failed_compose_job_and_quiesces(
         self,
         tmp_path: Path,
@@ -8315,6 +8436,7 @@ class TestContainerBackend:
         assert state["worker_container"] == ""
         assert runner.ps_container_ids == set()
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize(
         ("status", "exit_code"),
         [("created", 0), ("dead", 0), ("exited", 1)],
@@ -8360,6 +8482,7 @@ class TestContainerBackend:
         assert unhealthy not in refreshed["runtime_generation_containers"]
         assert refreshed["runtime_generation_status"] == "running"
 
+    @pytest.mark.requires_ps
     def test_host_suspend_skips_exact_owned_exited_compose_job(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -8391,6 +8514,7 @@ class TestContainerBackend:
         assert completed not in persisted["host_access_paused_containers"]
         assert "container-123" in persisted["host_access_paused_containers"]
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize("workspace_mode", ["bind", "volume"])
     def test_suspend_resume_preserves_the_same_runtime_generation(
         self,
@@ -8432,6 +8556,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_paused_runtime_death_quiesces_and_requires_setup_retry(
         self,
         tmp_path: Path,
@@ -8470,6 +8595,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize("failed_member", ["worker", "sidecar"])
     def test_command_replaces_incomplete_recorded_runtime_generation(
         self,
@@ -8528,6 +8654,7 @@ class TestContainerBackend:
         assert worker in refreshed["runtime_generation_containers"]
         assert sidecar in refreshed["runtime_generation_containers"]
 
+    @pytest.mark.requires_ps
     def test_sidecar_restore_stops_services_before_importing_volume_snapshot(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -8589,6 +8716,7 @@ class TestContainerBackend:
         assert import_index < compose_up_index
         assert compose_up_index < bootstrap_index
 
+    @pytest.mark.requires_ps
     def test_sidecar_restore_stop_failure_preserves_current_workspace(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -8634,6 +8762,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_sidecar_restore_preflights_all_archives_before_any_mutation(
         self,
         tmp_path: Path,
@@ -8682,6 +8811,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize("archive_index", [0, -1])
     def test_sidecar_restore_rejects_corrupt_archive_before_any_volume_wipe(
         self,
@@ -8725,6 +8855,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_sidecar_restore_rechecks_volume_consumers_immediately_before_wipe(
         self,
         tmp_path: Path,
@@ -8780,6 +8911,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_in_worker_restore_recreates_persistent_worker_container(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -8829,6 +8961,7 @@ class TestContainerBackend:
         assert state["worker_container"] == "container-123"
         assert state["service_processes"][0]["container_id"] == "container-123"
 
+    @pytest.mark.requires_ps
     def test_restore_aborts_when_worker_removal_is_not_verified(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -8860,6 +8993,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_restore_reruns_bootstrap_install_after_worker_reset(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -8901,6 +9035,7 @@ class TestContainerBackend:
         assert rm_index < restart_index
         assert restart_index < install_index
 
+    @pytest.mark.requires_ps
     def test_reseed_workspace_volume_defers_single_bootstrap_until_resume(self, tmp_path: Path):
         """Re-seeding the worker volume after repositioning the
         host source wipes /workspace/source (including bootstrap-installed
@@ -8954,6 +9089,7 @@ class TestContainerBackend:
             for call in runner.calls
         ) == 1
 
+    @pytest.mark.requires_ps
     def test_reseed_workspace_volume_is_noop_in_bind_mode(self, tmp_path: Path):
         """The reseed step only applies to volume mode; a bind-mode workspace
         (where the host worktree is the workspace) must not seed or reinstall."""
@@ -8983,6 +9119,7 @@ class TestContainerBackend:
         )
         assert not any(call[-3:] == ["sh", "-lc", "make install"] for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_cleanup_removes_sidecars_after_successful_startup(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -9013,6 +9150,7 @@ class TestContainerBackend:
         )
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
+    @pytest.mark.requires_ps
     def test_cleanup_refuses_service_data_directory_outside_source(
         self,
         tmp_path: Path,
@@ -9046,6 +9184,7 @@ class TestContainerBackend:
         assert handle.path.is_dir()
         assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_cleanup_refuses_symlinked_service_data_directory(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -9076,6 +9215,7 @@ class TestContainerBackend:
         assert sentinel.read_text() == "keep\n"
         assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name == "nt", reason="requires POSIX symlink support")
     def test_cleanup_revalidates_service_data_after_stopping_runtime(
         self,
@@ -9124,6 +9264,7 @@ class TestContainerBackend:
         assert sentinel.read_text() == "keep\n"
         assert outside.is_dir()
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize(
         "relative_path",
         ["src", "nested/../.local/postgres/data"],
@@ -9157,6 +9298,7 @@ class TestContainerBackend:
         assert handle.path.is_dir()
         assert runner.calls == []
 
+    @pytest.mark.requires_ps
     def test_cleanup_refuses_mismatched_resource_labels_before_teardown(
         self,
         tmp_path: Path,
@@ -9185,6 +9327,7 @@ class TestContainerBackend:
         assert handle.path.is_dir()
         assert runner.calls == []
 
+    @pytest.mark.requires_ps
     def test_cleanup_refuses_changed_engine_without_losing_original_run_state(
         self,
         tmp_path: Path,
@@ -9218,6 +9361,7 @@ class TestContainerBackend:
         assert handle.outbox_path.parent.is_dir()
         assert state_path.read_bytes() == state_before
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize(
         "corruption",
         [
@@ -9295,6 +9439,7 @@ class TestContainerBackend:
         assert handle.outbox_path.parent.is_dir()
         assert state_path.is_file()
 
+    @pytest.mark.requires_ps
     def test_cleanup_refuses_undiscovered_workspace_volume_before_stopping_runtime(
         self,
         tmp_path: Path,
@@ -9329,6 +9474,7 @@ class TestContainerBackend:
         assert runner.owned_volume_ids == volumes_before
         assert state_path.read_bytes() == state_before
 
+    @pytest.mark.requires_ps
     @pytest.mark.parametrize(
         "operation",
         [
@@ -9405,6 +9551,7 @@ class TestContainerBackend:
         assert docker_runner.ps_container_ids == containers_before
         assert state_path.read_bytes() == state_before
 
+    @pytest.mark.requires_ps
     def test_cleanup_refuses_unauthenticated_service_pid(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -9430,6 +9577,7 @@ class TestContainerBackend:
         assert handle.path.is_dir()
         assert runner.calls == []
 
+    @pytest.mark.requires_ps
     def test_cleanup_fails_closed_when_owned_resource_discovery_fails(
         self,
         tmp_path: Path,
@@ -9455,6 +9603,7 @@ class TestContainerBackend:
         assert handle.path.is_dir()
         assert not any(call[:3] == ["docker", "rm", "-f"] for call in runner.calls)
 
+    @pytest.mark.requires_ps
     def test_cleanup_preserves_service_data_when_container_removal_fails(
         self,
         tmp_path: Path,
@@ -9583,6 +9732,7 @@ class TestContainerBackend:
         assert len(volume_consumer_checks) == 3
         assert not (repo / ".spec-workspaces" / "my-feature-abc").exists()
 
+    @pytest.mark.requires_ps
     def test_missing_snapshot_restore_recreates_fresh_workspace(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -9633,6 +9783,7 @@ class TestContainerBackend:
         ]
         assert len(worker_starts) == 1
 
+    @pytest.mark.requires_ps
     def test_passwd_shim_files_are_created_with_runtime_uid(self, tmp_path: Path):
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
             pytest.skip("requires POSIX uid/gid")
@@ -9680,6 +9831,7 @@ class TestContainerBackend:
         }
         assert removed_ids == {"extract-1", "extract-2"}
 
+    @pytest.mark.requires_ps
     def test_passwd_shim_create_failure_never_copies_or_removes_by_name(
         self,
         tmp_path: Path,
@@ -9713,6 +9865,7 @@ class TestContainerBackend:
             for call in runner.calls
         )
 
+    @pytest.mark.requires_ps
     def test_passwd_shim_does_not_duplicate_existing_uid(self, tmp_path: Path):
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
             pytest.skip("requires POSIX uid/gid")
@@ -9748,6 +9901,7 @@ class TestContainerBackend:
         assert len(matching_group_lines) == 1
         assert matching_group_lines[0].startswith("node:")
 
+    @pytest.mark.requires_ps
     def test_passwd_shim_falls_back_to_baseline_when_image_lacks_passwd(self, tmp_path: Path):
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
             pytest.skip("requires POSIX uid/gid")
@@ -9777,6 +9931,7 @@ class TestContainerBackend:
         assert "nogroup:x:65534:" in group_text
         assert f"spec:x:{gid}:" in group_text
 
+    @pytest.mark.requires_ps
     def test_in_worker_start_mounts_passwd_shim_when_user_mapping_set(self, tmp_path: Path):
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
             pytest.skip("requires POSIX uid/gid")
@@ -9811,6 +9966,7 @@ class TestContainerBackend:
         assert worker_call.index(passwd_mount) > user_idx
         assert worker_call.index(group_mount) > user_idx
 
+    @pytest.mark.requires_ps
     def test_run_command_replaces_unrecorded_worker_before_exec(self, tmp_path: Path):
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
             pytest.skip("requires POSIX uid/gid")
@@ -9882,6 +10038,7 @@ class TestContainerBackend:
         assert passwd_mount in worker_call
         assert group_mount in worker_call
 
+    @pytest.mark.requires_ps
     def test_passwd_shim_is_skipped_on_windows(self, tmp_path: Path):
         repo = tmp_path / "repo"
         _init_clone_source(repo)
@@ -9908,6 +10065,7 @@ class TestContainerBackend:
         assert not any(":/etc/passwd:ro" in item for item in worker_call)
         assert not any(":/etc/group:ro" in item for item in worker_call)
 
+    @pytest.mark.requires_ps
     def test_volume_import_mounts_passwd_shim(self, tmp_path: Path):
         if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
             pytest.skip("requires POSIX uid/gid")

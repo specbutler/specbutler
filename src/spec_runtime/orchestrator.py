@@ -7127,13 +7127,8 @@ def _load_spec_creation_prompt(
     if prompt_path.exists():
         prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
-        prompt = (
-            "Author a focused spec for this repository. Read AGENTS.md and "
-            f"`{PurePosixPath(SPEC_RUNTIME_CONFIG.paths.specs_dir) / 'TEMPLATE.md'}` "
-            "first, then write "
-            f"`{PurePosixPath(SPEC_RUNTIME_CONFIG.paths.specs_dir) / '<spec-id>.md'}`, "
-            "commit it locally. Do not run `git push` or create a pull request."
-        )
+        from .init import _read_bundled_template
+        prompt = _read_bundled_template("spec-creation.md").strip()
 
     effective_spec_id = spec_id or _spec_id_from_authoring_branch(branch)
     resume_note = (
@@ -15644,15 +15639,11 @@ def _load_task_scoping_prompt(
 ) -> str:
     """Build the prompt for the task-scoping conversation."""
     prompt_path = repo_root / TASK_SCOPING_PROMPT_FILE
-    top_level_spec_pattern = f"{SPEC_RUNTIME_CONFIG.paths.specs_dir}/*.md"
     if prompt_path.exists():
         prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
-        prompt = (
-            "You are a task-scoping assistant. Ask the user what they want to build, "
-            f"explore the codebase, agree on scope, then write exactly one task spec at "
-            f"{TASK_SPEC_DIR}/<spec-id>.md. Do not write top-level {top_level_spec_pattern} files in task mode."
-        )
+        from .init import _read_bundled_template
+        prompt = _read_bundled_template("task-scoping.md").strip()
     slug_note = (
         "Slug: choose a slug during the conversation, then write the spec to "
         f"`{TASK_SPEC_DIR}/<slug>.md` with matching frontmatter `id: <slug>`. "
@@ -28492,6 +28483,26 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 1
 
 
+def _validate_new_spec_run(repo_root: Path, spec_id: str, base_ref: str) -> None:
+    """Validate catalog input before pinning a new immutable run contract."""
+    from .config import load_repo_spec_runtime_config
+    from .spec_lint import format_lint, lint_specs
+
+    results = lint_specs(repo_root, spec_id)
+    print(format_lint(results))
+    if any(result.errors for result in results):
+        raise RuntimeError("Spec lint failed")
+    config = load_repo_spec_runtime_config(repo_root)
+    if config.specs.require_merged_spec:
+        relative = f"{config.paths.specs_dir}/{spec_id}.md"
+        check = subprocess.run(
+            ["git", "cat-file", "-e", f"{base_ref}:{relative}"],
+            cwd=repo_root, capture_output=True,
+        )
+        if check.returncode:
+            raise RuntimeError("Spec must exist on the base ref; merge it first or set [specs] require_merged_spec = false.")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Start or resume a full workflow run."""
     repo_root = resolve_repo_root()
@@ -28579,6 +28590,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 )
 
             if run is None:
+                _validate_new_spec_run(repo_root, spec_id, base_ref)
                 if is_spec_merged(repo_root, spec_id):
                     raise RuntimeError(
                         f"Spec '{spec_id}' is already merged on {BASE_REF}; refusing to start a new implementation run."
@@ -28654,6 +28666,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 spec_path = _command_spec_path(repo_root, spec_id, run)
                 if not spec_path.exists():
                     raise RuntimeError(f"Spec not found: {spec_path}")
+                if run.run_mode != "task":
+                    from .spec_lint import format_lint, lint_specs
+
+                    results = lint_specs(repo_root, spec_id, source_path=spec_path)
+                    print(format_lint(results))
+                    if any(result.errors for result in results):
+                        raise RuntimeError("Spec lint failed")
                 run.agent = agent
                 run.review_agent = review_agent
                 # Preserve the run's saved base_ref (e.g. web handoffs that
