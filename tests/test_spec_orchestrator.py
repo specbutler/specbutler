@@ -339,6 +339,9 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         description: A test spec
         ---
 
+        ## Goal
+        Deliver the requested feature.
+
         ## Acceptance Criteria
         - [ ] First criterion
         - [ ] Second criterion
@@ -372,6 +375,9 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
               required: true
         ---
 
+        ## Goal
+        Deliver the requested feature.
+
         ## Acceptance Criteria
         - [ ] Intake collects answers
     """)
@@ -385,6 +391,13 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         description: Intake optional spec
         intake: optional
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "dep-a.md").write_text(
@@ -395,6 +408,13 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         depends_on: []
         description: Merged dep
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "dep-b.md").write_text(
@@ -405,6 +425,13 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         depends_on: []
         description: Unmerged dep
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "depends-on-both.md").write_text(
@@ -415,6 +442,13 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         depends_on: [dep-a, dep-b]
         description: Depends on two
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "old-spec.md").write_text(
@@ -426,6 +460,13 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         depends_on: []
         description: Superseded spec
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "new-spec.md").write_text(
@@ -436,6 +477,13 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         depends_on: []
         description: Replacement spec
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
     (specs / "depends-on-superseded.md").write_text(
@@ -446,6 +494,13 @@ def _repo_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
         depends_on: [old-spec]
         description: Invalid dependency
         ---
+
+        ## Goal
+        Deliver the requested behavior.
+
+        ## Acceptance Criteria
+        - [ ] The requested behavior can be verified.
+
     """)
     )
 
@@ -1723,6 +1778,7 @@ class TestPhaseImplementHandshake:
             agent="claude",
         )
 
+    @pytest.mark.requires_ps
     def test_requires_completion_handshake(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -1918,6 +1974,7 @@ class TestPhaseImplementHandshake:
         private_home_parent = operator_state / "claude-provider-homes"
         assert not list(private_home_parent.glob("launch-*"))
 
+    @pytest.mark.requires_ps
     def test_passes_when_agent_reports_passed(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -2039,6 +2096,7 @@ class TestPhaseImplementHandshake:
         assert run.implement_head_sha_after == "newhead"
         assert run.implement_has_new_commit is True
 
+    @pytest.mark.requires_ps
     def test_review_retry_does_not_infer_success_from_merge_only_head_movement(self, repo: Path):
         run = self._make_run()
         run.attempts = 1
@@ -2065,6 +2123,7 @@ class TestPhaseImplementHandshake:
         assert status == "failed"
         assert "does not count as fresh review-fix evidence" in run.last_error
 
+    @pytest.mark.requires_ps
     def test_review_retry_does_not_infer_passed_from_environment_block_after_merge_only_movement(self, repo: Path):
         run = self._make_run()
         run.attempts = 1
@@ -2102,6 +2161,7 @@ class TestPhaseImplementHandshake:
         assert mirrored is not None
         assert mirrored.status == "blocked"
 
+    @pytest.mark.requires_ps
     def test_initial_implement_passes_prior_review_findings_to_prompt(self, repo: Path):
         run = self._make_run()
         run.prior_review_run_id = "my-feature-20251231T235959"
@@ -2143,6 +2203,7 @@ class TestPhaseImplementHandshake:
         assert captured_kwargs["prior_review_summary"] == "Carry these fixes into the new attempt."
         assert captured_kwargs["prior_review_findings"] == run.prior_review_findings
 
+    @pytest.mark.requires_ps
     def test_initial_implement_passes_resolved_input_to_prompt(self, repo: Path):
         run = self._make_run()
         run.status = "pending"
@@ -2243,6 +2304,30 @@ class TestPhaseImplementHandshake:
         assert consumed_attempt.continuation == orch.OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
         assert consumed_attempt.response_consumed_attempt_number == 2
 
+    def test_build_implement_attempt_context_drops_operator_response_consumed_by_earlier_attempt(
+        self, repo: Path
+    ):
+        run = self._make_run()
+        run.status = "failed"
+        run.phase = "merge"
+        run.attempts = 3
+        run.save(repo)
+        orch.OperatorRequest(
+            kind="debugger_guidance",
+            prompt="Sandbox-only failures?",
+            status="consumed",
+            response="Do not change code for those failures.",
+            response_source="spec input",
+            request_attempt_number=2,
+            response_consumed_attempt_number=3,
+        ).save(repo, run.run_id)
+
+        bundle = orch._build_implement_attempt_context(run, repo)
+
+        assert bundle.context.attempt_number == 4
+        assert bundle.context.operator_request_response == ""
+        assert bundle.context.operator_request_kind == ""
+
     def test_build_implement_attempt_context_keeps_active_operator_steering_pending_until_launch(self, repo: Path):
         run = self._make_run()
         run.status = "passed"
@@ -2269,6 +2354,7 @@ class TestPhaseImplementHandshake:
         assert history
         assert history[0].status == "active"
 
+    @pytest.mark.requires_ps
     def test_phase_implement_consumes_active_operator_steering_after_launch(self, repo: Path):
         run = self._make_run()
         run.status = "passed"
@@ -2351,6 +2437,7 @@ class TestPhaseImplementHandshake:
         assert history[1].message == "Prefer the smallest retry that fixes lint."
         assert history[1].influenced_attempt_number is None
 
+    @pytest.mark.requires_ps
     def test_phase_implement_records_head_shas_and_tree_state(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -2373,6 +2460,7 @@ class TestPhaseImplementHandshake:
         assert run.implement_unstaged_changes is False
         assert run.implement_tree_status == "new_commit"
 
+    @pytest.mark.requires_ps
     def test_reused_branch_syncs_origin_master_before_first_implement(self, repo: Path):
         run = self._make_run()
         run.branch = "specrun/my-feature--20260101T000000"
@@ -2401,6 +2489,7 @@ class TestPhaseImplementHandshake:
         merge_mock.assert_called_once_with(worktree, fetch_origin_master=False, base_ref="origin/master")
         assert run.last_merged_master_sha == "mastersha"
 
+    @pytest.mark.requires_ps
     def test_reused_branch_head_base_ref_skips_sync(self, repo: Path):
         """When base_ref is HEAD (local-only repo), sync is skipped entirely."""
         run = self._make_run()
@@ -2423,6 +2512,7 @@ class TestPhaseImplementHandshake:
         assert status == "passed"
         fetch_mock.assert_not_called()
 
+    @pytest.mark.requires_ps
     def test_reused_branch_merge_conflict_enters_merge_conflict_context(
         self,
         repo: Path,
@@ -2469,6 +2559,7 @@ class TestPhaseImplementHandshake:
         assert ctx is not None
         assert ctx.implement_reason == "merge_conflict"
 
+    @pytest.mark.requires_ps
     def test_retry_context_keeps_gate_review_and_merge_evidence_together(
         self,
         repo: Path,
@@ -3327,6 +3418,7 @@ class TestPhaseImplementHandshake:
         assert saved_run.last_error == "Codex CLI does not support 'exec' subcommand."
         assert orch.ImplementContext.load(repo, run.run_id) is None
 
+    @pytest.mark.requires_ps
     def test_treats_environment_gate_block_as_passed_after_clean_commit(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -3354,6 +3446,7 @@ class TestPhaseImplementHandshake:
         assert mirrored.status == "passed"
         assert "local environment constraints" in mirrored.summary
 
+    @pytest.mark.requires_ps
     def test_keeps_environment_gate_block_when_no_new_commit(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -3376,6 +3469,7 @@ class TestPhaseImplementHandshake:
         assert status == "blocked"
         assert run.last_error == summary
 
+    @pytest.mark.requires_ps
     def test_passes_when_agent_reports_passed_via_worktree_local_state(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -3397,6 +3491,7 @@ class TestPhaseImplementHandshake:
         assert mirrored is not None
         assert mirrored.summary == "done local"
 
+    @pytest.mark.requires_ps
     def test_dirty_worktree_preserves_worktree_local_handshake_until_after_interpretation(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -3519,6 +3614,7 @@ class TestPhaseImplementHandshake:
             kind="agent",
         )
 
+    @pytest.mark.requires_ps
     def test_implement_context_includes_intake_answers(self, repo: Path):
         run = self._make_run()
         run.run_id = "interactive-feature-20260101T000000"
@@ -3563,6 +3659,7 @@ class TestPhaseImplementHandshake:
         assert isinstance(launch_intake, dict)
         assert launch_intake["answers"]["rollout_mode"] == "canary"
 
+    @pytest.mark.requires_ps
     def test_retry_context_prefers_diagnostic_output_for_failed_test_gate(
         self,
         repo: Path,
@@ -3704,6 +3801,7 @@ class TestPhaseImplementHandshake:
         assert "incompatible with the current intake schema" in run.last_error
         assert "--reset-intake" in run.last_error
 
+    @pytest.mark.requires_ps
     def test_ignores_stale_result_from_previous_attempt(self, repo: Path):
         run = self._make_run()
         run.attempts = 1
@@ -3786,6 +3884,7 @@ class TestPhaseImplementHandshake:
         ]
         assert stale_messages == []
 
+    @pytest.mark.requires_ps
     def test_uses_fresh_worktree_local_result_when_common_result_is_stale(
         self,
         repo: Path,
@@ -3817,6 +3916,7 @@ class TestPhaseImplementHandshake:
         assert mirrored.attempt == 1
         assert mirrored.summary == "fresh local"
 
+    @pytest.mark.requires_ps
     def test_no_handshake_with_new_commit_infers_passed(self, repo: Path):
         run = self._make_run()
         worktree = repo / ".worktrees" / run.spec_id
@@ -6213,6 +6313,7 @@ class TestReviewWorktreeBootstrap:
             ),
         )
 
+    @pytest.mark.requires_ps
     def test_runs_trusted_bootstrap_command_with_stripped_env(self, tmp_path: Path):
         worktree = tmp_path / "review-worktree"
         worktree.mkdir()
@@ -6315,6 +6416,7 @@ class TestReviewWorktreeBootstrap:
         assert captured["encoding"] == "utf-8"
         assert captured["errors"] == "replace"
 
+    @pytest.mark.requires_ps
     def test_bootstrap_cannot_read_real_home_credentials(self, tmp_path: Path):
         """Stripping named credential env vars is not enough on its own: build
         hooks run as the same OS user and can read credential files straight
@@ -6379,6 +6481,7 @@ class TestReviewWorktreeBootstrap:
         # The isolated HOME is a temp dir removed once bootstrap finishes.
         assert not Path(observed).exists()
 
+    @pytest.mark.requires_ps
     def test_records_warning_when_bootstrap_fails(self, tmp_path: Path):
         worktree = tmp_path / "review-worktree"
         worktree.mkdir()
@@ -6444,6 +6547,7 @@ class TestReviewWorktreeBootstrap:
         assert payload["summary"] == warning
         assert payload["detail"] == "native sandbox setup is unavailable"
 
+    @pytest.mark.requires_ps
     def test_records_warning_on_timeout(self, tmp_path: Path):
         worktree = tmp_path / "review-worktree"
         worktree.mkdir()
@@ -6476,6 +6580,7 @@ class TestReviewWorktreeBootstrap:
         # Must not wait out the full untrusted command; the timeout is enforced.
         assert elapsed < 15
 
+    @pytest.mark.requires_ps
     def test_timeout_kills_whole_process_group_not_just_the_shell(self, tmp_path: Path):
         """A regression test for a hang: the untrusted install command can spawn
         a descendant that outlives its parent and keeps stdout/stderr open.
@@ -6862,6 +6967,7 @@ class TestBatchedStatusParity:
 
 
 class TestSpecTableRefRefresh:
+    @pytest.mark.requires_ps
     def test_refresh_git_spec_refs_syncs_remote_merge_tags(self, repo: Path):
         _run_git("tag", "spec/merged/new-spec", cwd=repo)
         _run_git("push", "origin", "refs/tags/spec/merged/new-spec", cwd=repo)
@@ -6877,6 +6983,7 @@ class TestSpecTableRefRefresh:
         listed_specs = {line[:22].strip() for line in table.splitlines()[2:] if line.strip()}
         assert "new-spec" not in listed_specs
 
+    @pytest.mark.requires_ps
     def test_refresh_git_spec_refs_prunes_stale_remote_implementation_refs(self, repo: Path):
         stale_ref = "refs/remotes/origin/code/my-feature--20260102T000000"
         _run_git("update-ref", stale_ref, _unreachable_commit(repo), cwd=repo)
@@ -7325,6 +7432,7 @@ class TestDistributedLeaseIntegration:
         finally:
             orch._ACTIVE_COORDINATOR_LEASE = None
 
+    @pytest.mark.requires_ps
     def test_background_heartbeat_failure_interrupts_active_phase_subprocess(
         self,
         repo: Path,
@@ -7573,6 +7681,10 @@ class TestSpecAutopilot:
 
             ## Goal
             Build a responsive React modal for the frontend.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         heuristic = next(spec for spec in autopilot.iter_spec_metadata(repo) if spec.spec_id == "ui-helper")
@@ -7592,6 +7704,10 @@ class TestSpecAutopilot:
 
             ## Goal
             Implement a batch data pipeline.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         spec = next(s for s in autopilot.iter_spec_metadata(repo) if s.spec_id == "plain-spec")
@@ -7612,6 +7728,13 @@ class TestSpecAutopilot:
             area: backend
             description: Should stay out of the dispatch queue
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "main-queued.txt").write_text("queued on main\n")
@@ -7645,6 +7768,10 @@ class TestSpecAutopilot:
 
             ## Goal
             Implement a batch data pipeline.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         spec = next(s for s in autopilot.iter_spec_metadata(repo) if s.spec_id == "plain-spec")
@@ -7665,6 +7792,10 @@ class TestSpecAutopilot:
 
             ## Goal
             Implement a batch data pipeline.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         # Write a .spec.toml in the repo with a custom default agent
@@ -7685,6 +7816,13 @@ class TestSpecAutopilot:
             priority: 40
             description: Unblocks two specs
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "hub-b.md").write_text(
@@ -7697,6 +7835,13 @@ class TestSpecAutopilot:
             priority: 10
             description: Same unlock count, higher priority
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-1.md").write_text(
@@ -7707,6 +7852,13 @@ class TestSpecAutopilot:
             depends_on: [hub-a]
             description: Depends on hub-a
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-2.md").write_text(
@@ -7717,6 +7869,13 @@ class TestSpecAutopilot:
             depends_on: [hub-a]
             description: Depends on hub-a
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-3.md").write_text(
@@ -7727,6 +7886,13 @@ class TestSpecAutopilot:
             depends_on: [hub-b]
             description: Depends on hub-b
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
 
@@ -8243,6 +8409,13 @@ class TestSpecAutopilot:
             priority: 40
             description: Historically unblocked two specs
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "hub-b.md").write_text(
@@ -8254,6 +8427,13 @@ class TestSpecAutopilot:
             priority: 10
             description: Currently unblocks one spec
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-1.md").write_text(
@@ -8264,6 +8444,13 @@ class TestSpecAutopilot:
             depends_on: [hub-a]
             description: Already merged dependent
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-2.md").write_text(
@@ -8274,6 +8461,13 @@ class TestSpecAutopilot:
             depends_on: [hub-a]
             description: Pending dependent
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "leaf-3.md").write_text(
@@ -8284,6 +8478,13 @@ class TestSpecAutopilot:
             depends_on: [hub-b]
             description: Pending dependent
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         _run_git("tag", "spec/merged/leaf-1", cwd=repo)
@@ -8303,6 +8504,13 @@ class TestSpecAutopilot:
             priority: 0
             description: Highest explicit priority
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         (repo / "specs" / "priority-ten.md").write_text(
@@ -8314,6 +8522,13 @@ class TestSpecAutopilot:
             priority: 10
             description: Lower than priority zero
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
 
@@ -8333,6 +8548,13 @@ class TestSpecAutopilot:
             depends_on: []
             description: An obsolete spec that should be skipped
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         queue = autopilot.build_dispatch_queue(repo)
@@ -8348,6 +8570,13 @@ class TestSpecAutopilot:
             depends_on: []
             description: A legacy draft spec that should be dispatched
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         queue = autopilot.build_dispatch_queue(repo)
@@ -8361,6 +8590,13 @@ class TestSpecAutopilot:
             depends_on: []
             description: Template file
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         specs = autopilot.iter_spec_metadata(repo)
@@ -8485,6 +8721,7 @@ class TestSpecAutopilot:
         assert autopilot.available_memory_bytes() == (100 + 200 + 25) * 16384
         assert autopilot.available_memory_bytes is process_supervisor.available_memory_bytes
 
+    @pytest.mark.requires_ps
     def test_run_loop_dry_run_refreshes_remote_refs_before_building_queue(
         self,
         repo: Path,
@@ -8526,6 +8763,7 @@ class TestSpecAutopilot:
         refreshed_queue = autopilot.build_dispatch_queue(repo)
         assert all(item.spec_id != "new-spec" for item in refreshed_queue)
 
+    @pytest.mark.requires_ps
     def test_run_loop_dry_run_prints_queue_even_when_memory_is_low(
         self,
         repo: Path,
@@ -8582,6 +8820,7 @@ class TestSpecAutopilot:
         sleep_mock.assert_not_called()
         start_mock.assert_not_called()
 
+    @pytest.mark.requires_ps
     def test_run_loop_attempts_acquire_when_lease_inspection_is_unavailable(
         self,
         repo: Path,
@@ -8678,6 +8917,7 @@ class TestSpecAutopilot:
         assert "lease inspection unavailable; attempting acquire: forbidden" in captured.out
         assert "spec coord doctor" in captured.out
 
+    @pytest.mark.requires_ps
     def test_run_loop_records_graceful_shutdown_on_first_signal(
         self,
         repo: Path,
@@ -8754,6 +8994,7 @@ class TestSpecAutopilot:
         captured_out = capsys.readouterr()
         assert "shutdown requested" in captured_out.out
 
+    @pytest.mark.requires_ps
     def test_run_loop_forces_shutdown_on_second_signal(
         self,
         repo: Path,
@@ -8823,6 +9064,7 @@ class TestSpecAutopilot:
         assert payload["interrupt_count"] >= 2
         assert payload["forced_at"]
 
+    @pytest.mark.requires_ps
     def test_run_loop_reconciles_stale_shutdown_on_restart(
         self,
         repo: Path,
@@ -9297,6 +9539,13 @@ class TestSpecAutopilot:
             area: backend
             description: Hidden from legacy watch output
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         runs_dir = repo / ".spec-state" / "runs"
@@ -9689,6 +9938,7 @@ class TestSpecAutopilot:
         assert state.nonce == record.nonce
         legacy_shutdown.assert_not_called()
 
+    @pytest.mark.requires_ps
     def test_stop_command_round_trips_targeted_shutdown_across_processes(
         self,
         repo: Path,
@@ -10232,6 +10482,7 @@ class TestSpecAutopilot:
         assert "adopt" in captured.out
         assert "my-spec" in captured.out
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX session-leader adoption")
     @pytest.mark.parametrize("run_id", ["", "live-spec-run-1"])
     def test_adopt_active_processes_recovers_real_posix_adoptable_child(
@@ -10289,6 +10540,7 @@ class TestSpecAutopilot:
         finally:
             managed.terminate(grace_seconds=0.1)
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX launch reservation recovery")
     def test_adopt_active_processes_recovers_posix_launch_reservation(
         self,
@@ -10908,6 +11160,13 @@ class TestSpecAutopilot:
             area: backend
             description: Hidden from legacy watch rows
             ---
+
+            ## Goal
+            Deliver the requested behavior.
+
+            ## Acceptance Criteria
+            - [ ] The requested behavior can be verified.
+
         """)
         )
         runs_dir = repo / ".spec-state" / "runs"
@@ -13528,6 +13787,7 @@ class TestImplementSetupTeardownHelpers:
 
         terminate.assert_called_once_with(ownership_token, grace_seconds=0)
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX setup handoff integration")
     def test_posix_setup_service_handoff_persists_and_reaps_complete_group(
         self,
@@ -13589,6 +13849,7 @@ class TestImplementSetupTeardownHelpers:
                 )
             process_supervisor.close_empty_held_posix_groups()
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX setup failure integration")
     def test_posix_setup_child_without_manifest_is_stopped_before_agent_launch(
         self,
@@ -13631,6 +13892,7 @@ class TestImplementSetupTeardownHelpers:
                 )
             process_supervisor.close_empty_held_posix_groups()
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX keeper handoff integration")
     def test_posix_keeper_reaps_worker_after_declared_service_exits(
         self,
@@ -13718,6 +13980,7 @@ class TestImplementSetupTeardownHelpers:
                 )
             process_supervisor.close_empty_held_posix_groups()
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX escaped setup cleanup")
     def test_escaped_setup_service_is_stopped_when_registry_write_fails(
         self,
@@ -13784,6 +14047,7 @@ class TestImplementSetupTeardownHelpers:
                 )
                 process_supervisor.terminate(fallback, grace_seconds=0)
 
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name != "posix", reason="POSIX atomic escaped cleanup")
     def test_atomic_handoff_failure_stops_every_escaped_setup_service(
         self,
@@ -16565,6 +16829,7 @@ class TestPhaseTransitions:
             branch="spec/my-feature",
         )
 
+    @pytest.mark.requires_ps
     def test_all_phases_pass(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -16575,6 +16840,7 @@ class TestPhaseTransitions:
         assert result == "passed"
         assert run.status == "passed"
 
+    @pytest.mark.requires_ps
     def test_resumes_from_next_phase_when_current_phase_already_passed(self, repo: Path):
         run = self._make_run(repo)
         run.phase = "publish"
@@ -16602,6 +16868,7 @@ class TestPhaseTransitions:
         assert result == "passed"
         assert phase_sequence == ["review", "merge", "cleanup"]
 
+    @pytest.mark.requires_ps
     def test_passed_implement_with_active_steering_reruns_implement(self, repo: Path):
         run = self._make_run(repo)
         run.phase = "implement"
@@ -16646,6 +16913,7 @@ class TestPhaseTransitions:
         assert phase_sequence[:3] == ["implement", "verify", "publish"]
         assert run.attempts == 1
 
+    @pytest.mark.requires_ps
     def test_passed_implement_with_consumed_operator_response_advances_to_verify(self, repo: Path):
         run = self._make_run(repo)
         run.phase = "implement"
@@ -16681,6 +16949,7 @@ class TestPhaseTransitions:
         handlers["implement"].assert_not_called()
         assert run.attempts == 3
 
+    @pytest.mark.requires_ps
     def test_midflight_operator_steering_reruns_implement_before_verify(self, repo: Path):
         run = self._make_run(repo)
         run.phase = "implement"
@@ -16721,6 +16990,7 @@ class TestPhaseTransitions:
         assert phase_sequence[:3] == ["implement", "implement", "verify"]
         assert run.attempts == 1
 
+    @pytest.mark.requires_ps
     def test_operator_steering_does_not_bypass_retry_cap(self, repo: Path):
         run = self._make_run(repo)
         run.phase = "implement"
@@ -16749,6 +17019,7 @@ class TestPhaseTransitions:
         assert phase_order.index("publish") < phase_order.index("review")
         assert phase_order.index("review") < phase_order.index("merge")
 
+    @pytest.mark.requires_ps
     def test_bootstrap_blocked_stops(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -16764,6 +17035,7 @@ class TestPhaseTransitions:
 
         assert result == "blocked"
 
+    @pytest.mark.requires_ps
     def test_verify_failure_retries_implement(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -16792,6 +17064,7 @@ class TestPhaseTransitions:
         assert call_counts["implement"] == 2  # initial + retry
         assert call_counts["verify"] == 2
 
+    @pytest.mark.requires_ps
     def test_first_verify_failure_defers_publish_until_verify_passes(
         self,
         repo: Path,
@@ -16845,6 +17118,7 @@ class TestPhaseTransitions:
             record.message for record in caplog.records if record.message == "Deferring publish until verify passes"
         ] == ["Deferring publish until verify passes"]
 
+    @pytest.mark.requires_ps
     def test_verify_merge_conflict_retries_with_conflict_context(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -16880,6 +17154,7 @@ class TestPhaseTransitions:
         assert "merge conflict while merging origin/master before verify" in (implement_contexts[1].lower())
         assert run.merge_conflict_error == ""
 
+    @pytest.mark.requires_ps
     def test_verify_retry_does_not_reenter_intake(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -16911,6 +17186,7 @@ class TestPhaseTransitions:
         assert call_counts["implement"] == 2
         assert call_counts["verify"] == 2
 
+    @pytest.mark.requires_ps
     def test_verify_retry_cap_skips_draft_publish_before_first_verify_success(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -16943,6 +17219,7 @@ class TestPhaseTransitions:
         assert publish_called["count"] == 0
         assert "Resume with: spec implement --spec my-feature" in run.last_error
 
+    @pytest.mark.requires_ps
     def test_implement_failure_stops(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -16967,6 +17244,7 @@ class TestPhaseTransitions:
         assert run.attempts == 1
         assert run.implement_failures == 1
 
+    @pytest.mark.requires_ps
     def test_non_retryable_implement_failure_stops(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -16986,6 +17264,7 @@ class TestPhaseTransitions:
         assert run.attempts == 0
         assert run.implement_failures == 0
 
+    @pytest.mark.requires_ps
     def test_review_request_changes_retries_implement(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -17029,6 +17308,7 @@ class TestPhaseTransitions:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_ps
 class TestResumeSandboxConfigRewrite:
     """Verify _write_sandbox_config runs when resuming past bootstrap."""
 
@@ -20055,6 +20335,30 @@ class TestReviewPhaseRouting:
         assert pr is not None
         assert pr["number"] == 42
         assert pr["headRefOid"] == "a" * 40
+
+    def test_required_checks_from_error_ignores_appended_log_summary(self):
+        error = (
+            "Readiness promotion refused for ac5e5d43dca8: Required checks failing: "
+            "ci (https://github.com/o/r/actions/runs/40729739012/job/1), lint"
+            "\nRequired check log summary:\n- ci: ##[error]Process completed with exit code 1."
+        )
+
+        labels = orch._required_checks_from_error(error)
+
+        assert labels == ["ci (https://github.com/o/r/actions/runs/40729739012/job/1)", "lint"]
+        assert orch._split_check_label(labels[0]) == ("ci", "https://github.com/o/r/actions/runs/40729739012/job/1")
+
+    def test_find_pr_for_branch_raises_when_no_forge_frontend_answers(self, repo: Path):
+        def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
+            return subprocess.CompletedProcess(cmd, 1, "", "error connecting to api.github.com")
+
+        with (
+            patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_repo_name_with_owner", return_value="acme/repo"),
+        ):
+            assert orch._find_pr_for_branch(repo, "code/x", state="all") is None
+            with pytest.raises(orch.PrLookupUnavailable, match="error connecting to"):
+                orch._find_pr_for_branch(repo, "code/x", state="all", raise_on_error=True)
 
     def test_find_pr_for_branch_falls_back_to_rest_after_graphql_failure(
         self,
@@ -23485,6 +23789,7 @@ class TestRequiredCheckLogSummaries:
         assert "- ci: Error: flaky mobile assertion" in enriched
 
 
+@pytest.mark.requires_ps
 class TestMergeConflictRetry:
     """Test merge-conflict → implement retry in run_full_workflow."""
 
@@ -23697,6 +24002,7 @@ class TestNoProgressCircuitBreaker:
             branch="spec/my-feature",
         )
 
+    @pytest.mark.requires_ps
     def test_repeated_verify_failures_on_same_clean_head_block(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -23753,6 +24059,7 @@ class TestNoProgressCircuitBreaker:
         # Durable: survives the counter reset when a resumed run later passes verify.
         assert run.no_progress_trips == 1
 
+    @pytest.mark.requires_ps
     def test_repeated_verify_failures_on_same_dirty_head_block(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -23807,6 +24114,7 @@ class TestNoProgressCircuitBreaker:
         assert run.attempts == 2
         assert "tree status: staged_changes+unstaged_changes" in run.last_error
 
+    @pytest.mark.requires_ps
     def test_real_code_change_resets_no_progress_counter(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -23884,6 +24192,7 @@ class TestNoProgressCircuitBreaker:
         assert run.no_progress_retries == 0
         assert run.last_verify_failure_gate == ""
 
+    @pytest.mark.requires_ps
     def test_same_failure_on_new_head_still_trips_circuit_breaker(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -23946,6 +24255,7 @@ class TestNoProgressCircuitBreaker:
         assert "implement returned new head" in run.last_error
         assert "(from cccccccccccc)" in run.last_error
 
+    @pytest.mark.requires_ps
     def test_verify_failure_clears_stale_merge_conflict_retry_reason(self, repo: Path):
         run = self._make_run()
         run.merge_conflict_error = "Confirmed local merge conflict with origin/master during review"
@@ -23991,6 +24301,7 @@ class TestNoProgressCircuitBreaker:
         consume_retry.assert_called_once_with(run, "verify_failures", 10)
         assert run.merge_conflict_error == ""
 
+    @pytest.mark.requires_ps
     def test_diagnostic_distinguishes_same_stdout_test_failures_on_same_head(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -24076,6 +24387,7 @@ class TestNoProgressCircuitBreaker:
         assert run.no_progress_retries == 0
         assert run.last_verify_failure_gate == ""
 
+    @pytest.mark.requires_ps
     def test_origin_master_merge_does_not_reset_no_progress_counter(self, repo: Path):
         """When the agent merges origin/master (new head) but the same tests
         keep failing, the circuit breaker should still trip."""
@@ -24144,6 +24456,7 @@ class TestNoProgressCircuitBreaker:
         # Head changed each time, so the message should reflect the new head
         assert "new head" in run.last_error
 
+    @pytest.mark.requires_ps
     def test_same_head_repeat_prepares_debugger_guided_retry_before_circuit_breaker(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -24260,6 +24573,7 @@ class TestNoProgressCircuitBreaker:
         assert prepared is False
         mock_debugger.assert_not_called()
 
+    @pytest.mark.requires_ps
     def test_same_head_repeat_guided_retry_still_runs_when_threshold_is_one(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -24336,6 +24650,7 @@ class TestNoProgressCircuitBreaker:
         assert debugger_calls == ["verify"]
         assert pending_signatures == ["", "", "sig-guided"]
 
+    @pytest.mark.requires_ps
     def test_same_head_repeat_waits_for_input_when_debugger_escalates(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -24406,6 +24721,7 @@ class TestNoProgressCircuitBreaker:
         assert call_counts["implement"] == 2
         assert call_counts["verify"] == 2
 
+    @pytest.mark.requires_ps
     def test_distinct_lint_failures_on_same_head_do_not_trip_circuit_breaker(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -24477,6 +24793,7 @@ class TestNoProgressCircuitBreaker:
         assert run.last_verify_failure_gate == ""
 
 
+@pytest.mark.requires_ps
 class TestStaleMergeConflictErrorClearing:
     def _make_run(self) -> orch.RunState:
         return orch.RunState(
@@ -24543,6 +24860,7 @@ class TestStaleMergeConflictErrorClearing:
         assert run.merge_conflicts == 0
 
 
+@pytest.mark.requires_ps
 class TestRunFullWorkflowRetryHandling:
     def _make_run(self, repo: Path) -> orch.RunState:
         del repo
@@ -25176,6 +25494,7 @@ class TestMergeCompletionFence:
         auth.assert_not_called()
         refresh.assert_not_called()
 
+    @pytest.mark.requires_ps
     def test_open_pr_not_merged_when_completion_tag_already_reachable(
         self,
         repo: Path,
@@ -25223,6 +25542,7 @@ class TestMergeCompletionFence:
         assert len(fence_warnings) == 1
         assert "already merged" in fence_warnings[0].get("summary", "")
 
+    @pytest.mark.requires_ps
     def test_draft_pr_not_marked_ready_when_fence_trips(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -25308,6 +25628,7 @@ class TestMergeCompletionFence:
         assert auto_merge_mock.call_count == 0
         assert manual_merge_mock.call_count == 0
 
+    @pytest.mark.requires_ps
     def test_normal_merge_flow_calls_forge_merge_when_no_completion_tag(
         self,
         repo: Path,
@@ -25366,6 +25687,7 @@ class TestMergeCompletionFence:
             for warning in run.nonfatal_warnings
         )
 
+    @pytest.mark.requires_ps
     def test_refresh_advances_remote_tracking_base_ref(self, repo: Path):
         """The fence must update refs/remotes/origin/master, not just FETCH_HEAD.
 
@@ -25449,6 +25771,7 @@ class TestMergeCompletionFence:
         assert "timed out" in error.lower()
         assert fenced_ref == "refs/remotes/origin/master"
 
+    @pytest.mark.requires_ps
     def test_unqualified_base_ref_checks_refreshed_remote_tracking_ref(
         self,
         repo: Path,
@@ -25504,6 +25827,7 @@ class TestMergeCompletionFence:
         assert spec_status.fence_base_ref("master") == fenced_ref
 
 
+@pytest.mark.requires_ps
 class TestMergeRequiredChecks:
     def _make_run(self) -> orch.RunState:
         return _merge_ready_run(orch.RunState(
@@ -25787,6 +26111,7 @@ class TestMergeRequiredChecks:
         assert "PR head changed" in run.last_error
 
 
+@pytest.mark.requires_ps
 class TestMergeRetryOnBranchPolicy:
     """Tests for the merge retry loop when base-branch-policy errors occur."""
 
@@ -26022,6 +26347,7 @@ class TestMergeRetryOnBranchPolicy:
         assert sleep_mock.call_count == 1
 
 
+@pytest.mark.requires_ps
 class TestMergeAutoFallback:
     """Tests for falling back when auto-merge is unavailable."""
 
@@ -26264,6 +26590,7 @@ class TestAutoMerge:
             checks_error="Required checks still pending: review-decision-gate",
         )
 
+    @pytest.mark.requires_ps
     def test_auto_merge_succeeds(self, repo: Path):
         """Auto-merge enabled, PR merges after polling."""
         run = self._make_run()
@@ -26331,6 +26658,83 @@ class TestAutoMerge:
 
         assert result == "passed"
 
+    @pytest.mark.requires_ps
+    def test_auto_merge_wait_survives_forge_outage(self, repo: Path):
+        """A failed PR lookup mid-wait is an outage, not a vanished PR."""
+        run = self._make_run()
+        run.save(repo)
+
+        auto_ok = subprocess.CompletedProcess(
+            args=["gh", "pr", "merge", "12", "--squash", "--auto"],
+            returncode=0,
+            stdout="auto-merge enabled",
+            stderr="",
+        )
+
+        def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
+            if cmd[:3] == ["gh", "auth", "status"]:
+                return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                return auto_ok
+            if cmd[:3] == ["git", "worktree", "list"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:3] == ["git", "worktree", "prune"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:3] == ["git", "tag", "--list"]:
+                return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
+            if cmd[:2] == ["git", "fetch"] and (
+                cmd[-1] == "master" or cmd[-1].endswith("refs/remotes/origin/master")
+            ):
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:4] == ["git", "symbolic-ref", "--short", "HEAD"]:
+                return subprocess.CompletedProcess(cmd, 0, "master\n", "")
+            if cmd[:4] == ["git", "merge", "--ff-only", "origin/master"]:
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        pr_open = {
+            "number": 12,
+            "state": "OPEN",
+            "headRefOid": "deadbeef1234567",
+            "mergeStateStatus": "BLOCKED",
+        }
+        pr_merged = {
+            "number": 12,
+            "state": "MERGED",
+            "headRefOid": "deadbeef1234567",
+        }
+
+        with (
+            patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(
+                orch,
+                "_find_pr_for_branch",
+                side_effect=[
+                    pr_open,
+                    pr_open,
+                    pr_open,
+                    # The first lookup inside the auto-merge wait hits an outage.
+                    orch.PrLookupUnavailable("error connecting to api.github.com"),
+                    pr_merged,
+                ],
+            ),
+            patch.object(
+                orch,
+                "_required_checks_green",
+                side_effect=[
+                    (True, ""),
+                    (False, "Required checks still pending: ci"),
+                ],
+            ),
+            patch.object(orch, "run_or_fail", return_value=True),
+            patch.object(orch, "_poll_sleep"),
+        ):
+            result = orch.phase_merge(run, repo)
+
+        assert result == "passed", run.last_error
+        assert "disappeared" not in run.last_error
+
+    @pytest.mark.requires_ps
     def test_auto_merge_unavailable_falls_back_to_manual(self, repo: Path):
         """When auto-merge is not enabled on the repo, fall back to manual merge."""
         run = self._make_run()
@@ -26392,6 +26796,7 @@ class TestAutoMerge:
 
         assert result == "passed"
 
+    @pytest.mark.requires_ps
     def test_auto_merge_detects_dirty_pr(self, repo: Path):
         """Auto-merge fails fast when PR has merge conflicts."""
         run = self._make_run()
@@ -26454,6 +26859,7 @@ class TestAutoMerge:
         assert result == "failed"
         assert "confirmed local merge conflict" in run.last_error.lower()
 
+    @pytest.mark.requires_ps
     def test_auto_merge_surfaces_failing_checks_for_retry(self, repo: Path):
         """When checks are genuinely failing during auto-merge wait,
         surface the error so run_full_workflow can loop to implement."""
@@ -26552,6 +26958,7 @@ class TestAutoMerge:
         assert disable_calls == [["gh", "pr", "merge", "12", "--disable-auto"]]
         assert "Required checks failing" in run.last_error
 
+    @pytest.mark.requires_ps
     def test_auto_merge_becoming_behind_falls_back_to_manual_sync(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -26641,6 +27048,7 @@ class TestAutoMerge:
             ["gh", "pr", "merge", "12", "--squash", "--match-head-commit", "deadbeef1234567"],
         ]
 
+    @pytest.mark.requires_ps
     def test_draft_pr_is_marked_ready_before_merge(self, repo: Path):
         """Draft PRs should be marked ready-for-review before attempting merge."""
         run = self._make_run()
@@ -26886,22 +27294,15 @@ class TestAutoMerge:
         assert run.readiness_status == "draft-published"
         assert "current head has not passed independent verify" in run.readiness_blocker
 
-    def test_draft_pr_refuses_ready_promotion_when_branch_is_behind(self, repo: Path):
+    def test_draft_pr_behind_base_is_promoted_and_left_to_merge_sync(self, repo: Path):
+        # BEHIND is mechanical: the merge phase merges the base itself, so
+        # readiness must not refuse promotion over it.
         run = self._make_run()
         run.verify_passed_once = True
         run.verify_head_sha = "deadbeef1234567"
         run.review_expected_head_sha = "deadbeef1234567"
         run.review_decision_status = "approved"
         run.save(repo)
-
-        def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
-            if cmd[:3] == ["gh", "auth", "status"]:
-                return subprocess.CompletedProcess(cmd, 0, "ok", "")
-            if cmd[:3] == ["gh", "pr", "ready"]:
-                raise AssertionError("behind branches must not be promoted before sync")
-            if cmd[:3] == ["git", "tag", "--list"]:
-                return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
-            raise AssertionError(f"Unexpected command: {cmd}")
 
         pr_draft = {
             "number": 12,
@@ -26910,22 +27311,29 @@ class TestAutoMerge:
             "isDraft": True,
             "mergeStateStatus": "BEHIND",
         }
+        forge = MagicMock()
+        forge.mark_pr_ready.return_value = True
 
         with (
-            patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "run_subprocess", return_value=subprocess.CompletedProcess([], 0, "ok", "")),
             patch.object(orch, "refresh_merge_completion_state", return_value=("git fetch", "", "origin/master")),
             patch.object(orch, "is_spec_merged", return_value=False),
             patch.object(orch, "_find_pr_for_branch", return_value=pr_draft),
             patch.object(orch, "_head_sha", return_value="deadbeef1234567"),
             patch.object(orch, "_required_checks_green", return_value=(True, "")),
+            patch.object(orch, "_revalidate_readiness_pr_head", return_value=None),
+            patch.object(orch, "_assert_publication_transition_safe"),
+            patch.object(orch, "_forge", return_value=forge),
+            patch.object(orch, "_try_auto_merge", return_value="failed") as auto_merge_mock,
         ):
-            result = orch.phase_merge(run, repo)
+            orch.phase_merge(run, repo)
 
-        assert result == "failed"
-        assert run.readiness_status == "merge-blocked"
-        assert "mergeStateStatus=BEHIND" in run.readiness_blocker
+        forge.mark_pr_ready.assert_called_once()
+        auto_merge_mock.assert_called_once()
+        assert run.readiness_status == "ready"
+        assert "BEHIND" not in run.readiness_blocker
 
-    def test_ready_pr_refuses_merge_when_branch_is_behind(self, repo: Path):
+    def test_ready_pr_behind_base_proceeds_to_merge_sync(self, repo: Path):
         run = self._make_run()
         run.verify_passed_once = True
         run.verify_head_sha = "deadbeef1234567"
@@ -26948,14 +27356,14 @@ class TestAutoMerge:
             patch.object(orch, "_find_pr_for_branch", return_value=pr_ready),
             patch.object(orch, "_head_sha", return_value="deadbeef1234567"),
             patch.object(orch, "_required_checks_green", return_value=(True, "")),
-            patch.object(orch, "_try_auto_merge") as auto_merge_mock,
+            patch.object(orch, "_revalidate_readiness_pr_head", return_value=None),
+            patch.object(orch, "_try_auto_merge", return_value="failed") as auto_merge_mock,
         ):
-            result = orch.phase_merge(run, repo)
+            orch.phase_merge(run, repo)
 
-        assert result == "failed"
-        assert run.readiness_status == "merge-blocked"
-        assert "mergeStateStatus=BEHIND" in run.readiness_blocker
-        auto_merge_mock.assert_not_called()
+        auto_merge_mock.assert_called_once()
+        assert run.readiness_status == "ready"
+        assert "BEHIND" not in run.readiness_blocker
 
     def test_readiness_uses_post_verify_head_instead_of_implement_head(self, repo: Path):
         run = self._make_run()
@@ -27010,6 +27418,39 @@ class TestAutoMerge:
 
         assert decision.ready is False
         assert "verify head is unavailable" in decision.blocker
+
+    @pytest.mark.parametrize(("merge_state", "ready"), [("BEHIND", True), ("DIRTY", False)])
+    def test_readiness_leaves_behind_branches_to_the_merge_phase_sync(
+        self, repo: Path, merge_state: str, ready: bool
+    ):
+        run = self._make_run()
+        run.verify_passed_once = True
+        run.verify_head_sha = "deadbeef1234567"
+        run.review_expected_head_sha = "deadbeef1234567"
+        run.review_decision_status = "approved"
+        pr = {
+            "number": 12,
+            "state": "OPEN",
+            "headRefOid": "deadbeef1234567",
+            "isDraft": False,
+            "mergeStateStatus": merge_state,
+        }
+        with (
+            patch.object(orch, "_required_checks_green", return_value=(True, "")),
+            patch.object(orch, "_find_pr_for_branch", return_value=pr),
+            patch.object(orch, "_poll_sleep"),
+        ):
+            decision = orch._evaluate_readiness_for_promotion(
+                run,
+                repo,
+                pr_number=12,
+                pr_data=pr,
+                current_head_sha="deadbeef1234567",
+            )
+
+        assert decision.ready is ready
+        if not ready:
+            assert "mergeStateStatus=DIRTY" in decision.blocker
 
     def test_draft_pr_refuses_ready_promotion_with_pending_operator_request(self, repo: Path):
         run = self._make_run()
@@ -27185,6 +27626,7 @@ class TestAutoMerge:
         assert orch._is_draft_pr_error(err)
 
 
+@pytest.mark.requires_ps
 class TestMergeBehindBranchUpdate:
     """Tests for mergeStateStatus=BEHIND handling."""
 
@@ -27195,8 +27637,35 @@ class TestMergeBehindBranchUpdate:
             branch="spec/my-feature",
         ))
 
-    def test_phase_merge_blocks_initial_behind_checkpoint(self, repo: Path):
-        """Initial BEHIND checkpoints must fail readiness before merge mutations."""
+    @pytest.mark.parametrize(
+        ("pr_body", "expect_rerun"),
+        [
+            ("## Review\nReview-Owner: local\n", True),
+            # phase_review always reviews locally, so an unmarked body (for
+            # example one an agent supplied) must not skip the rerun.
+            ("Agent-written summary without a review section.", True),
+            ("## Review\nReview-Owner: platform-team\n", False),
+        ],
+    )
+    def test_post_sync_review_rerun_follows_review_owner(self, repo: Path, pr_body: str, expect_rerun: bool):
+        run = self._make_run()
+        run.review_decision_status = "approved"
+        run.review_expected_head_sha = "deadbeef1234567"
+
+        with patch.object(orch, "_reset_local_review_gate_for_head", return_value=True):
+            rerun = orch._mark_local_review_for_rerun_after_sync(
+                run,
+                repo,
+                pr_body=pr_body,
+                current_head_sha="5ac0ed1234567",
+            )
+
+        assert rerun is expect_rerun
+        if expect_rerun:
+            assert run.last_error.startswith(orch.LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX)
+
+    def test_phase_merge_syncs_initial_behind_checkpoint(self, repo: Path):
+        """Initial BEHIND checkpoints pass readiness and reach the merge-phase base sync."""
         run = self._make_run()
         run.save(repo)
         worktree = repo / ".worktrees" / run.spec_id
@@ -27205,11 +27674,18 @@ class TestMergeBehindBranchUpdate:
         pr_open = {
             "number": 12,
             "state": "OPEN",
+            # A non-local review owner merges straight after the sync; local
+            # review reruns first (test_post_sync_review_rerun_follows_review_owner).
+            "body": "## Review\nReview-Owner: platform-team\n",
             "headRefOid": "deadbeef1234567",
             "baseRefOid": "base1234",
             "mergeStateStatus": "BEHIND",
         }
         push_called = False
+        merge_commands: list[list[str]] = []
+
+        def mock_head_sha(_path):
+            return "5ac0ed1234567" if push_called else "deadbeef1234567"
 
         def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
             nonlocal push_called
@@ -27219,6 +27695,7 @@ class TestMergeBehindBranchUpdate:
                 push_called = True
                 return subprocess.CompletedProcess(cmd, 0, "pushed", "")
             if cmd[:3] == ["gh", "pr", "merge"]:
+                merge_commands.append(list(cmd))
                 return subprocess.CompletedProcess(cmd, 0, "merged", "")
             if cmd[:3] == ["git", "worktree", "list"]:
                 return subprocess.CompletedProcess(cmd, 0, "", "")
@@ -27251,18 +27728,23 @@ class TestMergeBehindBranchUpdate:
                 return_value=orch.MergeOriginMasterResult(status="success"),
             ) as merge_master_mock,
             patch.object(orch, "_resolve_git_ref_sha", return_value="mastersha"),
-            patch.object(orch, "_head_sha", return_value="deadbeef1234567"),
+            patch.object(orch, "_head_sha", side_effect=mock_head_sha),
             patch.object(orch, "_required_checks_green", return_value=(True, "")),
             patch.object(orch, "run_or_fail", return_value=True),
             patch.object(orch, "_poll_sleep"),
+            patch.object(orch, "refresh_merge_completion_state", return_value=("git fetch", "", "origin/master")),
+            # Stop right after the merge command; post-merge cleanup is covered elsewhere.
+            patch.object(orch, "_wait_for_pr_merged", return_value=(False, "stopped after merge")),
         ):
-            result = orch.phase_merge(run, repo)
+            orch.phase_merge(run, repo)
 
-        assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
-        merge_master_mock.assert_not_called()
-        assert not push_called
-        assert run.last_merged_master_sha == ""
+        assert run.last_error == "stopped after merge"
+        merge_master_mock.assert_called_once()
+        assert push_called
+        assert run.last_merged_master_sha == "mastersha"
+        # The final merge pins the post-sync head, not the head readiness saw.
+        assert merge_commands, "merge was never attempted"
+        assert all("5ac0ed1234567" in cmd for cmd in merge_commands), merge_commands
 
     def test_phase_merge_fails_when_master_merge_fails(self, repo: Path):
         """When local origin/master merge fails, phase_merge returns failed."""
@@ -27306,7 +27788,7 @@ class TestMergeBehindBranchUpdate:
             result = orch.phase_merge(run, repo)
 
         assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
+        assert "Failed to merge origin/master before merge phase" in run.last_error
 
     def test_phase_merge_sets_conflict_context_when_master_merge_conflicts(self, repo: Path):
         run = self._make_run()
@@ -27346,8 +27828,8 @@ class TestMergeBehindBranchUpdate:
             result = orch.phase_merge(run, repo)
 
         assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
-        assert run.merge_conflict_error == ""
+        assert "Merge conflict while merging origin/master" in run.last_error
+        assert run.merge_conflict_error == run.last_error
 
     def test_phase_merge_checks_fail_after_sync(self, repo: Path):
         """When required checks fail after syncing with origin/master, phase fails."""
@@ -27399,7 +27881,7 @@ class TestMergeBehindBranchUpdate:
             result = orch.phase_merge(run, repo)
 
         assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
+        assert "Required checks failing" in run.last_error
 
     def test_phase_merge_restarts_local_review_after_sync_push(self, repo: Path):
         run = self._make_run()
@@ -27451,13 +27933,11 @@ class TestMergeBehindBranchUpdate:
             result = orch.phase_merge(run, repo)
 
         assert result == "failed"
-        assert "mergeStateStatus=BEHIND" in run.last_error
-        assert run.last_merged_master_sha == ""
-        assert run.review_decision_status == "approved"
-        assert run.review_decision_summary == "Approved on prior head"
-        assert run.review_decision_check_url == "https://example.com/pr/12"
-        assert run.review_expected_head_sha == "deadbeef1234567"
-        checks_mock.assert_called_once()
+        assert run.last_error.startswith(orch.LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX)
+        assert run.last_merged_master_sha == "mastersha"
+        assert run.review_decision_status != "approved"
+        # Readiness and the pre-sync merge gate each read the checks once.
+        assert checks_mock.call_count == 2
 
     def test_phase_merge_restarts_local_review_when_pr_head_is_stale(self, repo: Path):
         run = self._make_run()
@@ -27500,6 +27980,7 @@ class TestMergeBehindBranchUpdate:
         checks_mock.assert_not_called()
 
 
+@pytest.mark.requires_ps
 class TestMergeTagCreation:
     def _make_run(self) -> orch.RunState:
         return _merge_ready_run(orch.RunState(
@@ -27809,6 +28290,7 @@ class TestAutopilotMergeTagCreation:
         ]
 
 
+@pytest.mark.requires_ps
 class TestPostMergeSync:
     """Tests for post-merge local master sync in phase_merge."""
 
@@ -28024,6 +28506,7 @@ class TestPostMergeSync:
         assert result == "failed"
 
 
+@pytest.mark.requires_ps
 class TestBestEffortPostMergeLocalSync:
     """Regression coverage for `_best_effort_post_merge_local_sync` against real git repos.
 
@@ -28852,6 +29335,7 @@ class TestRetryCap:
             branch="spec/my-feature",
         )
 
+    @pytest.mark.requires_ps
     def test_custom_retry_cap_limits_retries(self, repo: Path):
         """A custom retry cap limits total retries across retryable phases."""
         run = self._make_run(repo)
@@ -28886,6 +29370,7 @@ class TestRetryCap:
         assert call_counts["verify"] == 3
         run_debugger.assert_called_once()
 
+    @pytest.mark.requires_ps
     def test_custom_retry_cap_publishes_as_draft(self, repo: Path):
         """When a PR already exists, retry-cap escalation still republishes as draft."""
         run = self._make_run(repo)
@@ -28917,6 +29402,7 @@ class TestRetryCap:
         assert publish_draft_value["draft"] is True
         assert "Resume with: spec implement --spec my-feature" in run.last_error
 
+    @pytest.mark.requires_ps
     def test_custom_retry_cap_emits_escalation_summary(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -29268,6 +29754,7 @@ class TestRetryCap:
         assert "spec phase --spec my-feature --phase implement" in captured.out
         assert any("Retry-cap escalation summary for my-feature" in record.message for record in caplog.records)
 
+    @pytest.mark.requires_ps
     def test_custom_retry_cap_is_shared_across_verify_and_review(self, repo: Path):
         run = self._make_run(repo)
         run.save(repo)
@@ -29318,6 +29805,7 @@ class TestRetryCap:
             "review": 2,
         }
 
+    @pytest.mark.requires_ps
     def test_merge_checks_failure_after_sync_retries_implement(self, repo: Path):
         """Post-sync required-check failure triggers implement retry."""
         run = self._make_run(repo)
@@ -30406,6 +30894,23 @@ class TestWaitForPrMerged:
         assert wait_error == ""
         sleep_mock.assert_called_once()
 
+    def test_wait_for_pr_merged_retries_through_forge_outage(self, repo: Path):
+        outage = orch.PrLookupUnavailable("error connecting to api.github.com")
+
+        with (
+            patch.object(
+                orch,
+                "_find_pr_for_branch",
+                side_effect=[outage, outage, {"number": 12, "state": "MERGED"}],
+            ),
+            patch.object(orch, "_poll_sleep") as sleep_mock,
+        ):
+            merged, wait_error = orch._wait_for_pr_merged(repo, "spec/my-feature", 12)
+
+        assert merged is True
+        assert wait_error == ""
+        assert sleep_mock.call_count == 2
+
     def test_wait_for_pr_merged_times_out_while_open(self, repo: Path):
         pr_open = {"number": 12, "state": "OPEN"}
 
@@ -31258,6 +31763,7 @@ class TestBaseOverride:
         assert observed == {"status": "failed", "phase": "implement"}
 
     def test_cmd_run_sets_base_ref_on_new_run(self, repo: Path):
+        _run_git("update-ref", "refs/remotes/origin/feature-branch", "origin/master", cwd=repo)
         captured: dict[str, str] = {}
 
         def fake_run_full_workflow(run: orch.RunState, _repo_root: Path, **_kw: object) -> str:
@@ -34641,6 +35147,7 @@ class TestCmdStep:
             "phase": "review",
         }
 
+    @pytest.mark.requires_ps
     def test_step_implement_blocks_when_required_intake_missing(
         self,
         repo: Path,
@@ -34757,6 +35264,7 @@ class TestWaitingForInputWorkflow:
         assert request.kind == "agent_question"
         assert request.prompt == "Which API version should we target?"
 
+    @pytest.mark.requires_ps
     def test_implement_needs_input_propagates_through_workflow(self, repo: Path):
         """run_full_workflow returns 'waiting-for-input' when implement
         reports needs-input, without consuming retry budget."""
@@ -35707,6 +36215,7 @@ class TestWaitingForInputWorkflow:
         assert resume_args.run == run.run_id
         assert resume_args.retry_cap == reloaded.retry_cap
 
+    @pytest.mark.requires_ps
     def test_cmd_run_returns_exit_code_2_for_waiting_for_input(
         self,
         repo: Path,
@@ -35796,6 +36305,7 @@ class TestWaitingForInputWorkflow:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="POSIX-only signal handling")
 class TestEnsureOrchestratorProcessGroupSigttou:
     """Regression test: tcsetpgrp() must be wrapped with SIGTTOU ignored.
@@ -38971,6 +39481,7 @@ class TestPositionReviewRetryWorkspaceHead:
         ctx.triggering_review_result_path = "runs/review-result.attempt-1.json"
         assert orch._validate_review_retry_lineage(run, work, work, ctx) == ""
 
+    @pytest.mark.requires_ps
     def test_reviewed_head_missing_fetches_branch_then_resets(self, tmp_path: Path):
         work, base, reviewed = self._build_missing(tmp_path)
         assert orch._commit_present(work, reviewed).returncode != 0
@@ -38995,6 +39506,7 @@ class TestPositionReviewRetryWorkspaceHead:
         ctx.triggering_review_result_path = "runs/review-result.attempt-1.json"
         assert orch._validate_review_retry_lineage(run, work, work, ctx) == ""
 
+    @pytest.mark.requires_ps
     def test_reviewed_head_still_missing_after_fetch_fails_cleanly(self, tmp_path: Path):
         work, base, _reviewed = self._build_missing(tmp_path)
         run = self._run()
@@ -39073,6 +39585,7 @@ class TestPositionReviewRetryWorkspaceHead:
         # AC4: the repositioned head is pushed toward the worker volume.
         assert backend.reseed_calls == [work]
 
+    @pytest.mark.requires_ps
     def test_end_to_end_lineage_pass_reproduces_305(self, tmp_path: Path):
         # Workspace restored to base, origin/<branch> reachable at the reviewed
         # head: restore -> position -> lineage must pass.
@@ -39432,7 +39945,7 @@ class TestConsumedRequestDispatch:
         )
         (repo / "specs" / "stranded-spec.md").write_text(
             "---\nid: stranded-spec\nstatus: not-started\ndepends_on: []\n"
-            "description: stranded\n---\n\n## Goal\nx\n"
+            "description: stranded\n---\n\n## Goal\nx\n\n## Acceptance Criteria\n- [ ] Resume the saved run.\n"
         )
 
         queue = autopilot.build_dispatch_queue(repo)
@@ -39461,7 +39974,7 @@ class TestConsumedRequestDispatch:
         )
         (repo / "specs" / "asking-spec.md").write_text(
             "---\nid: asking-spec\nstatus: not-started\ndepends_on: []\n"
-            "description: asking\n---\n\n## Goal\nx\n"
+            "description: asking\n---\n\n## Goal\nx\n\n## Acceptance Criteria\n- [ ] Await operator input.\n"
         )
 
         queue = autopilot.build_dispatch_queue(repo)
@@ -39593,6 +40106,7 @@ class TestRepositionRestoredWorkspaceHead:
         subprocess.run(["git", "reflog", "expire", "--expire=now", "--all"], cwd=worktree, capture_output=True)
         subprocess.run(["git", "gc", "--prune=now", "--aggressive", "-q"], cwd=worktree, capture_output=True)
 
+    @pytest.mark.requires_ps
     def test_unpushed_head_rehydrates_from_rescue_bundle(self, tmp_path: Path):
         worktree, base, impl = self._init_repo_with_impl_commit(tmp_path)
         rescue_dir = tmp_path / "rescue" / "20260101T000000000000"
@@ -39619,6 +40133,7 @@ class TestRepositionRestoredWorkspaceHead:
         assert head == impl
         assert (worktree / "a.txt").read_text() == "impl\n"
 
+    @pytest.mark.requires_ps
     def test_unrecoverable_head_raises_instead_of_continuing_from_base(self, tmp_path: Path):
         worktree, base, impl = self._init_repo_with_impl_commit(tmp_path)
         self._purge_commit(worktree, base)
@@ -39628,6 +40143,7 @@ class TestRepositionRestoredWorkspaceHead:
                 self._workspace(worktree, tmp_path), self._backend(), ctx, impl
             )
 
+    @pytest.mark.requires_ps
     def test_thin_rescue_bundle_rehydrates_after_refilling_from_origin(self, tmp_path: Path):
         """Production stall: a verify retry stranded the run because the rescue
         bundle was thin and its prerequisite (the base-ref commit the agent had
@@ -39954,6 +40470,7 @@ def test_read_process_identity_delegates_to_portable_boundary() -> None:
     assert type(legacy) is orch.ProcessIdentity
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX process-group integration")
 def test_terminate_agent_process_managed_posix_group_receives_sigterm(tmp_path: Path) -> None:
     script, ready_paths, term_paths = _write_sigterm_tree_script(tmp_path)
@@ -39972,6 +40489,7 @@ def test_terminate_agent_process_managed_posix_group_receives_sigterm(tmp_path: 
             managed.wait(timeout=5)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX legacy process-group integration")
 def test_terminate_agent_process_raw_popen_preserves_owned_group_semantics(tmp_path: Path) -> None:
     script, ready_paths, term_paths = _write_sigterm_tree_script(tmp_path)
@@ -40861,6 +41379,7 @@ class TestMergeabilityWorktreeFetchesMissingHead:
         _run_git("checkout", "-q", "master", cwd=origin)
         return origin, clone, branch, head_sha
 
+    @pytest.mark.requires_ps
     def test_head_missing_from_the_checkout_is_fetched(self, tmp_path: Path):
         _, clone, branch, head_sha = self._origin_and_clone(tmp_path)
         assert orch._commit_present(clone, head_sha).returncode != 0
@@ -41189,6 +41708,7 @@ class TestInfrastructureFailureBackoff:
         ):
             yield waits, poll_sleep
 
+    @pytest.mark.requires_ps
     def test_repeating_infrastructure_failure_backs_off_then_stops(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -41316,6 +41836,7 @@ class TestInfrastructureFailureBackoff:
         assert run.last_failure_retryable is False
         assert spec_status.get_spec_status(repo, "my-feature") == "needs-attention"
 
+    @pytest.mark.requires_ps
     def test_relaunched_run_gets_no_fresh_inprocess_retries(self, repo: Path):
         run = self._make_run()
         run.phase = "verify"
@@ -41344,6 +41865,7 @@ class TestInfrastructureFailureBackoff:
         poll_sleep.assert_not_called()
         assert run.infra_failure_streak == 4
 
+    @pytest.mark.requires_ps
     def test_operator_infrastructure_failure_fails_without_waiting(self, repo: Path):
         run = self._make_run()
         run.save(repo)
@@ -41367,6 +41889,7 @@ class TestInfrastructureFailureBackoff:
         assert run.attempts == 0
         assert run.last_failure_signature.startswith("toolchain_missing:")
 
+    @pytest.mark.requires_ps
     def test_code_failures_still_retry_implement_without_backoff(self, repo: Path):
         run = self._make_run()
         run.save(repo)
