@@ -144,3 +144,26 @@ class TestSpecAuthoringPathAllowlist:
         assert result.returncode == 1
         assert changed_path in result.stderr
         assert "touches non-spec files" in result.stderr
+
+
+def test_implementation_may_add_its_own_spec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """The trusted policy checks the head tree, so no base spec PR is required."""
+    event_path = tmp_path / 'event.json'
+    event_path.write_text(json.dumps({'pull_request': {'body': (
+        '## Spec\nSpec-ID: new-feature\nspecs/new-feature.md\n'
+        '## Acceptance Criteria\n- [ ] Works\n## Known Issues\nNone\n'
+    )}}))
+    monkeypatch.setenv('BASE_SHA', 'base-without-spec')
+    monkeypatch.setenv('HEAD_SHA', 'head-with-spec')
+    monkeypatch.setenv('GITHUB_HEAD_REF', 'code/new-feature--test')
+    monkeypatch.setenv('GITHUB_EVENT_PATH', str(event_path))
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        # The spec exists only in the implementation head.
+        return subprocess.CompletedProcess(command, 0 if 'head-with-spec:specs/new-feature.md' in command else 1)
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+    exec(_spec_pr_policy_python(), {'__name__': '__main__'})
+    assert calls == [['git', 'cat-file', '-e', 'head-with-spec:specs/new-feature.md']]

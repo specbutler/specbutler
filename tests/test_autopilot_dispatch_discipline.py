@@ -329,7 +329,7 @@ class TestOperatorGrace:
         """A live operator lease surfaces operator-grace in the dispatch queue."""
         (repo / "specs" / "my-feature.md").write_text(
             "---\nid: my-feature\ndepends_on: []\narea: backend\n"
-            "description: A test spec\n---\n\n## Acceptance Criteria\n- [ ] x\n"
+            "description: A test spec\n---\n\n## Goal\nDeliver the feature.\n\n## Acceptance Criteria\n- [ ] x\n"
         )
         run = orch.RunState(
             run_id="my-feature-20260711T120000",
@@ -367,7 +367,7 @@ class TestOperatorGrace:
     def _spec_and_failed_run(self, repo: Path) -> orch.RunState:
         (repo / "specs" / "my-feature.md").write_text(
             "---\nid: my-feature\ndepends_on: []\narea: backend\n"
-            "description: A test spec\n---\n\n## Acceptance Criteria\n- [ ] x\n"
+            "description: A test spec\n---\n\n## Goal\nDeliver the feature.\n\n## Acceptance Criteria\n- [ ] x\n"
         )
         run = orch.RunState(
             run_id="my-feature-20260711T120000",
@@ -539,7 +539,7 @@ class TestStrandedCommittedWork:
         dispatch queue instead of dispatching a fresh (superseding) run."""
         (repo / "specs" / "my-feature.md").write_text(
             "---\nid: my-feature\ndepends_on: []\narea: backend\n"
-            "description: A test spec\n---\n\n## Acceptance Criteria\n- [ ] x\n"
+            "description: A test spec\n---\n\n## Goal\nDeliver the feature.\n\n## Acceptance Criteria\n- [ ] x\n"
         )
         branch = "code/my-feature--20260629T010544"
         self._make_branch_with_commits(repo, branch, commits=1)
@@ -576,7 +576,7 @@ class TestStrandedCommittedWork:
 
         (repo / "specs" / "my-feature.md").write_text(
             "---\nid: my-feature\ndepends_on: []\narea: backend\n"
-            "description: A test spec\n---\n\n## Acceptance Criteria\n- [ ] x\n"
+            "description: A test spec\n---\n\n## Goal\nDeliver the feature.\n\n## Acceptance Criteria\n- [ ] x\n"
         )
         branch = "code/my-feature--20260629T010544"
         self._make_branch_with_commits(repo, branch, commits=1)

@@ -1013,6 +1013,8 @@ class TestCmdInit:
         # Marker file so the empty tasks dir survives `git add specs/` + clone.
         assert (tmp_path / "specs" / "tasks" / ".gitkeep").is_file()
         assert (tmp_path / ".github" / "prompts" / "review.md").is_file()
+        assert (tmp_path / "prompts" / "spec-creation.md").is_file()
+        assert (tmp_path / "prompts" / "task-scoping.md").is_file()
         assert (tmp_path / "AGENTS.md").is_file()
         assert "spec doctor" in capsys.readouterr().out
 
