@@ -958,15 +958,20 @@ def _cmd_lint(args: argparse.Namespace) -> int:
     if args.critique and not args.spec:
         print("--critique requires --spec", file=sys.stderr)
         return 1
-    return cmd_lint(args)
+    return cmd_lint(args, repo_root=_resolve_repo_root())
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     """Run the read-only repository onboarding preflight."""
+    from .config import SpecConfigError
     from .doctor import cmd_doctor
     from .spec_lint import format_lint, lint_specs
+
     root = Path(args.repo_root) if args.repo_root else _resolve_repo_root()
-    print(format_lint(lint_specs(root)))
+    try:
+        print(format_lint(lint_specs(root)))
+    except (SpecConfigError, OSError) as exc:
+        print(f"Lint unavailable: {exc}")
     return cmd_doctor(args)
 
 

@@ -27565,6 +27565,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 spec_path = _command_spec_path(repo_root, spec_id, run)
                 if not spec_path.exists():
                     raise RuntimeError(f"Spec not found: {spec_path}")
+                if run.run_mode != "task":
+                    from .spec_lint import format_lint, lint_specs
+
+                    results = lint_specs(repo_root, spec_id, source_path=spec_path)
+                    print(format_lint(results))
+                    if any(result.errors for result in results):
+                        raise RuntimeError("Spec lint failed")
                 run.agent = agent
                 run.review_agent = review_agent
                 # Preserve the run's saved base_ref (e.g. web handoffs that

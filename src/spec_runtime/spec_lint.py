@@ -7,7 +7,7 @@ import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from .config import resolve_specs_root
+from .config import load_repo_spec_runtime_config, resolve_specs_root
 from .spec_metadata import (
     VALID_SPEC_AREAS,
     InvalidSpecIdError,
@@ -26,24 +26,39 @@ class LintResult:
     warnings: list[str]
 
 
-def lint_specs(repo_root: Path, spec_id: str | None = None, *, merged_spec_ids=()) -> list[LintResult]:
+def lint_specs(
+    repo_root: Path, spec_id: str | None = None, *, merged_spec_ids=None, source_path: Path | None = None
+) -> list[LintResult]:
     from .orchestrator import _extract_acceptance_checklist_items
 
     paths = sorted(p for p in resolve_specs_root(repo_root).glob("*.md") if p.name != "TEMPLATE.md")
+    if source_path is not None:
+        if spec_id is None:
+            raise ValueError("An explicit spec ID is required for a pinned source")
+        paths = [path for path in paths if path.stem != spec_id] + [source_path]
     metadata = []
     for path in paths:
         try:
             metadata.append(parse_spec_metadata(path))
         except InvalidSpecIdError:
             pass
+    if merged_spec_ids is None:
+        from .spec_status import _git_lines
+
+        config = load_repo_spec_runtime_config(repo_root)
+        merged_spec_ids = {
+            tag.removeprefix("spec/merged/")
+            for tag in _git_lines("tag", "--merged", config.base_ref, "--list", "spec/merged/*", cwd=repo_root)
+        }
     graph = validate_spec_graph(metadata, merged_spec_ids=merged_spec_ids, external_spec_ids=task_spec_ids(repo_root))
     results = []
     for path in paths:
-        if spec_id is not None and path.stem != spec_id:
+        file_id = spec_id if path == source_path else path.stem
+        if spec_id is not None and file_id != spec_id:
             continue
         errors, warnings = [], []
         fm = parse_spec_frontmatter(path)
-        if fm.get("id") != path.stem:
+        if fm.get("id") != file_id:
             errors.append("id must match the filename stem")
         try:
             parse_spec_metadata(path)
@@ -84,7 +99,7 @@ def lint_specs(repo_root: Path, spec_id: str | None = None, *, merged_spec_ids=(
             warnings.append(f"{count} criteria; consider decomposing into at most 8")
         if "Out of Scope" not in headings:
             warnings.append("missing Out of Scope section")
-        results.append(LintResult(path.stem, errors, warnings))
+        results.append(LintResult(file_id, errors, warnings))
     if spec_id is not None and not results:
         results.append(LintResult(spec_id, ["spec not found"], []))
     return results
@@ -102,10 +117,8 @@ def format_lint(results: list[LintResult]) -> str:
     return "\n".join(lines)
 
 
-def cmd_lint(args) -> int:
-    from .cli import _resolve_repo_root
-
-    root = _resolve_repo_root()
+def cmd_lint(args, *, repo_root: Path) -> int:
+    root = repo_root
     results = lint_specs(root, args.spec)
     print(json.dumps([asdict(r) for r in results]) if args.json else format_lint(results))
     if args.critique:

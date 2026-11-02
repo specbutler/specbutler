@@ -180,7 +180,10 @@ def test_single_pr_preflight_allows_local_spec(tmp_path, monkeypatch):
     (tmp_path / ".spec.toml").write_text("[specs]\nrequire_merged_spec = false\n")
     monkeypatch.setattr(orch, "resolve_repo_root", lambda: tmp_path)
     # Single-PR mode does not require a base-tree spec lookup.
-    monkeypatch.setattr(subprocess, "run", Mock(side_effect=AssertionError("unexpected Git command")))
+    from spec_runtime import spec_status
+
+    monkeypatch.setattr(spec_status, "_git_lines", lambda *a, **kw: [])
+    monkeypatch.setattr(subprocess, "run", Mock(side_effect=AssertionError("unexpected base-tree lookup")))
     orch._validate_new_spec_run(tmp_path, "feature", "origin/main")
 
 
@@ -191,3 +194,30 @@ def test_doctor_includes_lint_summary(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(doctor, "cmd_doctor", lambda args: 0)
     assert cli._cmd_doctor(argparse.Namespace(repo_root=str(tmp_path))) == 0
     assert "Lint: 0 errors" in capsys.readouterr().out
+
+
+def test_pinned_source_is_linted_instead_of_mutable_catalog(tmp_path):
+    source = write_spec(tmp_path)
+    pinned = tmp_path / "snapshot.md"
+    pinned.write_text(source.read_text())
+    source.write_text("broken catalog")
+    assert not lint_specs(tmp_path, "feature", source_path=pinned)[0].errors
+    pinned.write_text("---\nid: feature\n---\n## Goal\nIncomplete")
+    assert "zero parseable acceptance criteria" in lint_specs(tmp_path, "feature", source_path=pinned)[0].errors
+
+
+def test_merged_dependency_need_not_have_a_catalog_file(tmp_path, monkeypatch):
+    from spec_runtime import spec_status
+
+    write_spec(tmp_path, frontmatter="depends_on: [removed]")
+    monkeypatch.setattr(spec_status, "_git_lines", lambda *a, **kw: ["spec/merged/removed"])
+    assert not lint_specs(tmp_path, "feature")[0].errors
+
+
+def test_doctor_can_diagnose_invalid_config_even_when_lint_cannot_run(tmp_path, monkeypatch, capsys):
+    from spec_runtime import doctor
+
+    (tmp_path / ".spec.toml").write_text('[specs]\nrequire_merged_spec = "invalid"\n')
+    monkeypatch.setattr(doctor, "cmd_doctor", lambda args: 1)
+    assert cli._cmd_doctor(argparse.Namespace(repo_root=str(tmp_path))) == 1
+    assert "Lint unavailable" in capsys.readouterr().out
