@@ -86,5 +86,5 @@ def _stub_provider_session_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         orchestrator,
         "_provider_session_support",
-        lambda _agent: orchestrator.ProviderSessionSupport(),
+        lambda _agent, *_probe_target: orchestrator.ProviderSessionSupport(),
     )

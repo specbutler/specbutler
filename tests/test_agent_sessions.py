@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
+from spec_runtime import execution_backend as eb
 from spec_runtime import orchestrator as orch
 from spec_runtime.agent_adapter import (
     COMPLETION_SCHEMA,
@@ -35,6 +36,9 @@ pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
     reason="fake provider binaries are POSIX scripts",
 )
+
+REAL_CLAUDE_SUPPORTS_STREAM_JSON = orch._claude_supports_stream_json
+REAL_PROVIDER_SESSION_SUPPORT = orch._provider_session_support
 
 SPEC_ID = "my-feature"
 RUN_ID = "my-feature-20260101T000000"
@@ -54,12 +58,12 @@ def _hermetic_launch(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
     monkeypatch.setattr(orch, "_claude_credentials_preflight_error", lambda: "")
-    monkeypatch.setattr(orch, "_claude_supports_stream_json", lambda: True)
+    monkeypatch.setattr(orch, "_claude_supports_stream_json", lambda *_probe_target: True)
     monkeypatch.setattr(orch, "_validate_codex_exec", lambda _run: True)
     monkeypatch.setattr(
         orch,
         "_provider_session_support",
-        lambda _agent: orch.ProviderSessionSupport(
+        lambda _agent, *_probe_target: orch.ProviderSessionSupport(
             persist=True,
             resume=True,
             structured_output=True,
@@ -514,6 +518,67 @@ def test_claude_resume_failure_falls_back_to_fresh_session(
     )
 
 
+def test_resume_falls_back_when_changes_predate_the_launch(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unfinished edits (or an unresolved merge) must not pin a dead session."""
+    fake = FakeProvider(tmp_path, "claude")
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, "claude")
+    (worktree / "src").mkdir()
+    (worktree / "src" / "app.py").write_text("half done\n", encoding="utf-8")
+    dirty = [" M src/app.py", "UU src/merge.py"]
+    assert _implement(run, repo, worktree, dirty=dirty) == "passed"
+    old_session = run.agent_session_id
+
+    fake.forget_sessions()
+    _prepare_retry(run, repo)
+    assert _implement(run, repo, worktree, dirty=dirty) == "passed"
+
+    resumed, fresh = fake.calls()[-2:]
+    assert _flag_value(resumed, "--resume") == old_session
+    assert _flag_value(fresh, "--session-id") == run.agent_session_id != old_session
+    assert old_session in run.agent_session_fallback_reason
+
+
+def test_worktree_fingerprint_tracks_edits_to_already_dirty_files(repo: Path) -> None:
+    tracked = repo / "specs" / f"{SPEC_ID}.md"
+    tracked.write_text("edit one\n", encoding="utf-8")
+    (repo / "notes").mkdir()
+    (repo / "notes" / "todo.txt").write_text("a\n", encoding="utf-8")
+    before = orch._worktree_change_fingerprint(repo)
+    assert orch._worktree_change_fingerprint(repo) == before
+
+    # Same dirty-file list, different content: the launch changed something.
+    tracked.write_text("edit two\n", encoding="utf-8")
+    assert orch._worktree_change_fingerprint(repo) != before
+    edited = orch._worktree_change_fingerprint(repo)
+    (repo / "notes" / "todo.txt").write_text("b\n", encoding="utf-8")
+    assert orch._worktree_change_fingerprint(repo) != edited
+
+
+def test_resume_with_new_workspace_changes_is_not_a_resume_failure(
+    repo: Path,
+    tmp_path: Path,
+) -> None:
+    run, worktree = _make_run(repo, "claude")
+    plan = orch.ImplementLaunchPlan(
+        use_stream_json=True,
+        agent_env={},
+        agent_cmd=["claude"],
+        popen_kwargs={},
+        progress_tracker=orch.AgentProgressTracker(agent="claude"),
+        session=orch.AgentSessionPlan(resume_session_id="sess-1"),
+    )
+    with patch.object(orch, "_worktree_change_fingerprint", return_value="after"):
+        assert orch._resume_failure_reason(run, plan, 1, worktree, "before") == ""
+        assert "could not resume session sess-1" in orch._resume_failure_reason(
+            run, plan, 1, worktree, "after"
+        )
+
+
 def test_claude_spec_report_is_fallback_without_structured_output(
     repo: Path,
     tmp_path: Path,
@@ -597,7 +662,7 @@ def test_unsupported_cli_keeps_stateless_launch(
     monkeypatch.setattr(
         orch,
         "_provider_session_support",
-        lambda _agent: orch.ProviderSessionSupport(),
+        lambda _agent, *_probe_target: orch.ProviderSessionSupport(),
     )
     fake = FakeProvider(tmp_path, "claude")
     fake.scenario(structured=None, report=True)
@@ -610,6 +675,111 @@ def test_unsupported_cli_keeps_stateless_launch(
     assert "--session-id" not in argv
     assert "--json-schema" not in argv
     assert run.agent_session_id == ""
+
+
+# ---------------------------------------------------------------------------
+# Container workers: probe and stream through the backend
+# ---------------------------------------------------------------------------
+
+WORKER_CLAUDE_HELP = (
+    "--output-format stream-json --session-id --resume --json-schema --fork-session"
+)
+
+
+class _ContainerIdentityBackend(eb.WorktreeExecutionBackend):
+    """A backend reporting a container identity whose CLI probes are recorded.
+
+    The agent still runs as a local process, so the phase sees exactly what a
+    container worker's piped stdout would deliver.
+    """
+
+    def __init__(self, base: eb.WorktreeExecutionBackend) -> None:
+        self.__dict__.update(base.__dict__)
+        self.probes: list[list[str]] = []
+
+    @property
+    def identity(self) -> eb.BackendIdentity:
+        return replace(super().identity, backend="container")
+
+    def run_command(self, request: eb.CommandRequest) -> eb.CommandResult:
+        if request.argv[:1] == ["claude"]:
+            self.probes.append(list(request.argv))
+            return eb.CommandResult(
+                returncode=0,
+                stdout=WORKER_CLAUDE_HELP,
+                stderr="",
+                argv=list(request.argv),
+            )
+        return super().run_command(request)
+
+
+_ContainerIdentityBackend.__name__ = "WorktreeExecutionBackend"
+
+
+def test_container_claude_launch_streams_structured_completion(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = _ContainerIdentityBackend(orch._resolve_execution_backend())
+    monkeypatch.setattr(orch, "_resolve_execution_backend", lambda: backend)
+    monkeypatch.setattr(orch, "_claude_supports_stream_json", REAL_CLAUDE_SUPPORTS_STREAM_JSON)
+    monkeypatch.setattr(orch, "_provider_session_support", REAL_PROVIDER_SESSION_SUPPORT)
+
+    real_run_subprocess = orch.run_subprocess
+
+    def host_subprocess(cmd, *args, **kwargs):
+        if cmd[:1] in (["claude"], ["codex"]):
+            raise AssertionError("container capability probes must not run on the host")
+        return real_run_subprocess(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(orch, "run_subprocess", host_subprocess)
+    # The fake commits nothing; lost-work detection is covered elsewhere.
+    monkeypatch.setattr(orch, "_detect_container_lost_implementation", lambda *_a, **_k: None)
+    fake = FakeProvider(tmp_path, "claude")
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, "claude")
+
+    with patch.object(orch, "_worktree_dirty_files", return_value=[]):
+        assert _implement(run, repo, worktree) == "passed"
+
+    argv = fake.calls()[-1]
+    assert _flag_value(argv, "--output-format") == "stream-json"
+    assert "--json-schema" in argv
+    assert run.agent_session_id == _flag_value(argv, "--session-id")
+    assert ["claude", "--help"] in backend.probes
+    result = orch.ImplementResult.load(repo, run.run_id)
+    assert result is not None
+    assert result.result_source == "structured_output"
+    assert result.summary == "structured done"
+
+
+def test_provider_probes_run_inside_container_worker(tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    class Worker:
+        identity = eb.BackendIdentity(
+            backend="container",
+            safety_mode="safe",
+            workspace_root=".spec-workspaces",
+        )
+
+        def run_command(self, request: eb.CommandRequest) -> eb.CommandResult:
+            calls.append(list(request.argv))
+            text = (
+                WORKER_CLAUDE_HELP
+                if request.argv[0] == "claude"
+                else "--json --output-schema"
+            )
+            return eb.CommandResult(returncode=0, stdout=text, stderr="", argv=request.argv)
+
+    with patch.object(orch, "run_subprocess", side_effect=AssertionError("host probe")):
+        assert REAL_CLAUDE_SUPPORTS_STREAM_JSON(Worker(), tmp_path)
+        claude = REAL_PROVIDER_SESSION_SUPPORT("claude", Worker(), tmp_path)
+        codex = REAL_PROVIDER_SESSION_SUPPORT("codex", Worker(), tmp_path)
+    assert claude == orch.ProviderSessionSupport(persist=True, resume=True, structured_output=True)
+    assert codex.structured_output and codex.resume
+    assert ["codex", "exec", "resume", "--help"] in calls
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +839,55 @@ def test_codex_resume_failure_falls_back_to_fresh_thread(
     assert "resume" not in fresh
     assert run.agent_session_id not in ("", old_thread)
     assert old_thread in run.agent_session_fallback_reason
+
+
+def test_preserved_container_codex_home_is_archived_and_restored(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container worker's provider home is cleared after each launch too."""
+    preserved_root = tmp_path / "worker-provider-homes" / "codex"
+    preserved_root.mkdir(parents=True)
+    monkeypatch.setattr(
+        orch,
+        "_prepare_codex_launch_home",
+        lambda _backend, _worktree: (None, preserved_root, True),
+    )
+    fake = FakeProvider(tmp_path, "codex")
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, "codex")
+
+    assert _implement(run, repo, worktree) == "passed"
+    thread_id = run.agent_session_id
+    archive = orch._codex_session_archive_dir(repo, run.run_id)
+    assert (archive / f"rollout-{thread_id}.jsonl").is_file()
+    # The preserved home was emptied; only the archive keeps the thread.
+    assert not any(preserved_root.rglob(f"rollout-{thread_id}.jsonl"))
+
+    _prepare_retry(run, repo)
+    assert _implement(run, repo, worktree) == "passed"
+    retry = fake.calls()[-1]
+    assert "resume" in retry
+    assert retry[-2] == thread_id
+    assert run.agent_session_id == thread_id
+    assert run.agent_session_fallback_reason == ""
+
+
+def test_codex_session_copy_skips_links(tmp_path: Path) -> None:
+    source = tmp_path / "home" / "sessions"
+    (source / "2026").mkdir(parents=True)
+    (source / "2026" / "rollout-t.jsonl").write_text("{}\n", encoding="utf-8")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("secret", encoding="utf-8")
+    (source / "2026" / "rollout-link.jsonl").symlink_to(secret)
+    destination = tmp_path / "operator" / "sessions"
+
+    orch._copy_codex_sessions(source, destination)
+
+    assert (destination / "2026" / "rollout-t.jsonl").is_file()
+    assert not (destination / "2026" / "rollout-link.jsonl").exists()
+    assert not (destination / "2026" / "rollout-link.jsonl").is_symlink()
 
 
 def test_codex_spec_report_is_fallback_without_structured_output(
@@ -761,6 +980,68 @@ def test_attach_without_session_fails(repo: Path, capsys: pytest.CaptureFixture[
     code, _, err = _attach(repo, worktree, capsys)
     assert code == 1
     assert "no recorded" in err
+
+
+def _archive_codex_rollout(repo: Path, run: orch.RunState, thread_id: str) -> None:
+    archive = orch._codex_session_archive_dir(repo, run.run_id) / "2026"
+    archive.mkdir(parents=True)
+    (archive / f"rollout-{thread_id}.jsonl").write_text("{}\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("fork", [False, True])
+def test_attach_prints_codex_command_that_finds_the_thread(
+    repo: Path,
+    capsys: pytest.CaptureFixture[str],
+    fork: bool,
+) -> None:
+    """The printed command works on its own: the rollout is already restored."""
+    run, worktree = _make_run(repo, "codex")
+    run.agent_session_id = "thread-1"
+    run.agent_session_agent = "codex"
+    run.save(repo)
+    _archive_codex_rollout(repo, run, "thread-1")
+
+    code, out, _ = _attach(repo, worktree, capsys, fork=fork)
+
+    assert code == 0
+    expected = "codex fork thread-1" if fork else "codex resume thread-1"
+    assert expected in out
+    operator_home = Path(os.environ["CODEX_HOME"])
+    assert (operator_home / "sessions" / "2026" / "rollout-thread-1.jsonl").is_file()
+    assert "Restored archived Codex rollouts" in out
+
+
+def test_attach_refusal_does_not_touch_operator_codex_home(
+    repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run, worktree = _make_run(repo, "codex")
+    run.agent_session_id = "thread-1"
+    run.agent_session_agent = "codex"
+    run.save(repo)
+    _archive_codex_rollout(repo, run, "thread-1")
+
+    code, _, err = _attach(repo, worktree, capsys, alive=True)
+
+    assert code == 1
+    assert "still running" in err
+    assert not (Path(os.environ["CODEX_HOME"]) / "sessions").exists()
+
+
+def test_attach_warns_when_codex_rollout_archive_is_missing(
+    repo: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run, worktree = _make_run(repo, "codex")
+    run.agent_session_id = "thread-1"
+    run.agent_session_agent = "codex"
+    run.save(repo)
+
+    code, out, err = _attach(repo, worktree, capsys)
+
+    assert code == 0
+    assert "codex resume thread-1" in out
+    assert "No archived Codex rollouts" in err
 
 
 def test_attach_exec_runs_codex_resume_in_workspace(
