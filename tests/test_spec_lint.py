@@ -238,7 +238,8 @@ def test_json_critique_is_one_document(tmp_path, monkeypatch, capsys, failure):
 
 
 @pytest.mark.parametrize("pinned_valid", [True, False])
-def test_autopilot_resume_lints_pinned_contract(tmp_path, monkeypatch, pinned_valid):
+@pytest.mark.parametrize("partial_record", [True, False])
+def test_autopilot_resume_lints_pinned_contract(tmp_path, monkeypatch, pinned_valid, partial_record):
     from spec_runtime import autopilot
     from spec_runtime.spec_metadata import iter_spec_metadata
 
@@ -250,7 +251,11 @@ def test_autopilot_resume_lints_pinned_contract(tmp_path, monkeypatch, pinned_va
     else:
         orch._run_spec_snapshot_path(tmp_path, run.run_id).write_text("---\nid: feature\n---\n## Goal\nIncomplete")
     monkeypatch.setattr(autopilot, "resolve_resume_run", lambda *a, **kw: (run.run_id, "resume-implement"))
-    monkeypatch.setattr(autopilot, "read_latest_run_record", lambda *a, **kw: asdict(run))
+    record = asdict(run)
+    if partial_record:
+        record.pop("branch")
+        record.pop("spec_id")
+    monkeypatch.setattr(autopilot, "read_latest_run_record", lambda *a, **kw: record)
     reasons = autopilot.spec_graph_skip_reasons(tmp_path, iter_spec_metadata(tmp_path))
     assert ("feature" not in reasons) == pinned_valid
     monkeypatch.setattr(autopilot, "get_spec_status", lambda *a, **kw: "in-progress")
