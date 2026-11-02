@@ -17351,6 +17351,16 @@ class TestMergeOriginMaster:
 
 
 class TestVerifyPreflightMerge:
+    @pytest.fixture(autouse=True)
+    def _configure_pytest_diagnostic(self, repo: Path, monkeypatch):
+        worktree = repo / ".worktrees" / "my-feature"
+        config = orch.SPEC_RUNTIME_CONFIG
+        gates = tuple(
+            replace(gate, diagnostic_command=shlex.join(orch._test_gate_diagnostic_command(worktree)))
+            if gate.name == "test" else gate for gate in config.verify_gates
+        )
+        monkeypatch.setattr(orch, "SPEC_RUNTIME_CONFIG", replace(config, verify_gates=gates))
+
     def _make_run(self) -> orch.RunState:
         return orch.RunState(
             run_id="test-spec-20260101T000000",
@@ -28629,44 +28639,15 @@ class TestCleanupPhase:
         assert error == ""
         assert registered is False
 
-    def test_cleanup_stops_postgres_via_pg_ctl_not_worktree_script(self, repo: Path):
-        worktree = repo / ".worktrees" / "feature"
-        data_dir = worktree / ".local" / "postgres" / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        (data_dir / "postmaster.pid").write_text("123\n")
-        script = worktree / "scripts" / "local_postgres.sh"
-        script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text("#!/usr/bin/env bash\nexit 99\n")
-
-        commands: list[list[str]] = []
-
-        def fake_run(cmd, cwd=None, env=None, timeout=None):  # noqa: ARG001
-            commands.append(cmd)
-            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
-
-        config = replace(
-            orch.SPEC_RUNTIME_CONFIG,
-            implement=replace(
-                orch.SPEC_RUNTIME_CONFIG.implement,
-                teardown_command="scripts/implement-teardown.sh",
-            ),
-        )
-
-        with (
-            patch.object(orch, "SPEC_RUNTIME_CONFIG", config),
-            patch.object(orch, "_resolve_pg_ctl", return_value="/trusted/pg_ctl"),
-            patch.object(orch, "run_subprocess", side_effect=fake_run),
-        ):
-            orch._stop_worktree_postgres_if_present(worktree)
-
-        assert commands == [
-            ["/trusted/pg_ctl", "-D", str(data_dir), "status"],
-            ["/trusted/pg_ctl", "-D", str(data_dir), "stop", "-m", "fast"],
-        ]
-
     def test_cleanup_reaps_registered_helpers_before_worktree_removal(self, repo: Path):
         worktree = repo / ".worktrees" / "feature"
         worktree.mkdir(parents=True, exist_ok=True)
+        data_dir = worktree / ".local" / "postgres" / "data"
+        data_dir.mkdir(parents=True)
+        (data_dir / "postmaster.pid").write_text("123\n")
+        script = worktree / "scripts" / "local_postgres.sh"
+        script.parent.mkdir()
+        script.write_text("#!/bin/sh\nexit 99\n")
         state_root = repo / ".spec-state"
         process_registry.register_process(
             state_root,
@@ -28710,6 +28691,7 @@ class TestCleanupPhase:
 
         assert error == ""
         assert process_registry.list_registered_worktrees(state_root) == []
+        assert all(call.args[0][0] == "git" for call in run_subprocess.call_args_list)
 
     def test_cleanup_preserves_worktree_when_registered_helper_survives(self, repo: Path):
         worktree = repo / ".worktrees" / "feature"
@@ -28719,7 +28701,6 @@ class TestCleanupPhase:
         )
 
         with (
-            patch.object(orch, "_stop_worktree_postgres_if_present") as stop_postgres,
             patch.object(orch, "_reap_registered_worktree_processes", return_value=report),
             patch.object(
                 orch,
@@ -28737,7 +28718,6 @@ class TestCleanupPhase:
         assert "registered processes survived cleanup" in error
         assert "dev-server pid=4242" in error
         assert worktree.is_dir()
-        stop_postgres.assert_called_once_with(worktree)
 
     def test_cleanup_falls_back_when_git_cannot_delete_registered_worktree(self, repo: Path):
         worktree = repo / ".worktrees" / "feature"
@@ -41004,7 +40984,15 @@ class TestVerifyGateFlakeRerun:
         worktree = tmp_path / "wt"
         worktree.mkdir(parents=True, exist_ok=True)
         backend, gate_calls = self._backend(gate_results, targeted_returncode)
-        with patch.object(orch, "_resolve_execution_backend", return_value=backend):
+        config = orch.SPEC_RUNTIME_CONFIG
+        gates = tuple(
+            replace(gate, diagnostic_command=shlex.join(orch._test_gate_diagnostic_command(worktree)))
+            if gate.name == "test" else gate for gate in config.verify_gates
+        )
+        with (
+            patch.object(orch, "_resolve_execution_backend", return_value=backend),
+            patch.object(orch, "SPEC_RUNTIME_CONFIG", replace(config, verify_gates=gates)),
+        ):
             result = orch._run_verify_gate(worktree, "test", tmp_path)
         return result, gate_calls
 
