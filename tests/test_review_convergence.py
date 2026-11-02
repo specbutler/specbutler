@@ -771,6 +771,51 @@ def test_codex_review_profile_reads_checkout_and_denies_credentials(
     assert 'model_reasoning_effort="high"' in cmd
 
 
+def test_codex_review_with_checkout_enforces_inspection_only_commands(tmp_path: Path):
+    """A read-only filesystem alone would still let checkout code execute."""
+    checkout = tmp_path / "review-checkout"
+    scratch = tmp_path / "scratch"
+    checkout.mkdir()
+    scratch.mkdir()
+
+    cmd = CodexAgent().build_review_command(
+        prompt="p",
+        output_path=scratch / "out.json",
+        writable_temp_dir=scratch,
+        review_checkout=checkout,
+    )
+
+    # Only Codex's known-safe inspection commands auto-run; every other
+    # command (interpreters, test runners, checkout scripts) escalates, and
+    # exec mode rejects escalations.
+    assert 'approval_policy="untrusted"' in cmd
+    # No model reviewer and no execpolicy rule can pre-approve an escalation.
+    assert 'approvals_reviewer="user"' in cmd
+    assert "--ignore-rules" in cmd
+    assert "--strict-config" in cmd
+    # A later override must not loosen the policy.
+    approvals = [c for c in cmd if c.startswith("approval_policy=")]
+    reviewers = [c for c in cmd if c.startswith("approvals_reviewer=")]
+    assert approvals == ['approval_policy="untrusted"']
+    assert reviewers == ['approvals_reviewer="user"']
+    for loosening in (
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--full-auto",
+        "--yolo",
+        "-a",
+        "--ask-for-approval",
+    ):
+        assert loosening not in cmd
+    # The checkout is never writable and never the working root.
+    filesystem = next(c for c in cmd if c.startswith("permissions.specbutler-review.filesystem="))
+    assert f'"{checkout.resolve()}"="write"' not in filesystem
+    assert cmd[cmd.index("-C") + 1] == str(scratch)
+    # Codex 0.164 routes shell calls through the code-mode host; disabling
+    # it would silently remove the inspection commands this path exists for.
+    assert "features.code_mode_host=false" not in cmd
+    assert "features.code_mode=false" in cmd
+
+
 def test_codex_review_without_checkout_keeps_no_tool_boundary(tmp_path: Path):
     cmd = CodexAgent().build_review_command(
         prompt="p", output_path=tmp_path / "out.json", writable_temp_dir=tmp_path

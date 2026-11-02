@@ -13392,8 +13392,10 @@ def _format_gate_evidence_for_review(
     if review_agent == "codex":
         capability_note = (
             "The Codex reviewer may run read-only commands against the review "
-            "checkout, but cannot install packages or reach the network, so do not "
-            "rerun these gates. Do not report that limitation as a product finding."
+            "checkout, but cannot install packages or reach the network, and "
+            "commands outside read-only inspection (interpreters, test runners, "
+            "builds, checkout scripts) are rejected, so do not rerun these gates. "
+            "Do not report that limitation as a product finding."
         )
     else:
         capability_note = (

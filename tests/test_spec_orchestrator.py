@@ -20676,6 +20676,8 @@ class TestLocalReviewPhase:
             assert 'default_permissions="specbutler-review"' in cmd
             filesystem = next(c for c in cmd if c.startswith("permissions.specbutler-review.filesystem="))
             assert f'"{review_worktree.resolve()}"="read"' in filesystem
+            assert 'approval_policy="untrusted"' in cmd
+            assert 'approvals_reviewer="user"' in cmd
             assert "--skip-git-repo-check" in cmd
             assert "--add-dir" not in cmd
             assert env["TMPDIR"] == str(scratch_dir)

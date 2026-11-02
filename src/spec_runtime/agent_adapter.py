@@ -550,6 +550,24 @@ def _codex_implement_permission_overrides(
 
 _CODEX_REVIEW_PERMISSION_PROFILE = "specbutler-review"
 
+# Which commands the reviewer may run at all. A read-only filesystem does not
+# stop ``python checkout/script.py`` or a test run that writes to the scratch
+# dir, so the review never relies on the prompt alone. Under ``untrusted``
+# Codex auto-runs only its built-in known-safe inspection commands (cat, ls,
+# grep/rg, head/tail, wc, nl, sed -n, find without -exec/-delete, git
+# status/log/show/diff/branch) and escalates everything else for approval.
+# Exec mode cannot answer an approval ("exec command approval is not supported
+# in exec mode"), so interpreters, test runners, builds, installs and checkout
+# scripts are rejected. The approval reviewer is pinned to ``user`` so an
+# ``auto_review`` model can never approve an escalation, and the launch passes
+# ``--ignore-rules`` so no execpolicy ``.rules`` file can pre-approve one.
+# Values verified against codex-cli 0.164.0; --strict-config rejects a CLI
+# that does not recognise them.
+CODEX_REVIEW_COMMAND_POLICY_OVERRIDES = (
+    'approval_policy="untrusted"',
+    'approvals_reviewer="user"',
+)
+
 
 def codex_review_permission_overrides(
     review_checkout: Path,
@@ -950,9 +968,10 @@ CODEX_AMBIENT_CAPABILITY_OVERRIDES = (
     "features.code_mode=false",
     # Do not add features.code_mode_host=false here: Codex 0.164 routes the
     # shell tool itself through the code-mode host, so disabling it makes every
-    # tool call fail ("code-mode host is disabled"). Reviews may disable it
-    # because they have no shell. features.code_mode=true reproducibly hangs
-    # exec; code_mode=false works (probe on codex-cli 0.164.0).
+    # tool call fail ("code-mode host is disabled"). Only the no-checkout
+    # review, which has no shell, disables it. features.code_mode=true
+    # reproducibly hangs exec; code_mode=false works (probe on codex-cli
+    # 0.164.0).
     "features.computer_use=false",
     "features.enable_mcp_apps=false",
     "features.hooks=false",
@@ -1302,13 +1321,15 @@ class CodexAgent:
             )
         else:
             # Read-only inspection (cat, grep, git log/show) of the pinned
-            # checkout. The permission profile, not the prompt, is the
-            # boundary: the filesystem is read-only except the scratch dir,
+            # checkout. The permission profile bounds what a command can
+            # touch: the filesystem is read-only except the scratch dir,
             # credential stores and the provider home are denied, and the
             # network is off. Shell children get only core variables.
+            # The code-mode host stays enabled: Codex 0.164 routes the shell
+            # tool through it (see CODEX_AMBIENT_CAPABILITY_OVERRIDES).
             overrides = (
-                "features.code_mode_host=false",
                 *CODEX_AMBIENT_CAPABILITY_OVERRIDES,
+                *CODEX_REVIEW_COMMAND_POLICY_OVERRIDES,
                 "shell_environment_policy.inherit=core",
             )
         for override in overrides:
