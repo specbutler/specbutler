@@ -436,15 +436,46 @@ def _normalized_file(finding: dict[str, Any]) -> str:
     return str(finding.get("file", "") or "").strip().removeprefix("./")
 
 
+def _line_span(finding: dict[str, Any]) -> tuple[int, int] | None:
+    try:
+        start = int(finding.get("start_line") or 0)
+        end = int(finding.get("end_line") or start)
+    except (TypeError, ValueError):
+        return None
+    if start <= 0:
+        return None
+    return (start, max(start, end))
+
+
+def _normalized_title(finding: dict[str, Any]) -> str:
+    return " ".join(str(finding.get("title", "") or "").split()).lower()
+
+
+def _same_location(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
+    """Whether two same-file findings point at the same defect.
+
+    With line spans on both, the spans must overlap. Without them there is no
+    location to compare, so only an identical title counts as the same defect.
+    """
+    span, prior_span = _line_span(finding), _line_span(prior)
+    if span is not None and prior_span is not None:
+        return span[0] <= prior_span[1] and prior_span[0] <= span[1]
+    title = _normalized_title(finding)
+    return bool(title) and title == _normalized_title(prior)
+
+
 def _restates_prior(finding: dict[str, Any], prior: dict[str, Any], status: str) -> bool:
     """A same-id finding restates the prior one only if nothing about it is new.
 
-    It must be on the same file, no more severe, and the prior finding must
-    still be unresolved; otherwise it is a distinct defect that reused an id.
+    It must be at the same location (file and overlapping lines), no more
+    severe, and the prior finding must still be unresolved; otherwise it is a
+    distinct defect that reused an id.
     """
     if status != "unresolved":
         return False
     if _normalized_file(finding) != _normalized_file(prior):
+        return False
+    if not _same_location(finding, prior):
         return False
     rank = _SEVERITY_RANK.get(_severity(finding), 2)
     return rank >= _SEVERITY_RANK.get(_severity(prior), 2)

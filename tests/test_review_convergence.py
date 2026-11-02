@@ -287,6 +287,59 @@ def test_new_finding_colliding_with_unresolved_prior_id_is_kept_when_it_differs(
     assert computed.blocking_ids == ["F1-new", "F1-new2"]
 
 
+def test_new_same_file_finding_colliding_with_non_blocking_prior_id_still_blocks():
+    # F1 is an unresolved, non-blocking P1 from an earlier round at line 10.
+    # The reviewer reuses F1 for a distinct P1 on newly changed lines 40-42.
+    prior = {**_finding("F1", "P1"), "blocking": False}
+    new = {**_finding("F1", "P1", line=40), "end_line": 42, "title": "Different defect"}
+    computed = compute_review_decision(
+        model_decision="approved",
+        findings=[new],
+        prior_findings=[prior],
+        prior_classifications=[{"id": "F1", "status": "unresolved"}],
+        changed_ranges={"src/app.py": [(40, 42)]},
+    )
+
+    assert computed.decision == "request_changes"
+    assert computed.blocking_ids == ["F1-new"]
+    assert [(f["id"], f["blocking"]) for f in computed.outstanding_findings] == [
+        ("F1", False),
+        ("F1-new", True),
+    ]
+
+
+def test_same_id_finding_with_overlapping_lines_restates_prior():
+    prior = {**_finding("F1", "P1"), "start_line": 8, "end_line": 12, "blocking": False}
+    computed = compute_review_decision(
+        model_decision="request_changes",
+        findings=[{**_finding("F1", "P1", line=11), "title": "Reworded"}],
+        prior_findings=[prior],
+        prior_classifications=[{"id": "F1", "status": "unresolved"}],
+        changed_ranges={"src/app.py": [(11, 11)]},
+    )
+
+    assert computed.decision == "approved"
+    assert [f["id"] for f in computed.outstanding_findings] == ["F1"]
+
+
+@pytest.mark.parametrize(
+    ("title", "expected_ids"),
+    [("Problem F1", ["F1"]), ("Another defect", ["F1", "F1-new"])],
+)
+def test_same_id_finding_without_lines_restates_prior_only_with_same_title(title, expected_ids):
+    prior = {**_finding("F1", "P1"), "start_line": None, "end_line": None, "blocking": False}
+    new = {**_finding("F1", "P1"), "start_line": None, "end_line": None, "title": title}
+    computed = compute_review_decision(
+        model_decision="approved",
+        findings=[new],
+        prior_findings=[prior],
+        prior_classifications=[{"id": "F1", "status": "unresolved"}],
+        changed_ranges=None,
+    )
+
+    assert [f["id"] for f in computed.outstanding_findings] == expected_ids
+
+
 def test_restated_unresolved_prior_finding_is_not_double_counted():
     computed = compute_review_decision(
         model_decision="request_changes",
