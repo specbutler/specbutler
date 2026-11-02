@@ -129,6 +129,82 @@ def test_incremental_diff_covers_only_changes_since_last_reviewed_head(
     assert "could not diff" in missing_diff and missing_ranges is None
 
 
+def test_incremental_diff_keeps_deleted_and_renamed_files_eligible(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    _git(tmp_path, "init", "-q")
+    body = "".join(f"line {i}\n" for i in range(1, 21))
+    (tmp_path / "gone.py").write_text(body)
+    (tmp_path / "old_name.py").write_text("".join(f"keep {i}\n" for i in range(1, 21)))
+    (tmp_path / "blob.bin").write_bytes(b"\x00\x01\x02")
+    _git(tmp_path, "add", ".")
+    _git(tmp_path, "commit", "-qm", "first")
+    first = _git(tmp_path, "rev-parse", "HEAD")
+    _git(tmp_path, "rm", "-q", "gone.py", "blob.bin")
+    _git(tmp_path, "mv", "old_name.py", "new_name.py")
+    _git(tmp_path, "commit", "-qm", "second")
+    second = _git(tmp_path, "rev-parse", "HEAD")
+    # Operator git config must not change the parsed paths.
+    _git(tmp_path, "config", "diff.noprefix", "true")
+
+    _diff, ranges = orch._local_review_incremental_diff(
+        tmp_path, last_reviewed_head_sha=first, head_sha=second
+    )
+
+    assert ranges is not None
+    assert ranges["gone.py"] == [(1, 20)]
+    assert ranges["blob.bin"] == [review_convergence.WHOLE_FILE_SPAN]
+    assert ranges["new_name.py"] == [review_convergence.WHOLE_FILE_SPAN]
+    assert ranges["old_name.py"] == [review_convergence.WHOLE_FILE_SPAN]
+    computed = compute_review_decision(
+        model_decision="approved",
+        findings=[_finding("N1", "P1", file="gone.py", line=7)],
+        prior_findings=[_finding("F1", "P1")],
+        prior_classifications=[{"id": "F1", "status": "resolved"}],
+        changed_ranges=ranges,
+    )
+    assert computed.decision == "request_changes" and computed.blocking_ids == ["N1"]
+
+
+def test_changed_line_ranges_handles_deletion_rename_and_quoted_paths():
+    diff = (
+        "diff --git a/gone.py b/gone.py\n"
+        "deleted file mode 100644\n"
+        "--- a/gone.py\n"
+        "+++ /dev/null\n"
+        "@@ -1,3 +0,0 @@\n"
+        "-a\n-b\n-c\n"
+        "diff --git a/old.py b/new.py\n"
+        "similarity index 90%\n"
+        "rename from old.py\n"
+        "rename to new.py\n"
+        "--- a/old.py\n"
+        "+++ b/new.py\n"
+        "@@ -4,2 +4 @@\n"
+        "-x\n-y\n+z\n"
+        'diff --git "a/sp\\303\\251c.py" "b/sp\\303\\251c.py"\n'
+        '--- "a/sp\\303\\251c.py"\n'
+        '+++ "b/sp\\303\\251c.py"\n'
+        "@@ -2,0 +3,2 @@\n"
+        "+n\n+m\n"
+        "diff --git a/empty.txt b/empty.txt\n"
+        "deleted file mode 100644\n"
+        "index e69de29..0000000\n"
+    )
+
+    ranges = review_convergence.changed_line_ranges(diff)
+
+    assert ranges == {
+        "gone.py": [(1, 3)],
+        "new.py": [(4, 4)],
+        "old.py": [(4, 5)],
+        "spéc.py": [(3, 4)],
+        "empty.txt": [review_convergence.WHOLE_FILE_SPAN],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Decision rule
 # ---------------------------------------------------------------------------

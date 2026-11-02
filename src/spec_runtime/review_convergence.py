@@ -249,31 +249,120 @@ def render_rereview_rules_section(*, last_reviewed_head_sha: str, incremental_di
     )
 
 
-_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+_BINARY_LINE = re.compile(r"^Binary files (.+) and (.+) differ$")
+_DIFF_GIT_UNQUOTED = re.compile(r"^diff --git a/(.+) b/(.+)$")
+_C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+WHOLE_FILE_SPAN = (1, 2**31 - 1)
+
+
+def _unquote_git_path(raw: str) -> str:
+    """Undo git's C-style path quoting (``core.quotePath``)."""
+    text = raw.strip()
+    if len(text) < 2 or not (text.startswith('"') and text.endswith('"')):
+        return text
+    body = text[1:-1]
+    out = bytearray()
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char == "\\" and index + 1 < len(body):
+            nxt = body[index + 1]
+            octal = body[index + 1 : index + 4]
+            if re.fullmatch(r"[0-7]{3}", octal):
+                out.append(int(octal, 8) & 0xFF)
+                index += 4
+                continue
+            if nxt in _C_ESCAPES:
+                out.append(_C_ESCAPES[nxt])
+                index += 2
+                continue
+        out.extend(char.encode("utf-8"))
+        index += 1
+    return out.decode("utf-8", errors="replace")
+
+
+def _diff_side_path(raw: str, prefix: str) -> str | None:
+    """Return a repo-relative path from a ``---``/``+++``/binary side, or None for /dev/null."""
+    text = raw.strip() if raw.startswith('"') else raw.split("\t", 1)[0]
+    path = _unquote_git_path(text)
+    if path == "/dev/null":
+        return None
+    return path[len(prefix) :] if path.startswith(prefix) else path
 
 
 def changed_line_ranges(unified_zero_diff: str) -> dict[str, list[tuple[int, int]]]:
-    """Map new-side file paths to changed line ranges from a ``-U0`` diff.
+    """Map file paths to changed line ranges from a ``-U0`` diff.
 
-    Pure deletions are recorded as a one-line range at the deletion point so a
-    finding about removed behavior still counts as touching the change.
+    New-side lines are recorded under the new path. Lines removed from a path
+    that no longer exists on the new side (a deleted file, or the old name of a
+    rename) are recorded under the old path with old-side line numbers, so a
+    finding about the removal still counts as touching the change. Pure
+    deletions inside a surviving file are a one-line range at the deletion
+    point. A file changed without textual hunks (binary, mode-only, empty
+    add/delete, pure rename) counts as changed throughout.
     """
     ranges: dict[str, list[tuple[int, int]]] = {}
-    current: str | None = None
+    old_path: str | None = None
+    new_path: str | None = None
+    header_paths: list[str] = []
+    in_file = False
+    has_hunks = False
+
+    def add(path: str | None, span: tuple[int, int]) -> None:
+        if path:
+            ranges.setdefault(path, []).append(span)
+
+    def finish_file() -> None:
+        if not in_file or has_hunks:
+            return
+        paths = {p for p in (old_path, new_path) if p} or set(header_paths)
+        for path in sorted(paths):
+            add(path, WHOLE_FILE_SPAN)
+
     for line in unified_zero_diff.splitlines():
-        if line.startswith("+++ "):
-            target = line[4:].strip()
-            if target == "/dev/null":
-                current = None
-            else:
-                current = target[2:] if target.startswith("b/") else target
+        if line.startswith("diff --git "):
+            finish_file()
+            in_file, has_hunks = True, False
+            old_path = new_path = None
+            header = _DIFF_GIT_UNQUOTED.match(line)
+            header_paths = (
+                [header.group(1)] if header and header.group(1) == header.group(2) else []
+            )
             continue
+        if not has_hunks:
+            if line.startswith("--- "):
+                old_path = _diff_side_path(line[4:], "a/")
+                continue
+            if line.startswith("+++ "):
+                new_path = _diff_side_path(line[4:], "b/")
+                continue
+            for marker, attr in (("rename from ", "old"), ("copy from ", "old"), ("rename to ", "new"), ("copy to ", "new")):
+                if line.startswith(marker):
+                    value = _unquote_git_path(line[len(marker) :])
+                    if attr == "old":
+                        old_path = value
+                    else:
+                        new_path = value
+                    break
+            else:
+                binary = _BINARY_LINE.match(line)
+                if binary:
+                    old_path = _diff_side_path(binary.group(1), "a/")
+                    new_path = _diff_side_path(binary.group(2), "b/")
         match = _HUNK_HEADER.match(line)
-        if match and current is not None:
-            start = int(match.group(1))
-            count = int(match.group(2)) if match.group(2) is not None else 1
-            end = start + count - 1 if count > 0 else start
-            ranges.setdefault(current, []).append((max(1, start), max(1, end)))
+        if match and in_file:
+            has_hunks = True
+            old_start = int(match.group(1))
+            old_count = int(match.group(2)) if match.group(2) is not None else 1
+            new_start = int(match.group(3))
+            new_count = int(match.group(4)) if match.group(4) is not None else 1
+            if new_path is not None:
+                end = new_start + new_count - 1 if new_count > 0 else new_start
+                add(new_path, (max(1, new_start), max(1, end)))
+            if old_path is not None and old_path != new_path and old_count > 0:
+                add(old_path, (max(1, old_start), max(1, old_start + old_count - 1)))
+    finish_file()
     return ranges
 
 

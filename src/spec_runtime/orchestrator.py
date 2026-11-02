@@ -23465,11 +23465,31 @@ def _local_review_incremental_diff(
         return "", {}
     revision_range = f"{last_reviewed_head_sha}..{head_sha}"
     full = run_subprocess(
-        ["git", "diff", "--unified=20", "--no-ext-diff", "--no-textconv", revision_range],
+        [
+            "git",
+            "diff",
+            "--unified=20",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            revision_range,
+        ],
         cwd=review_worktree,
     )
     zero = run_subprocess(
-        ["git", "diff", "--unified=0", "--no-ext-diff", "--no-textconv", revision_range],
+        [
+            "git",
+            "diff",
+            "--unified=0",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            revision_range,
+        ],
         cwd=review_worktree,
     )
     if full.returncode != 0 or zero.returncode != 0:
