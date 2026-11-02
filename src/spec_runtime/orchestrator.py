@@ -219,12 +219,13 @@ from .sandbox_denials import (
     sandbox_denial_summary,
 )
 from .spec_identity import (
+    LOCAL_REVIEW_OWNER,
     SPEC_ID_RE,
     authoring_branch_identity,
+    extract_review_owner_from_pr_body,
     format_pr_review_owner,
     implementation_branch_identity,
     is_authoring_branch,
-    pr_body_uses_local_review,
     resolve_spec_id_for_pr,
     spec_run_branch,
     spec_run_worktree_name,
@@ -4672,7 +4673,8 @@ def _required_checks_from_error(error: str) -> list[str]:
     idx = lowered.find(marker)
     if idx < 0:
         return []
-    detail = error[idx + len(marker) :].strip()
+    # The check list is one line; callers may append multi-line log summaries.
+    detail = error[idx + len(marker) :].strip().split("\n", 1)[0].strip()
     if not detail:
         return []
     return [part.strip() for part in detail.split(",") if part.strip()]
@@ -7120,13 +7122,8 @@ def _load_spec_creation_prompt(
     if prompt_path.exists():
         prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
-        prompt = (
-            "Author a focused spec for this repository. Read AGENTS.md and "
-            f"`{PurePosixPath(SPEC_RUNTIME_CONFIG.paths.specs_dir) / 'TEMPLATE.md'}` "
-            "first, then write "
-            f"`{PurePosixPath(SPEC_RUNTIME_CONFIG.paths.specs_dir) / '<spec-id>.md'}`, "
-            "commit it locally. Do not run `git push` or create a pull request."
-        )
+        from .init import _read_bundled_template
+        prompt = _read_bundled_template("spec-creation.md").strip()
 
     effective_spec_id = spec_id or _spec_id_from_authoring_branch(branch)
     resume_note = (
@@ -12619,13 +12616,24 @@ def _check_name_matches(actual: str, expected: str) -> bool:
     return review_feedback.check_name_matches(actual, expected)
 
 
+class PrLookupUnavailable(RuntimeError):
+    """Neither GitHub frontend answered a PR lookup (an outage, not "no PR")."""
+
+
 def _find_pr_for_branch(
     repo_root: Path,
     branch: str,
     *,
     state: str = "open",
     repo_slug: str = "",
+    raise_on_error: bool = False,
 ) -> dict | None:
+    """Return the newest PR for ``branch``, or None when there is none.
+
+    With ``raise_on_error``, a lookup that no forge frontend answered raises
+    :class:`PrLookupUnavailable` instead of returning None, so pollers can
+    tell a network outage from a PR that really is gone.
+    """
     pr_check = run_subprocess(
         [
             "gh",
@@ -12653,6 +12661,7 @@ def _find_pr_for_branch(
             branch,
             state=state,
             repo_slug=repo_slug,
+            raise_on_error=raise_on_error,
         )
     pr_info = pr_check.stdout.strip()
     if not pr_info:
@@ -12669,6 +12678,7 @@ def _find_pr_for_branch(
             branch,
             state=state,
             repo_slug=repo_slug,
+            raise_on_error=raise_on_error,
         )
     return parsed if isinstance(parsed, dict) else None
 
@@ -12679,6 +12689,7 @@ def _find_pr_for_branch_via_rest(
     *,
     state: str,
     repo_slug: str = "",
+    raise_on_error: bool = False,
 ) -> dict | None:
     """Fall back to GitHub REST when ``gh pr list`` GraphQL is unavailable.
 
@@ -12718,12 +12729,16 @@ def _find_pr_for_branch_via_rest(
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
         logger.warning("PR REST fallback failed for branch %s: %s", branch, detail)
+        if raise_on_error:
+            raise PrLookupUnavailable(detail)
         return None
 
     try:
         payload = json.loads(result.stdout or "[]")
     except json.JSONDecodeError:
         logger.warning("Could not decode PR REST fallback response for branch %s", branch)
+        if raise_on_error:
+            raise PrLookupUnavailable("undecodable PR REST response")
         return None
     if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
         return None
@@ -14038,7 +14053,11 @@ def _mark_local_review_for_rerun_after_sync(
     pr_body: str,
     current_head_sha: str,
 ) -> bool:
-    if not pr_body_uses_local_review(pr_body):
+    # phase_review always reviews locally, so a missing Review-Owner marker
+    # (e.g. an agent-supplied PR body) still means local review; only a PR
+    # that names another owner is exempt from the post-sync rerun.
+    review_owner = extract_review_owner_from_pr_body(pr_body)
+    if review_owner and review_owner != LOCAL_REVIEW_OWNER:
         return False
     if not current_head_sha:
         return False
@@ -15075,12 +15094,21 @@ def _wait_for_pr_merged(
     poll_interval = max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS)
 
     while True:
-        pr_data = _find_pr_for_branch(
-            repo_root,
-            branch,
-            state="all",
-            repo_slug=repo_slug,
-        )
+        try:
+            pr_data = _find_pr_for_branch(
+                repo_root,
+                branch,
+                state="all",
+                repo_slug=repo_slug,
+                raise_on_error=True,
+            )
+        except PrLookupUnavailable as exc:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False, f"Could not query PR #{pr_number} while waiting for merge: {exc}"
+            logger.warning("PR #%s lookup failed while waiting for merge; retrying: %s", pr_number, exc)
+            _poll_sleep(min(poll_interval, remaining))
+            continue
         if pr_data is None:
             return False, f"Could not query PR #{pr_number} while waiting for merge"
 
@@ -15486,15 +15514,11 @@ def _load_task_scoping_prompt(
 ) -> str:
     """Build the prompt for the task-scoping conversation."""
     prompt_path = repo_root / TASK_SCOPING_PROMPT_FILE
-    top_level_spec_pattern = f"{SPEC_RUNTIME_CONFIG.paths.specs_dir}/*.md"
     if prompt_path.exists():
         prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
-        prompt = (
-            "You are a task-scoping assistant. Ask the user what they want to build, "
-            f"explore the codebase, agree on scope, then write exactly one task spec at "
-            f"{TASK_SPEC_DIR}/<spec-id>.md. Do not write top-level {top_level_spec_pattern} files in task mode."
-        )
+        from .init import _read_bundled_template
+        prompt = _read_bundled_template("task-scoping.md").strip()
     slug_note = (
         "Slug: choose a slug during the conversation, then write the spec to "
         f"`{TASK_SPEC_DIR}/<slug>.md` with matching frontmatter `id: <slug>`. "
@@ -16666,7 +16690,11 @@ def _build_implement_attempt_context(
             repo_root,
             _state_root(repo_root) / "runs" / run.run_id / OPERATOR_REQUEST_FILENAME,
         )
-        if _is_resolved_operator_request(operator_request):
+        # A response answers the blocker it was asked about. Once an attempt has
+        # consumed it, later attempts are retrying a different failure and must
+        # not inherit it (e.g. "do not change code for those failures").
+        consumed_attempt = operator_request.response_consumed_attempt_number
+        if _is_resolved_operator_request(operator_request) and consumed_attempt in {None, ctx.attempt_number}:
             ctx.operator_request_kind = operator_request.kind
             ctx.operator_request_prompt = operator_request.prompt
             ctx.operator_request_context = dict(operator_request.context)
@@ -24242,12 +24270,28 @@ def _try_auto_merge(
     deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
     poll_interval = max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS)
     while True:
-        pr_data = _find_pr_for_branch(
-            repo_root,
-            run.branch,
-            state="all",
-            repo_slug=repo_slug,
-        )
+        try:
+            pr_data = _find_pr_for_branch(
+                repo_root,
+                run.branch,
+                state="all",
+                repo_slug=repo_slug,
+                raise_on_error=True,
+            )
+        except PrLookupUnavailable as exc:
+            # A forge outage says nothing about the PR; auto-merge stays armed
+            # on GitHub, so keep polling until the normal deadline.
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return _fail_after_auto_merge_armed(
+                    run,
+                    repo_root,
+                    pr_number,
+                    f"Could not reach the forge while waiting for auto-merge on PR #{pr_number}: {exc}",
+                )
+            logger.warning("PR #%s lookup failed while waiting for auto-merge; retrying: %s", pr_number, exc)
+            _poll_sleep(min(poll_interval, remaining))
+            continue
         if pr_data is None:
             return _fail_after_auto_merge_armed(
                 run,
@@ -24488,6 +24532,10 @@ def _manual_merge(
             return "failed"
 
         current_head_sha = _head_sha(worktree_path) or _remote_branch_head_sha(repo_root, branch)
+        if current_head_sha:
+            # The sync push moved the branch; the final merge must pin the new
+            # head or GitHub rejects --match-head-commit.
+            pr_head_sha = current_head_sha
         pr_body = str((latest_pr or pr_data).get("body", "") or "")
         if _mark_local_review_for_rerun_after_sync(
             run,
@@ -24858,7 +24906,12 @@ def _evaluate_readiness_for_promotion(
 
     if require_integration_checkpoint:
         merge_state = str(pr_data.get("mergeStateStatus", "") or "").strip().upper()
-        if merge_state in {"BEHIND", "DIRTY"}:
+        # BEHIND is not a blocker: the merge phase itself merges the base into
+        # the branch, pushes, re-runs review when needed and waits for checks
+        # (see _manual_merge). Refusing here instead sent the run back to an
+        # implement attempt that cannot change BEHIND, looping until an
+        # operator updated the branch. DIRTY (conflicts) still blocks.
+        if merge_state == "DIRTY":
             return ReadinessDecision(
                 False,
                 current_head_sha,
@@ -27460,6 +27513,26 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 1
 
 
+def _validate_new_spec_run(repo_root: Path, spec_id: str, base_ref: str) -> None:
+    """Validate catalog input before pinning a new immutable run contract."""
+    from .config import load_repo_spec_runtime_config
+    from .spec_lint import format_lint, lint_specs
+
+    results = lint_specs(repo_root, spec_id)
+    print(format_lint(results))
+    if any(result.errors for result in results):
+        raise RuntimeError("Spec lint failed")
+    config = load_repo_spec_runtime_config(repo_root)
+    if config.specs.require_merged_spec:
+        relative = f"{config.paths.specs_dir}/{spec_id}.md"
+        check = subprocess.run(
+            ["git", "cat-file", "-e", f"{base_ref}:{relative}"],
+            cwd=repo_root, capture_output=True,
+        )
+        if check.returncode:
+            raise RuntimeError("Spec must exist on the base ref; merge it first or set [specs] require_merged_spec = false.")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Start or resume a full workflow run."""
     repo_root = resolve_repo_root()
@@ -27547,6 +27620,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 )
 
             if run is None:
+                _validate_new_spec_run(repo_root, spec_id, base_ref)
                 if is_spec_merged(repo_root, spec_id):
                     raise RuntimeError(
                         f"Spec '{spec_id}' is already merged on {BASE_REF}; refusing to start a new implementation run."
@@ -27622,6 +27696,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 spec_path = _command_spec_path(repo_root, spec_id, run)
                 if not spec_path.exists():
                     raise RuntimeError(f"Spec not found: {spec_path}")
+                if run.run_mode != "task":
+                    from .spec_lint import format_lint, lint_specs
+
+                    results = lint_specs(repo_root, spec_id, source_path=spec_path)
+                    print(format_lint(results))
+                    if any(result.errors for result in results):
+                        raise RuntimeError("Spec lint failed")
                 run.agent = agent
                 run.review_agent = review_agent
                 # Preserve the run's saved base_ref (e.g. web handoffs that

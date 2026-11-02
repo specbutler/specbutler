@@ -251,6 +251,7 @@ def test_posix_token_membership_rejects_reverse_darwin_framework_transition(
     assert not process_supervisor.supervision_token_contains_process(token, live)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX launch invariant")
 def test_posix_spawn_records_session_group_without_post_launch_getpgid(
     monkeypatch: pytest.MonkeyPatch,
@@ -270,6 +271,7 @@ def test_posix_spawn_records_session_group_without_post_launch_getpgid(
         managed.wait(timeout=5)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX retained ownership")
 def test_posix_managed_process_termination_uses_retained_launch_capability(
     monkeypatch: pytest.MonkeyPatch,
@@ -856,6 +858,7 @@ def test_current_process_claim_quiesces_monitor_before_retirement(
     ]
 
 
+@pytest.mark.requires_ps
 def test_detached_durable_token_publication_is_opt_in(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -905,6 +908,7 @@ def test_detached_durable_token_publication_is_opt_in(
         metadata_path.unlink(missing_ok=True)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="POSIX adoptable publication")
 def test_adoptable_durable_token_is_published_before_spawn_returns(
     monkeypatch: pytest.MonkeyPatch,
@@ -1164,6 +1168,7 @@ def test_managed_close_failure_retains_facade() -> None:
         )
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_strict_managed_process_cleanup_reaps_descendant_after_leader_exit(
     tmp_path: Path,
@@ -1197,6 +1202,7 @@ def test_strict_managed_process_cleanup_reaps_descendant_after_leader_exit(
         managed.close()
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_run_reaps_descendant_that_inherits_redirected_stdio(
     tmp_path: Path,
@@ -1224,6 +1230,7 @@ def test_run_reaps_descendant_that_inherits_redirected_stdio(
     assert not process_supervisor.is_process_group_alive(leader_pid)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_exited_process_drains_output_after_communication_deadline(
     monkeypatch: pytest.MonkeyPatch,
@@ -1247,6 +1254,7 @@ def test_exited_process_drains_output_after_communication_deadline(
         managed.process.communicate(timeout=2.0)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_output_drain_stays_bounded_when_external_writer_holds_pipe(
     monkeypatch: pytest.MonkeyPatch,
@@ -1273,6 +1281,7 @@ def test_output_drain_stays_bounded_when_external_writer_holds_pipe(
         managed.process.communicate(timeout=2.0)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_managed_communicate_timeout_preserves_tree_for_polling_retry() -> None:
     managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
@@ -1297,6 +1306,7 @@ def test_managed_communicate_timeout_preserves_tree_for_polling_retry() -> None:
     assert not managed.owned_tree_active()
 
 
+@pytest.mark.requires_ps
 @pytest.mark.parametrize("text", [True, False])
 def test_managed_communicate_delivers_large_input_to_a_slow_reader(text: bool) -> None:
     # Codex reads its whole prompt from stdin before doing anything else. When
@@ -1325,6 +1335,7 @@ def test_managed_communicate_delivers_large_input_to_a_slow_reader(text: bool) -
     assert managed.returncode == 0
 
 
+@pytest.mark.requires_ps
 def test_managed_communicate_retry_after_timeout_still_closes_stdin() -> None:
     managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
         [
@@ -1346,6 +1357,7 @@ def test_managed_communicate_retry_after_timeout_still_closes_stdin() -> None:
     assert int(stdout.strip()) == 200_000
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_managed_wait_timeout_preserves_tree_for_polling_retry() -> None:
     managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
@@ -1361,6 +1373,7 @@ def test_managed_wait_timeout_preserves_tree_for_polling_retry() -> None:
     assert not managed.owned_tree_active()
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_run_owned_supervisor_close_reaps_live_tree() -> None:
     supervisor = ProcessSupervisor(LifetimeMode.RUN_OWNED)
@@ -1544,6 +1557,7 @@ def test_run_owned_cgroup_reaps_descendant_that_escapes_process_group(
             os.kill(descendant_pid, signal.SIGKILL)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_managed_wait_reaps_descendant_after_normal_leader_exit(
     tmp_path: Path,
@@ -1565,6 +1579,7 @@ def test_managed_wait_reaps_descendant_after_normal_leader_exit(
         terminate_managed_process_tree(managed, grace_seconds=0)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_run_async_reaps_descendant_that_inherits_redirected_stdio(
     tmp_path: Path,
@@ -1593,6 +1608,7 @@ def test_run_async_reaps_descendant_that_inherits_redirected_stdio(
     assert not process_supervisor.is_process_group_alive(leader_pid)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_managed_async_communicate_timeout_preserves_tree_for_retry() -> None:
     async def exercise() -> None:
@@ -1618,6 +1634,7 @@ def test_managed_async_communicate_timeout_preserves_tree_for_retry() -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_managed_async_communicate_timeout_sends_input_once() -> None:
     async def exercise() -> None:
@@ -1642,6 +1659,7 @@ def test_managed_async_communicate_timeout_sends_input_once() -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_managed_async_communicate_cancellation_reaps_complete_tree(
     tmp_path: Path,
@@ -1667,7 +1685,8 @@ def test_managed_async_communicate_cancellation_reaps_complete_tree(
         # in that degenerate case.
         await asyncio.sleep(0)
         deadline = asyncio.get_running_loop().time() + 5.0
-        while not identities_path.exists():
+        # write_text opens the file before writing; wait for content.
+        while not (identities_path.exists() and identities_path.read_text(encoding="utf-8").strip()):
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.01)
         communication.cancel()
@@ -1682,6 +1701,7 @@ def test_managed_async_communicate_cancellation_reaps_complete_tree(
     assert not process_supervisor.is_process_group_alive(pgid)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_run_async_timeout_reaps_complete_tree(tmp_path: Path) -> None:
     identities_path = tmp_path / "async-timeout-pids.json"
@@ -1765,6 +1785,7 @@ def test_managed_communicate_fails_without_closing_unconfirmed_tree(
         )
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX ownership integration")
 def test_detached_publication_failure_terminates_launched_session(
     monkeypatch: pytest.MonkeyPatch,
@@ -1864,6 +1885,7 @@ def test_legacy_raw_popen_without_owned_group_fails_closed() -> None:
         process.wait(timeout=5)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX current-process ownership integration")
 def test_posix_claimed_current_process_token_stops_complete_group(tmp_path: Path) -> None:
     state_path = tmp_path / "claimed.json"
@@ -1914,6 +1936,7 @@ def test_posix_claimed_current_process_token_stops_complete_group(tmp_path: Path
         process.wait(timeout=5)
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX orphan-group integration")
 def test_legacy_orphaned_group_with_live_descendant_fails_closed(tmp_path: Path) -> None:
     state_path = tmp_path / "orphan.json"
@@ -2983,8 +3006,14 @@ def test_persisted_windows_termination_accepts_empty_job_after_keeper_exits(
         def close(self) -> None:
             events.append("close")
 
-    def identity_matches_then_exits(_identity: ProcessIdentity) -> bool:
+    real_identity_matches = process_supervisor.identity_matches
+
+    def identity_matches_then_exits(identity: ProcessIdentity) -> bool:
         nonlocal identity_checks
+        if identity not in (keeper, payload):
+            # A current-process claim made earlier in this pytest process
+            # keeps a stop monitor polling its own identity in the background.
+            return real_identity_matches(identity)
         identity_checks += 1
         return identity_checks == 1
 
@@ -3038,8 +3067,13 @@ def test_persisted_windows_termination_rejects_nonempty_job_after_keeper_exits(
         def close(self) -> None:
             events.append("close")
 
-    def keeper_exits_after_authentication(_identity: ProcessIdentity) -> bool:
+    real_identity_matches = process_supervisor.identity_matches
+
+    def keeper_exits_after_authentication(identity: ProcessIdentity) -> bool:
         nonlocal identity_checks
+        if identity not in (keeper, payload):
+            # See test_persisted_windows_termination_accepts_empty_job_after_keeper_exits.
+            return real_identity_matches(identity)
         identity_checks += 1
         return identity_checks == 1
 
@@ -3115,6 +3149,7 @@ def test_payload_promotion_converges_after_death_between_atomic_writes(
     assert promote_payload_identity(token, candidate).payload == candidate
 
 
+@pytest.mark.requires_ps
 def test_durable_helper_retires_only_matching_authenticated_records(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3142,6 +3177,7 @@ def test_durable_helper_retires_only_matching_authenticated_records(
     assert not (tmp_path / token.control_relpath).with_suffix(".lock").exists()
 
 
+@pytest.mark.requires_ps
 def test_durable_helper_refuses_to_retire_mismatched_control_record(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3238,6 +3274,7 @@ def test_durable_helper_cleanup_never_masks_payload_baseexception(
         )
 
 
+@pytest.mark.requires_ps
 def test_durable_helper_retires_control_after_metadata_publication_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -131,7 +131,7 @@ def _write_spec(repo: Path, spec_id: str, depends_on: list[str], *, subdir: str 
     deps = ", ".join(depends_on)
     (repo / subdir / f"{spec_id}.md").write_text(
         f"---\nid: {spec_id}\ndepends_on: [{deps}]\narea: backend\n"
-        f"description: {spec_id} spec\n---\n\n## Acceptance Criteria\n1. works\n"
+        f"description: {spec_id} spec\n---\n\n## Goal\nDeliver the feature.\n\n## Acceptance Criteria\n1. works\n"
     )
 
 
@@ -162,6 +162,7 @@ class TestDispatchSkipsInvalidGraph:
         assert not spec_ids & {"ghost-dep", "cycle-a", "cycle-b"}
 
 
+    @pytest.mark.requires_ps
     def test_run_loop_logs_skip_reason(self, repo: Path, monkeypatch, capsys):
         _write_invalid_graph(repo)
         args = argparse.Namespace(

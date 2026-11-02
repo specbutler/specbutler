@@ -97,6 +97,7 @@ into non-interactive sessions, list its name under `[mcp] allow_from_user` in
 ```bash
 pytest tests/           # full test suite
 pytest tests/ -x -q     # stop on first failure
+pytest tests/ -n auto   # parallel across cores (pytest-xdist, in the dev extra)
 ```
 
 Tests are hermetic: they do not require network access, model providers, a real
