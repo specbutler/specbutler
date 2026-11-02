@@ -1634,7 +1634,8 @@ def test_managed_async_communicate_cancellation_reaps_complete_tree(
         # in that degenerate case.
         await asyncio.sleep(0)
         deadline = asyncio.get_running_loop().time() + 5.0
-        while not identities_path.exists():
+        # write_text opens the file before writing; wait for content.
+        while not (identities_path.exists() and identities_path.read_text(encoding="utf-8").strip()):
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.01)
         communication.cancel()
