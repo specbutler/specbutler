@@ -191,6 +191,9 @@ def main():
             print("codex exec --add-dir --ephemeral --ignore-rules --ignore-user-config "
                   "--json --output-schema --strict-config")
             return 0
+        if exec_args == ["resume", "--help"]:
+            print("codex exec resume --json --output-schema")
+            return 0
     marker = pathlib.Path(".fixture-agent-needs-input")
     python = __FIXTURE_PYTHON__
     if not marker.exists():
@@ -1056,6 +1059,7 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
             "authoring invocation",
         ),
         (("sandbox", "--help"), "--permission-profile"),
+        (("exec", "resume", "--help"), "--output-schema"),
     ):
         probe = subprocess.run(
             [str(codex_path), *arguments],
