@@ -30,7 +30,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spec_runtime import autopilot, git_common, process_supervisor, spec_status, spec_table
+from spec_runtime import autopilot, git_common, interactive_authoring, process_supervisor, spec_status, spec_table
 from spec_runtime import backfill_merge_tags as spec_backfill
 from spec_runtime import execution_backend as eb
 from spec_runtime import orchestrator as orch
@@ -68,6 +68,23 @@ def _make_host_agent_availability_hermetic(
     if request.node.get_closest_marker("host_agent_preflight") is not None:
         return
     monkeypatch.setattr(orch, "require_host_agent_available", lambda _agent: None)
+
+
+@pytest.fixture(autouse=True)
+def _ignore_operator_mcp_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep interactive launches independent of the host's provider config.
+
+    Interactive sessions forward env names referenced by the operator's own
+    ``~/.codex/config.toml`` or ``~/.claude.json`` MCP registrations. Reading
+    those real files would make expected protected-key sets depend on the
+    machine running pytest; tests/test_interactive_authoring.py covers the
+    discovery itself.
+    """
+    monkeypatch.setattr(
+        interactive_authoring,
+        "user_mcp_environment_keys",
+        lambda _provider, _source=None: frozenset(),
+    )
 
 
 @pytest.fixture(autouse=True)
