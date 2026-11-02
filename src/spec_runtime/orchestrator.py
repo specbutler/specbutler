@@ -527,7 +527,7 @@ BLOCK_DEBUGGER_PROMPT = (
     "Return a single JSON object matching the required schema."
 )
 MERGE_CONFLICT_PROMPT = (
-    "The PR could not be merged due to conflicts with master. "
+    f"The PR could not be merged due to conflicts with {PR_BASE_BRANCH}. "
     "Resolve the conflicts by running: "
     f"git fetch origin && git merge {BASE_REF}. "
     f"Fix any merge conflicts, run {_format_verify_commands(_non_e2e_verify_commands())} "
@@ -1125,49 +1125,6 @@ def _ensure_local_branch_available(repo_root: Path, branch: str) -> str:
     return f"Branch '{branch}' is not available locally and could not be fetched from origin: {detail}"
 
 
-def _resolve_pg_ctl() -> str | None:
-    """Return a trusted pg_ctl binary path when available."""
-    pg_bin = os.environ.get("SIM_LOCAL_PG_BIN", "").rstrip("/")
-    if pg_bin:
-        candidate = Path(pg_bin) / "pg_ctl"
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-
-    homebrew_pg = Path("/opt/homebrew/opt/postgresql@16/bin/pg_ctl")
-    if homebrew_pg.is_file() and os.access(homebrew_pg, os.X_OK):
-        return str(homebrew_pg)
-
-    return shutil.which("pg_ctl")
-
-
-def _stop_worktree_postgres_if_present(worktree_path: Path) -> None:
-    """Best-effort stop for a worktree-local Postgres cluster before removal."""
-    data_dir = worktree_path / ".local" / "postgres" / "data"
-    if not (data_dir / "postmaster.pid").is_file():
-        return
-
-    pg_ctl = _resolve_pg_ctl()
-    if not pg_ctl:
-        logger.warning(
-            "Cleanup could not stop local Postgres for %s because pg_ctl was not found",
-            worktree_path,
-        )
-        return
-
-    status_result = run_subprocess([pg_ctl, "-D", str(data_dir), "status"])
-    if status_result.returncode != 0:
-        return
-
-    stop_result = run_subprocess([pg_ctl, "-D", str(data_dir), "stop", "-m", "fast"])
-    if stop_result.returncode != 0:
-        detail = redact_sensitive(tail_lines(stop_result.stderr or stop_result.stdout))
-        logger.warning(
-            "Cleanup could not stop local Postgres for %s (non-blocking): %s",
-            worktree_path,
-            detail[-240:],
-        )
-
-
 def _validated_worktree_cleanup_target(
     repo_root: Path,
     worktree_path: Path,
@@ -1222,7 +1179,6 @@ def _cleanup_worktree_checkout(
     except UnsafeWorktreePathError as exc:
         return f"Refusing unsafe worktree cleanup for {worktree_path}: {exc}"
 
-    _stop_worktree_postgres_if_present(worktree_path)
     reap_report = _reap_registered_worktree_processes(
         repo_root,
         worktree_path,
@@ -3590,8 +3546,50 @@ def _diagnostic_note(message: str) -> str:
     return f"{TEST_GATE_DIAGNOSTIC_UNAVAILABLE_PREFIX} {message.strip()}"
 
 
+def _command_is_pytest(args: list[str]) -> bool:
+    """Recognize executable invocation forms, never script or test operands."""
+    if not args:
+        return False
+    executable = args[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if executable in {"pytest", "pytest.exe", "py.test", "py.test.exe"}:
+        return True
+    if not re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?", executable):
+        return False
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg == "-m":
+            return args[index + 1:index + 2] == ["pytest"]
+        if arg in {"-W", "-X"}:
+            index += 2
+        elif arg in {"-B", "-E", "-I", "-s", "-S", "-u", "-O", "-OO", "-q"}:
+            index += 1
+        else:
+            return False
+    return False
+
+
+def _gate_is_pytest_like(gate: str) -> bool:
+    config = _verify_gate_config(gate)
+    args = (shlex.split(config.diagnostic_command)
+            if config and config.diagnostic_command else _verify_gate_command_args(gate))
+    return _command_is_pytest(args)
+
+
+def _gate_diagnostic_command(worktree_path: Path, gate: str) -> list[str]:
+    config = _verify_gate_config(gate)
+    if config is not None and config.diagnostic_command:
+        return shlex.split(config.diagnostic_command)
+    args = _verify_gate_command_args(gate)
+    if _command_is_pytest(args):
+        # Preserve interpreter, options, and selection, including a literal --.
+        index = args.index("--") if "--" in args else len(args)
+        return [*args[:index], "--tb=short", "--no-header", "-q", "--maxfail=20", *args[index:]]
+    return []
+
+
 def _test_gate_diagnostic_command(worktree_path: Path) -> list[str]:
-    """Mirror `make test` by running pytest via the worktree virtualenv."""
+    """Run pytest diagnostics through the worktree virtualenv."""
     return [str(_worktree_venv_python(worktree_path)), *TEST_GATE_DIAGNOSTIC_ARGS]
 
 
@@ -3623,8 +3621,14 @@ def _run_failed_test_diagnostic(
     *,
     env: dict[str, str] | None = None,
     backend: ExecutionBackend | None = None,
+    gate: str | None = None,
 ) -> str:
-    diagnostic_command = _test_gate_diagnostic_command(worktree_path)
+    diagnostic_command = (
+        _gate_diagnostic_command(worktree_path, gate)
+        if gate is not None else _test_gate_diagnostic_command(worktree_path)
+    )
+    if not diagnostic_command:
+        return ""
     command = shlex.join(diagnostic_command)
     if backend is None:
         backend = _resolve_execution_backend()
@@ -3642,6 +3646,9 @@ def _run_failed_test_diagnostic(
         return _diagnostic_note(f"timed out after {TEST_GATE_DIAGNOSTIC_TIMEOUT_SECONDS}s while running {command}.")
     except OSError as exc:
         return _diagnostic_note(f"could not start {command}: {exc}.")
+
+    if gate is not None and not _gate_is_pytest_like(gate):
+        return "\n".join(part for part in (result.stdout, result.stderr) if part)
 
     if result.returncode not in {0, 1}:
         detail_parts: list[str] = []
@@ -12802,7 +12809,7 @@ def _post_merge_commit_candidates(
     current_master_ref: str,
 ) -> tuple[list[str], str]:
     if not previous_master_sha:
-        return [], "pre-merge origin/master SHA is unavailable"
+        return [], f"pre-merge {BASE_REF} SHA is unavailable"
 
     current_master_sha = _resolve_git_ref_sha(repo_root, current_master_ref)
     if not current_master_sha:
@@ -12863,7 +12870,7 @@ def _infer_merge_commit_from_post_merge_history(
         )
 
     return "", (
-        "multiple commits landed after the pre-merge origin/master SHA, and none "
+        f"multiple commits landed after the pre-merge {BASE_REF} SHA, and none "
         f"uniquely reference spec {run.spec_id!r} for PR #{pr_number}: "
         f"{', '.join(_short_sha(sha) for sha in candidates)}"
     )
@@ -14977,13 +14984,13 @@ def _dirty_pr_state_allows_continue(
     if mergeability_check.status in {"success", "noop"}:
         issue = (
             f"PR for branch {run.branch} reports mergeStateStatus=DIRTY during {context}, "
-            "but a local merge against origin/master is clean. Treating this as stale "
+            f"but a local merge against {BASE_REF} is clean. Treating this as stale "
             "or remote-only DIRTY PR state."
         )
         if isinstance(pr_number, int):
             issue = (
                 f"PR #{pr_number} for branch {run.branch} reports mergeStateStatus=DIRTY "
-                f"during {context}, but a local merge against origin/master is clean. "
+                f"during {context}, but a local merge against {BASE_REF} is clean. "
                 "Treating this as stale or remote-only DIRTY PR state."
             )
         run.merge_conflict_error = ""
@@ -14992,8 +14999,8 @@ def _dirty_pr_state_allows_continue(
         return True
 
     if mergeability_check.status == "conflict":
-        detail = mergeability_check.stderr or "git merge origin/master reported conflicts"
-        issue = f"Confirmed local merge conflict with origin/master during {context}: {detail}"
+        detail = mergeability_check.stderr or f"git merge {BASE_REF} reported conflicts"
+        issue = f"Confirmed local merge conflict with {BASE_REF} during {context}: {detail}"
         run.merge_conflict_error = issue
         run.mergeability_issue = issue
         run.last_error = issue
@@ -16598,7 +16605,7 @@ def _validate_codex_exec(run: RunState, *, require_output_schema: bool = False) 
 
 
 def _sync_reused_branch_before_implement(run: RunState, worktree_path: Path) -> str:
-    """Bring a reused branch up to date with origin/master before first implement."""
+    """Bring a reused branch up to date with the configured base before implement."""
     if not run.resumed_from_branch or run.attempts > 0 or run.last_merged_master_sha or run.merge_conflict_error:
         return "passed"
 
@@ -20262,7 +20269,7 @@ def _build_agent_command(
             debugger_section = "\n".join(debugger_lines)
         reason_label = {
             "retry": "the orchestrator's verify phase found test/lint failures",
-            "merge_conflict": "a merge conflict with master needs resolution",
+            "merge_conflict": f"a merge conflict with {PR_BASE_BRANCH} needs resolution",
             "review_feedback": "a code review requested changes",
             "recovery": "the previous implement attempt failed before completion",
         }.get(retry_context.implement_reason, "a prior attempt did not pass")
@@ -20397,7 +20404,7 @@ def _build_agent_command(
         elif retry_context.mergeability_issue:
             instruction_lines.append(
                 "Keep the recorded PR mergeability note in mind, but do not treat it as "
-                "the primary task unless a fresh local `git merge origin/master` now "
+                f"the primary task unless a fresh local `git merge {BASE_REF}` now "
                 "conflicts."
             )
         if retry_context.rescue_snapshot_path:
@@ -21106,10 +21113,17 @@ def _run_verify_gate(
     if not _is_test_gate(gate):
         gate_env: dict[str, str] = {}
         _inject_worktree_venv_into_env(gate_env, worktree_path)
+        completed = _run_via_backend(gate_env)
         return _attach_gate_review_evidence(
             gate,
             worktree_path,
-            VerifyGateResult(completed_process=_run_via_backend(gate_env)),
+            VerifyGateResult(
+                completed_process=completed,
+                diagnostic=(
+                    _run_failed_test_diagnostic(worktree_path, env=gate_env, backend=backend, gate=gate)
+                    if completed.returncode != 0 and not getattr(completed, "_timed_out", False) else ""
+                ),
+            ),
         )
 
     diagnostic = ""
@@ -21126,6 +21140,7 @@ def _run_verify_gate(
             ):
                 diagnostic = _run_failed_test_diagnostic(
                     worktree_path,
+                    gate=gate,
                     env=gate_env,
                     backend=backend,
                 )
@@ -21141,7 +21156,7 @@ def _run_verify_gate(
                     targeted_output,
                     env=gate_env,
                     backend=backend,
-                )
+                ) if _gate_is_pytest_like(gate) else []
                 if _every_failed_test_passed_in_isolation(targeted_output, targeted_diagnostics):
                     failed_nodes = ", ".join(_extract_failed_test_node_ids(targeted_output))
                     logger.warning(
@@ -22638,7 +22653,7 @@ def _retry_reason_label(reason_key: str) -> str:
     return {
         "implement_failures": "Implement phase failed before handoff",
         "review_changes": "Review requested changes",
-        "merge_conflicts": "Merge conflict with `master`",
+        "merge_conflicts": f"Merge conflict with `{PR_BASE_BRANCH}`",
         "verify_failures": "Required checks failed after publish",
         "unknown": "Retry budget consumed without preserved failure detail",
     }.get(reason_key, RETRY_REASON_LABELS.get(reason_key, reason_key.replace("_", " ")).strip())
@@ -24479,7 +24494,7 @@ def _manual_merge(
     merge_state = str((latest_pr or pr_data).get("mergeStateStatus", "")).strip().upper()
     if merge_state == "BEHIND":
         logger.info(
-            "PR #%s branch is behind base — merging origin/master locally...",
+            f"PR #%s branch is behind base — merging {BASE_REF} locally...",
             pr_number,
         )
         try:
@@ -24494,8 +24509,8 @@ def _manual_merge(
             remote_url=run.publish_remote_url,
         )
         if merge_result.status == "conflict":
-            detail = merge_result.stderr or "git merge origin/master reported conflicts"
-            run.last_error = f"Merge conflict while merging origin/master before merge: {detail}"
+            detail = merge_result.stderr or f"git merge {BASE_REF} reported conflicts"
+            run.last_error = f"Merge conflict while merging {BASE_REF} before merge: {detail}"
             run.merge_conflict_error = run.last_error
             run.mergeability_issue = run.last_error
             return "failed"
@@ -24520,7 +24535,7 @@ def _manual_merge(
         )
         if push_result.returncode != 0:
             run.last_error = (
-                "Failed to push branch after merging origin/master: "
+                f"Failed to push branch after merging {BASE_REF}: "
                 f"{push_result.stderr.strip() or push_result.stdout.strip()}"
             )
             return "failed"
@@ -24552,16 +24567,16 @@ def _manual_merge(
             if _required_checks_still_pending(checks_error):
                 remaining = checks_deadline - time.time()
                 if remaining <= 0:
-                    run.last_error = f"Timed out waiting for checks after syncing with origin/master: {checks_error}"
+                    run.last_error = f"Timed out waiting for checks after syncing with {BASE_REF}: {checks_error}"
                     return "failed"
                 logger.info(
-                    "Waiting for checks after syncing with origin/master on PR #%s: %s",
+                    f"Waiting for checks after syncing with {BASE_REF} on PR #%s: %s",
                     pr_number,
                     checks_error,
                 )
                 _poll_sleep(min(checks_poll_interval, remaining))
                 continue
-            run.last_error = f"Checks failed after syncing with origin/master: {checks_error}"
+            run.last_error = f"Checks failed after syncing with {BASE_REF}: {checks_error}"
             return "failed"
     # Retry gh pr merge a few times to handle race between checks
     # passing and GitHub branch protection allowing the merge.
@@ -24977,7 +24992,7 @@ def _best_effort_post_merge_local_sync(
             failure_type="merge",
             failure_subtype="local_post_merge_sync_timed_out",
             summary=(
-                "Remote merge succeeded, but post-merge local master refresh timed out. "
+                f"Remote merge succeeded, but post-merge local {PR_BASE_BRANCH} refresh timed out. "
                 "Cleanup can continue; refresh local refs manually if needed."
             ),
             action=f"git fetch {remote_name} {remote_branch}",
@@ -24992,7 +25007,7 @@ def _best_effort_post_merge_local_sync(
             failure_type="merge",
             failure_subtype="local_post_merge_sync_failed",
             summary=(
-                "Remote merge succeeded, but post-merge local master refresh failed. "
+                f"Remote merge succeeded, but post-merge local {PR_BASE_BRANCH} refresh failed. "
                 "Cleanup can continue; refresh local refs manually if needed."
             ),
             action=f"git fetch {remote_name} {remote_branch}",
@@ -25042,7 +25057,7 @@ def _best_effort_post_merge_local_sync(
             phase="merge",
             failure_type="merge",
             failure_subtype="local_post_merge_sync_failed",
-            summary=("Remote merge succeeded, but the local `master` ref could not be updated after the merge."),
+            summary=(f"Remote merge succeeded, but the local `{PR_BASE_BRANCH}` ref could not be updated after the merge."),
             action=f"git update-ref refs/heads/{PR_BASE_BRANCH} {remote_tracking_ref}",
             detail=detail,
         )
@@ -25602,8 +25617,8 @@ def _confirm_merge_conflict_retry(
         branch=run.branch,
     )
     if mergeability_check.status == "conflict":
-        detail = mergeability_check.stderr or "git merge origin/master reported conflicts"
-        issue = f"Confirmed local merge conflict with origin/master during {context}: {detail}"
+        detail = mergeability_check.stderr or f"git merge {BASE_REF} reported conflicts"
+        issue = f"Confirmed local merge conflict with {BASE_REF} during {context}: {detail}"
         run.merge_conflict_error = issue
         run.mergeability_issue = issue
         run.last_error = issue
@@ -25613,7 +25628,7 @@ def _confirm_merge_conflict_retry(
         run.merge_conflict_error = ""
         run.mergeability_issue = (
             f"PR mergeability issue during {context} appears stale or remote-only: "
-            f"{run.last_error}. A local merge against origin/master is clean."
+            f"{run.last_error}. A local merge against {BASE_REF} is clean."
         )
         run.last_error = run.mergeability_issue
         return False
@@ -25793,7 +25808,7 @@ def _classify_phase_result(
                     "gate_name": _gate_name_from_error(message),
                 }
             )
-        elif "merge conflict while merging origin/master before verify" in normalized:
+        elif f"merge conflict while merging {BASE_REF} before verify".lower() in normalized:
             metadata.update(
                 {
                     "failure_type": "verify",
@@ -27798,7 +27813,7 @@ def cmd_step(args: argparse.Namespace) -> int:
             if run is None:
                 if is_spec_merged(repo_root, spec_id):
                     raise RuntimeError(
-                        f"Spec '{spec_id}' is already merged on origin/master; "
+                        f"Spec '{spec_id}' is already merged on {BASE_REF}; "
                         "use RUN=<run-id> to inspect or clean up an existing run."
                     )
                 run = _create_spec_run(
