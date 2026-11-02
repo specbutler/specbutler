@@ -116,6 +116,10 @@ class FakeProvider:
     ``scenario.json`` controls the final turn: ``structured`` is the
     structured completion to return, and ``report`` makes the fake run the
     ``spec report`` fallback by writing the scoped completion outbox.
+    ``transcripts`` makes Claude keep sessions only where the real CLI does,
+    under its provider home, so resume depends on that home's contents.
+    ``hold`` makes Codex wait, with a half-written rollout record, until the
+    ``release`` file appears.
     """
 
     def __init__(self, root: Path, agent: str) -> None:
@@ -133,9 +137,23 @@ class FakeProvider:
         self.binary.chmod(0o755)
         self.scenario(structured=OK_COMPLETION)
 
-    def scenario(self, *, structured: dict | None = None, report: bool = False) -> None:
+    def scenario(
+        self,
+        *,
+        structured: dict | None = None,
+        report: bool = False,
+        transcripts: bool = False,
+        hold: bool = False,
+    ) -> None:
         (self.state / "scenario.json").write_text(
-            json.dumps({"structured": structured, "report": report}),
+            json.dumps(
+                {
+                    "structured": structured,
+                    "report": report,
+                    "transcripts": transcripts,
+                    "hold": hold,
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -152,7 +170,9 @@ class FakeProvider:
 _FAKE_PROVIDER_BODY = """\
 import json
 import os
+import re
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -166,13 +186,24 @@ known_path = STATE / "sessions.json"
 known = json.loads(known_path.read_text(encoding="utf-8")) if known_path.exists() else []
 
 if AGENT == "claude":
+    config_dir = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path(os.environ["HOME"]) / ".claude")
+    project_dir = config_dir / "projects" / re.sub(r"[^A-Za-z0-9]", "-", os.getcwd())
     if "--resume" in args:
         sid = args[args.index("--resume") + 1]
-        if sid not in known:
+        found = (
+            (project_dir / f"{sid}.jsonl").is_file()
+            if scenario.get("transcripts")
+            else sid in known
+        )
+        if not found:
             print(f"No conversation found with session ID: {sid}", file=sys.stderr)
             raise SystemExit(1)
     else:
         sid = args[args.index("--session-id") + 1] if "--session-id" in args else ""
+    if sid and scenario.get("transcripts"):
+        project_dir.mkdir(parents=True, exist_ok=True)
+        with (project_dir / f"{sid}.jsonl").open("a", encoding="utf-8") as transcript:
+            transcript.write(json.dumps({"sessionId": sid}) + "\\n")
 else:
     sessions_dir = Path(os.environ["CODEX_HOME"]) / "sessions"
     if "resume" in args:
@@ -184,6 +215,15 @@ else:
         sid = str(uuid.uuid4())
         sessions_dir.mkdir(parents=True, exist_ok=True)
         (sessions_dir / f"rollout-{sid}.jsonl").write_text("{}\\n", encoding="utf-8")
+    if scenario.get("hold"):
+        rollout = sessions_dir / f"rollout-{sid}.jsonl"
+        with rollout.open("a", encoding="utf-8") as stream:
+            stream.write('{"partial')
+        (STATE / "holding").write_text(sid, encoding="utf-8")
+        deadline = time.monotonic() + 60
+        while not (STATE / "release").exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        rollout.write_text("{}\\n{}\\n", encoding="utf-8")
 if sid and sid not in known:
     known.append(sid)
     known_path.write_text(json.dumps(known), encoding="utf-8")
@@ -754,6 +794,155 @@ def test_container_claude_launch_streams_structured_completion(
     assert result.summary == "structured done"
 
 
+class _IsolatedHomeContainerBackend(_ContainerIdentityBackend):
+    """A container backend whose Claude launches use ``.spec-claude-home``."""
+
+
+def _use_isolated_home_container(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> _IsolatedHomeContainerBackend:
+    backend = _IsolatedHomeContainerBackend(orch._resolve_execution_backend())
+    monkeypatch.setattr(orch, "_resolve_execution_backend", lambda: backend)
+    monkeypatch.setattr(orch, "_detect_container_lost_implementation", lambda *_a, **_k: None)
+    # The operator's own Claude config directory, as seen by `spec attach`.
+    monkeypatch.setenv("HOME", str(tmp_path / "operator-home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    return backend
+
+
+def _claude_transcript(config_dir: Path, cwd: Path, session_id: str) -> Path:
+    return (
+        config_dir / "projects" / orch._claude_project_dir_name(cwd.resolve())
+        / f"{session_id}.jsonl"
+    )
+
+
+def test_container_claude_session_survives_the_isolated_home(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The transcript lives only in the transient launch home; it is archived,
+    restored for the retry's resume, and installed for the operator's attach."""
+    _use_isolated_home_container(monkeypatch, tmp_path)
+    fake = FakeProvider(tmp_path, "claude")
+    fake.scenario(structured=OK_COMPLETION, transcripts=True)
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, "claude")
+
+    with patch.object(orch, "_worktree_dirty_files", return_value=[]):
+        assert _implement(run, repo, worktree) == "passed"
+    session_id = run.agent_session_id
+    assert session_id == _flag_value(fake.calls()[-1], "--session-id")
+    # The launch HOME was the isolated home, which is gone after the launch.
+    assert not (worktree / ".spec-claude-home").exists()
+    operator_config = tmp_path / "operator-home" / ".claude"
+    assert not _claude_transcript(operator_config, worktree, session_id).exists()
+    archive = orch._claude_session_archive_dir(repo, run.run_id)
+    assert any(archive.glob(f"*/{session_id}.jsonl"))
+
+    _prepare_retry(run, repo)
+    with patch.object(orch, "_worktree_dirty_files", return_value=[]):
+        assert _implement(run, repo, worktree) == "passed"
+    retry = fake.calls()[-1]
+    assert _flag_value(retry, "--resume") == session_id
+    assert run.agent_session_id == session_id
+    assert run.agent_session_fallback_reason == ""
+
+    code, out, _ = _attach(repo, worktree, capsys, exec_=False)
+
+    assert code == 0
+    assert f"claude --resume {session_id}" in out
+    installed = _claude_transcript(operator_config, worktree, session_id)
+    # Both turns (initial and resumed) are in the installed transcript.
+    assert len(installed.read_text(encoding="utf-8").splitlines()) == 2
+    assert f"Restored Claude session {session_id}" in out
+
+
+def test_attach_exec_resumes_container_claude_session_from_operator_home(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--exec` runs a Claude CLI that only searches the operator's home."""
+    _use_isolated_home_container(monkeypatch, tmp_path)
+    fake = FakeProvider(tmp_path, "claude")
+    fake.scenario(structured=OK_COMPLETION, transcripts=True)
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, "claude")
+    with patch.object(orch, "_worktree_dirty_files", return_value=[]):
+        assert _implement(run, repo, worktree) == "passed"
+
+    monkeypatch.setenv("PATH", f"{fake.binary.parent}{os.pathsep}{os.environ['PATH']}")
+    code, _, err = _attach(repo, worktree, capsys, exec_=True)
+
+    assert code == 0, err
+    assert fake.calls()[-1] == ["--resume", run.agent_session_id]
+
+
+def test_host_claude_attach_leaves_operator_config_alone(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Host launches write into the operator's config already; nothing to copy."""
+    monkeypatch.setenv("HOME", str(tmp_path / "operator-home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    run, worktree = _make_run(repo, "claude")
+    run.agent_session_id = "sess-host"
+    run.agent_session_agent = "claude"
+    run.save(repo)
+
+    code, out, _ = _attach(repo, worktree, capsys)
+
+    assert code == 0
+    assert "Restored" not in out
+    assert not (tmp_path / "operator-home" / ".claude").exists()
+
+
+def test_live_fork_snapshots_container_claude_transcript(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A running container launch's transcript is newer than any archive."""
+    monkeypatch.setenv("HOME", str(tmp_path / "operator-home"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    run, worktree = _make_run(repo, "claude")
+    run.agent_session_id = "sess-live"
+    run.agent_session_agent = "claude"
+    run.save(repo)
+    stale = orch._claude_session_archive_dir(repo, run.run_id) / "-workspace-source"
+    stale.mkdir(parents=True)
+    (stale / "sess-live.jsonl").write_text("turn-1\n", encoding="utf-8")
+    live = worktree / orch.CLAUDE_ISOLATED_PROJECTS_RELPATH / "-workspace-source"
+    live.mkdir(parents=True)
+    (live / "sess-live.jsonl").write_text('turn-1\nturn-2\n{"partial', encoding="utf-8")
+    orch._record_live_provider_sessions(
+        repo,
+        run,
+        orch.ImplementLaunchPlan(
+            use_stream_json=True,
+            agent_env={},
+            agent_cmd=[],
+            popen_kwargs={},
+            claude_isolated_home=worktree / ".spec-claude-home",
+        ),
+    )
+
+    code, out, _ = _attach(repo, worktree, capsys, alive=True, fork=True)
+
+    assert code == 0
+    assert "claude --resume sess-live --fork-session" in out
+    installed = _claude_transcript(tmp_path / "operator-home" / ".claude", worktree, "sess-live")
+    assert installed.read_text(encoding="utf-8") == "turn-1\nturn-2\n"
+
+
 def test_provider_probes_run_inside_container_worker(tmp_path: Path) -> None:
     calls: list[list[str]] = []
 
@@ -1080,6 +1269,109 @@ def test_attach_exec_runs_codex_resume_in_workspace(
     # The archived rollout is visible to the operator's own Codex home.
     operator_home = Path(os.environ["CODEX_HOME"])
     assert (operator_home / "sessions" / "2026" / "rollout-thread-1.jsonl").is_file()
+
+
+def test_attach_fork_reads_the_running_codex_rollout(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """On the first attempt the thread exists only in the live launch home."""
+    import threading
+
+    fake = FakeProvider(tmp_path, "codex")
+    fake.scenario(structured=OK_COMPLETION, hold=True)
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, "codex")
+    attached: dict[str, object] = {}
+
+    def attach_while_running() -> None:
+        try:
+            holding = fake.state / "holding"
+            for _ in range(600):
+                if holding.exists():
+                    break
+                threading.Event().wait(0.05)
+            thread_id = holding.read_text(encoding="utf-8")
+            assert not orch._codex_session_archive_dir(repo, run.run_id).exists()
+            live = orch.RunState.load(repo, run.run_id)
+            live.agent_session_id = thread_id
+            live.agent_session_agent = "codex"
+            live.save(repo)
+            with (
+                patch.object(orch, "resolve_repo_root", return_value=repo),
+                patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            ):
+                attached["alive"] = orch._run_agent_process_alive(repo, worktree)
+                attached["code"] = orch.cmd_attach(
+                    argparse.Namespace(spec=SPEC_ID, exec=False, fork=True)
+                )
+            attached["thread_id"] = thread_id
+        except BaseException as exc:  # surfaced by the main thread
+            attached["error"] = exc
+        finally:
+            (fake.state / "release").write_text("go", encoding="utf-8")
+
+    worker = threading.Thread(target=attach_while_running)
+    worker.start()
+    try:
+        assert _implement(run, repo, worktree) == "passed"
+    finally:
+        (fake.state / "release").write_text("go", encoding="utf-8")
+        worker.join(timeout=60)
+    if "error" in attached:
+        raise attached["error"]  # type: ignore[misc]
+
+    out = capsys.readouterr().out
+    thread_id = attached["thread_id"]
+    assert attached["alive"] is True
+    assert attached["code"] == 0
+    assert f"codex fork {thread_id}" in out
+    assert "Restored live Codex rollouts" in out
+    restored = Path(os.environ["CODEX_HOME"]) / "sessions" / f"rollout-{thread_id}.jsonl"
+    # The half-written record the provider was appending is not carried over.
+    assert restored.read_text(encoding="utf-8") == "{}\n"
+    assert not orch._live_provider_sessions_path(repo, run.run_id).exists()
+
+
+def test_attach_fork_prefers_live_codex_rollout_over_stale_archive(
+    repo: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    run, worktree = _make_run(repo, "codex")
+    run.agent_session_id = "thread-1"
+    run.agent_session_agent = "codex"
+    run.save(repo)
+    archive = orch._codex_session_archive_dir(repo, run.run_id)
+    archive.mkdir(parents=True)
+    (archive / "rollout-thread-1.jsonl").write_text("turn-1\n", encoding="utf-8")
+    live_home = tmp_path / "live-codex-home"
+    (live_home / "sessions").mkdir(parents=True)
+    (live_home / "sessions" / "rollout-thread-1.jsonl").write_text(
+        "turn-1\nturn-2\n{\"partial", encoding="utf-8"
+    )
+    orch._record_live_provider_sessions(
+        repo,
+        run,
+        orch.ImplementLaunchPlan(
+            use_stream_json=False,
+            agent_env={},
+            agent_cmd=[],
+            popen_kwargs={},
+            codex_home=live_home,
+        ),
+    )
+
+    code, out, _ = _attach(repo, worktree, capsys, alive=True, fork=True)
+
+    assert code == 0
+    assert "codex fork thread-1" in out
+    restored = Path(os.environ["CODEX_HOME"]) / "sessions" / "rollout-thread-1.jsonl"
+    assert restored.read_text(encoding="utf-8") == "turn-1\nturn-2\n"
+    # The archive itself is left for the launch to finalize.
+    assert (archive / "rollout-thread-1.jsonl").read_text(encoding="utf-8") == "turn-1\n"
 
 
 # ---------------------------------------------------------------------------

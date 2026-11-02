@@ -10907,6 +10907,9 @@ class ImplementLaunchPlan:
     session: AgentSessionPlan = field(default_factory=AgentSessionPlan)
     completion_outbox_path: Path | None = None
     codex_home: Path | None = None
+    # Transient ``.spec-claude-home`` of a container launch; its transcripts
+    # are archived before the home is removed.
+    claude_isolated_home: Path | None = None
 
 
 @dataclass
@@ -16837,7 +16840,41 @@ def _codex_session_archive_dir(repo_root: Path, run_id: str) -> Path:
     return _state_root(repo_root) / "runs" / run_id / "codex-sessions"
 
 
+def _claude_session_archive_dir(repo_root: Path, run_id: str) -> Path:
+    """Run-scoped copy of Claude transcripts from a disposable isolated home.
+
+    Mirrors the provider's ``projects/`` tree. Only launches whose ``HOME`` is
+    the transient ``.spec-claude-home`` (container workers) are archived; host
+    launches already write into the operator's Claude config directory.
+    """
+    return _state_root(repo_root) / "runs" / run_id / "claude-sessions"
+
+
+# Relative to the workspace: where a container Claude launch keeps transcripts.
+CLAUDE_ISOLATED_PROJECTS_RELPATH = ".spec-claude-home/.claude/projects"
+
+
+def _live_provider_sessions_path(repo_root: Path, run_id: str) -> Path:
+    """Pointer to where the running launch's provider writes its sessions."""
+    return _state_root(repo_root) / "runs" / run_id / "live-provider-sessions.json"
+
+
 def _copy_codex_sessions(source: Path, destination: Path) -> None:
+    _copy_provider_sessions(source, destination)
+
+
+def _copy_provider_sessions(
+    source: Path,
+    destination: Path,
+    *,
+    trim_partial_lines: bool = False,
+) -> None:
+    """Copy a provider session tree without following links.
+
+    With *trim_partial_lines*, each copied ``.jsonl`` file ends at its last
+    complete line, so a snapshot of a file the provider is still appending
+    to never carries a half-written record.
+    """
     if not source.is_dir() or source.is_symlink():
         return
 
@@ -16846,10 +16883,164 @@ def _copy_codex_sessions(source: Path, destination: Path) -> None:
         # provider home (a container worker's home included).
         return [name for name in names if os.path.islink(os.path.join(directory, name))]
 
+    def copy_complete_lines(src: str, dst: str) -> str:
+        if not src.endswith(".jsonl"):
+            return shutil.copy2(src, dst)
+        data = Path(src).read_bytes()
+        Path(dst).write_bytes(data[: data.rfind(b"\n") + 1])
+        return dst
+
     try:
-        shutil.copytree(source, destination, ignore=skip_links, dirs_exist_ok=True)
+        shutil.copytree(
+            source,
+            destination,
+            ignore=skip_links,
+            dirs_exist_ok=True,
+            copy_function=copy_complete_lines if trim_partial_lines else shutil.copy2,
+        )
     except OSError as exc:
-        logger.warning("Could not copy Codex sessions %s -> %s: %s", source, destination, exc)
+        logger.warning("Could not copy provider sessions %s -> %s: %s", source, destination, exc)
+
+
+def _export_workspace_sessions(
+    backend: ExecutionBackend,
+    worktree_path: Path,
+    relative_path: str,
+    destination: Path,
+    *,
+    trim_partial_lines: bool = False,
+) -> None:
+    """Copy a provider session tree that lives inside the workspace to the host.
+
+    A volume-mode container workspace is only reachable through the backend;
+    bind-mode and host workspaces are read directly from the host checkout.
+    """
+    export = getattr(backend, "export_workspace_path_to_host", None)
+    if callable(export):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".export-", dir=destination.parent))
+        try:
+            if export(worktree_path, relative_path, staging):
+                _copy_provider_sessions(
+                    staging,
+                    destination,
+                    trim_partial_lines=trim_partial_lines,
+                )
+                return
+        except (OSError, RuntimeError) as exc:
+            logger.warning(
+                "Could not export %s from workspace %s: %s",
+                relative_path,
+                worktree_path,
+                exc,
+            )
+            return
+        finally:
+            remove_tree(staging, ignore_errors=True)
+    _copy_provider_sessions(
+        worktree_path / relative_path,
+        destination,
+        trim_partial_lines=trim_partial_lines,
+    )
+
+
+def _record_live_provider_sessions(
+    repo_root: Path,
+    run: RunState,
+    plan: ImplementLaunchPlan,
+) -> bool:
+    """Note where this launch's provider keeps its sessions while it runs."""
+    if run.agent == "codex" and plan.codex_home is not None:
+        payload = {"agent": "codex", "sessions_dir": str(plan.codex_home / "sessions")}
+    elif run.agent == "claude" and plan.claude_isolated_home is not None:
+        payload = {"agent": "claude", "workspace_path": CLAUDE_ISOLATED_PROJECTS_RELPATH}
+    else:
+        return False
+    atomic_write_text(
+        _live_provider_sessions_path(repo_root, run.run_id),
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return True
+
+
+def _snapshot_live_provider_sessions(
+    repo_root: Path,
+    run: RunState,
+    worktree_path: Path,
+    agent: str,
+    destination: Path,
+) -> bool:
+    """Copy the running launch's current sessions to *destination*.
+
+    Returns False when the live launch keeps no separate session store (host
+    Claude launches write straight into the operator's config directory).
+    """
+    try:
+        payload = json.loads(
+            _live_provider_sessions_path(repo_root, run.run_id).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get("agent") != agent:
+        return False
+    if agent == "codex" and isinstance(payload.get("sessions_dir"), str):
+        _copy_provider_sessions(
+            Path(payload["sessions_dir"]),
+            destination,
+            trim_partial_lines=True,
+        )
+        return True
+    if agent == "claude" and payload.get("workspace_path") == CLAUDE_ISOLATED_PROJECTS_RELPATH:
+        _export_workspace_sessions(
+            _resolve_execution_backend(),
+            worktree_path,
+            CLAUDE_ISOLATED_PROJECTS_RELPATH,
+            destination,
+            trim_partial_lines=True,
+        )
+        return True
+    return False
+
+
+def _claude_project_dir_name(cwd: Path) -> str:
+    """Claude Code's per-project transcript directory name for *cwd*."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+def _operator_claude_config_dir() -> Path:
+    configured = str(os.environ.get("CLAUDE_CONFIG_DIR", "")).strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def _install_claude_session(source: Path, session_id: str, worktree_path: Path) -> Path | None:
+    """Place one archived Claude transcript where ``claude --resume`` finds it.
+
+    Transcripts are filed per working directory; a container worker's copy is
+    filed under the container path, so it is re-filed under the host
+    workspace the attach command runs in. Returns the installed transcript.
+    """
+    if not source.is_dir() or source.is_symlink():
+        return None
+    candidates = sorted(
+        path
+        for path in source.glob(f"*/{session_id}.jsonl")
+        if path.is_file() and not path.is_symlink() and not path.parent.is_symlink()
+    )
+    if not candidates:
+        return None
+    transcript = max(candidates, key=lambda path: path.stat().st_mtime)
+    target_dir = (
+        _operator_claude_config_dir()
+        / "projects"
+        / _claude_project_dir_name(worktree_path.resolve())
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / transcript.name
+    shutil.copyfile(transcript, target)
+    # Subagent transcripts and tool results live beside the main transcript.
+    _copy_provider_sessions(transcript.parent / session_id, target_dir / session_id)
+    return target
 
 
 def _structured_completion_result(
@@ -17441,6 +17632,7 @@ def _prepare_implement_launch_plan(
     codex_preserve_home = False
     claude_private_home: Path | None = None
     claude_private_home_context: tempfile.TemporaryDirectory[str] | None = None
+    claude_isolated_home: Path | None = None
     if run.agent == "codex" and adapter.capabilities.supports_mcp:
         # Remove legacy checkout-local provider state before allocating the
         # external home. In volume mode this also deletes any old copied
@@ -17507,6 +17699,15 @@ def _prepare_implement_launch_plan(
                 worktree_path,
                 include_auth=False,
             )
+            claude_isolated_home = claude_home
+            if session.resumes:
+                # The isolated home is removed after every launch; bring back
+                # the run's archived transcripts so `claude --resume` finds
+                # the session. The sync below pushes them into the worker.
+                _copy_provider_sessions(
+                    _claude_session_archive_dir(repo_root, run.run_id),
+                    worktree_path / CLAUDE_ISOLATED_PROJECTS_RELPATH,
+                )
         agent_env = _subprocess_env_with_home(agent_env, claude_home)
         if use_provider_sandbox and canonical_claude_config is not None:
             agent_env["CLAUDE_CONFIG_DIR"] = str(canonical_claude_config)
@@ -17663,6 +17864,7 @@ def _prepare_implement_launch_plan(
         session=session,
         completion_outbox_path=completion_outbox_path,
         codex_home=codex_home if codex_auth_root is not None else None,
+        claude_isolated_home=claude_isolated_home,
     )
 
 
@@ -17728,6 +17930,7 @@ def _launch_implement_attempt(
             _set_active_agent_process(None)
             _prune_registered_worktree_processes(repo_root, worktree_path)
 
+    live_sessions_recorded = _record_live_provider_sessions(repo_root, run, plan)
     try:
         result = backend.launch_agent(request, monitor=_supervise)
         # backend.launch_agent returns only after its monitor has confirmed the
@@ -17764,6 +17967,15 @@ def _launch_implement_attempt(
                         required=True,
                     )
             elif run.agent == "claude":
+                if plan.claude_isolated_home is not None:
+                    # Keep the session resumable by the next container launch
+                    # and attachable from the host after the home is removed.
+                    _export_workspace_sessions(
+                        backend,
+                        worktree_path,
+                        CLAUDE_ISOLATED_PROJECTS_RELPATH,
+                        _claude_session_archive_dir(repo_root, run.run_id),
+                    )
                 if (
                     plan.claude_private_home_context is not None
                     and plan.claude_private_home is not None
@@ -17780,6 +17992,9 @@ def _launch_implement_attempt(
                     required=True,
                 )
         finally:
+            if live_sessions_recorded:
+                # Sessions are archived by now; attach reads the archive.
+                _live_provider_sessions_path(repo_root, run.run_id).unlink(missing_ok=True)
             if plan.git_isolation is not None:
                 try:
                     # Idempotent after successful reconciliation; also removes
@@ -27605,6 +27820,60 @@ def _operator_codex_home() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".codex"
 
 
+def _expose_run_sessions_to_operator(
+    repo_root: Path,
+    run: RunState,
+    worktree_path: Path,
+    agent: str,
+    *,
+    live: bool,
+) -> None:
+    """Make the run's session visible to the operator's own provider CLI.
+
+    Launch provider homes (a host Codex home, a container worker's Codex or
+    Claude home) do not outlive the launch, so the run's archived sessions are
+    restored into the operator's home first; the printed command then works on
+    its own as well. While the launch still runs (``--fork``) its live
+    sessions are newer than the archive, so a snapshot of them is laid on top.
+    """
+    archive = (
+        _codex_session_archive_dir(repo_root, run.run_id)
+        if agent == "codex"
+        else _claude_session_archive_dir(repo_root, run.run_id)
+    )
+    with tempfile.TemporaryDirectory(prefix="spec-attach-") as scratch:
+        sources = [archive] if archive.is_dir() else []
+        live_snapshot = Path(scratch) / "live"
+        if live and _snapshot_live_provider_sessions(
+            repo_root, run, worktree_path, agent, live_snapshot
+        ):
+            sources.append(live_snapshot)
+        if agent == "codex":
+            operator_sessions = _operator_codex_home() / "sessions"
+            for source in sources:
+                _copy_codex_sessions(source, operator_sessions)
+            if any(
+                any(source.rglob(f"*{run.agent_session_id}*.jsonl")) for source in sources
+            ):
+                origin = "live" if live_snapshot in sources else "archived"
+                print(f"Restored {origin} Codex rollouts for {run.run_id} into {operator_sessions}")
+            else:
+                print(
+                    f"Warning: No archived Codex rollouts for run {run.run_id}; "
+                    f"`codex resume` may not find thread {run.agent_session_id}.",
+                    file=sys.stderr,
+                )
+            return
+        installed: Path | None = None
+        for source in sources:
+            installed = (
+                _install_claude_session(source, run.agent_session_id, worktree_path)
+                or installed
+            )
+        if installed is not None:
+            print(f"Restored Claude session {run.agent_session_id} into {installed}")
+
+
 def cmd_attach(args: argparse.Namespace) -> int:
     """Print (or run) the command that resumes the latest run's agent session."""
     repo_root = resolve_repo_root()
@@ -27630,7 +27899,8 @@ def cmd_attach(args: argparse.Namespace) -> int:
     if not worktree_path.is_dir():
         print(f"Error: Workspace missing: {worktree_path}", file=sys.stderr)
         return 1
-    if not fork and _run_agent_process_alive(repo_root, worktree_path):
+    alive = _run_agent_process_alive(repo_root, worktree_path)
+    if alive and not fork:
         # One session must not be driven headless and interactively at once.
         print(
             f"Error: The {agent} agent for run {run.run_id} is still running. "
@@ -27641,21 +27911,14 @@ def cmd_attach(args: argparse.Namespace) -> int:
         return 1
     if fork and agent == "codex":
         print("Note: --fork uses `codex fork` for Codex sessions.")
-    if agent == "codex":
-        # Launch provider homes (host or container worker) do not outlive the
-        # launch; restore the run's archived rollouts into the operator's own
-        # Codex home first, so the printed command works on its own as well.
-        archive = _codex_session_archive_dir(repo_root, run.run_id)
-        operator_sessions = _operator_codex_home() / "sessions"
-        if archive.is_dir():
-            _copy_codex_sessions(archive, operator_sessions)
-            print(f"Restored archived Codex rollouts for {run.run_id} into {operator_sessions}")
-        else:
-            print(
-                f"Warning: No archived Codex rollouts for run {run.run_id}; "
-                f"`codex resume` may not find thread {run.agent_session_id}.",
-                file=sys.stderr,
-            )
+    if agent in {"codex", "claude"}:
+        _expose_run_sessions_to_operator(
+            repo_root,
+            run,
+            worktree_path,
+            agent,
+            live=alive,
+        )
 
     print(f"Run: {run.run_id}")
     print(f"  Agent Session: {run.agent_session_id} ({agent})")

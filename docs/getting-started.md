@@ -394,6 +394,12 @@ run's agent is still running, because one session must not be driven headless
 and interactively at once; `--fork` branches the session instead
 (`--fork-session` for Claude, `codex fork` for Codex).
 
+Sessions from launches whose provider home does not outlive the launch (every
+Codex launch, and Claude in a container worker) are archived with the run.
+Before printing the command, `spec attach` copies the session into your own
+Codex home or Claude config directory. While the agent is still running,
+`--fork` takes a snapshot of the live session first.
+
 List all specs with their status:
 
 ```bash
