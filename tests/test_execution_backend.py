@@ -37,6 +37,10 @@ from spec_runtime.git_publish_guard import apply_host_owned_publication_guard
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+# Git on Windows CI runners routinely takes several seconds to start under load.
+GIT_SUBPROCESS_TIMEOUT_SECONDS = 60
+
+
 def test_link_boundary_detects_windows_reparse_attribute_without_is_junction() -> None:
     class ReparsePath:
         def is_symlink(self) -> bool:
@@ -10894,7 +10898,7 @@ class TestContainerWorkerEnvHostPathDenylist:
             env={"PATH": os.environ.get("PATH", os.defpath), **filtered},
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=GIT_SUBPROCESS_TIMEOUT_SECONDS,
             check=False,
         )
         assert status.returncode == 0, status.stderr
@@ -10904,7 +10908,7 @@ class TestContainerWorkerEnvHostPathDenylist:
             env={"PATH": os.environ.get("PATH", os.defpath), **filtered},
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=GIT_SUBPROCESS_TIMEOUT_SECONDS,
             check=False,
         )
         assert push.returncode != 0

@@ -1687,7 +1687,8 @@ description: Exercise installed Windows autopilot supervision
                     )
                 )
                 active_item = active_payload[auto_id]
-            except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+            # PermissionError: Windows refuses reads while autopilot replaces the file.
+            except (FileNotFoundError, PermissionError, json.JSONDecodeError, KeyError, TypeError):
                 return False
             return (
                 active_item.get("adoption_generation", 0) >= 1
@@ -1724,7 +1725,8 @@ description: Exercise installed Windows autopilot supervision
         def graceful_stop_was_requested() -> bool:
             try:
                 return json.loads(shutdown_path.read_text(encoding="utf-8"))["phase"] == "graceful"
-            except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+            # PermissionError: Windows refuses reads while autopilot replaces the file.
+            except (FileNotFoundError, PermissionError, json.JSONDecodeError, KeyError, TypeError):
                 return False
 
         _wait_until(
