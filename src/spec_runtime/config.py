@@ -38,6 +38,11 @@ class VerifyGateConfig:
 
 
 @dataclass(frozen=True)
+class SpecsConfig:
+    require_merged_spec: bool = True
+
+
+@dataclass(frozen=True)
 class SpecPathConfig:
     specs_dir: str = "specs"
     task_specs_dir: str = "specs/tasks"
@@ -68,6 +73,19 @@ class UpdateConfig:
 @dataclass(frozen=True)
 class ReadinessConfig:
     require_forge_checks: bool = True
+
+
+REVIEW_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
+
+
+@dataclass(frozen=True)
+class ReviewConfig:
+    # Review rounds one run may spend before the operator must decide: the
+    # max_rounds-th request_changes moves the run to waiting-for-input instead
+    # of starting another implement retry.
+    max_rounds: int = 3
+    # Empty keeps the first-pass reasoning effort for re-reviews.
+    rereview_reasoning_effort: str = ""
 
 
 @dataclass(frozen=True)
@@ -300,6 +318,7 @@ class McpConfig:
 
 @dataclass(frozen=True)
 class SpecRuntimeConfig:
+    specs: SpecsConfig = SpecsConfig()
     paths: SpecPathConfig = SpecPathConfig()
     base_ref: str = "origin/master"
     retry_cap: int = 20
@@ -323,6 +342,7 @@ class SpecRuntimeConfig:
     implement: ImplementConfig = ImplementConfig()
     update: UpdateConfig = UpdateConfig()
     readiness: ReadinessConfig = ReadinessConfig()
+    review: ReviewConfig = ReviewConfig()
     autopilot: AutopilotConfig = AutopilotConfig()
     execution: ExecutionConfig = ExecutionConfig()
     coordination: CoordinationConfig = CoordinationConfig()
@@ -370,6 +390,32 @@ class SpecConfigError(ValueError):
 
 
 _MAX_REVIEW_EVIDENCE_FILES_PER_GATE = 8
+
+
+def _parse_review_section(payload: object) -> ReviewConfig:
+    if payload is None:
+        return ReviewConfig()
+    if not isinstance(payload, dict):
+        raise SpecConfigError("[review] must be a table")
+    unknown = sorted(set(payload) - {"max_rounds", "rereview_reasoning_effort"})
+    if unknown:
+        raise SpecConfigError(
+            "Unknown [review] key(s): " + ", ".join(unknown)
+            + ". Allowed: max_rounds, rereview_reasoning_effort"
+        )
+    max_rounds = payload.get("max_rounds", ReviewConfig.max_rounds)
+    if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1:
+        raise SpecConfigError("[review].max_rounds must be an integer >= 1")
+    effort = payload.get("rereview_reasoning_effort", "")
+    if not isinstance(effort, str):
+        raise SpecConfigError("[review].rereview_reasoning_effort must be a string")
+    effort = effort.strip().lower()
+    if effort and effort not in REVIEW_REASONING_EFFORTS:
+        raise SpecConfigError(
+            "[review].rereview_reasoning_effort must be one of: "
+            + ", ".join(REVIEW_REASONING_EFFORTS)
+        )
+    return ReviewConfig(max_rounds=max_rounds, rereview_reasoning_effort=effort)
 
 
 def _parse_review_evidence_paths(payload: object, *, gate_name: str) -> tuple[str, ...]:
@@ -931,7 +977,11 @@ def load_spec_runtime_config(
     )
     coordination = _finalize_coordination(coordination)
 
+    specs_payload = raw.get("specs", {})
+    if not isinstance(specs_payload, dict) or not isinstance(specs_payload.get("require_merged_spec", True), bool):
+        raise SpecConfigError("specs.require_merged_spec must be a boolean")
     return SpecRuntimeConfig(
+        specs=SpecsConfig(require_merged_spec=specs_payload.get("require_merged_spec", True)),
         paths=paths,
         base_ref=str(raw.get("base_ref", "origin/master")).strip() or "origin/master",
         retry_cap=max(1, int(retry_payload.get("cap", 20))),
@@ -967,6 +1017,7 @@ def load_spec_runtime_config(
         readiness=ReadinessConfig(
             require_forge_checks=bool(readiness_payload.get("require_forge_checks", True)),
         ),
+        review=_parse_review_section(raw.get("review", {})),
         autopilot=autopilot,
         execution=execution,
         coordination=coordination,

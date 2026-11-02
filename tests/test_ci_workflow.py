@@ -302,6 +302,8 @@ def test_ci_windows_job_is_a_required_product_gate_with_diagnostics():
     assert '-m pytest -o "pythonpath=" tests -v --ignore=tests/test_windows_probe.py' in commands[
         "Run full portable test suite"
     ]
+    # The Windows portable suite only fits a PR's wall-clock budget in parallel.
+    assert "-n auto" in commands["Run full portable test suite"]
     assert '-m pytest -o "pythonpath=" tests/test_windows_probe.py -v' in commands[
         "Run Windows integration probes"
     ]

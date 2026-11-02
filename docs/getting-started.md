@@ -121,6 +121,10 @@ cap = 20                        # max retries across verify/review/merge failure
 no_progress_retry_threshold = 2 # consecutive no-progress retries before giving up
 infra_retry_attempts = 2        # in-place reruns after a transient infrastructure failure
 
+[review]
+max_rounds = 3                  # request_changes rounds before the run waits for operator input
+rereview_reasoning_effort = ""  # empty keeps the first review's reasoning effort
+
 [agents]
 default = "claude"
 review_default = "codex"
@@ -449,3 +453,30 @@ spec task                                  # quick task (no spec file needed)
 spec clean --spec <id>                     # remove execution workspaces and branches
 spec analytics                             # summarize run history
 ```
+
+
+### Spec quality and single-PR authoring
+
+Run `spec lint` to validate all specs, or `spec lint --spec my-feature --json`
+for machine-readable diagnostics. Errors block implementation and autopilot;
+warnings (including more than eight criteria) are advisory. `spec doctor` also
+prints a lint summary. `spec lint --critique --spec my-feature` asks the configured
+review agent for read-only, advisory suggestions about ambiguity, testability,
+out-of-scope gaps, and decomposition. Critique suggestions never block a run.
+
+`spec init` installs authoring prompts under `prompts/`. Repositories can override
+`prompts/spec-creation.md` and `prompts/task-scoping.md`; otherwise bundled prompts
+are used. They guide intent discovery, code exploration, and focused criteria.
+
+By default the spec must already exist on the remote base. To include a local
+spec and its implementation in one PR, configure:
+
+```toml
+[specs]
+require_merged_spec = false
+```
+
+Write the spec in the local base checkout before starting the run. Spec Butler
+pins it, restores it into the implementation workspace, and commits it into the
+implementation branch. The implementation PR policy accepts its own new spec file.
+Publication remains operator/orchestrator owned.

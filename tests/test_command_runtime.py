@@ -16,6 +16,7 @@ from spec_runtime.command_runtime import (
 )
 
 
+@pytest.mark.requires_ps
 def test_argv_preserves_difficult_arguments_in_real_process(tmp_path: Path) -> None:
     helper = tmp_path / "argv helper.py"
     output = tmp_path / "received.json"

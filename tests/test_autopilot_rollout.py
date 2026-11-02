@@ -241,6 +241,7 @@ def test_missing_container_engine_diagnostic_is_actionable(tmp_path: Path, monke
     assert "Install Docker Desktop" in message
 
 
+@pytest.mark.requires_ps
 def test_run_loop_surfaces_effective_concurrency_in_dry_run(
     tmp_path: Path,
     monkeypatch,
@@ -283,6 +284,7 @@ def test_run_loop_surfaces_effective_concurrency_in_dry_run(
     assert "concurrency_source=computed" in captured.out
 
 
+@pytest.mark.requires_ps
 def test_run_loop_cleans_stale_container_artifacts_on_restart(
     tmp_path: Path,
     monkeypatch,
