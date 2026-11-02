@@ -1519,11 +1519,11 @@ def test_codex_review_profile_reads_checkout_and_denies_credentials(
 
     filesystem = next(c for c in cmd if c.startswith("permissions.specbutler-review.filesystem="))
     assert '":root"="read"' in filesystem
-    assert json.dumps(str(checkout.resolve())) + '="read"' in filesystem
-    assert json.dumps(str(scratch.resolve())) + '="write"' in filesystem
-    assert json.dumps(str(provider_home.resolve())) + '="deny"' in filesystem
-    assert json.dumps(str(operator_secret.resolve())) + '="deny"' in filesystem
-    assert json.dumps(str(checkout.resolve())) + '="deny"' not in filesystem
+    assert agent_adapter._toml_quote(str(checkout.resolve())) + '="read"' in filesystem
+    assert agent_adapter._toml_quote(str(scratch.resolve())) + '="write"' in filesystem
+    assert agent_adapter._toml_quote(str(provider_home.resolve())) + '="deny"' in filesystem
+    assert agent_adapter._toml_quote(str(operator_secret.resolve())) + '="deny"' in filesystem
+    assert agent_adapter._toml_quote(str(checkout.resolve())) + '="deny"' not in filesystem
     assert 'default_permissions="specbutler-review"' in cmd
     assert "permissions.specbutler-review.network={enabled=false}" in cmd
     assert "features.shell_tool=false" not in cmd
@@ -1568,7 +1568,7 @@ def test_codex_review_with_checkout_enforces_inspection_only_commands(tmp_path: 
         assert loosening not in cmd
     # The checkout is never writable and never the working root.
     filesystem = next(c for c in cmd if c.startswith("permissions.specbutler-review.filesystem="))
-    assert json.dumps(str(checkout.resolve())) + '="write"' not in filesystem
+    assert agent_adapter._toml_quote(str(checkout.resolve())) + '="write"' not in filesystem
     assert cmd[cmd.index("-C") + 1] == str(scratch)
     # Codex 0.164 routes shell calls through the code-mode host; disabling
     # it would silently remove the inspection commands this path exists for.

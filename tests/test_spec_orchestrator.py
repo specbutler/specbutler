@@ -45,6 +45,7 @@ from spec_runtime import spec_merge_tags as merge_tags
 from spec_runtime import worktree_process_registry as process_registry
 from spec_runtime.agent_adapter import (
     HostAgentUnavailableError,
+    _toml_quote,
     host_agent_unavailability_reason,
 )
 from spec_runtime.command_runtime import CommandVariants
@@ -21013,7 +21014,7 @@ class TestLocalReviewPhase:
             assert "-s" not in cmd
             assert 'default_permissions="specbutler-review"' in cmd
             filesystem = next(c for c in cmd if c.startswith("permissions.specbutler-review.filesystem="))
-            assert json.dumps(str(review_worktree.resolve())) + '="read"' in filesystem
+            assert _toml_quote(str(review_worktree.resolve())) + '="read"' in filesystem
             assert 'approval_policy="untrusted"' in cmd
             assert 'approvals_reviewer="user"' in cmd
             assert "--skip-git-repo-check" in cmd
