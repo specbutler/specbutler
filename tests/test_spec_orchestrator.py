@@ -21013,7 +21013,7 @@ class TestLocalReviewPhase:
             assert "-s" not in cmd
             assert 'default_permissions="specbutler-review"' in cmd
             filesystem = next(c for c in cmd if c.startswith("permissions.specbutler-review.filesystem="))
-            assert f'"{review_worktree.resolve()}"="read"' in filesystem
+            assert json.dumps(str(review_worktree.resolve())) + '="read"' in filesystem
             assert 'approval_policy="untrusted"' in cmd
             assert 'approvals_reviewer="user"' in cmd
             assert "--skip-git-repo-check" in cmd
