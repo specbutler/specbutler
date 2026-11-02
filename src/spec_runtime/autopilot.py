@@ -1292,8 +1292,25 @@ def spec_graph_skip_reasons(
         and spec.spec_id not in hidden
         and spec.spec_id not in merged
     }
+    from .orchestrator import _command_spec_path
     from .spec_lint import lint_specs
-    for result in lint_specs(repo_root, merged_spec_ids=merged):
+
+    results = {result.spec_id: result for result in lint_specs(repo_root, merged_spec_ids=merged)}
+    for spec in specs:
+        run_id, _ = resolve_resume_run(repo_root, spec)
+        if not run_id:
+            continue
+        record = read_latest_run_record(repo_root, spec.spec_id, run_id=run_id)
+        if not record:
+            continue
+        run = RunState.from_dict(record)
+        source = _command_spec_path(repo_root, spec.spec_id, run)
+        results[spec.spec_id] = lint_specs(
+            repo_root, spec.spec_id, merged_spec_ids=merged, source_path=source
+        )[0]
+        # The pinned contract replaces catalog graph diagnostics as well.
+        reasons.pop(spec.spec_id, None)
+    for result in results.values():
         if result.errors and result.spec_id not in merged and result.spec_id not in hidden:
             reasons[result.spec_id] = "; ".join(result.errors)
     return reasons
@@ -1478,7 +1495,16 @@ def build_dispatch_queue(
         # the reason via ``spec_graph_skip_reasons`` instead of waiting silently.
         if spec.spec_id in graph_skip_reasons:
             continue
-        if not dependencies_are_merged(repo_root, spec.depends_on, git_state=git_state):
+        dependencies = spec.depends_on
+        if run_id:
+            from .orchestrator import _command_spec_path
+            from .spec_metadata import parse_spec_metadata
+
+            record = read_latest_run_record(repo_root, spec.spec_id, run_id=run_id, run_index=run_index)
+            if record:
+                source = _command_spec_path(repo_root, spec.spec_id, RunState.from_dict(record))
+                dependencies = parse_spec_metadata(source).depends_on
+        if not dependencies_are_merged(repo_root, dependencies, git_state=git_state):
             continue
 
         if not run_id:

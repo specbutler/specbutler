@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -149,12 +151,10 @@ def test_critique_uses_restricted_adapter_and_is_advisory(tmp_path, monkeypatch,
     suggestions = {key: [] for key in ("ambiguities", "untestable_criteria", "missing_out_of_scope", "decomposition")}
     runner = Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps(suggestions), ""))
     monkeypatch.setattr(subprocess, "run", runner)
-    critique(tmp_path, "feature")
-    assert json.loads(capsys.readouterr().out) == suggestions
+    assert critique(tmp_path, "feature") == suggestions
     assert "id: feature" in runner.call_args.kwargs["input"]
     runner.side_effect = OSError("unavailable")
-    critique(tmp_path, "feature")
-    assert "advisory" in capsys.readouterr().out
+    assert "advisory" in critique(tmp_path, "feature")["error"]
 
 
 def test_task_prompt_fallback_and_override(tmp_path):
@@ -212,6 +212,54 @@ def test_merged_dependency_need_not_have_a_catalog_file(tmp_path, monkeypatch):
     write_spec(tmp_path, frontmatter="depends_on: [removed]")
     monkeypatch.setattr(spec_status, "_git_lines", lambda *a, **kw: ["spec/merged/removed"])
     assert not lint_specs(tmp_path, "feature")[0].errors
+
+
+@pytest.mark.parametrize("failure", ["", "exit", "os", "invalid"])
+def test_json_critique_is_one_document(tmp_path, monkeypatch, capsys, failure):
+    from spec_runtime import agent_adapter, spec_status
+    from spec_runtime.spec_lint import cmd_lint
+
+    write_spec(tmp_path)
+    monkeypatch.setattr(spec_status, "_git_lines", lambda *a, **kw: [])
+    suggestions = {key: [] for key in ("ambiguities", "untestable_criteria", "missing_out_of_scope", "decomposition")}
+    adapter = Mock()
+    adapter.build_review_command.return_value = ["review-agent"]
+    monkeypatch.setattr(agent_adapter, "get_agent_adapter", lambda _: adapter)
+    runner = Mock(return_value=subprocess.CompletedProcess(
+        [], int(failure == "exit"), "invalid" if failure == "invalid" else json.dumps(suggestions), "failed"
+    ))
+    if failure == "os":
+        runner.side_effect = OSError("unavailable")
+    monkeypatch.setattr(subprocess, "run", runner)
+    assert cmd_lint(argparse.Namespace(spec="feature", json=True, critique=True), repo_root=tmp_path) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["lint"][0]["errors"] == []
+    assert ("error" in payload["critique"]) == bool(failure)
+
+
+@pytest.mark.parametrize("pinned_valid", [True, False])
+def test_autopilot_resume_lints_pinned_contract(tmp_path, monkeypatch, pinned_valid):
+    from spec_runtime import autopilot
+    from spec_runtime.spec_metadata import iter_spec_metadata
+
+    source = write_spec(tmp_path)
+    run = orch.RunState(run_id="feature-test", spec_id="feature", branch="code/feature--test")
+    orch._pin_run_spec_from_file(tmp_path, run, source, tree_root=tmp_path)
+    if pinned_valid:
+        write_spec(tmp_path, frontmatter="depends_on: [missing]", body="## Goal\nIncomplete")
+    else:
+        orch._run_spec_snapshot_path(tmp_path, run.run_id).write_text("---\nid: feature\n---\n## Goal\nIncomplete")
+    monkeypatch.setattr(autopilot, "resolve_resume_run", lambda *a, **kw: (run.run_id, "resume-implement"))
+    monkeypatch.setattr(autopilot, "read_latest_run_record", lambda *a, **kw: asdict(run))
+    reasons = autopilot.spec_graph_skip_reasons(tmp_path, iter_spec_metadata(tmp_path))
+    assert ("feature" not in reasons) == pinned_valid
+    monkeypatch.setattr(autopilot, "get_spec_status", lambda *a, **kw: "in-progress")
+    monkeypatch.setattr(autopilot, "project_canonical_spec_status", lambda *a, **kw: None)
+    monkeypatch.setattr(autopilot, "_annotate_candidate_with_lease", lambda candidate, snapshot: candidate)
+    queue = autopilot.build_dispatch_queue(
+        tmp_path, git_state=SimpleNamespace(merged_specs=set()), run_index=Mock()
+    )
+    assert [candidate.run_id for candidate in queue] == ([run.run_id] if pinned_valid else [])
 
 
 def test_doctor_can_diagnose_invalid_config_even_when_lint_cannot_run(tmp_path, monkeypatch, capsys):

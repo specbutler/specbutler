@@ -1310,6 +1310,10 @@ description: Exercise the installed Windows lifecycle fixture
 
 # Installed Windows lifecycle fixture
 
+## Goal
+
+Exercise the installed lifecycle through operator resolution.
+
 ## Acceptance Criteria
 
 - [ ] Resolve the deterministic operator question and commit the answer.
@@ -1592,6 +1596,14 @@ description: Exercise installed Windows autopilot supervision
 ---
 
 # Windows autopilot fixture
+
+## Goal
+
+Exercise installed autopilot supervision.
+
+## Acceptance Criteria
+
+- [ ] Dispatch and adopt the supervised child without duplication.
 """,
         encoding="utf-8",
     )

@@ -120,13 +120,18 @@ def format_lint(results: list[LintResult]) -> str:
 def cmd_lint(args, *, repo_root: Path) -> int:
     root = repo_root
     results = lint_specs(root, args.spec)
-    print(json.dumps([asdict(r) for r in results]) if args.json else format_lint(results))
-    if args.critique:
-        critique(root, args.spec)
+    suggestions = critique(root, args.spec) if args.critique else None
+    if args.json:
+        payload = [asdict(r) for r in results]
+        print(json.dumps({"lint": payload, "critique": suggestions} if args.critique else payload))
+    else:
+        print(format_lint(results))
+        if args.critique:
+            print(json.dumps(suggestions, indent=2))
     return int(any(r.errors for r in results))
 
 
-def critique(root: Path, spec_id: str) -> None:
+def critique(root: Path, spec_id: str) -> dict:
     """Advisory review using the adapter's restricted review boundary."""
     import subprocess
     import tempfile
@@ -162,8 +167,7 @@ def critique(root: Path, spec_id: str) -> None:
             )
             result = subprocess.run(command, input=prompt, text=True, capture_output=True, cwd=directory, timeout=300)
             if result.returncode:
-                print(f"Critique unavailable (advisory): {result.stderr.strip()}")
-                return
+                return {"error": f"Critique unavailable (advisory): {result.stderr.strip()}"}
             suggestions = json.loads(output.read_text() if output.exists() else result.stdout)
             if not isinstance(suggestions, dict) or any(
                 not isinstance(suggestions.get(key), list)
@@ -171,6 +175,6 @@ def critique(root: Path, spec_id: str) -> None:
                 for key in keys
             ):
                 raise ValueError("review agent returned an invalid suggestion structure")
-            print(json.dumps({key: suggestions[key] for key in keys}, indent=2))
+            return {key: suggestions[key] for key in keys}
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        print(f"Critique unavailable (advisory): {exc}")
+        return {"error": f"Critique unavailable (advisory): {exc}"}
