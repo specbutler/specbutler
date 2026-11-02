@@ -453,12 +453,20 @@ def test_parent_child_grandchild_termination(tmp_path: Path) -> None:
     identities = []
     try:
         deadline = time.monotonic() + 10
-        while not (child_pid_path.exists() and grandchild_pid_path.exists()):
+        # The helpers open each file before writing the pid; wait for content.
+        while not all(
+            path.exists() and path.read_text(encoding="utf-8").strip()
+            for path in (child_pid_path, grandchild_pid_path)
+        ):
             assert parent.poll() is None, "parent exited before creating its descendants"
             assert time.monotonic() < deadline, "timed out waiting for descendant PIDs"
             time.sleep(0.1)
 
-        pids = [parent.pid, int(child_pid_path.read_text()), int(grandchild_pid_path.read_text())]
+        pids = [
+            parent.pid,
+            int(child_pid_path.read_text(encoding="utf-8")),
+            int(grandchild_pid_path.read_text(encoding="utf-8")),
+        ]
         identities = [read_process_identity(pid) for pid in pids]
         assert all(identity is not None for identity in identities)
         parent_identity = identities[0]
@@ -1679,7 +1687,8 @@ description: Exercise installed Windows autopilot supervision
                     )
                 )
                 active_item = active_payload[auto_id]
-            except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+            # PermissionError: Windows refuses reads while autopilot replaces the file.
+            except (FileNotFoundError, PermissionError, json.JSONDecodeError, KeyError, TypeError):
                 return False
             return (
                 active_item.get("adoption_generation", 0) >= 1
@@ -1716,7 +1725,8 @@ description: Exercise installed Windows autopilot supervision
         def graceful_stop_was_requested() -> bool:
             try:
                 return json.loads(shutdown_path.read_text(encoding="utf-8"))["phase"] == "graceful"
-            except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError):
+            # PermissionError: Windows refuses reads while autopilot replaces the file.
+            except (FileNotFoundError, PermissionError, json.JSONDecodeError, KeyError, TypeError):
                 return False
 
         _wait_until(
