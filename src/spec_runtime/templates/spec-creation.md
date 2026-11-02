@@ -11,4 +11,4 @@ when the work needs more. Explicitly record excluded behavior and open questions
 Use the session-provided destination and matching frontmatter ID.
 
 Leave publication to the operator. You may commit the draft locally, but do not
-push, open a pull request, merge, or start implementation.
+push, open a pull request, merge, or start implementation. Do not run `git push`.

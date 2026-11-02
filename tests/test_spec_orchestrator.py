@@ -39598,7 +39598,7 @@ class TestConsumedRequestDispatch:
         )
         (repo / "specs" / "stranded-spec.md").write_text(
             "---\nid: stranded-spec\nstatus: not-started\ndepends_on: []\n"
-            "description: stranded\n---\n\n## Goal\nx\n"
+            "description: stranded\n---\n\n## Goal\nx\n\n## Acceptance Criteria\n- [ ] Resume the saved run.\n"
         )
 
         queue = autopilot.build_dispatch_queue(repo)
@@ -39627,7 +39627,7 @@ class TestConsumedRequestDispatch:
         )
         (repo / "specs" / "asking-spec.md").write_text(
             "---\nid: asking-spec\nstatus: not-started\ndepends_on: []\n"
-            "description: asking\n---\n\n## Goal\nx\n"
+            "description: asking\n---\n\n## Goal\nx\n\n## Acceptance Criteria\n- [ ] Await operator input.\n"
         )
 
         queue = autopilot.build_dispatch_queue(repo)
