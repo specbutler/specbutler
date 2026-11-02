@@ -846,6 +846,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     if _update_gitignore(repo_root):
         print("  Updated .gitignore")
 
+    for prompt_name in ("spec-creation.md", "task-scoping.md"):
+        if _copy_template(repo_root, prompt_name, f"prompts/{prompt_name}", force=force):
+            print(f"  Created prompts/{prompt_name}")
+
     # Copy templates — track skipped files so we can warn at the end
     skipped: list[str] = []
 
@@ -923,7 +927,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print(f"      {view_cmd}")
 
     # Build list of files to include in git add
-    all_changed: list[str] = [".spec.toml", ".gitignore", "specs/"]
+    all_changed: list[str] = [".spec.toml", ".gitignore", "specs/", "prompts/spec-creation.md", "prompts/task-scoping.md"]
     if ".github/prompts/review.md" not in declined:
         all_changed.append(".github/prompts/")
     for name in ("AGENTS.md", "CLAUDE.md", "CODEX.md"):

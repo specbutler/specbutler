@@ -322,6 +322,9 @@ def repo(tmp_path: Path) -> Path:
         description: A test spec
         ---
 
+        ## Goal
+        Deliver the requested feature.
+
         ## Acceptance Criteria
         - [ ] First criterion
         - [ ] Second criterion
@@ -354,6 +357,9 @@ def repo(tmp_path: Path) -> Path:
               max: 24
               required: true
         ---
+
+        ## Goal
+        Deliver the requested feature.
 
         ## Acceptance Criteria
         - [ ] Intake collects answers
@@ -31226,6 +31232,7 @@ class TestBaseOverride:
         assert observed == {"status": "failed", "phase": "implement"}
 
     def test_cmd_run_sets_base_ref_on_new_run(self, repo: Path):
+        _run_git("update-ref", "refs/remotes/origin/feature-branch", "origin/master", cwd=repo)
         captured: dict[str, str] = {}
 
         def fake_run_full_workflow(run: orch.RunState, _repo_root: Path, **_kw: object) -> str:

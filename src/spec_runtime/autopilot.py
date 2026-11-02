@@ -1283,7 +1283,7 @@ def spec_graph_skip_reasons(
         merged_spec_ids=merged,
         external_spec_ids=task_spec_ids(repo_root, config=config),
     )
-    return {
+    reasons = {
         spec.spec_id: format_spec_graph_problems(problems[spec.spec_id])
         for spec in specs
         if spec.spec_id in problems
@@ -1292,6 +1292,12 @@ def spec_graph_skip_reasons(
         and spec.spec_id not in hidden
         and spec.spec_id not in merged
     }
+    from .spec_lint import lint_specs
+    for result in lint_specs(repo_root, merged_spec_ids=merged):
+        if result.errors and result.spec_id not in merged and result.spec_id not in hidden:
+            reasons[result.spec_id] = "; ".join(result.errors)
+    return reasons
+
 
 
 def _block_debugger_auto_resume_available(run_record: dict) -> bool:
