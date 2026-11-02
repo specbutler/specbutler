@@ -27443,6 +27443,86 @@ class TestMergeBehindBranchUpdate:
         assert merge_commands, "merge was never attempted"
         assert all("5ac0ed1234567" in cmd for cmd in merge_commands), merge_commands
 
+    def test_phase_merge_syncs_when_forge_refuses_a_stale_base(self, repo: Path):
+        """GitHub may say BLOCKED, not BEHIND, after the base moves; the merge refusal triggers the sync."""
+        run = self._make_run()
+        run.save(repo)
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        pr_open = {
+            "number": 12,
+            "state": "OPEN",
+            "body": "## Review\nReview-Owner: platform-team\n",
+            "headRefOid": "deadbeef1234567",
+            "baseRefOid": "base1234",
+            "mergeStateStatus": "BLOCKED",
+        }
+        push_called = False
+        merge_commands: list[list[str]] = []
+
+        def mock_head_sha(_path):
+            return "5ac0ed1234567" if push_called else "deadbeef1234567"
+
+        def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
+            nonlocal push_called
+            if cmd[:3] == ["gh", "auth", "status"]:
+                return subprocess.CompletedProcess(cmd, 0, "ok", "")
+            if cmd[:2] == ["git", "push"]:
+                push_called = True
+                return subprocess.CompletedProcess(cmd, 0, "pushed", "")
+            if cmd[:3] == ["gh", "pr", "merge"]:
+                merge_commands.append(list(cmd))
+                if not push_called:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        1,
+                        "",
+                        "X Pull request o/r#12 is not mergeable: the head branch is not up to date "
+                        "with the base branch.",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, "merged", "")
+            if cmd[:3] == ["git", "tag", "--list"]:
+                return subprocess.CompletedProcess(cmd, 0, f"spec/merged/{run.spec_id}\n", "")
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch, "run_subprocess", side_effect=mock_run_subprocess),
+            patch.object(orch, "_find_pr_for_branch", return_value=pr_open),
+            patch.object(orch, "_try_auto_merge", return_value="unavailable"),
+            patch.object(
+                orch,
+                "_merge_origin_master",
+                return_value=orch.MergeOriginMasterResult(status="success"),
+            ) as merge_master_mock,
+            patch.object(orch, "_resolve_git_ref_sha", return_value="mastersha"),
+            patch.object(orch, "_head_sha", side_effect=mock_head_sha),
+            patch.object(orch, "_required_checks_green", return_value=(True, "")),
+            patch.object(orch, "run_or_fail", return_value=True),
+            patch.object(orch, "_poll_sleep"),
+            patch.object(orch, "refresh_merge_completion_state", return_value=("git fetch", "", "origin/master")),
+            patch.object(orch, "_wait_for_pr_merged", return_value=(False, "stopped after merge")),
+        ):
+            orch.phase_merge(run, repo)
+
+        merge_master_mock.assert_called_once()
+        assert push_called
+        assert run.last_error == "stopped after merge"
+        assert "5ac0ed1234567" in merge_commands[-1], merge_commands
+
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            ("X Pull request o/r#60 is not mergeable: the head branch is not up to date with the base branch.", True),
+            ("Head branch is out of date. Review and try the merge again.", True),
+            ("X Pull request o/r#60 is not mergeable: the merge commit cannot be cleanly created.", False),
+            ("Required status check \"ci\" is expected.", False),
+        ],
+    )
+    def test_is_stale_base_merge_error(self, message: str, expected: bool):
+        assert orch._is_stale_base_merge_error(message) is expected
+
     def test_phase_merge_fails_when_master_merge_fails(self, repo: Path):
         """When local origin/master merge fails, phase_merge returns failed."""
         run = self._make_run()

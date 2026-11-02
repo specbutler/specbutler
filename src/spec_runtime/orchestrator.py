@@ -24416,6 +24416,19 @@ def _try_auto_merge(
         _poll_sleep(min(poll_interval, remaining))
 
 
+def _is_stale_base_merge_error(text: str) -> bool:
+    """True when the forge refused a merge because the head is behind its base."""
+    lowered = (text or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "not up to date with the base branch",
+            "head branch is out of date",
+            "branch is out-of-date",
+        )
+    )
+
+
 def _manual_merge(
     run: RunState,
     repo_root: Path,
@@ -24427,6 +24440,7 @@ def _manual_merge(
     *,
     use_auto_merge: bool = True,
     prior_merge_attempts: int = 0,
+    force_base_sync: bool = False,
 ) -> str:
     """Poll required checks then squash-merge the PR.
 
@@ -24492,7 +24506,7 @@ def _manual_merge(
         return "failed"
     # If branch is behind base, merge origin/master locally and push.
     merge_state = str((latest_pr or pr_data).get("mergeStateStatus", "")).strip().upper()
-    if merge_state == "BEHIND":
+    if merge_state == "BEHIND" or force_base_sync:
         logger.info(
             f"PR #%s branch is behind base — merging {BASE_REF} locally...",
             pr_number,
@@ -24671,6 +24685,27 @@ def _manual_merge(
                     )
                 _poll_sleep(MERGE_CHECKS_POLL_INTERVAL_SECONDS)
                 continue
+        if _is_stale_base_merge_error(merge_err) and not force_base_sync:
+            # GitHub can report BLOCKED (checks pending) rather than BEHIND for
+            # a branch the base has moved past, so the sync above was skipped.
+            # The forge refusal is authoritative: sync once and go again.
+            logger.info(
+                "PR #%s is not up to date with %s; merging the base and retrying.",
+                pr_number,
+                BASE_REF,
+            )
+            return _manual_merge(
+                run,
+                repo_root,
+                worktree_path,
+                branch,
+                pr_number,
+                pr_head_sha,
+                pr_data,
+                use_auto_merge=use_auto_merge,
+                prior_merge_attempts=prior_merge_attempts + merge_try + 1,
+                force_base_sync=True,
+            )
         run.last_error = f"gh pr merge failed: {merge_err}"
         return "failed"
     if not merged_successfully:
