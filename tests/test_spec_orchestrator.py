@@ -53,6 +53,7 @@ from spec_runtime.config import CoordinationConfig, VerifyGateConfig
 from spec_runtime.control_plane import save_run_lease
 from spec_runtime.control_plane.lease import build_lease
 from spec_runtime.coordination import CoordinatorError, CoordinatorLeaseConflictError
+from spec_runtime.forge import MergeResult
 from spec_runtime.process_supervisor import LifetimeMode, ProcessIdentity, SupervisionToken
 from spec_runtime.review_bootstrap import (
     PreparedReviewBootstrapSandbox,
@@ -27761,6 +27762,40 @@ class TestMergeBehindBranchUpdate:
         # The final merge pins the post-sync head, not the head readiness saw.
         assert merge_commands, "merge was never attempted"
         assert all("5ac0ed1234567" in cmd for cmd in merge_commands), merge_commands
+
+    def test_auto_merge_stale_base_refusal_routes_to_forced_sync(self, repo: Path):
+        """The initial `gh pr merge --auto` can be refused for a stale base too."""
+        run = self._make_run()
+        run.save(repo)
+        forge = MagicMock()
+        forge.merge_pr.return_value = MergeResult(
+            ok=False,
+            message="X Pull request o/r#12 is not mergeable: the head branch is not up to date with the base branch.",
+        )
+
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=repo),
+            patch.object(orch, "_assert_publication_transition_safe"),
+            patch.object(orch, "_forge", return_value=forge),
+        ):
+            assert orch._try_auto_merge(run, repo, 12, expected_head_sha="deadbeef1234567") == "stale_base"
+
+        pr_open = {"number": 12, "state": "OPEN", "headRefOid": "deadbeef1234567", "mergeStateStatus": "BLOCKED"}
+        with (
+            patch.object(orch, "run_subprocess", return_value=subprocess.CompletedProcess([], 0, "ok", "")),
+            patch.object(orch, "refresh_merge_completion_state", return_value=("git fetch", "", "origin/master")),
+            patch.object(orch, "is_spec_merged", return_value=False),
+            patch.object(orch, "_find_pr_for_branch", return_value=pr_open),
+            patch.object(orch, "_head_sha", return_value="deadbeef1234567"),
+            patch.object(orch, "_required_checks_green", return_value=(True, "")),
+            patch.object(orch, "_revalidate_readiness_pr_head", return_value=None),
+            patch.object(orch, "_try_auto_merge", return_value="stale_base"),
+            patch.object(orch, "_manual_merge", return_value="failed") as manual_mock,
+        ):
+            orch.phase_merge(run, repo)
+
+        manual_mock.assert_called_once()
+        assert manual_mock.call_args.kwargs["force_base_sync"] is True
 
     def test_phase_merge_syncs_when_forge_refuses_a_stale_base(self, repo: Path):
         """GitHub may say BLOCKED, not BEHIND, after the base moves; the merge refusal triggers the sync."""

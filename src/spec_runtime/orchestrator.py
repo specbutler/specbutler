@@ -24771,6 +24771,8 @@ def _try_auto_merge(
             flow with --auto enabled.
         "unavailable_after_auto_no_auto" – auto-merge command was attempted and
             reported unsupported; retry manual flow without --auto.
+        "stale_base"  – the forge refused the merge because the base moved;
+            retry the manual flow with a forced base sync.
         "failed"      – auto-merge was enabled but the merge failed (run.last_error set).
     """
     worktree_path = resolve_worktree_path(run, repo_root)
@@ -24815,6 +24817,15 @@ def _try_auto_merge(
             )
             _poll_sleep(MERGE_CHECKS_POLL_INTERVAL_SECONDS)
             return "unavailable_after_auto"
+        # The base moved past the head (GitHub may still say BLOCKED rather
+        # than BEHIND); the manual path merges the base before merging.
+        if _is_stale_base_merge_error(err):
+            logger.info(
+                "Auto-merge refused PR #%s for a stale base; syncing with %s first.",
+                pr_number,
+                BASE_REF,
+            )
+            return "stale_base"
         # Any other error is a real failure.
         run.last_error = f"gh pr merge --auto failed: {err}"
         return "failed"
@@ -25819,7 +25830,7 @@ def phase_merge(run: RunState, repo_root: Path) -> str:
             # Auto-merge unavailable — fall back to manual poll-then-merge.
             manual_use_auto_merge = True
             prior_merge_attempts = 0
-            if auto == "unavailable_after_auto":
+            if auto in {"unavailable_after_auto", "stale_base"}:
                 prior_merge_attempts = 1
             elif auto == "unavailable_after_auto_no_auto":
                 manual_use_auto_merge = False
@@ -25834,6 +25845,7 @@ def phase_merge(run: RunState, repo_root: Path) -> str:
                 pr_data,
                 use_auto_merge=manual_use_auto_merge,
                 prior_merge_attempts=prior_merge_attempts,
+                force_base_sync=auto == "stale_base",
             )
             if manual != "passed":
                 return manual
