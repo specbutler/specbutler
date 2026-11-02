@@ -91,12 +91,36 @@ def load_review_rounds(run_dir: Path) -> list[ReviewRound]:
                 decision=str(entry.get("decision", "") or ""),
                 model_decision=str(entry.get("model_decision", "") or ""),
                 recorded_at=str(entry.get("recorded_at", "") or ""),
-                outstanding_findings=[f for f in findings if isinstance(f, dict)]
-                if isinstance(findings, list)
-                else [],
+                outstanding_findings=_with_stable_ids(
+                    [f for f in findings if isinstance(f, dict)] if isinstance(findings, list) else [],
+                    round_number=round_number,
+                ),
             )
         )
     return rounds
+
+
+def _with_stable_ids(findings: list[dict], *, round_number: int) -> list[dict]:
+    """Give id-less or duplicate-id (legacy) findings a stable, unique id.
+
+    Without a unique id the reviewer cannot mark a prior finding resolved, so
+    it would stay unresolved, and blocking, forever.
+    """
+    used = {str(f.get("id", "") or "").strip() for f in findings}
+    seen: set[str] = set()
+    normalized: list[dict] = []
+    for index, finding in enumerate(findings, start=1):
+        finding_id = str(finding.get("id", "") or "").strip()
+        if finding_id and finding_id not in seen:
+            seen.add(finding_id)
+            normalized.append(finding)
+            continue
+        candidate, suffix = f"R{round_number}-{index}", 2
+        while candidate in used:
+            candidate, suffix = f"R{round_number}-{index}-{suffix}", suffix + 1
+        used.add(candidate)
+        normalized.append({**finding, "id": candidate})
+    return normalized
 
 
 def load_extra_rounds_granted(run_dir: Path) -> int:
@@ -252,6 +276,7 @@ def render_rereview_rules_section(*, last_reviewed_head_sha: str, incremental_di
 _HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 _BINARY_LINE = re.compile(r"^Binary files (.+) and (.+) differ$")
 _DIFF_GIT_UNQUOTED = re.compile(r"^diff --git a/(.+) b/(.+)$")
+_DIFF_GIT_QUOTED = re.compile(r'^diff --git ("(?:[^"\\]|\\.)*"|a/\S+) ("(?:[^"\\]|\\.)*"|b/\S+)$')
 _C_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
 WHOLE_FILE_SPAN = (1, 2**31 - 1)
 
@@ -291,6 +316,20 @@ def _diff_side_path(raw: str, prefix: str) -> str | None:
     return path[len(prefix) :] if path.startswith(prefix) else path
 
 
+def _diff_git_header_paths(line: str) -> list[str]:
+    """Return the path of a ``diff --git`` header whose two sides name the same file."""
+    quoted = _DIFF_GIT_QUOTED.match(line)
+    if quoted:
+        old = _diff_side_path(quoted.group(1), "a/")
+        new = _diff_side_path(quoted.group(2), "b/")
+        if old and old == new:
+            return [old]
+    header = _DIFF_GIT_UNQUOTED.match(line)
+    if header and header.group(1) == header.group(2):
+        return [header.group(1)]
+    return []
+
+
 def changed_line_ranges(unified_zero_diff: str) -> dict[str, list[tuple[int, int]]]:
     """Map file paths to changed line ranges from a ``-U0`` diff.
 
@@ -325,10 +364,7 @@ def changed_line_ranges(unified_zero_diff: str) -> dict[str, list[tuple[int, int
             finish_file()
             in_file, has_hunks = True, False
             old_path = new_path = None
-            header = _DIFF_GIT_UNQUOTED.match(line)
-            header_paths = (
-                [header.group(1)] if header and header.group(1) == header.group(2) else []
-            )
+            header_paths = _diff_git_header_paths(line)
             continue
         if not has_hunks:
             if line.startswith("--- "):
@@ -358,24 +394,48 @@ def changed_line_ranges(unified_zero_diff: str) -> dict[str, list[tuple[int, int
             new_start = int(match.group(3))
             new_count = int(match.group(4)) if match.group(4) is not None else 1
             if new_path is not None:
-                end = new_start + new_count - 1 if new_count > 0 else new_start
-                add(new_path, (max(1, new_start), max(1, end)))
+                if new_count > 0:
+                    add(new_path, (max(1, new_start), new_start + new_count - 1))
+                else:
+                    # A pure deletion sits between new lines N and N+1.
+                    add(new_path, (max(1, new_start), new_start + 1))
             if old_path is not None and old_path != new_path and old_count > 0:
                 add(old_path, (max(1, old_start), max(1, old_start + old_count - 1)))
     finish_file()
     return ranges
 
 
+def _ranges_for_file(file_path: str, ranges: dict[str, list[tuple[int, int]]]) -> list[tuple[int, int]]:
+    """Look up a finding's file, tolerating ``./``, ``a/``/``b/`` and absolute checkout paths."""
+    path = file_path.replace("\\", "/").strip()
+    while path.startswith("./"):
+        path = path[2:]
+    if path in ranges:
+        return ranges[path]
+    for prefix in ("a/", "b/"):
+        if path.startswith(prefix) and path[len(prefix) :] in ranges:
+            return ranges[path[len(prefix) :]]
+    if path.startswith("/"):
+        # Reviewers with a checkout may report absolute paths inside it.
+        matches = [key for key in ranges if path.endswith("/" + key)]
+        if matches:
+            return ranges[max(matches, key=len)]
+    return []
+
+
 def finding_touches_ranges(finding: dict, ranges: dict[str, list[tuple[int, int]]]) -> bool:
-    file_path = str(finding.get("file", "") or "").strip().removeprefix("./")
-    spans = ranges.get(file_path)
+    spans = _ranges_for_file(str(finding.get("file", "") or ""), ranges)
     if not spans:
         return False
     try:
-        start = int(finding.get("start_line") or 1)
+        start = int(finding.get("start_line") or 0)
         end = int(finding.get("end_line") or start)
     except (TypeError, ValueError):
         return True
+    if start <= 0:
+        # A file-level finding on a changed file touches the change.
+        return True
+    end = max(start, end)
     return any(start <= span_end and span_start <= end for span_start, span_end in spans)
 
 

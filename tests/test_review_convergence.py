@@ -451,6 +451,240 @@ def test_new_p1_on_dot_prefixed_path_touching_changed_lines_blocks(path: str):
     assert review_convergence.finding_touches_ranges({"file": path, "start_line": 5}, {key: [(5, 5)]})
 
 
+# One incremental -U0 diff exercising every file-level change shape.
+_ELIGIBILITY_DIFF = (
+    "diff --git a/gone.py b/gone.py\n"
+    "deleted file mode 100644\n"
+    "--- a/gone.py\n"
+    "+++ /dev/null\n"
+    "@@ -1,30 +0,0 @@\n"
+    "-x\n"
+    "diff --git a/old.py b/new.py\n"
+    "similarity index 90%\n"
+    "rename from old.py\n"
+    "rename to new.py\n"
+    "--- a/old.py\n"
+    "+++ b/new.py\n"
+    "@@ -20,2 +20 @@\n"
+    "-x\n-y\n+z\n"
+    "diff --git a/before.py b/after.py\n"
+    "similarity index 100%\n"
+    "rename from before.py\n"
+    "rename to after.py\n"
+    "diff --git a/added.py b/added.py\n"
+    "new file mode 100644\n"
+    "--- /dev/null\n"
+    "+++ b/added.py\n"
+    "@@ -0,0 +1,5 @@\n"
+    "+a\n"
+    'diff --git "a/sp ac\\303\\251.txt" "b/sp ac\\303\\251.txt"\n'
+    "new file mode 100644\n"
+    "index 0000000..e69de29\n"
+    "diff --git a/src/app.py b/src/app.py\n"
+    "--- a/src/app.py\n"
+    "+++ b/src/app.py\n"
+    "@@ -40,3 +40,3 @@\n"
+    "-a\n+b\n"
+    "@@ -61,2 +60,0 @@\n"
+    "-gone\n"
+)
+
+
+def _f(finding_id: str, severity: str, file: str = "src/app.py", line: int | None = 10, **extra) -> dict:
+    return {**_finding(finding_id, severity, file=file, line=line or 0), "start_line": line, "end_line": line, **extra}
+
+
+_ELIGIBILITY_CASES = [
+    # (case, prior findings, classifications, new findings, decision, [(id, blocking)])
+    ("new P1 on a deleted file", [], [], [_f("N1", "P1", "gone.py", 7)], "request_changes", [("N1", True)]),
+    ("new P1 on a renamed file's new side", [], [], [_f("N1", "P1", "new.py", 20)], "request_changes", [("N1", True)]),
+    ("new P1 on a renamed file's removed lines", [], [], [_f("N1", "P1", "old.py", 21)], "request_changes", [("N1", True)]),
+    ("new P1 on a pure rename", [], [], [_f("N1", "P1", "after.py", 3)], "request_changes", [("N1", True)]),
+    ("new P1 on the old name of a pure rename", [], [], [_f("N1", "P1", "before.py", 3)], "request_changes", [("N1", True)]),
+    ("new P1 on a new file", [], [], [_f("N1", "P1", "added.py", 2)], "request_changes", [("N1", True)]),
+    ("new P1 on an empty new file with a quoted path", [], [], [_f("N1", "P1", "sp acé.txt", None)], "request_changes", [("N1", True)]),
+    ("new P1 next to a pure deletion", [], [], [_f("N1", "P1", line=61)], "request_changes", [("N1", True)]),
+    ("new file-level P1 on a changed file", [], [], [_f("N1", "P1", line=None)], "request_changes", [("N1", True)]),
+    ("new P1 with an absolute checkout path", [], [], [_f("N1", "P1", "/tmp/checkout/src/app.py", 41)], "request_changes", [("N1", True)]),
+    ("new P1 with a diff-side prefix", [], [], [_f("N1", "P1", "b/src/app.py", 41)], "request_changes", [("N1", True)]),
+    ("new P1 on unchanged lines", [], [], [_f("N1", "P1", line=10)], "approved", [("N1", False)]),
+    ("new P1 on an unchanged file", [], [], [_f("N1", "P1", "src/other.py", 41)], "approved", [("N1", False)]),
+    ("new P1 without a file", [], [], [_f("N1", "P1", "", None)], "approved", [("N1", False)]),
+    ("new P0 anywhere", [], [], [_f("N1", "P0", "src/other.py", 1)], "request_changes", [("N1", True)]),
+    (
+        "restated non-blocking prior whose lines moved into the change is treated as new",
+        [_f("F1", "P1", blocking=False)],
+        [{"id": "F1", "status": "unresolved"}],
+        [_f("F1", "P1", line=41)],
+        "request_changes",
+        [("F1", False), ("F1-new", True)],
+    ),
+    (
+        "restated non-blocking prior at the same lines stays non-blocking",
+        [_f("F1", "P1", blocking=False)],
+        [{"id": "F1", "status": "unresolved"}],
+        [_f("F1", "P1", line=10)],
+        "approved",
+        [("F1", False)],
+    ),
+    (
+        "id collision at a different location in the change blocks",
+        [_f("F1", "P2")],
+        [{"id": "F1", "status": "unresolved"}],
+        [_f("F1", "P1", "new.py", 20, title="Other")],
+        "request_changes",
+        [("F1", False), ("F1-new", True)],
+    ),
+    (
+        "id collision with a resolved prior blocks",
+        [_f("F1", "P1")],
+        [{"id": "F1", "status": "resolved"}],
+        [_f("F1", "P1", line=41)],
+        "request_changes",
+        [("F1-new", True)],
+    ),
+    (
+        "prior P1 downgraded to P2 at the same lines stops blocking",
+        [_f("F1", "P1", blocking=True)],
+        [{"id": "F1", "status": "unresolved"}],
+        [_f("F1", "P2")],
+        "approved",
+        [("F1", False)],
+    ),
+    (
+        "prior P0 downgraded to P1 at the same lines keeps blocking",
+        [_f("F1", "P0", blocking=True)],
+        [{"id": "F1", "status": "unresolved"}],
+        [_f("F1", "P1")],
+        "request_changes",
+        [("F1", True)],
+    ),
+    (
+        "restatement without a severity keeps the prior eligibility",
+        [_f("F1", "P1", blocking=True)],
+        [{"id": "F1", "status": "unresolved"}],
+        [_f("F1", "")],
+        "request_changes",
+        [("F1", True)],
+    ),
+    (
+        "prior P2 raised to P1 in the change supersedes the prior",
+        [_f("F1", "P2", line=41, blocking=False)],
+        [{"id": "F1", "status": "unresolved"}],
+        [_f("F1", "P1", line=41)],
+        "request_changes",
+        [("F1-new", True)],
+    ),
+    (
+        "prior P2 raised to P1 outside the change stays non-blocking",
+        [_f("F1", "P2", blocking=False)],
+        [{"id": "F1", "status": "unresolved"}],
+        [_f("F1", "P1")],
+        "approved",
+        [("F1-new", False)],
+    ),
+    (
+        "legacy prior P1 without a blocking flag blocks",
+        [_f("F1", "P1")],
+        [],
+        [],
+        "request_changes",
+        [("F1", True)],
+    ),
+    (
+        "legacy prior without severity or location does not block",
+        [{"id": "F1", "title": "Old"}],
+        [],
+        [],
+        "approved",
+        [("F1", False)],
+    ),
+    (
+        "legacy priors sharing an id are both kept",
+        [_f("F1", "P2"), _f("F1", "P1", line=80)],
+        [],
+        [],
+        "request_changes",
+        [("F1", False), ("F1", True)],
+    ),
+    (
+        "new findings without or with duplicate ids get unique ids",
+        [],
+        [],
+        [_f("", "P0", line=41), _f("N2", "P3"), _f("N2", "P3", line=12)],
+        "request_changes",
+        [("N1", True), ("N2", False), ("N2-new", False)],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("prior", "classifications", "findings", "decision", "expected"),
+    [case[1:] for case in _ELIGIBILITY_CASES],
+    ids=[case[0] for case in _ELIGIBILITY_CASES],
+)
+def test_rereview_eligibility_and_carry_forward_table(prior, classifications, findings, decision, expected):
+    computed = compute_review_decision(
+        model_decision="approved" if decision == "request_changes" else "request_changes",
+        findings=findings,
+        prior_findings=prior,
+        prior_classifications=classifications,
+        changed_ranges=review_convergence.changed_line_ranges(_ELIGIBILITY_DIFF),
+    )
+
+    assert computed.decision == decision
+    assert [(f["id"], f["blocking"]) for f in computed.outstanding_findings] == expected
+    assert computed.blocking_ids == [i for i, blocking in expected if blocking]
+    # Blocking eligibility survives a later round that only restates the findings.
+    carried = compute_review_decision(
+        model_decision="approved",
+        findings=[],
+        prior_findings=computed.outstanding_findings,
+        prior_classifications=[],
+        changed_ranges={},
+    )
+    assert [f["blocking"] for f in carried.outstanding_findings] == [b for _, b in expected]
+
+
+def test_legacy_ledger_findings_without_or_with_duplicate_ids_get_classifiable_ids(tmp_path: Path):
+    path = review_convergence.review_rounds_path(tmp_path)
+    path.write_text(
+        json.dumps(
+            {
+                "rounds": [
+                    {
+                        "round_number": 1,
+                        "reviewed_head_sha": HEAD,
+                        "decision": "request_changes",
+                        "outstanding_findings": [
+                            {"title": "No id", "severity": "P1"},
+                            {"id": "F1", "title": "First", "severity": "P2"},
+                            {"id": "F1", "title": "Second", "severity": "P1"},
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    (round_one,) = review_convergence.load_review_rounds(tmp_path)
+    ids = [f["id"] for f in round_one.outstanding_findings]
+    section = review_convergence.render_prior_findings_section(
+        round_one.outstanding_findings, round_number=2, implementer_summary=""
+    )
+    computed = compute_review_decision(
+        model_decision="request_changes",
+        findings=[],
+        prior_findings=round_one.outstanding_findings,
+        prior_classifications=[{"id": i, "status": "resolved"} for i in ids],
+        changed_ranges={},
+    )
+
+    assert ids == ["R1-1", "F1", "R1-3"]
+    assert all(f"id `{i}`" in section for i in ids)
+    assert computed.decision == "approved"
+
+
 def _gate_evaluation(tmp_path: Path, *, decision: str, findings: list[dict], **extra) -> GateEvaluation:
     from spec_runtime.review_gate import evaluate_review_gate
 
@@ -693,9 +927,11 @@ def test_review_round_is_not_recorded_when_phase_fails_after_review(tmp_path: Pa
         patch.object(orch, "_remote_branch_head_sha", return_value="c" * 40),
     ):
         patches, pr = _patch_local_review_phase(tmp_path, result, tmp_path / "review-result.json")
+        # The helper's own PR lookup (index 9) is skipped so the moved head above stays in effect.
         with (
             patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
-            patches[6], patches[7], patches[8],
+            patches[6], patches[7], patches[8], patches[10], patches[11], patches[12],
+            patch.object(orch, "run_subprocess", return_value=subprocess.CompletedProcess([], 0, "", "")),
         ):
             outcome = orch._phase_review_local(
                 run, tmp_path, pr_data=pr, expected_head_sha=HEAD, expected_base_sha=BASE

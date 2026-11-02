@@ -433,7 +433,21 @@ _SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 
 
 def _normalized_file(finding: dict[str, Any]) -> str:
-    return str(finding.get("file", "") or "").strip().removeprefix("./")
+    path = str(finding.get("file", "") or "").replace("\\", "/").strip()
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def _same_file(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
+    path, prior_path = _normalized_file(finding), _normalized_file(prior)
+    if path == prior_path:
+        return True
+    if not path or not prior_path:
+        return False
+    # One side may be an absolute path inside the review checkout.
+    shorter, longer = sorted((path, prior_path), key=len)
+    return longer.startswith("/") and longer.endswith("/" + shorter)
 
 
 def _line_span(finding: dict[str, Any]) -> tuple[int, int] | None:
@@ -452,7 +466,7 @@ def _normalized_title(finding: dict[str, Any]) -> str:
 
 
 def _same_location(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
-    """Whether two same-file findings point at the same defect.
+    """Whether two same-file findings point at the same lines.
 
     With line spans on both, the spans must overlap. Without them there is no
     location to compare, so only an identical title counts as the same defect.
@@ -460,25 +474,48 @@ def _same_location(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
     span, prior_span = _line_span(finding), _line_span(prior)
     if span is not None and prior_span is not None:
         return span[0] <= prior_span[1] and prior_span[0] <= span[1]
+    return _same_title(finding, prior)
+
+
+def _same_title(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
     title = _normalized_title(finding)
     return bool(title) and title == _normalized_title(prior)
+
+
+def _same_defect(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
+    """Whether a same-id finding is at the prior finding's location.
+
+    A title match alone is not enough when the lines differ: a distinct defect
+    that reuses an id must never be absorbed into a (possibly non-blocking)
+    prior finding. A restatement whose lines moved is therefore treated as new,
+    which can only add a blocking finding, never hide one.
+    """
+    return _same_file(finding, prior) and _same_location(finding, prior)
 
 
 def _restates_prior(finding: dict[str, Any], prior: dict[str, Any], status: str) -> bool:
     """A same-id finding restates the prior one only if nothing about it is new.
 
-    It must be at the same location (file and overlapping lines), no more
+    It must describe the same defect (see ``_same_defect``), be no more
     severe, and the prior finding must still be unresolved; otherwise it is a
     distinct defect that reused an id.
     """
-    if status != "unresolved":
+    if status != "unresolved" or not _same_defect(finding, prior):
         return False
-    if _normalized_file(finding) != _normalized_file(prior):
-        return False
-    if not _same_location(finding, prior):
-        return False
-    rank = _SEVERITY_RANK.get(_severity(finding), 2)
-    return rank >= _SEVERITY_RANK.get(_severity(prior), 2)
+    return _severity_rank(finding) >= _severity_rank(prior)
+
+
+def _supersedes_prior(finding: dict[str, Any], prior: dict[str, Any], status: str) -> bool:
+    """A same-id, same-defect finding re-raised at a higher severity replaces the prior entry."""
+    return (
+        status == "unresolved"
+        and _same_defect(finding, prior)
+        and _severity_rank(finding) < _severity_rank(prior)
+    )
+
+
+def _severity_rank(finding: dict[str, Any]) -> int:
+    return _SEVERITY_RANK.get(_severity(finding), 2)
 
 
 def _prior_blocking(prior: dict[str, Any]) -> bool:
@@ -544,38 +581,56 @@ def compute_review_decision(
         if finding_id and status in {"resolved", "unresolved", "withdrawn"}:
             statuses[finding_id] = status
 
-    outstanding: list[dict[str, Any]] = []
-    blocking_ids: list[str] = []
+    # Unresolved prior findings in order, keyed by id so a restatement can
+    # update one and a higher-severity re-raise can replace it.
+    prior_outstanding: dict[str, dict[str, Any]] = {}
     prior_by_id: dict[str, dict[str, Any]] = {}
-    for prior in prior_findings or []:
+    for index, prior in enumerate(prior_findings or [], start=1):
         finding_id = str(prior.get("id", "") or "").strip()
-        if finding_id:
+        first_with_id = bool(finding_id) and finding_id not in prior_by_id
+        if first_with_id:
             prior_by_id[finding_id] = prior
         status = statuses.get(finding_id, "unresolved")
         if finding_id:
             statuses[finding_id] = status
         if status != "unresolved":
             continue
-        blocking = _prior_blocking(prior)
-        outstanding.append({**prior, "origin": "prior", "blocking": blocking})
-        if blocking:
-            blocking_ids.append(finding_id)
+        # A duplicate (legacy) id keeps its own entry rather than replacing the first.
+        key = finding_id if first_with_id else f"\0prior-{index}"
+        prior_outstanding[key] = {**prior, "origin": "prior", "blocking": _prior_blocking(prior)}
 
+    new_outstanding: list[dict[str, Any]] = []
     used_ids = set(prior_by_id)
-    for finding in findings:
+    for index, finding in enumerate(findings, start=1):
         finding_id = str(finding.get("id", "") or "").strip()
         prior = prior_by_id.get(finding_id) if finding_id else None
         if prior is not None:
-            if _restates_prior(finding, prior, statuses.get(finding_id, "unresolved")):
-                # A restated, still-unresolved prior finding is already counted.
+            status = statuses.get(finding_id, "unresolved")
+            if _restates_prior(finding, prior, status):
+                # Already counted. Keep the prior eligibility (a reviewer can
+                # lower a prior finding's severity, never raise its blocking
+                # status) and its latest location for the next round.
+                carried = prior_outstanding[finding_id]
+                updated = {**carried, **{k: finding[k] for k in ("start_line", "end_line") if finding.get(k)}}
+                severity = _severity(finding)
+                if severity in _SEVERITY_RANK:
+                    updated["severity"] = severity
+                    updated["blocking"] = carried["blocking"] and severity in BLOCKING_SEVERITIES
+                prior_outstanding[finding_id] = updated
                 continue
+            if _supersedes_prior(finding, prior, status):
+                prior_outstanding.pop(finding_id, None)
             # Reviewers mint ids per round, so a new finding can reuse a prior
             # id. Give it a distinct id so it is neither dropped nor confused
             # with the prior finding in later rounds.
             finding = {**finding, "id": _unique_id(finding_id, used_ids), "reported_id": finding_id}
             finding_id = finding["id"]
-        if finding_id:
-            used_ids.add(finding_id)
+        elif not finding_id or finding_id in used_ids:
+            # Every outstanding finding needs its own id so the next round can classify it.
+            candidate = finding_id or f"N{index}"
+            finding_id = candidate if candidate not in used_ids else _unique_id(candidate, used_ids)
+            finding = {**finding, "id": finding_id}
+        used_ids.add(finding_id)
         severity = _severity(finding)
         if severity == "P0":
             blocking = True
@@ -587,9 +642,10 @@ def compute_review_decision(
             )
         else:
             blocking = False
-        outstanding.append({**finding, "origin": "new", "blocking": blocking})
-        if blocking:
-            blocking_ids.append(finding_id)
+        new_outstanding.append({**finding, "origin": "new", "blocking": blocking})
+
+    outstanding = [*prior_outstanding.values(), *new_outstanding]
+    blocking_ids = [str(f.get("id", "") or "") for f in outstanding if f["blocking"]]
 
     decision = "request_changes" if blocking_ids else "approved"
     return ComputedReviewDecision(
