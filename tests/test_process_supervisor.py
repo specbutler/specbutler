@@ -1297,6 +1297,55 @@ def test_managed_communicate_timeout_preserves_tree_for_polling_retry() -> None:
     assert not managed.owned_tree_active()
 
 
+@pytest.mark.parametrize("text", [True, False])
+def test_managed_communicate_delivers_large_input_to_a_slow_reader(text: bool) -> None:
+    # Codex reads its whole prompt from stdin before doing anything else. When
+    # it started slower than the first short internal poll, Popen stranded the
+    # rest of a pipe-buffer-sized prompt and never closed stdin, so the reader
+    # waited for EOF until the review timed out.
+    payload = "x" * 300_000
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; time.sleep(0.5); print(len(sys.stdin.buffer.read()), flush=True)",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+    )
+
+    stdout, _stderr = managed.communicate(
+        input=payload if text else payload.encode(),
+        timeout=20.0,
+    )
+
+    assert int(stdout.strip()) == len(payload)
+    assert managed.returncode == 0
+
+
+def test_managed_communicate_retry_after_timeout_still_closes_stdin() -> None:
+    managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
+        [
+            sys.executable,
+            "-c",
+            "import sys, time; time.sleep(0.5); print(len(sys.stdin.read()), flush=True)",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        managed.communicate(input="y" * 200_000, timeout=0.05)
+    # Callers retry without input, as run_subprocess does after a poll timeout.
+    stdout, _stderr = managed.communicate(timeout=20.0)
+
+    assert int(stdout.strip()) == 200_000
+
+
 @pytest.mark.skipif(os.name != "posix", reason="native POSIX group integration")
 def test_managed_wait_timeout_preserves_tree_for_polling_retry() -> None:
     managed = ProcessSupervisor(LifetimeMode.RUN_OWNED).spawn(
