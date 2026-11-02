@@ -3545,21 +3545,45 @@ def _diagnostic_note(message: str) -> str:
     return f"{TEST_GATE_DIAGNOSTIC_UNAVAILABLE_PREFIX} {message.strip()}"
 
 
+def _command_is_pytest(args: list[str]) -> bool:
+    """Recognize executable invocation forms, never script or test operands."""
+    if not args:
+        return False
+    executable = args[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if executable in {"pytest", "pytest.exe", "py.test", "py.test.exe"}:
+        return True
+    if not re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?", executable):
+        return False
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg == "-m":
+            return args[index + 1:index + 2] == ["pytest"]
+        if arg in {"-W", "-X"}:
+            index += 2
+        elif arg in {"-B", "-E", "-I", "-s", "-S", "-u", "-O", "-OO", "-q"}:
+            index += 1
+        else:
+            return False
+    return False
+
+
 def _gate_is_pytest_like(gate: str) -> bool:
     config = _verify_gate_config(gate)
-    diagnostic_args = shlex.split(config.diagnostic_command) if config and config.diagnostic_command else []
-    return any(
-        Path(arg).name in {"pytest", "pytest.exe", "py.test"}
-        for arg in [*_verify_gate_command_args(gate), *diagnostic_args]
-    )
+    args = (shlex.split(config.diagnostic_command)
+            if config and config.diagnostic_command else _verify_gate_command_args(gate))
+    return _command_is_pytest(args)
 
 
 def _gate_diagnostic_command(worktree_path: Path, gate: str) -> list[str]:
     config = _verify_gate_config(gate)
     if config is not None and config.diagnostic_command:
         return shlex.split(config.diagnostic_command)
-    if _gate_is_pytest_like(gate):
-        return _test_gate_diagnostic_command(worktree_path)
+    args = _verify_gate_command_args(gate)
+    if _command_is_pytest(args):
+        # Preserve interpreter, options, and selection, including a literal --.
+        index = args.index("--") if "--" in args else len(args)
+        return [*args[:index], "--tb=short", "--no-header", "-q", "--maxfail=20", *args[index:]]
     return []
 
 
