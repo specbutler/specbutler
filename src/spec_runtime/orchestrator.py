@@ -3903,6 +3903,21 @@ def _format_gate_retry_output(gate_name: str, gate_data: dict) -> str:
     return "\n".join(sections)
 
 
+def _verify_gate_tool_names() -> list[str]:
+    """Tool names agents use for the configured gates ("pytest" for ``python -m pytest``)."""
+    names: list[str] = []
+    for command in VERIFY_GATE_COMMANDS.values():
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            continue
+        if "-m" in tokens[:-1]:
+            names.append(tokens[tokens.index("-m") + 1].lower())
+        elif tokens:
+            names.append(Path(tokens[0]).name.lower())
+    return [name for name in names if len(name) >= 4]
+
+
 def is_non_actionable_gate_environment_block(summary: str) -> bool:
     """Return True when blocked text indicates local sandbox/runtime constraints."""
     text = (summary or "").lower()
@@ -3911,6 +3926,7 @@ def is_non_actionable_gate_environment_block(summary: str) -> bool:
 
     gate_context = (
         *VERIFY_GATE_COMMANDS.values(),
+        *_verify_gate_tool_names(),
         "playwright",
         "browser",
         "pg_ctl",
@@ -3925,6 +3941,15 @@ def is_non_actionable_gate_environment_block(summary: str) -> bool:
         "shmat",
         "bootstrap_check_in",
         "browsers cannot launch",
+        # Agents describe the provider sandbox's denials in their own words
+        # ("denied provider-home writes and unavailable process identity in
+        # this sandbox"). A false positive only sends a clean commit to host
+        # verify, which stays authoritative.
+        "sandbox",
+        "process identity",
+        "inspect launched process",
+        "provider home",
+        "provider-home",
     )
     return any(marker in text for marker in gate_context) and any(sig in text for sig in env_signatures)
 
