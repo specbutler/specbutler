@@ -39,7 +39,8 @@ def test_pid_scope_reaps_only_registered_process_in_shared_group(tmp_path: Path)
     child_identity = None
     try:
         deadline = time.monotonic() + 10
-        while not child_pid_path.exists():
+        # The helper opens the file before writing the pid; wait for content.
+        while not (child_pid_path.exists() and child_pid_path.read_text(encoding="utf-8").strip()):
             assert launcher.poll() is None
             assert time.monotonic() < deadline
             time.sleep(0.05)
