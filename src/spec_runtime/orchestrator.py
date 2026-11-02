@@ -4665,7 +4665,8 @@ def _required_checks_from_error(error: str) -> list[str]:
     idx = lowered.find(marker)
     if idx < 0:
         return []
-    detail = error[idx + len(marker) :].strip()
+    # The check list is one line; callers may append multi-line log summaries.
+    detail = error[idx + len(marker) :].strip().split("\n", 1)[0].strip()
     if not detail:
         return []
     return [part.strip() for part in detail.split(",") if part.strip()]
@@ -12612,13 +12613,24 @@ def _check_name_matches(actual: str, expected: str) -> bool:
     return review_feedback.check_name_matches(actual, expected)
 
 
+class PrLookupUnavailable(RuntimeError):
+    """Neither GitHub frontend answered a PR lookup (an outage, not "no PR")."""
+
+
 def _find_pr_for_branch(
     repo_root: Path,
     branch: str,
     *,
     state: str = "open",
     repo_slug: str = "",
+    raise_on_error: bool = False,
 ) -> dict | None:
+    """Return the newest PR for ``branch``, or None when there is none.
+
+    With ``raise_on_error``, a lookup that no forge frontend answered raises
+    :class:`PrLookupUnavailable` instead of returning None, so pollers can
+    tell a network outage from a PR that really is gone.
+    """
     pr_check = run_subprocess(
         [
             "gh",
@@ -12646,6 +12658,7 @@ def _find_pr_for_branch(
             branch,
             state=state,
             repo_slug=repo_slug,
+            raise_on_error=raise_on_error,
         )
     pr_info = pr_check.stdout.strip()
     if not pr_info:
@@ -12662,6 +12675,7 @@ def _find_pr_for_branch(
             branch,
             state=state,
             repo_slug=repo_slug,
+            raise_on_error=raise_on_error,
         )
     return parsed if isinstance(parsed, dict) else None
 
@@ -12672,6 +12686,7 @@ def _find_pr_for_branch_via_rest(
     *,
     state: str,
     repo_slug: str = "",
+    raise_on_error: bool = False,
 ) -> dict | None:
     """Fall back to GitHub REST when ``gh pr list`` GraphQL is unavailable.
 
@@ -12711,12 +12726,16 @@ def _find_pr_for_branch_via_rest(
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
         logger.warning("PR REST fallback failed for branch %s: %s", branch, detail)
+        if raise_on_error:
+            raise PrLookupUnavailable(detail)
         return None
 
     try:
         payload = json.loads(result.stdout or "[]")
     except json.JSONDecodeError:
         logger.warning("Could not decode PR REST fallback response for branch %s", branch)
+        if raise_on_error:
+            raise PrLookupUnavailable("undecodable PR REST response")
         return None
     if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
         return None
@@ -15068,12 +15087,21 @@ def _wait_for_pr_merged(
     poll_interval = max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS)
 
     while True:
-        pr_data = _find_pr_for_branch(
-            repo_root,
-            branch,
-            state="all",
-            repo_slug=repo_slug,
-        )
+        try:
+            pr_data = _find_pr_for_branch(
+                repo_root,
+                branch,
+                state="all",
+                repo_slug=repo_slug,
+                raise_on_error=True,
+            )
+        except PrLookupUnavailable as exc:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False, f"Could not query PR #{pr_number} while waiting for merge: {exc}"
+            logger.warning("PR #%s lookup failed while waiting for merge; retrying: %s", pr_number, exc)
+            _poll_sleep(min(poll_interval, remaining))
+            continue
         if pr_data is None:
             return False, f"Could not query PR #{pr_number} while waiting for merge"
 
@@ -16659,7 +16687,11 @@ def _build_implement_attempt_context(
             repo_root,
             _state_root(repo_root) / "runs" / run.run_id / OPERATOR_REQUEST_FILENAME,
         )
-        if _is_resolved_operator_request(operator_request):
+        # A response answers the blocker it was asked about. Once an attempt has
+        # consumed it, later attempts are retrying a different failure and must
+        # not inherit it (e.g. "do not change code for those failures").
+        consumed_attempt = operator_request.response_consumed_attempt_number
+        if _is_resolved_operator_request(operator_request) and consumed_attempt in {None, ctx.attempt_number}:
             ctx.operator_request_kind = operator_request.kind
             ctx.operator_request_prompt = operator_request.prompt
             ctx.operator_request_context = dict(operator_request.context)
@@ -24227,12 +24259,28 @@ def _try_auto_merge(
     deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
     poll_interval = max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS)
     while True:
-        pr_data = _find_pr_for_branch(
-            repo_root,
-            run.branch,
-            state="all",
-            repo_slug=repo_slug,
-        )
+        try:
+            pr_data = _find_pr_for_branch(
+                repo_root,
+                run.branch,
+                state="all",
+                repo_slug=repo_slug,
+                raise_on_error=True,
+            )
+        except PrLookupUnavailable as exc:
+            # A forge outage says nothing about the PR; auto-merge stays armed
+            # on GitHub, so keep polling until the normal deadline.
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return _fail_after_auto_merge_armed(
+                    run,
+                    repo_root,
+                    pr_number,
+                    f"Could not reach the forge while waiting for auto-merge on PR #{pr_number}: {exc}",
+                )
+            logger.warning("PR #%s lookup failed while waiting for auto-merge; retrying: %s", pr_number, exc)
+            _poll_sleep(min(poll_interval, remaining))
+            continue
         if pr_data is None:
             return _fail_after_auto_merge_armed(
                 run,
@@ -24843,7 +24891,12 @@ def _evaluate_readiness_for_promotion(
 
     if require_integration_checkpoint:
         merge_state = str(pr_data.get("mergeStateStatus", "") or "").strip().upper()
-        if merge_state in {"BEHIND", "DIRTY"}:
+        # BEHIND is not a blocker: the merge phase itself merges the base into
+        # the branch, pushes, re-runs review when needed and waits for checks
+        # (see _manual_merge). Refusing here instead sent the run back to an
+        # implement attempt that cannot change BEHIND, looping until an
+        # operator updated the branch. DIRTY (conflicts) still blocks.
+        if merge_state == "DIRTY":
             return ReadinessDecision(
                 False,
                 current_head_sha,
