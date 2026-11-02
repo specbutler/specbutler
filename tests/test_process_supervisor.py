@@ -2955,8 +2955,14 @@ def test_persisted_windows_termination_accepts_empty_job_after_keeper_exits(
         def close(self) -> None:
             events.append("close")
 
-    def identity_matches_then_exits(_identity: ProcessIdentity) -> bool:
+    real_identity_matches = process_supervisor.identity_matches
+
+    def identity_matches_then_exits(identity: ProcessIdentity) -> bool:
         nonlocal identity_checks
+        if identity not in (keeper, payload):
+            # A current-process claim made earlier in this pytest process
+            # keeps a stop monitor polling its own identity in the background.
+            return real_identity_matches(identity)
         identity_checks += 1
         return identity_checks == 1
 
@@ -3010,8 +3016,13 @@ def test_persisted_windows_termination_rejects_nonempty_job_after_keeper_exits(
         def close(self) -> None:
             events.append("close")
 
-    def keeper_exits_after_authentication(_identity: ProcessIdentity) -> bool:
+    real_identity_matches = process_supervisor.identity_matches
+
+    def keeper_exits_after_authentication(identity: ProcessIdentity) -> bool:
         nonlocal identity_checks
+        if identity not in (keeper, payload):
+            # See test_persisted_windows_termination_accepts_empty_job_after_keeper_exits.
+            return real_identity_matches(identity)
         identity_checks += 1
         return identity_checks == 1
 
