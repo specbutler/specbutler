@@ -671,25 +671,26 @@ def test_missing_agent_session_controls_warn_without_blocking(tmp_path: Path) ->
     )
 
     class _NoSessionRunner(_Runner):
+        # Derive the help text from the base runner so every other check that
+        # reads `claude --help` still sees the flags it needs; only the session
+        # flags go missing.
         def __call__(self, argv, cwd, timeout):
             name = Path(argv[0]).name
             if name == "claude" and argv[1:] == ["--help"]:
-                return subprocess.CompletedProcess(
-                    argv,
-                    0,
-                    "--restricted --safe-mode --permission-mode --strict-mcp-config "
-                    "--no-session-persistence --setting-sources --settings",
-                    "",
-                )
+                result = super().__call__(argv, cwd, timeout)
+                kept = [
+                    token
+                    for token in result.stdout.split()
+                    if token not in {"--session-id", "--resume"}
+                ]
+                return subprocess.CompletedProcess(argv, 0, " ".join(kept), "")
             if name == "codex" and argv[1:] == ["exec", "resume", "--help"]:
                 return subprocess.CompletedProcess(argv, 2, "", "unrecognized subcommand")
             return super().__call__(argv, cwd, timeout)
 
-    report = doctor.run_doctor_checks(
-        repo,
-        runner=_NoSessionRunner(),
-        which=_resolver(claude=True, claude_sandbox=True),
-    )
+    which = _resolver(claude=True, claude_sandbox=True)
+    baseline = doctor.run_doctor_checks(repo, runner=_Runner(), which=which)
+    report = doctor.run_doctor_checks(repo, runner=_NoSessionRunner(), which=which)
     checks = _checks_by_name(report)
     claude = checks["agent sessions (claude)"]
     assert claude.status == "warning"
@@ -697,7 +698,19 @@ def test_missing_agent_session_controls_warn_without_blocking(tmp_path: Path) ->
     codex = checks["agent sessions (codex)"]
     assert codex.status == "warning"
     assert "exec resume" in codex.detail
-    assert report.exit_code == 0
+    session_checks = {"agent sessions (claude)", "agent sessions (codex)"}
+    baseline_statuses = {
+        name: check.status
+        for name, check in _checks_by_name(baseline).items()
+        if name not in session_checks
+    }
+    statuses = {
+        name: check.status for name, check in checks.items() if name not in session_checks
+    }
+    assert statuses == baseline_statuses
+    # Missing session controls only warn: they never add a blocker. The
+    # baseline itself can block on hosts without a Claude sandbox (Windows).
+    assert report.exit_code == baseline.exit_code
 
 
 def test_required_claude_without_sandbox_dependencies_is_blocked(
