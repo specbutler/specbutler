@@ -885,7 +885,8 @@ class TestWorktreeBackend:
         group_id = 0
         try:
             deadline = time.monotonic() + 10
-            while not evidence_path.exists():
+            # The helper opens the file before writing; wait for content.
+            while not (evidence_path.exists() and evidence_path.read_text(encoding="utf-8").strip()):
                 assert parent.poll() is None
                 assert time.monotonic() < deadline
                 time.sleep(0.05)
