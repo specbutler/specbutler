@@ -645,15 +645,19 @@ def compute_review_decision(
         if prior is not None:
             status = statuses.get(finding_id, "unresolved")
             if _restates_prior(finding, prior, status):
-                # Already counted. Keep the prior eligibility (a reviewer can
-                # lower a prior finding's severity, never raise its blocking
-                # status) and its latest location for the next round.
+                # Already counted. Keep the prior eligibility and its latest
+                # location for the next round. Restating an unresolved prior
+                # blocker at a lower severity must not unblock it: only a
+                # resolved or withdrawn classification does, so a blocking
+                # prior keeps its severity too and the restated one is noted.
                 carried = prior_outstanding[finding_id]
                 updated = {**carried, **{k: finding[k] for k in ("start_line", "end_line") if finding.get(k)}}
                 severity = _severity(finding)
-                if severity in _SEVERITY_RANK:
-                    updated["severity"] = severity
-                    updated["blocking"] = carried["blocking"] and severity in BLOCKING_SEVERITIES
+                if severity in _SEVERITY_RANK and severity != _severity(carried):
+                    if carried["blocking"]:
+                        updated["reported_severity"] = severity
+                    else:
+                        updated["severity"] = severity
                 prior_outstanding[finding_id] = updated
                 continue
             if _supersedes_prior(finding, prior, status):

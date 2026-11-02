@@ -544,12 +544,44 @@ _ELIGIBILITY_CASES = [
         [("F1-new", True)],
     ),
     (
-        "prior P1 downgraded to P2 at the same lines stops blocking",
+        "unresolved prior P1 restated as P2 keeps blocking",
         [_f("F1", "P1", blocking=True)],
         [{"id": "F1", "status": "unresolved"}],
         [_f("F1", "P2")],
+        "request_changes",
+        [("F1", True)],
+    ),
+    (
+        "unresolved prior P0 restated as P3 keeps blocking",
+        [_f("F1", "P0", blocking=True)],
+        [{"id": "F1", "status": "unresolved"}],
+        [_f("F1", "P3")],
+        "request_changes",
+        [("F1", True)],
+    ),
+    (
+        "unclassified legacy prior P1 restated as P2 keeps blocking",
+        [_f("F1", "P1")],
+        [],
+        [_f("F1", "P2")],
+        "request_changes",
+        [("F1", True)],
+    ),
+    (
+        "prior P1 restated as P2 and resolved stops blocking",
+        [_f("F1", "P1", blocking=True)],
+        [{"id": "F1", "status": "resolved"}],
+        [_f("F1", "P2")],
         "approved",
-        [("F1", False)],
+        [("F1-new", False)],
+    ),
+    (
+        "prior P1 restated as P2 and withdrawn stops blocking",
+        [_f("F1", "P1", blocking=True)],
+        [{"id": "F1", "status": "withdrawn"}],
+        [_f("F1", "P2")],
+        "approved",
+        [("F1-new", False)],
     ),
     (
         "prior P0 downgraded to P1 at the same lines keeps blocking",
@@ -644,6 +676,24 @@ def test_rereview_eligibility_and_carry_forward_table(prior, classifications, fi
         changed_ranges={},
     )
     assert [f["blocking"] for f in carried.outstanding_findings] == [b for _, b in expected]
+
+
+def test_unresolved_prior_blocker_restated_lower_keeps_severity_across_rounds():
+    prior = [_f("F1", "P1", blocking=True)]
+    for _ in range(2):
+        computed = compute_review_decision(
+            model_decision="approved",
+            findings=[_f("F1", "P2")],
+            prior_findings=prior,
+            prior_classifications=[{"id": "F1", "status": "unresolved"}],
+            changed_ranges={},
+        )
+        assert computed.decision == "request_changes"
+        assert computed.blocking_ids == ["F1"]
+        [carried] = computed.outstanding_findings
+        assert (carried["severity"], carried["reported_severity"], carried["blocking"]) == ("P1", "P2", True)
+        assert review_convergence.non_blocking_followups(computed.outstanding_findings) == []
+        prior = computed.outstanding_findings
 
 
 def test_legacy_ledger_findings_without_or_with_duplicate_ids_get_classifiable_ids(tmp_path: Path):
