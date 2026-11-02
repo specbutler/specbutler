@@ -30,7 +30,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from spec_runtime import autopilot, git_common, process_supervisor, spec_status, spec_table
+from spec_runtime import (
+    autopilot,
+    git_common,
+    interactive_authoring,
+    process_supervisor,
+    spec_status,
+    spec_table,
+)
 from spec_runtime import backfill_merge_tags as spec_backfill
 from spec_runtime import execution_backend as eb
 from spec_runtime import orchestrator as orch
@@ -32610,6 +32617,12 @@ class TestSpecAuthoring:
 
         monkeypatch.setattr(orch, "_run_interactive_agent_owned", run_interactive)
         monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
+        # Keep the operator's user-level MCP config out of protected-env keys.
+        monkeypatch.setattr(
+            interactive_authoring,
+            "user_mcp_environment_keys",
+            lambda *_args, **_kwargs: frozenset(),
+        )
         monkeypatch.setattr(
             orch,
             "capture_repository_publication_baseline",
@@ -35084,6 +35097,12 @@ class TestWaitingForInputWorkflow:
 
         monkeypatch.setattr(orch, "_run_interactive_agent_owned", run_interactive)
         monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
+        # Keep the operator's user-level MCP config out of protected-env keys.
+        monkeypatch.setattr(
+            interactive_authoring,
+            "user_mcp_environment_keys",
+            lambda *_args, **_kwargs: frozenset(),
+        )
         monkeypatch.setattr(
             orch,
             "_capture_or_validate_run_publication_baseline",
