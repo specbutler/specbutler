@@ -9960,10 +9960,18 @@ class ReviewResult:
         except (json.JSONDecodeError, TypeError):
             return None
 
-        findings = data.get("findings", [])
-        data["findings"] = [ReviewFinding(**f) for f in findings if isinstance(f, dict)]
+        if not isinstance(data, dict):
+            return None
+        findings = data.get("findings", None) or []
+        finding_keys = {f.name for f in fields(ReviewFinding)}
+        result_keys = {f.name for f in fields(cls)}
         try:
-            return cls(**data)
+            data["findings"] = [
+                ReviewFinding(**{k: v for k, v in f.items() if k in finding_keys})
+                for f in findings
+                if isinstance(f, dict)
+            ]
+            return cls(**{k: v for k, v in data.items() if k in result_keys})
         except TypeError:
             return None
 
@@ -23636,7 +23644,9 @@ def _run_local_review(
     review_agent = review_agent_override or _effective_review_agent(run)
     require_host_agent_available(review_agent)
     review_run_dir = _state_root(repo_root) / "runs" / run.run_id
-    prior_rounds = review_convergence.load_review_rounds(review_run_dir)
+    prior_rounds = review_convergence.load_review_rounds(
+        review_run_dir
+    ) or _seed_review_rounds_from_legacy_result(repo_root, run, review_run_dir)
     last_round = prior_rounds[-1] if prior_rounds else None
     round_number = len(prior_rounds) + 1
     changed_ranges: dict[str, list[tuple[int, int]]] | None = None
@@ -24133,6 +24143,48 @@ def _record_local_review_round(review_run_dir: Path, review_result: ReviewResult
             outstanding_findings=review_result.outstanding_findings,
         ),
     )
+
+
+def _seed_review_rounds_from_legacy_result(
+    repo_root: Path,
+    run: RunState,
+    review_run_dir: Path,
+) -> list[review_convergence.ReviewRound]:
+    """Recover the round ledger for a run that requested changes before it existed.
+
+    Runs started before review convergence have no ``review-rounds.json`` but
+    may already have a ``request_changes`` review-result.json (written without
+    ``review_round``). Seeding round 1 from it lets the resumed re-review see
+    and classify those findings and counts that round toward the cap.
+    """
+    if run.review_changes <= 0 or review_convergence.review_rounds_path(review_run_dir).exists():
+        return []
+    legacy = ReviewResult.load(repo_root, run.run_id)
+    if (
+        legacy is None
+        or legacy.review_round > 0
+        or legacy.status != "request_changes"
+        or not legacy.reviewed_head_sha
+    ):
+        return []
+    logger.info(
+        "Seeding review round ledger for %s from its pre-convergence review result at %s",
+        run.run_id,
+        _short_sha(legacy.reviewed_head_sha),
+    )
+    review_convergence.append_review_round(
+        review_run_dir,
+        review_convergence.ReviewRound(
+            round_number=1,
+            reviewed_head_sha=legacy.reviewed_head_sha,
+            reviewed_base_sha=legacy.reviewed_base_sha,
+            decision="request_changes",
+            model_decision="request_changes",
+            recorded_at=legacy.reviewed_at or _now_iso(),
+            outstanding_findings=[asdict(finding) for finding in legacy.findings],
+        ),
+    )
+    return review_convergence.load_review_rounds(review_run_dir)
 
 
 def _phase_review_local(

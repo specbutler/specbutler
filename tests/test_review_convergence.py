@@ -906,6 +906,257 @@ def test_claude_review_launch_with_legacy_repo_schema_embeds_and_validates_class
 
 
 # ---------------------------------------------------------------------------
+# Legacy inputs written before review convergence
+# ---------------------------------------------------------------------------
+
+
+def test_custom_legacy_repo_schema_keeps_its_fields_and_accepts_classifications(tmp_path: Path):
+    custom = {
+        "type": "object",
+        "required": ["decision", "summary", "reviewed_head_sha", "reviewed_base_sha", "findings"],
+        "properties": {
+            "schema_version": {"type": "string"},
+            "decision": {"type": "string", "enum": ["approved", "request_changes"]},
+            "summary": {"type": "string"},
+            "reviewed_head_sha": {"type": "string"},
+            "reviewed_base_sha": {"type": "string"},
+            "reviewer_role": {"type": "string"},
+            "reviewer_agent": {"type": "string"},
+            "reviewed_at": {"type": "string"},
+            "findings": {"type": "array", "items": {"type": "object"}},
+            "risk_level": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    path = tmp_path / ".github" / "schemas" / "codex-review.schema.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(custom))
+
+    upgraded = json.loads(orch._resolve_local_review_schema_path(tmp_path, tmp_path / "out").read_text())
+    assert upgraded["properties"]["risk_level"] == {"type": "string"}
+    assert "prior_findings" in upgraded["properties"]
+    assert upgraded["required"][-1] == "prior_findings"
+
+    classification = [{"id": "F1", "status": "resolved", "note": "fixed"}]
+    for extra in ({"prior_findings": classification}, {}):
+        evaluation = _gate_evaluation(
+            tmp_path, decision="approved", findings=[], schema=path, risk_level="low", **extra
+        )
+        assert evaluation.result_payload["status"] == "approved", evaluation.human_summary
+
+
+def test_legacy_review_result_json_without_convergence_fields_loads(tmp_path: Path):
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    run_dir.mkdir(parents=True)
+    legacy = {
+        "status": "request_changes",
+        "summary": "Fix it.",
+        "findings": [{**_finding("F1", "P1"), "legacy_extra": True}],
+        "attempt_number": 2,
+        "reviewed_head_sha": HEAD,
+        "reviewed_base_sha": BASE,
+        "reviewer_role": "independent-review",
+        "reviewer_agent": "codex",
+        "source_check_name": "review",
+        "source_check_url": "",
+        "reviewed_at": "2026-01-01T00:00:00Z",
+    }
+    (run_dir / "review-result.json").write_text(json.dumps(legacy))
+    gate_output = tmp_path / "review-decision.json"
+    gate_output.write_text(json.dumps({k: v for k, v in legacy.items() if k != "attempt_number"}))
+
+    for loaded in (
+        orch.ReviewResult.load(tmp_path, run.run_id),
+        orch._load_review_result_from_gate_output(gate_output),
+    ):
+        assert loaded is not None
+        assert loaded.status == "request_changes"
+        assert [f.id for f in loaded.findings] == ["F1"]
+        assert loaded.review_round == 0
+        assert loaded.model_decision == ""
+        assert loaded.outstanding_findings == []
+        assert loaded.prior_findings == []
+
+
+def test_legacy_ledger_entries_missing_fields_load_with_defaults(tmp_path: Path):
+    review_convergence.review_rounds_path(tmp_path).write_text(
+        json.dumps(
+            {
+                "rounds": [
+                    {"reviewed_head_sha": BASE, "decision": "request_changes"},
+                    {"reviewed_head_sha": HEAD, "outstanding_findings": [_finding("F1", "P2")]},
+                ]
+            }
+        )
+    )
+
+    rounds = review_convergence.load_review_rounds(tmp_path)
+
+    assert [r.round_number for r in rounds] == [1, 2]
+    assert rounds[1].decision == ""
+    assert review_convergence.load_extra_rounds_granted(tmp_path) == 0
+    assert review_convergence.request_changes_round_count(rounds) == 1
+    assert not review_convergence.round_cap_reached(tmp_path, max_rounds=3)
+    # Missing ``blocking`` falls back to severity; a P2 stays a follow-up.
+    computed = compute_review_decision(
+        model_decision="approved",
+        findings=[],
+        prior_findings=rounds[-1].outstanding_findings,
+        prior_classifications=[],
+        changed_ranges={},
+    )
+    assert computed.decision == "approved"
+    assert review_convergence.non_blocking_followups(computed.outstanding_findings)[0]["id"] == "F1"
+
+
+def test_old_format_sticky_comment_payload_still_parses(tmp_path: Path):
+    from spec_runtime.review_feedback import extract_review_result_from_commit_status
+    from spec_runtime.review_gate_sticky_comment import render_sticky_comment
+
+    old_payload = {
+        "status": "request_changes",
+        "decision": "request_changes",
+        "summary": "Fix it.",
+        "reviewed_head_sha": HEAD,
+        "reviewed_base_sha": BASE,
+        "findings": [_finding("F1", "P1")],
+        "reviewer_role": "independent-review",
+        "reviewer_agent": "codex",
+        "reviewed_at": "2026-01-01T00:00:00Z",
+    }
+    comments = [{"body": render_sticky_comment(old_payload, pr_number=7)}]
+
+    def fake_run_subprocess(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 0, json.dumps(comments), "")
+
+    result = extract_review_result_from_commit_status(
+        {"state": "failure", "context": "review"},
+        repo_root=tmp_path,
+        pr_number=7,
+        expected_head_sha=HEAD,
+        expected_base_sha=BASE,
+        require_payload=True,
+        run_subprocess=fake_run_subprocess,
+    )
+
+    assert result.status == "request_changes"
+    assert [f.id for f in result.findings] == ["F1"]
+    assert result.reviewed_head_sha == HEAD
+
+
+def _write_legacy_review_result(repo: Path, run: orch.RunState, *, review_round: int | None = None) -> None:
+    run_dir = _run_dir(repo, run)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": "request_changes",
+        "summary": "Fix it.",
+        "findings": [_finding("F1", "P1")],
+        "reviewed_head_sha": BASE,
+        "reviewed_base_sha": BASE,
+        "reviewer_role": "independent-review",
+        "reviewer_agent": "codex",
+        "reviewed_at": "2026-01-01T00:00:00Z",
+    }
+    if review_round is not None:
+        payload["review_round"] = review_round
+    (run_dir / "review-result.json").write_text(json.dumps(payload))
+
+
+def test_run_resumed_after_upgrade_seeds_round_ledger_from_legacy_review_result(tmp_path: Path):
+    run = _run()
+    run.review_changes = 1
+    run_dir = _run_dir(tmp_path, run)
+    _write_legacy_review_result(tmp_path, run)
+
+    (seeded,) = orch._seed_review_rounds_from_legacy_result(tmp_path, run, run_dir)
+
+    assert seeded.round_number == 1
+    assert seeded.reviewed_head_sha == BASE
+    assert seeded.decision == "request_changes"
+    assert [f["id"] for f in seeded.outstanding_findings] == ["F1"]
+    assert review_convergence.load_review_rounds(run_dir) == [seeded]
+    # Seeded once: an existing ledger is never re-seeded.
+    assert orch._seed_review_rounds_from_legacy_result(tmp_path, run, run_dir) == []
+
+
+def test_legacy_seed_skips_fresh_runs_and_post_upgrade_results(tmp_path: Path):
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    _write_legacy_review_result(tmp_path, run)
+    assert orch._seed_review_rounds_from_legacy_result(tmp_path, run, run_dir) == []
+
+    run.review_changes = 1
+    _write_legacy_review_result(tmp_path, run, review_round=1)
+    assert orch._seed_review_rounds_from_legacy_result(tmp_path, run, run_dir) == []
+    assert not review_convergence.review_rounds_path(run_dir).exists()
+
+
+def test_resumed_legacy_run_rereview_shows_and_resolves_legacy_findings(tmp_path: Path):
+    from contextlib import contextmanager
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    review_worktree = tmp_path / "review-worktree"
+    review_worktree.mkdir()
+    run = orch.RunState(
+        run_id="review-run",
+        spec_id="feature",
+        branch="code/feature--run",
+        review_agent="claude",
+        review_changes=1,
+    )
+    _write_legacy_review_result(repo, run)
+    raw_review = json.dumps(
+        {
+            "schema_version": "1",
+            "decision": "approved",
+            "summary": "Fixed.",
+            "reviewed_head_sha": HEAD,
+            "reviewed_base_sha": BASE,
+            "findings": [],
+            "reviewer_role": "independent-review",
+            "reviewer_agent": "claude",
+            "reviewed_at": "2026-01-01T00:00:00Z",
+            "prior_findings": [{"id": "F1", "status": "resolved", "note": "fixed"}],
+        }
+    )
+    prompts: list[str] = []
+
+    @contextmanager
+    def fake_review_worktree(*_args: object, **_kwargs: object):
+        yield review_worktree
+
+    def fake_review_exec(_repo_root: Path, cmd: list[str], **kwargs: object):
+        prompts.append(str(kwargs["input_text"]))
+        return subprocess.CompletedProcess(cmd, 0, raw_review, "")
+
+    with (
+        patch.object(orch, "_temporary_review_worktree", side_effect=fake_review_worktree),
+        patch.object(orch, "_render_local_review_prompt", return_value="review"),
+        patch.object(orch, "_host_materialized_review_spec_note", return_value=""),
+        patch.object(orch, "_claude_review_evidence_prompt_note", return_value=""),
+        patch.object(orch, "require_host_agent_available"),
+        patch.object(orch, "_local_review_incremental_diff", return_value=("", {})),
+        patch.object(orch, "_run_local_review_subprocess", side_effect=fake_review_exec),
+    ):
+        result, _path = orch._run_local_review(
+            run,
+            repo,
+            repo_name="owner/repo",
+            pr_number=1,
+            pr_body="",
+            expected_head_sha=HEAD,
+            expected_base_sha=BASE,
+        )
+
+    assert "Prior review findings" in prompts[0]
+    assert "id `F1` [P1]" in prompts[0]
+    assert result.review_round == 2
+    assert result.status == "approved", result.summary
+
+
+# ---------------------------------------------------------------------------
 # Round cap -> waiting-for-input, and operator resolution
 # ---------------------------------------------------------------------------
 
