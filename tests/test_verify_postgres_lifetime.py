@@ -10,6 +10,7 @@ import pytest
 from spec_runtime import orchestrator as orch
 
 
+@pytest.mark.requires_ps
 @pytest.mark.skipif(os.name != "posix", reason="POSIX daemon handoff")
 @pytest.mark.parametrize("failure", [None, "gate", "start"])
 def test_verify_database_daemon_lives_until_gate_cleanup(
