@@ -27324,6 +27324,33 @@ class TestMergeBehindBranchUpdate:
             branch="spec/my-feature",
         ))
 
+    @pytest.mark.parametrize(
+        ("pr_body", "expect_rerun"),
+        [
+            ("## Review\nReview-Owner: local\n", True),
+            # phase_review always reviews locally, so an unmarked body (for
+            # example one an agent supplied) must not skip the rerun.
+            ("Agent-written summary without a review section.", True),
+            ("## Review\nReview-Owner: platform-team\n", False),
+        ],
+    )
+    def test_post_sync_review_rerun_follows_review_owner(self, repo: Path, pr_body: str, expect_rerun: bool):
+        run = self._make_run()
+        run.review_decision_status = "approved"
+        run.review_expected_head_sha = "deadbeef1234567"
+
+        with patch.object(orch, "_reset_local_review_gate_for_head", return_value=True):
+            rerun = orch._mark_local_review_for_rerun_after_sync(
+                run,
+                repo,
+                pr_body=pr_body,
+                current_head_sha="5ac0ed1234567",
+            )
+
+        assert rerun is expect_rerun
+        if expect_rerun:
+            assert run.last_error.startswith(orch.LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX)
+
     def test_phase_merge_syncs_initial_behind_checkpoint(self, repo: Path):
         """Initial BEHIND checkpoints pass readiness and reach the merge-phase base sync."""
         run = self._make_run()
@@ -27334,6 +27361,9 @@ class TestMergeBehindBranchUpdate:
         pr_open = {
             "number": 12,
             "state": "OPEN",
+            # A non-local review owner merges straight after the sync; local
+            # review reruns first (test_post_sync_review_rerun_follows_review_owner).
+            "body": "## Review\nReview-Owner: platform-team\n",
             "headRefOid": "deadbeef1234567",
             "baseRefOid": "base1234",
             "mergeStateStatus": "BEHIND",

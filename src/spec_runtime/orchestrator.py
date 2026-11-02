@@ -219,12 +219,13 @@ from .sandbox_denials import (
     sandbox_denial_summary,
 )
 from .spec_identity import (
+    LOCAL_REVIEW_OWNER,
     SPEC_ID_RE,
     authoring_branch_identity,
+    extract_review_owner_from_pr_body,
     format_pr_review_owner,
     implementation_branch_identity,
     is_authoring_branch,
-    pr_body_uses_local_review,
     resolve_spec_id_for_pr,
     spec_run_branch,
     spec_run_worktree_name,
@@ -14050,7 +14051,11 @@ def _mark_local_review_for_rerun_after_sync(
     pr_body: str,
     current_head_sha: str,
 ) -> bool:
-    if not pr_body_uses_local_review(pr_body):
+    # phase_review always reviews locally, so a missing Review-Owner marker
+    # (e.g. an agent-supplied PR body) still means local review; only a PR
+    # that names another owner is exempt from the post-sync rerun.
+    review_owner = extract_review_owner_from_pr_body(pr_body)
+    if review_owner and review_owner != LOCAL_REVIEW_OWNER:
         return False
     if not current_head_sha:
         return False
