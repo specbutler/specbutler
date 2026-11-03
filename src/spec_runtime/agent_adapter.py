@@ -550,21 +550,18 @@ def _codex_implement_permission_overrides(
 
 _CODEX_REVIEW_PERMISSION_PROFILE = "specbutler-review"
 
-# Which commands the reviewer may run at all. A read-only filesystem does not
-# stop ``python checkout/script.py`` or a test run that writes to the scratch
-# dir, so the review never relies on the prompt alone. Under ``untrusted``
-# Codex auto-runs only its built-in known-safe inspection commands (cat, ls,
-# grep/rg, head/tail, wc, nl, sed -n, find without -exec/-delete, git
-# status/log/show/diff/branch) and escalates everything else for approval.
-# Exec mode cannot answer an approval ("exec command approval is not supported
-# in exec mode"), so interpreters, test runners, builds, installs and checkout
-# scripts are rejected. The approval reviewer is pinned to ``user`` so an
-# ``auto_review`` model can never approve an escalation, and the launch passes
-# ``--ignore-rules`` so no execpolicy ``.rules`` file can pre-approve one.
-# Values verified against codex-cli 0.164.0; --strict-config rejects a CLI
-# that does not recognise them.
+# What the reviewer's commands may do beyond the sandbox: nothing. The
+# filesystem profile (read-only except the scratch dir, provider home and
+# operator credentials denied) and the disabled network are the boundary;
+# ``never`` makes any command that would need more fail instead of asking, and
+# exec mode could not answer an approval anyway. The approval reviewer is
+# pinned to ``user`` so an ``auto_review`` model can never approve an
+# escalation, and the launch passes ``--ignore-rules`` so no execpolicy
+# ``.rules`` file can pre-approve one. codex-cli 0.164.0 rejects the older
+# ``untrusted`` policy ("no longer supported") under --strict-config, which
+# made every local Codex review fail to start.
 CODEX_REVIEW_COMMAND_POLICY_OVERRIDES = (
-    'approval_policy="untrusted"',
+    'approval_policy="never"',
     'approvals_reviewer="user"',
 )
 

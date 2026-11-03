@@ -1545,10 +1545,8 @@ def test_codex_review_with_checkout_enforces_inspection_only_commands(tmp_path: 
         review_checkout=checkout,
     )
 
-    # Only Codex's known-safe inspection commands auto-run; every other
-    # command (interpreters, test runners, checkout scripts) escalates, and
-    # exec mode rejects escalations.
-    assert 'approval_policy="untrusted"' in cmd
+    # Nothing may escalate past the read-only, network-off review profile.
+    assert 'approval_policy="never"' in cmd
     # No model reviewer and no execpolicy rule can pre-approve an escalation.
     assert 'approvals_reviewer="user"' in cmd
     assert "--ignore-rules" in cmd
@@ -1556,7 +1554,7 @@ def test_codex_review_with_checkout_enforces_inspection_only_commands(tmp_path: 
     # A later override must not loosen the policy.
     approvals = [c for c in cmd if c.startswith("approval_policy=")]
     reviewers = [c for c in cmd if c.startswith("approvals_reviewer=")]
-    assert approvals == ['approval_policy="untrusted"']
+    assert approvals == ['approval_policy="never"']
     assert reviewers == ['approvals_reviewer="user"']
     for loosening in (
         "--dangerously-bypass-approvals-and-sandbox",
