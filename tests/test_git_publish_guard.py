@@ -156,11 +156,12 @@ def test_guard_refuses_a_pushurl_that_equals_the_fetch_url(tmp_path: Path) -> No
 
 @pytest.mark.parametrize("spelling", ["file", "relative"])
 def test_guard_fences_every_spelling_of_a_local_remote(tmp_path: Path, spelling: str) -> None:
-    sink = tmp_path / "origin.git"
+    # The space and non-ASCII name make ``as_uri()`` percent-encode the path.
+    sink = tmp_path / "origin snow-\u96ea.git"
     workspace = tmp_path / "workspace"
     assert _git(tmp_path, "init", "--bare", str(sink)).returncode == 0
     assert _git(tmp_path, "init", "-b", "main", str(workspace)).returncode == 0
-    configured = sink.as_uri() if spelling == "file" else "../origin.git"
+    configured = sink.as_uri() if spelling == "file" else f"../{sink.name}"
     assert _git(workspace, "remote", "add", "origin", configured).returncode == 0
 
     guarded_env = {"PATH": os.environ.get("PATH", os.defpath)}

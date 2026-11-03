@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import itertools
 import os
 import subprocess
@@ -16,6 +17,21 @@ _PS_SKIP_PREFIX = "ps unavailable"
 _ps_unavailability_key = pytest.StashKey[str | None]()
 _ps_skip_count_key = pytest.StashKey[int]()
 _session_config: pytest.Config
+
+# Windows reads and writes text without an explicit ``encoding=`` as cp1252;
+# macOS and Linux use UTF-8.  A test that does that with non-ASCII text passes
+# on the machines where agents and host verify run, then fails only on the
+# windows-probe CI job.  pathlib and tempfile resolve a missing encoding through
+# ``io.text_encoding()``, so answering cp1252 there makes POSIX runs fail the
+# same way.  Builtin ``open()`` resolves it in C and is not covered.
+WINDOWS_DEFAULT_TEXT_ENCODING = "cp1252"
+_native_text_encoding = io.text_encoding
+
+
+def _windows_text_encoding(encoding: str | None, stacklevel: int = 2) -> str:
+    if encoding is None:
+        return WINDOWS_DEFAULT_TEXT_ENCODING
+    return _native_text_encoding(encoding, stacklevel + 1)
 
 
 def probe_ps(env: Mapping[str, str] | None = None) -> str | None:
@@ -84,6 +100,12 @@ def pytest_configure(config: pytest.Config) -> None:
     global _session_config
     _session_config = config
     config.stash[_ps_skip_count_key] = 0
+    if os.name != "nt":
+        io.text_encoding = _windows_text_encoding
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    io.text_encoding = _native_text_encoding
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
@@ -202,3 +224,20 @@ def _stub_provider_session_probe(monkeypatch: pytest.MonkeyPatch) -> None:
         "_provider_session_support",
         lambda _agent, *_probe_target: orchestrator.ProviderSessionSupport(),
     )
+
+
+@pytest.fixture
+def tmp_path(tmp_path: Path) -> Path:
+    """Put a backslash in every POSIX test's temporary path.
+
+    Windows paths are full of backslashes, which TOML, JSON and ``file://``
+    renderings must escape.  A test that builds its expectation from the raw
+    path (``f'"{path}"'``) instead of the code's own quoting helper passes on
+    macOS and Linux and fails only on windows-probe.  With a backslash in the
+    path, it fails here too.
+    """
+    if os.name == "nt":
+        return tmp_path
+    path = tmp_path / "back\\slash"
+    path.mkdir()
+    return path
