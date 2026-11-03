@@ -25093,7 +25093,8 @@ class TestRunFullWorkflowRetryHandling:
         assert run.implement_failures == 0
         wait_for_capacity.assert_called_once()
 
-    def test_local_review_stale_after_merge_sync_retries_review_not_implement(self, repo: Path):
+    @pytest.mark.parametrize("syncs", [1, 3])
+    def test_local_review_stale_after_merge_sync_retries_review_not_implement(self, repo: Path, syncs: int):
         run = self._make_run(repo)
         run.save(repo)
 
@@ -25112,7 +25113,7 @@ class TestRunFullWorkflowRetryHandling:
         def mock_merge(r, root):
             del root
             call_counts["merge"] += 1
-            if call_counts["merge"] == 1:
+            if call_counts["merge"] <= syncs:
                 r.last_error = (
                     "Local review must rerun after syncing with origin/main: "
                     "review status approved covered abc1234, but the branch now points to def5678."
@@ -25129,15 +25130,18 @@ class TestRunFullWorkflowRetryHandling:
             result = orch.run_full_workflow(run, repo)
 
         assert result == "passed"
-        assert run.attempts == 1
+        assert run.attempts == 0
+        assert orch._convergence_attempts(run) == 0
+        assert run.base_syncs == syncs
         assert call_counts["implement"] == 1
-        assert call_counts["review"] == 2
-        assert call_counts["merge"] == 2
+        assert call_counts["review"] == syncs + 1
+        assert call_counts["merge"] == syncs + 1
 
-    def test_local_review_stale_after_merge_sync_blocks_at_retry_cap(self, repo: Path):
+    def test_local_review_stale_after_merge_sync_stops_at_sync_cap(self, repo: Path):
         """When local review keeps going stale after merge sync, the workflow
         should escalate to blocked once the retry budget is exhausted."""
         run = self._make_run(repo)
+        run.base_sync_cap = 3
         run.attempts = 2  # Already at retry cap
         run.save(repo)
 
@@ -25165,8 +25169,60 @@ class TestRunFullWorkflowRetryHandling:
         ):
             result = orch.run_full_workflow(run, repo, retry_cap=2)
 
-        assert result == "blocked"
+        assert result == "failed"
+        assert run.base_syncs == 3
+        assert "Base sync cap reached (3/3)" in run.last_error
         assert run.attempts == 2  # Budget was not consumed further
+
+    def test_sync_then_verify_failure_consumes_attempt(self, repo: Path):
+        run = self._make_run(repo)
+        run.phase = "merge"
+        calls = {"merge": 0, "verify": 0}
+
+        def merge(r, root):
+            calls["merge"] += 1
+            if calls["merge"] == 1:
+                r.last_error = orch.LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX
+                return "failed"
+            return "passed"
+
+        def verify(r, root):
+            calls["verify"] += 1
+            if calls["verify"] == 1:
+                r.last_error = "test gate failed: assertion failed"
+                return "failed"
+            return "passed"
+
+        handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
+        handlers.update(merge=merge, verify=verify)
+        with (
+            patch.dict(orch.PHASE_HANDLERS, handlers),
+            patch.object(orch, "_maybe_prepare_debugger_guided_retry", return_value=False),
+            patch.object(orch, "_maybe_trip_no_progress_circuit_breaker", return_value=None),
+        ):
+            assert orch.run_full_workflow(run, repo) == "passed"
+        assert run.attempts == 1
+        assert run.verify_failures == 1
+        assert run.base_syncs == 1
+
+    @pytest.mark.parametrize("phase", ["merge", "verify", "review"])
+    def test_resume_post_sync_enters_gate_directly(self, repo: Path, phase: str):
+        run = self._make_run(repo)
+        run.phase = phase
+        run.status = "failed"
+        run.last_error = orch.LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX
+        run.save(repo)
+        run = orch.RunState.load(repo, run.run_id)
+        visited = []
+
+        def handler(r, root):
+            visited.append(r.phase)
+            return "passed"
+
+        with patch.dict(orch.PHASE_HANDLERS, {p: handler for p in orch.PHASES}):
+            assert orch.run_full_workflow(run, repo) == "passed"
+        assert visited[0] == ("verify" if phase == "merge" else phase)
+        assert run.attempts == 0
 
     def test_base_branch_policy_race_retries_merge_not_implement(self, repo: Path):
         """When gh pr merge fails with 'base branch policy' (race after checks
