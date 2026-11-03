@@ -67,6 +67,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import review_convergence, review_feedback, worktree_process_registry
 from .agent_adapter import (
+    CODEX_REVIEW_CHECKOUT_SHELL,
     COMPLETION_SCHEMA,
     HostAgentUnavailableError,
     _render_codex_mcp_toml,
@@ -24344,21 +24345,31 @@ def _codex_review_sandbox_prompt_note(
     base_sha: str,
     head_sha: str,
 ) -> str:
-    """Inline host-materialized evidence plus the read-only checkout layout."""
+    """Inline host-materialized evidence, plus the checkout layout when a shell is allowed."""
     diff_text = _local_review_diff_text(
         review_worktree,
         base_sha=base_sha,
         head_sha=head_sha,
     )
+    if CODEX_REVIEW_CHECKOUT_SHELL:
+        boundary = (
+            "\n\nCodex review boundary: you may run read-only shell commands (for "
+            "example `cat`, `rg`, `git log`, `git show`) against the PR checkout pinned "
+            f"to the reviewed head at `{review_worktree}`. The filesystem is read-only "
+            f"except the scratch dir `{scratch_dir}`; the network, credentials, MCP, "
+            "subagents and hooks are unavailable, so do not try to install packages or "
+            "rerun the test suite. "
+        )
+    else:
+        boundary = (
+            "\n\nCodex review boundary: you have no shell or file tools in this "
+            "review. Review from the host-materialized diff below, the canonical spec "
+            "and the gate results in this prompt; do not ask to run commands. "
+        )
     return (
-        "\n\nCodex review boundary: you may run read-only shell commands (for "
-        "example `cat`, `rg`, `git log`, `git show`) against the PR checkout pinned "
-        f"to the reviewed head at `{review_worktree}`. The filesystem is read-only "
-        f"except the scratch dir `{scratch_dir}`; the network, credentials, MCP, "
-        "subagents and hooks are unavailable, so do not try to install packages or "
-        "rerun the test suite. The orchestrator materialized the authoritative diff "
-        "on the host below; the gate results already in this prompt are "
-        "authoritative.\n\n"
+        boundary
+        + "The orchestrator materialized the authoritative diff on the host below; "
+        "the gate results already in this prompt are authoritative.\n\n"
         "<BEGIN_HOST_MATERIALIZED_DIFF>\n"
         f"{diff_text}"
         "\n<END_HOST_MATERIALIZED_DIFF>"
