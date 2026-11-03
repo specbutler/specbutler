@@ -131,3 +131,92 @@ def test_non_posix_runs_requires_ps_tests_without_ps(
 
     result.assert_outcomes(passed=3)
     assert not any("ps unavailable" in line for line in result.outlines)
+
+
+def test_user_state_is_isolated_and_inherited_by_children() -> None:
+    import json
+    import subprocess
+
+    from spec_runtime.provider_env import specbutler_user_state_root
+
+    root = specbutler_user_state_root()
+    assert root.parent == Path(os.environ["XDG_STATE_HOME"])
+    assert Path.home().is_relative_to(root.parent.parent)
+    child = subprocess.run(
+        [sys.executable, "-c", "import json, os; print(json.dumps(dict(os.environ)))"],
+        capture_output=True, text=True, check=True,
+    )
+    assert json.loads(child.stdout)["XDG_STATE_HOME"] == str(root.parent)
+
+
+def test_network_probe_reports_permission_denial(monkeypatch: pytest.MonkeyPatch) -> None:
+    import conftest
+
+    def denied():
+        raise PermissionError("network denied")
+
+    monkeypatch.setattr(conftest.socket, "socket", denied)
+    assert conftest.probe_network() == "network denied"
+
+
+def test_nested_sandbox_probe_reports_missing_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    import conftest
+
+    monkeypatch.setattr(conftest.shutil, "which", lambda _: None)
+    assert conftest.probe_nested_sandbox() == "Codex CLI is not installed"
+
+
+def test_provider_home_probe_reports_denial(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    import conftest
+
+    monkeypatch.setitem(conftest._REAL_PROVIDER_HOMES, "codex", tmp_path / "missing")
+    assert conftest.probe_provider_home("codex") is not None
+    monkeypatch.setitem(conftest._REAL_PROVIDER_HOMES, "codex", tmp_path)
+    assert conftest.probe_provider_home("codex") is None
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_capabilities_preserve_coverage_and_summarize_skips(
+    pytester: pytest.Pytester, available: bool,
+) -> None:
+    source = Path(__file__).with_name("conftest.py").read_text(encoding="utf-8")
+    reason = "None" if available else repr("denied by test sandbox")
+    pytester.makeconftest(source + f"""
+def probe_nested_sandbox():
+    return {reason}
+def probe_network():
+    return {reason}
+def probe_browser():
+    return {reason}
+def probe_provider_home(provider):
+    return {reason}
+""")
+    pytester.makeini("""[pytest]
+markers =
+    requires_nested_sandbox: nested sandbox
+    requires_network: networking
+    requires_browser: headless browser
+    requires_provider_home: provider home
+""")
+    pytester.makepyfile("""
+import pytest
+@pytest.mark.requires_nested_sandbox
+def test_nested(): pass
+@pytest.mark.requires_network
+def test_network(): pass
+@pytest.mark.requires_provider_home("codex")
+def test_home(): pass
+@pytest.mark.requires_browser
+def test_browser(): pass
+def test_plain(): pass
+""")
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+    if available:
+        result.assert_outcomes(passed=5)
+        assert not any("tests skipped:" in line for line in result.outlines)
+    else:
+        result.assert_outcomes(passed=1, skipped=4)
+        for capability in ("nested_sandbox", "network", "provider_home", "browser"):
+            result.stdout.fnmatch_lines([
+                f"1 tests skipped: {capability} unavailable (denied by test sandbox)"
+            ])

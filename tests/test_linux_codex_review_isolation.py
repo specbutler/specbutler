@@ -56,6 +56,8 @@ def test_codex_review_isolation_command_is_hermetic(tmp_path: Path) -> None:
     assert all("review host-materialized evidence" not in arg for arg in cmd)
 
 
+@pytest.mark.requires_provider_home("codex")
+@pytest.mark.requires_network
 def test_real_codex_reviewer_cannot_read_auth_or_environment_canaries(
     tmp_path: Path,
 ) -> None:
@@ -174,6 +176,8 @@ def test_real_codex_reviewer_cannot_read_auth_or_environment_canaries(
     assert all(event["item"].get("type") == "error" for event in capability_events)
 
 
+@pytest.mark.requires_provider_home("codex")
+@pytest.mark.requires_network
 def test_real_codex_reviewer_reads_checkout_but_cannot_execute_it(
     tmp_path: Path,
 ) -> None:

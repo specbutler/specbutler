@@ -111,6 +111,7 @@ def test_private_git_commit_does_not_touch_shared_metadata(tmp_path: Path) -> No
     reason="requires the installed Codex Linux sandbox",
 )
 @pytest.mark.parametrize("mode", ["implement", "authoring"])
+@pytest.mark.requires_nested_sandbox
 def test_real_codex_private_commit_can_read_shared_objects_without_writing_them(
     tmp_path: Path, mode: str,
 ) -> None:
@@ -803,6 +804,7 @@ def test_git_metadata_kind_rejects_real_windows_junction(tmp_path: Path) -> None
     not sys.platform.startswith("linux") or shutil.which("codex") is None,
     reason="requires the installed Codex Linux sandbox",
 )
+@pytest.mark.requires_nested_sandbox
 def test_real_codex_sandbox_blocks_hardlinks_from_read_only_git_metadata(
     tmp_path: Path,
 ) -> None:

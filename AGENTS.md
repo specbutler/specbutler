@@ -100,6 +100,15 @@ pytest tests/ -x -q     # stop on first failure
 pytest tests/ -n auto   # parallel across cores (pytest-xdist, in the dev extra)
 ```
 
+The autouse test fixtures isolate user state and provider homes in per-test
+temporary directories (including child processes). Tests that construct sparse
+subprocess environments must preserve the isolated HOME when resolving provider
+state. Capability tests use `requires_ps`, `requires_network` (local sockets),
+`requires_nested_sandbox` (Codex), `requires_browser` (headless Chrome), or `requires_provider_home("codex"|"claude")`.
+Probes skip only marked tests when the capability is unavailable; the terminal
+summary counts skips for each missing capability. Real provider tests remain
+opt-in through their existing environment flags.
+
 Tests are hermetic: they do not require network access, model providers, a real
 forge remote, or Docker. Some fixtures create temporary Git repositories and
 run bounded local command-parser/preflight checks.

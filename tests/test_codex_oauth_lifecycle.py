@@ -375,6 +375,7 @@ def test_oauth_recovery_is_discovered_after_process_restart(tmp_path: Path) -> N
 
     repo_root = Path(__file__).resolve().parents[1]
     child_env = {
+        "HOME": os.environ["HOME"],
         "PATH": os.environ.get("PATH", os.defpath),
         "PYTHONPATH": str(repo_root / "src"),
     }

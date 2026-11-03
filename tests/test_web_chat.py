@@ -5726,6 +5726,7 @@ class TestWebGitMetadataBoundary:
         not sys.platform.startswith("linux"),
         reason="Codex sandbox canary uses the Linux filesystem boundary",
     )
+    @pytest.mark.requires_nested_sandbox
     def test_real_codex_sandbox_can_commit_surface_ready_spec_and_handoff(
         self,
         tmp_path,
