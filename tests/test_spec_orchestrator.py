@@ -42004,6 +42004,37 @@ class TestInfrastructureFailureBackoff:
         ):
             yield waits, poll_sleep
 
+    def test_auth_preflight_after_outage_retries_without_spending_attempt(self, repo: Path):
+        run = self._make_run()
+        run.save(repo)
+        calls = 0
+
+        def publish(r, root):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                r.last_error = "error connecting to api.github.com"
+                return "failed"
+            error = orch._check_run_forge_auth(r, "publish")
+            if error:
+                r.last_error = error
+                return "failed"
+            return "passed"
+
+        handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
+        handlers["publish"] = publish
+        failed_auth = subprocess.CompletedProcess([], 1, "", "not logged in")
+        ok_auth = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            self._harness(handlers) as (waits, _),
+            patch.object(orch, "run_subprocess", side_effect=[failed_auth] * 3 + [ok_auth]),
+        ):
+            assert orch.run_full_workflow(run, repo, retry_cap=10) == "passed"
+        assert calls == 3
+        assert len(waits) == 2
+        assert run.attempts == 0
+        assert run.last_failure_signature == run.last_failure_phase == ""
+
     @pytest.mark.requires_ps
     def test_repeating_infrastructure_failure_backs_off_then_stops(self, repo: Path):
         run = self._make_run()
