@@ -3928,12 +3928,7 @@ def _verify_gate_tool_names() -> list[str]:
     return [name for name in names if len(name) >= 4]
 
 
-def is_non_actionable_gate_environment_block(summary: str) -> bool:
-    """Return True when blocked text indicates local sandbox/runtime constraints."""
-    text = (summary or "").lower()
-    if not text:
-        return False
-
+def _mentions_verify_gate(text: str) -> bool:
     gate_context = (
         *VERIFY_GATE_COMMANDS.values(),
         *_verify_gate_tool_names(),
@@ -3942,6 +3937,29 @@ def is_non_actionable_gate_environment_block(summary: str) -> bool:
         "pg_ctl",
         "postgres",
     )
+    return any(marker in text for marker in gate_context)
+
+
+def is_non_actionable_gate_environment_block(
+    summary: str,
+    *,
+    sandbox_denial_observed: bool = False,
+) -> bool:
+    """Return True when blocked text indicates local sandbox/runtime constraints.
+
+    ``sandbox_denial_observed`` is the structural signal: the launch's progress
+    tracker saw the provider sandbox deny something. Agents describe those
+    denials in unpredictable words ("denied provider config reads ... under
+    session restrictions"), so when the session really hit the sandbox, a
+    block about the verify gates counts without any wording match.
+    """
+    text = (summary or "").lower()
+    if not text:
+        return False
+    if not _mentions_verify_gate(text):
+        return False
+    if sandbox_denial_observed:
+        return True
     env_signatures = (
         "machport",
         "permission denied",
@@ -3961,7 +3979,7 @@ def is_non_actionable_gate_environment_block(summary: str) -> bool:
         "provider home",
         "provider-home",
     )
-    return any(marker in text for marker in gate_context) and any(sig in text for sig in env_signatures)
+    return any(sig in text for sig in env_signatures)
 
 
 CLAUDE_CREDENTIALS_PREFLIGHT_MARGIN_SECONDS = 120
@@ -18569,10 +18587,14 @@ def _interpret_implement_attempt_result(
             return "passed"
         if impl_result.status == "blocked":
             summary = impl_result.summary or "Agent reported blocked"
+            tracker = outcome.progress_tracker
             if (
                 outcome.has_new_commit
                 and not outcome.has_uncommitted_changes
-                and is_non_actionable_gate_environment_block(summary)
+                and is_non_actionable_gate_environment_block(
+                    summary,
+                    sandbox_denial_observed=tracker is not None and tracker.latest_sandbox_denial() is not None,
+                )
             ):
                 if not _review_retry_allows_inferred_success(worktree_path, ctx, outcome.head_after):
                     run.last_error = (
