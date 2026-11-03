@@ -9609,6 +9609,7 @@ class IntakeResult:
 class ImplementContext:
     implement_reason: str = "initial"
     framing_reason: str = ""
+    cleared_blocker_note: str = ""
     objective: str = ""
     recovery_objective: str = ""
     run_id: str = ""
@@ -11504,6 +11505,12 @@ def _build_retry_failure_package(run: RunState, repo_root: Path) -> RetryFailure
         if has_later_approval:
             # Reset to avoid using a superseded request_changes result.
             review_result = None
+    inherited_review = False
+    if review_result is None and not _has_run_review_evidence(run, repo_root):
+        prior_review, prior_path = _prior_branch_review(run, repo_root)
+        if prior_review is not None:
+            review_result, review_result_path = prior_review, prior_path
+            inherited_review = prior_review.status == "request_changes"
     review_requested = False
     # If the reviewed head is not an ancestor of the current head (e.g. after a
     # force-push), discard the review result — its findings cover code that is no
@@ -11606,7 +11613,10 @@ def _build_retry_failure_package(run: RunState, repo_root: Path) -> RetryFailure
         package.active_gates_or_checks.append("implement agent session")
         package.summary_parts.append(run.last_error.strip())
 
-    if run.review_decision_status == "request_changes" and not package.stale_review_feedback:
+    if (
+        run.review_decision_status == "request_changes"
+        or (inherited_review and package.review_feedback_active)
+    ) and not package.stale_review_feedback:
         package.triggering_phase = "review"
     elif run.pending_block_debugger_signature:
         package.triggering_phase = "debugger"
@@ -17547,24 +17557,125 @@ def _sync_reused_branch_before_implement(run: RunState, worktree_path: Path) -> 
     return "failed"
 
 
+def _has_run_review_evidence(run: RunState, repo_root: Path) -> bool:
+    state_dir = _state_root(repo_root) / "runs" / run.run_id
+    paths = [state_dir / "review-result.json", *state_dir.glob("review-result.attempt-*.json")]
+    return bool(run.review_decision_status) or any(
+        ReviewResult.load_from_path(path) is not None for path in paths
+    )
+
+
+def _prior_branch_review(
+    run: RunState, repo_root: Path,
+) -> tuple[ReviewResult | None, Path | None]:
+    """Find review evidence on the branch being continued, across run IDs.
+
+    Reviews carried from an abandoned *different* branch remain initial-prompt
+    advice. Only the reused branch's reviews establish prior implementation.
+    """
+    branches = {branch for branch in (run.branch, run.resumed_from_branch) if branch}
+    all_runs = RunState.list_all(repo_root)
+    predecessors = [
+        candidate for candidate in all_runs
+        if candidate.run_id != run.run_id and candidate.branch in branches
+    ]
+    known_ids = {candidate.run_id for candidate in predecessors}
+    if run.prior_review_run_id and run.prior_review_run_id not in known_ids and run.resumed_from_branch:
+        # The predecessor's state/artifacts may have been cleaned up. The
+        # explicitly inherited snapshot still belongs to this reused branch.
+        if not any(prior.run_id == run.prior_review_run_id for prior in all_runs):
+            predecessors.append(RunState(
+                run_id=run.prior_review_run_id, spec_id=run.spec_id, branch=run.resumed_from_branch,
+            ))
+    for prior in predecessors:
+        state_dir = _state_root(repo_root) / "runs" / prior.run_id
+        latest = state_dir / "review-result.json"
+        archived = sorted(
+            state_dir.glob("review-result.attempt-*.json"),
+            key=lambda path: int(re.search(r"\.attempt-(\d+)\.json$", path.name).group(1)),
+            reverse=True,
+        )
+        for path in [latest, *archived]:
+            result = ReviewResult.load_from_path(path)
+            if result is not None:
+                return result, path
+        if prior.review_decision_status and prior.review_decision_status != "request_changes":
+            return ReviewResult(
+                status=prior.review_decision_status, summary=prior.review_decision_summary,
+                reviewed_head_sha=prior.review_expected_head_sha,
+                source_check_url=prior.review_decision_check_url,
+            ), latest
+        if prior.run_id == run.prior_review_run_id and (
+            run.prior_review_summary or run.prior_review_findings
+        ):
+            return ReviewResult(
+                status="request_changes", summary=run.prior_review_summary,
+                reviewed_head_sha=prior.review_expected_head_sha,
+                source_check_url=prior.review_decision_check_url,
+                findings=[ReviewFinding(**finding) for finding in
+                          _coerce_saved_review_findings(run.prior_review_findings)],
+            ), latest
+        if prior.review_decision_status:
+            return ReviewResult(
+                status=prior.review_decision_status, summary=prior.review_decision_summary,
+                reviewed_head_sha=prior.review_expected_head_sha,
+                source_check_url=prior.review_decision_check_url,
+            ), latest
+    return None, None
+
+
+def _cleared_initial_blocker_note(run: RunState, repo_root: Path) -> str:
+    """Keep a short non-code explanation, without reviving the retry package."""
+    candidates = [(run.last_error, run.phase)]
+    diagnosis = BlockDiagnosis.load(repo_root, run.run_id)
+    if diagnosis is not None:
+        candidates.append((diagnosis.block_reason or diagnosis.summary, diagnosis.source_phase))
+    request = _load_operator_request(repo_root, run)
+    if _is_resolved_operator_request(request):
+        candidates.append((request.prompt, request.requested_by_phase))
+    # Successful bootstrap clears last_error. The phase audit is the historical
+    # source of truth when neither a diagnosis nor operator request survives.
+    for path in reversed(_orchestrator_phase_result_paths(repo_root, run.run_id)):
+        payload = _read_optional_json_payload(repo_root / path)
+        if isinstance(payload, dict) and payload.get("run_id") == run.run_id:
+            result = payload.get("result")
+            if isinstance(result, dict) and result.get("status") in {"blocked", "failed", "error"}:
+                candidates.append((str(result.get("error_code") or ""), str(payload.get("phase") or "")))
+    pre_implement_phases = PHASES[:PHASES.index("implement")]
+    for message, phase in candidates:
+        if not message.strip():
+            continue
+        classification = classify_failure(message, phase=phase)
+        if classification.is_infrastructure or (
+            classification.category is FailureCategory.UNKNOWN
+            and (phase in pre_implement_phases or message.lower().startswith(("bootstrap", "unmet dependencies:")))
+        ):
+            return message.strip().splitlines()[0][:400]
+    return ""
+
+
 def _implement_framing_evidence(run: RunState, repo_root: Path) -> tuple[bool, str]:
     """Choose prompt framing independently of retry accounting.
 
     Keep retry framing when legacy state cannot establish the base/head pair.
     A launch counter alone is never evidence of completed implementation work.
     """
-    state_dir = _state_root(repo_root) / "runs" / run.run_id
-    review_paths = [state_dir / "review-result.json", *state_dir.glob("review-result.attempt-*.json")]
-    if run.review_decision_status or any(
-        ReviewResult.load_from_path(path) is not None for path in review_paths
-    ):
+    if _has_run_review_evidence(run, repo_root):
         return False, "prior review result for this run branch"
+    prior_review, _ = _prior_branch_review(run, repo_root)
+    if prior_review is not None:
+        return False, "prior review result on the reused branch"
+    _migrate_legacy_publication_base(run)
+    base = run.publication_base_sha
+    if not base and (
+        run.implement_launches or run.implement_head_sha_before or run.implement_head_sha_after
+    ):
+        return False, "immutable original base unavailable; retaining retry framing"
     worktree = resolve_worktree_path(run, repo_root)
     # A missing workspace checkout must not borrow the enclosing repository's
     # HEAD. Keep this evidence probe separate from the implement lifecycle's
     # before/after snapshots, which describe the actual agent launch.
     has_checkout = (worktree / ".git").exists()
-    base = run.publication_base_sha or run.implement_head_sha_before
     if not base and has_checkout:
         base = _resolve_git_ref_sha(worktree, run.base_ref or BASE_REF)
     head = _resolve_git_ref_sha(worktree, "HEAD") if has_checkout else ""
@@ -17607,6 +17718,7 @@ def _build_implement_attempt_context(
     ctx = ImplementContext(
         implement_reason=framed_reason,
         framing_reason=framing_reason,
+        cleared_blocker_note=_cleared_initial_blocker_note(run, repo_root) if framed_reason == "initial" else "",
         objective=f"Implement spec {run.spec_id}",
         run_id=run.run_id,
         attempt_number=run.attempts + 1,
@@ -18170,6 +18282,7 @@ def _prepare_implement_launch_plan(
         # retry_context intentionally remains None there because it also marks
         # no-handshake recovery launches throughout the existing interface.
         "intake": ctx.intake,
+        "cleared_blocker_note": ctx.cleared_blocker_note,
         # Steering is launch context too, including before the first attempt.
         # Use the captured snapshot rather than rereading a midflight update.
         "operator_steering_message": ctx.operator_steering_message,
@@ -21284,6 +21397,7 @@ def _build_agent_command(
     acceptance_checklist: list[str] | None = None,
     verification_expectations: list[str] | None = None,
     intake: dict | None = None,
+    cleared_blocker_note: str | None = None,
     operator_request: OperatorRequest | None = None,
     input_question: str | None = None,
     input_response: str | None = None,
@@ -21633,6 +21747,8 @@ def _build_agent_command(
         )
         prompt = "\n\n".join(prompt_sections)
     else:
+        if cleared_blocker_note is None and retry_context is not None:
+            cleared_blocker_note = retry_context.cleared_blocker_note
         spec_prompt = (
             SPEC_PROMPT.replace("<spec-id>", spec_id or "<spec-id>")
             .replace("<spec-path>", spec_path or "<spec-path>")
@@ -21652,6 +21768,8 @@ def _build_agent_command(
             prompt_sections.append(resolved_steering)
         if prior_findings:
             prompt_sections.append(prior_findings)
+        if cleared_blocker_note:
+            prompt_sections.append(f"Cleared non-code blocker: {cleared_blocker_note}")
         prompt_sections.append(spec_prompt)
         prompt = "\n\n".join(prompt_sections)
 

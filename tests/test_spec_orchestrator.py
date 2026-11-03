@@ -42305,3 +42305,185 @@ def test_implement_framing_does_not_use_enclosing_repository(repo: Path):
         initial, reason = orch._implement_framing_evidence(run, repo)
     assert not initial
     assert "evidence unavailable" in reason
+
+
+@pytest.mark.parametrize("history", [
+    "immutable_base", "legacy_single_launch", "legacy_multiple_launches",
+    "legacy_missing_launch_counter", "legacy_noop", "immutable_noop", "legacy_single_noop",
+])
+def test_implement_framing_uses_original_base_after_noop(repo: Path, history: str):
+    original_base = orch._head_sha(repo)
+    if history not in {"legacy_noop", "immutable_noop", "legacy_single_noop"}:
+        (repo / "implemented.txt").write_text("earlier implementation\n")
+        _run_git("add", "implemented.txt", cwd=repo)
+        _run_git("commit", "-m", "Earlier implementation", cwd=repo)
+    head = orch._head_sha(repo)
+    run = orch.RunState(
+        run_id="framing-legacy", spec_id="my-feature", branch="spec/my-feature",
+        attempts=2, implement_launches=2, base_ref="HEAD",
+        implement_head_sha_before=head, implement_head_sha_after=head,
+        last_error="Required checks failing: ci (https://example.com/checks/7)",
+    )
+    if history.startswith("immutable"):
+        run.publication_base_sha = original_base
+    elif history in {"legacy_single_launch", "legacy_single_noop"}:
+        run.implement_launches = 1
+        run.implement_head_sha_before = original_base
+    elif history == "legacy_missing_launch_counter":
+        run.implement_launches = 0
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        ctx = orch._build_implement_attempt_context(run, repo).context
+    if history in {"immutable_noop", "legacy_single_noop"}:
+        assert ctx.implement_reason == "initial"
+        assert not ctx.failure_summary
+    else:
+        assert ctx.implement_reason == "retry"
+        assert "Required checks failing" in ctx.failure_summary
+    if history in {"legacy_multiple_launches", "legacy_missing_launch_counter", "legacy_noop"}:
+        assert "immutable original base unavailable" in ctx.framing_reason
+        assert not run.publication_base_sha
+    if history in {"legacy_single_launch", "legacy_single_noop"}:
+        assert run.publication_base_sha == original_base
+
+
+@pytest.mark.parametrize("evidence", ["latest", "archived", "decision", "snapshot", "cleaned_snapshot", "approval"])
+@pytest.mark.parametrize("same_branch", [True, False])
+def test_implement_framing_finds_reviews_across_runs(repo: Path, evidence: str, same_branch: bool):
+    branch = "spec/reused-feature"
+    prior = orch.RunState(
+        run_id="framing-predecessor", spec_id="my-feature",
+        branch=branch if same_branch else "spec/abandoned-feature", status="failed",
+    )
+    finding = orch.ReviewFinding(id="old-finding", body="Fix the inherited bug.", severity="P1")
+    run = orch.RunState(
+        run_id="framing-successor", spec_id="my-feature", branch=branch,
+        resumed_from_branch=branch,
+        publication_base_sha=orch._head_sha(repo),
+        last_error="Required checks failing: ci (https://example.com/checks/7)",
+        prior_review_run_id=prior.run_id,
+        prior_review_summary="Earlier review requested changes.",
+        prior_review_findings=[vars(finding)],
+    )
+    if evidence == "decision":
+        prior.review_decision_status = "request_changes"
+        prior.review_decision_summary = "Earlier review requested changes."
+        prior.review_expected_head_sha = run.publication_base_sha
+    # A retained other-branch state prevents a copied advisory snapshot from
+    # being mistaken for review evidence on the branch being continued.
+    if evidence != "cleaned_snapshot" or not same_branch:
+        prior.save(repo)
+    if evidence in {"latest", "archived", "approval"}:
+        path = orch.ReviewResult(
+            status="approved" if evidence == "approval" else "request_changes",
+            summary="Earlier review requested changes.", findings=[finding],
+            attempt_number=1, reviewed_head_sha=run.publication_base_sha,
+        ).save(repo, prior.run_id)
+        if evidence == "archived":
+            path.unlink()
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        ctx = orch._build_implement_attempt_context(run, repo).context
+    prompt = orch._build_agent_command("claude", repo, retry_context=ctx)[-1]
+    if same_branch:
+        assert ctx.implement_reason == "retry"
+        assert "reused branch" in ctx.framing_reason
+        assert "Required checks failing" in ctx.failure_summary
+        if evidence != "approval":
+            assert ctx.review_feedback_active
+            assert ctx.triggering_phase == "review"
+            assert prior.run_id in ctx.triggering_review_result_path
+            assert "Earlier review requested changes" in prompt
+            if evidence != "decision":
+                assert ctx.unresolved_review_findings[0]["id"] == "old-finding"
+                assert "Fix the inherited bug." in prompt
+        else:
+            assert ctx.triggering_phase != "review"
+    else:
+        assert ctx.implement_reason == "initial"
+        assert not ctx.failure_summary
+        assert not ctx.review_feedback_active
+
+
+@pytest.mark.parametrize("source", [
+    "last_error", "diagnosis", "operator_request", "audit", "audit_error", "code_failure", "code_audit",
+])
+@pytest.mark.parametrize("resume", [False, True])
+def test_initial_prompt_retains_only_cleared_non_code_blocker(repo: Path, source: str, resume: bool):
+    message = "Bootstrap dependency was unavailable"
+    run = orch.RunState(
+        run_id="framing-blocker", spec_id="my-feature", branch="spec/my-feature",
+        attempts=1, phase="implement", publication_base_sha=orch._head_sha(repo),
+    )
+    if source == "last_error":
+        run.last_error = message + "\nVerbose old setup output that should not be copied."
+    elif source in {"code_failure", "code_audit"}:
+        failure = "Gate 'test' failed (exit 1). Feature assertion failed."
+        if source == "code_failure":
+            run.last_error = failure
+        else:
+            orch._persist_audit(repo, run, "verify", orch.OrchestratorResult(status="failed", error_code=failure))
+    elif source == "diagnosis":
+        orch.BlockDiagnosis(
+            block_reason=message, source_phase="bootstrap", summary=message,
+            root_cause="A dependency was unavailable.", category="environment",
+            next_best_action="Resume when it is available.",
+            blocker_signature="bootstrap-blocker", evidence=["Bootstrap dependency probe failed."],
+        ).save(repo, run.run_id)
+    elif source == "operator_request":
+        orch.OperatorRequest(
+            kind="debugger_guidance", prompt=message, requested_by_phase="bootstrap",
+            status="resolved", response="Dependency is ready.",
+        ).save(repo, run.run_id)
+    else:
+        orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+            status="error" if source == "audit_error" else "blocked", error_code=message,
+        ))
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        ctx = orch._build_implement_attempt_context(run, repo).context
+    ctx.save(repo, run.run_id)
+    assert orch.ImplementContext.load(repo, run.run_id).cleared_blocker_note == ctx.cleared_blocker_note
+    prompt = orch._build_agent_command(
+        "claude", repo, retry_context=ctx, resume_session_id="session" if resume else "",
+    )[-1]
+    assert ctx.implement_reason == "initial"
+    assert not ctx.failure_summary
+    assert not ctx.gate_output
+    assert not ctx.previous_implement_result_path
+    assert "You are running the IMPLEMENT phase" in prompt
+    assert "Do NOT re-implement from scratch" not in prompt
+    assert "Verbose old setup output" not in prompt
+    if source in {"code_failure", "code_audit"}:
+        assert not ctx.cleared_blocker_note
+        assert "Cleared non-code blocker" not in prompt
+    else:
+        assert ctx.cleared_blocker_note == message
+        assert "Cleared non-code blocker: " + message in prompt
+    # The launch path can pass initial context independently of retry_context.
+    if not resume:
+        standalone = orch._build_agent_command(
+            "claude", repo, cleared_blocker_note=ctx.cleared_blocker_note,
+        )[-1]
+        assert ("Cleared non-code blocker" in standalone) is (source not in {"code_failure", "code_audit"})
+
+
+@pytest.mark.parametrize("approval_owner", ["current", "predecessor"])
+def test_implement_framing_does_not_resurrect_superseded_inherited_review(repo: Path, approval_owner: str):
+    prior = orch.RunState(run_id="old-reviewed-run", spec_id="my-feature", branch="spec/shared")
+    run = orch.RunState(
+        run_id="continued-run", spec_id="my-feature", branch=prior.branch, resumed_from_branch=prior.branch,
+        attempts=3, publication_base_sha=orch._head_sha(repo), prior_review_run_id=prior.run_id,
+        prior_review_summary="Old request for changes.",
+        prior_review_findings=[{"id": "superseded-finding", "body": "Old request for changes."}],
+    )
+    if approval_owner == "current":
+        orch.ReviewResult(status="request_changes", attempt_number=1).save(repo, prior.run_id)
+        orch.ReviewResult(status="approved", attempt_number=2).save(repo, run.run_id)
+    else:
+        prior.review_decision_status = "approved"
+    prior.save(repo)
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        ctx = orch._build_implement_attempt_context(run, repo).context
+    assert ctx.implement_reason == "retry"
+    assert not ctx.review_feedback_active
+    assert not ctx.unresolved_review_findings
+    assert "Old request for changes" not in ctx.failure_summary
+    assert ctx.triggering_phase != "review"
