@@ -8,7 +8,7 @@ import subprocess
 from collections.abc import MutableMapping
 from hashlib import sha256
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from .provider_env import MODEL_PROVIDER_ENV_KEYS
 
@@ -444,6 +444,8 @@ def _remote_names(repo_root: Path) -> tuple[str, ...]:
             cwd=repo_root,
             env=_git_inspection_environment(),
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=5,
             check=False,
@@ -466,7 +468,12 @@ def _remote_config_values(repo_root: Path, remote: str, key: str) -> tuple[str, 
             ["git", "config", "--get-all", f"remote.{remote}.{key}"],
             cwd=repo_root,
             env=_git_inspection_environment(),
+            # Git prints config values as UTF-8 bytes. The locale default
+            # (cp1252 on Windows) would mangle a non-ASCII remote path, and the
+            # fence would then never match the URL Git pushes to.
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=5,
             check=False,
@@ -496,7 +503,7 @@ def _local_remote_path(url: str, repo_root: Path) -> str | None:
     ``host:path`` forms return None.
     """
     if url.startswith("file://"):
-        path = url[len("file://"):]
+        path = unquote(url[len("file://"):])
         if path.startswith("localhost/"):
             path = path[len("localhost"):]
         if re.match(r"^/[A-Za-z]:[\\/]", path):
@@ -515,7 +522,8 @@ def _url_variants(url: str, repo_root: Path) -> list[str]:
     """Spellings Git accepts for the same remote, so direct pushes match too.
 
     Local remotes are normalized to an absolute path and fenced as plain paths
-    and ``file://`` URLs (both slash directions on Windows). This layer is
+    and ``file://`` URLs (both slash directions on Windows, raw and
+    percent-encoded as ``Path.as_uri()`` writes them). This layer is
     best effort: the OS sandbox's write roots are the boundary for local
     remotes, and forge credentials (which agents never receive) for network
     ones.
@@ -531,6 +539,9 @@ def _url_variants(url: str, repo_root: Path) -> list[str]:
         variants.extend((path, f"file://{path}"))
         if not path.startswith("/"):
             variants.append(f"file:///{path}")
+        encoded = quote(path, safe="/:")
+        if encoded != path:
+            variants.append(f"file://{encoded}" if path.startswith("/") else f"file:///{encoded}")
     return list(dict.fromkeys(variants))
 
 

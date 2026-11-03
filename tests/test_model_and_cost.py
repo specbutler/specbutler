@@ -290,7 +290,11 @@ def test_interactive_usage_reads_provider_transcript(monkeypatch, tmp_path, prov
             events = [{"type": "session_meta", "payload": {"cwd": str(cwd)}},
                       {"type": "event_msg", "payload": {"type": "token_count", "info": {
                           "total_token_usage": {"input_tokens": 100, "output_tokens": 10}}}}]
-        (root / "session.jsonl").write_text("\n".join(json.dumps(e) for e in events))
+        # Providers write raw UTF-8; "\u014d" encodes to a byte cp1252 cannot decode.
+        events.insert(0, {"type": "user", "message": {"content": "snow \u96ea in T\u014dky\u014d"}})
+        (root / "session.jsonl").write_text(
+            "\n".join(json.dumps(e, ensure_ascii=False) for e in events), encoding="utf-8"
+        )
         return subprocess.CompletedProcess(cmd, 0)
     monkeypatch.setattr(orch, "_run_interactive_agent_owned", launch)
     run = orch.RunState(run_id="r", spec_id="s", branch="b")
