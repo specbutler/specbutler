@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -465,6 +466,7 @@ def test_effective_ci_approval_refuses_stale_head(tmp_path, monkeypatch):
     runner.assert_not_called()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="executes the Linux review workflow Bash step")
 @pytest.mark.parametrize("owner,decision,outcome,expected", [
     ("ci", "request_changes", "failure", 0),
     ("ci", "approved", "success", 0),
