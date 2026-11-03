@@ -644,6 +644,8 @@ def _gc_run_knowledge(
         if not isinstance(run, dict):
             active.add(path.stem)
             continue
+        if run.get("phase") == "authoring":
+            continue
         claimed_run_id = str(run.get("run_id") or "").strip()
         spec_id = str(run.get("spec_id") or "").strip()
         if claimed_run_id != path.stem:

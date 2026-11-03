@@ -1105,6 +1105,8 @@ def load_run_record_index(repo_root: Path, *, config: SpecRuntimeConfig | None =
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
+        if data.get("phase") == "authoring":
+            continue
         all_records.append(data)
         run_id = str(data.get("run_id", "")).strip()
         if run_id:
@@ -1113,6 +1115,8 @@ def load_run_record_index(repo_root: Path, *, config: SpecRuntimeConfig | None =
     # Populate latest_by_spec: latest non-superseded record per spec
     grouped: dict[str, list[dict]] = {}
     for data in all_records:
+        if data.get("phase") == "authoring":
+            continue
         spec_id = str(data.get("spec_id", "")).strip()
         if not spec_id:
             continue
@@ -3525,6 +3529,8 @@ def _collect_run_rows(
     seen_specs: set[str] = set()
 
     for data in run_index.records:
+        if data.get("phase") == "authoring":
+            continue
         spec_id = str(data.get("spec_id", "")).strip()
         run_id = str(data.get("run_id", "")).strip()
         status = str(data.get("status", "")).strip()
@@ -4122,6 +4128,8 @@ def gc_command(args: argparse.Namespace) -> int:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
+            continue
+        if data.get("phase") == "authoring":
             continue
         spec_id = str(data.get("spec_id", "")).strip()
         if not spec_id:

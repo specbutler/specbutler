@@ -4667,6 +4667,8 @@ def classify_failure(
     """
     raw = str(message or "").strip()
     text = raw.lower()
+    if "budget_exceeded" in text:
+        return FailureClassification(FailureCategory.INFRASTRUCTURE, kind="budget_exceeded")
     infra = _infrastructure_failure_kind(text) if text else None
     if infra is not None:
         kind, transient, scope = infra
@@ -7377,7 +7379,7 @@ def _build_spec_authoring_command(
         "git_isolation",
     ):
         authoring_kwargs["git_isolation"] = git_isolation
-    return adapter.build_authoring_command(**authoring_kwargs)
+    return _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
 
 
 def _print_spec_authoring_summary(
@@ -9224,6 +9226,7 @@ class RunState:
     # remains the convergence/retry budget for compatibility; launch_numbered
     # artifacts keep recovery and post-cap operator resumes from overwriting one
     # another when the convergence count is intentionally unchanged.
+    usage: list[dict] = field(default_factory=list)
     implement_launches: int = 0
     implement_failures: int = 0
     verify_failures: int = 0
@@ -9472,12 +9475,12 @@ class RunState:
 
     @property
     def is_resumable(self) -> bool:
-        return self.status in RESUMABLE_RUN_STATUSES
+        return self.phase != "authoring" and self.status in RESUMABLE_RUN_STATUSES
 
     @property
     def is_step_selectable(self) -> bool:
         # Manual phase stepping should continue a run that just passed its prior phase.
-        return self.status in STEP_SELECTABLE_RUN_STATUSES
+        return self.phase != "authoring" and self.status in STEP_SELECTABLE_RUN_STATUSES
 
     @property
     def is_auto_resumable(self) -> bool:
@@ -9511,7 +9514,7 @@ class RunState:
                 data = json.loads(candidate.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
-            if data.get("spec_id") != spec_id:
+            if data.get("spec_id") != spec_id or data.get("phase") == "authoring":
                 continue
             runs.append(cls.from_dict(data))
 
@@ -9871,6 +9874,7 @@ class AgentProgressTracker:
     _provider_session_id: str = field(default="", repr=False)
     _structured_output: object = field(default=None, repr=False)
     _final_agent_message: str = field(default="", repr=False)
+    usage_events: list[dict] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         if not self.last_event_summary:
@@ -12221,8 +12225,8 @@ def _maybe_run_block_debugger(
                             debugger_env, debugger_codex_home
                         )
                     try:
-                        completed = _run_local_review_subprocess(
-                            repo_root,
+                        completed = _run_usage_subprocess(
+                            run, "debugger", debugger_agent, repo_root,
                             cmd,
                             cwd=(
                                 output_dir
@@ -13901,6 +13905,96 @@ def _build_local_review_env(
     return env
 
 
+class BudgetExceeded(RuntimeError):
+    """The configured estimated run budget has been consumed."""
+
+
+def _check_budget(run: RunState) -> None:
+    from .usage import totals
+    limit = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
+    if limit is not None and (
+        (totals(run.usage)["estimated_cost_usd"] or 0) >= limit
+        or any(row.get("budget_exceeded") and limit <= (row.get("budget_limit_usd") or limit)
+               for row in run.usage)
+    ):
+        raise BudgetExceeded("budget_exceeded")
+
+
+def _model_command(cmd: list[str], role: str, provider: str, failures: int = 0) -> list[str]:
+    model = SPEC_RUNTIME_CONFIG.agents.model_for(role, provider, failures)
+    if not model:
+        return cmd
+    cmd = list(cmd)
+    if "--model" in cmd:
+        cmd[cmd.index("--model") + 1] = model
+    else:
+        cmd[1:1] = ["--model", model]
+    return cmd
+
+
+def _budget_command(cmd: list[str], run: RunState) -> list[str]:
+    from .usage import totals
+    _check_budget(run)
+    limit = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
+    if limit is None or not cmd or Path(cmd[0]).stem != "claude":
+        return cmd
+    remaining = limit - (totals(run.usage)["estimated_cost_usd"] or 0)
+    return [cmd[0], "--max-budget-usd", str(remaining), *cmd[1:]]
+
+
+def _begin_usage(run: RunState, repo_root: Path, role: str, provider: str, cmd: list[str]) -> dict:
+    from .usage import new_launch
+    model = cmd[cmd.index("--model") + 1] if "--model" in cmd else ""
+    launch = new_launch(role, provider, model, run.phase)
+    launch["budget_limit_usd"] = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
+    run.usage.append(launch)
+    run.save(repo_root)
+    return launch
+
+
+def _run_interactive_usage(run, repo_root, provider, cmd, *, cwd, env):
+    from .usage import collect_transcript_usage, transcript_snapshot
+    cmd = _budget_command(cmd, run)
+    launch = _begin_usage(run, repo_root, "authoring", provider, cmd)
+    snapshot = transcript_snapshot(provider, cwd, env)
+    try:
+        return _run_interactive_agent_owned(cmd, cwd=cwd, env=env)
+    finally:
+        collect_transcript_usage(launch, cwd, snapshot)
+        run.save(repo_root)
+
+
+def _run_usage_subprocess(run: RunState, role: str, provider: str, repo_root: Path,
+                          cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    from .usage import parse_event, update_launch
+    cmd = _budget_command(cmd, run)
+    launch = _begin_usage(run, repo_root, role, provider, cmd)
+    try:
+        result = _run_local_review_subprocess(repo_root, cmd, **kwargs)
+        for line in (result.stdout or "").splitlines():
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            parsed = parse_event(provider, event)
+            if parsed is not None:
+                update_launch(launch, parsed)
+                # Keep the provider envelope in the receipt, while existing
+                # review/debugger consumers receive their requested JSON body.
+                if provider == "claude" and isinstance(event.get("result"), str):
+                    result.stdout = event["result"]
+        return result
+    finally:
+        run.save(repo_root)
+
+
+def _usage_analytics(runs: list[RunState]) -> dict:
+    from .usage import grouped, totals
+    rows = [row for run in runs for row in run.usage]
+    return {"total": totals(rows), "months": grouped(rows, "recorded_at"),
+            "roles": grouped(rows, "role"), "providers": grouped(rows, "provider")}
+
+
 def _build_local_review_command(
     *,
     prompt: str,
@@ -13933,7 +14027,10 @@ def _build_local_review_command(
     for key, value in optional_kwargs.items():
         if value and _adapter_method_accepts_kwarg(agent.build_review_command, key):
             review_kwargs[key] = value
-    return agent.build_review_command(**review_kwargs)
+    return _model_command(
+        agent.build_review_command(**review_kwargs), "review",
+        agent_name or _configured_review_agent_default() or SPEC_RUNTIME_CONFIG.agents.default,
+    )
 
 
 def _block_debugger_artifact_paths(repo_root: Path, run_id: str) -> dict[str, Path]:
@@ -13975,7 +14072,7 @@ def _build_block_debugger_command(
     agent = get_agent_adapter(agent_name or _configured_review_agent_default() or SPEC_RUNTIME_CONFIG.agents.default)
     if agent.name == "claude":
         del prompt, writable_output_dir, mcp_config_path
-        return [
+        return _model_command([
             "claude",
             "-p",
             "--restricted",
@@ -13986,14 +14083,15 @@ def _build_block_debugger_command(
             "",
             "--strict-mcp-config",
             "--no-session-persistence",
-        ]
+            "--output-format", "json",
+        ], "debugger", agent.name)
     if agent.name == "codex":
-        return agent.build_review_command(
+        return _model_command(agent.build_review_command(
             prompt=prompt,
             output_path=output_path,
             schema_path=schema_path,
             writable_temp_dir=writable_output_dir,
-        )
+        ), "debugger", agent.name)
     review_kwargs: dict[str, object] = {
         "prompt": prompt,
         "output_path": output_path,
@@ -14001,7 +14099,7 @@ def _build_block_debugger_command(
     }
     if _adapter_method_accepts_kwarg(agent.build_review_command, "mcp_config_path"):
         review_kwargs["mcp_config_path"] = mcp_config_path
-    return agent.build_review_command(**review_kwargs)
+    return _model_command(agent.build_review_command(**review_kwargs), "debugger", agent.name)
 
 
 def _render_block_debugger_prompt(
@@ -14317,11 +14415,10 @@ def _mark_local_review_for_rerun_after_sync(
     pr_body: str,
     current_head_sha: str,
 ) -> bool:
-    # phase_review always reviews locally, so a missing Review-Owner marker
-    # (e.g. an agent-supplied PR body) still means local review; only a PR
-    # that names another owner is exempt from the post-sync rerun.
+    # In local mode, an explicit external owner exempts the PR from reruns.
+    # CI mode also invalidates computed decisions when the head changes.
     review_owner = extract_review_owner_from_pr_body(pr_body)
-    if review_owner and review_owner != LOCAL_REVIEW_OWNER:
+    if SPEC_RUNTIME_CONFIG.review.source == "local" and review_owner and review_owner != LOCAL_REVIEW_OWNER:
         return False
     if not current_head_sha:
         return False
@@ -14398,6 +14495,8 @@ def _restore_approved_local_review_status_if_pending(
     merge polling, re-publish the saved decision only when that exact required
     check is pending and the approval still covers the expected head.
     """
+    if SPEC_RUNTIME_CONFIG.review.source != "local":
+        return False, ""
     if REVIEW_GATE_CHECK_NAME.lower() not in checks_error.lower():
         return False, ""
     if run.review_decision_status != "approved":
@@ -16036,7 +16135,7 @@ def _build_task_scoping_command(
         "git_isolation",
     ):
         authoring_kwargs["git_isolation"] = git_isolation
-    return adapter.build_authoring_command(**authoring_kwargs)
+    return _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
 
 
 def _agent_exit_suffix(agent: str) -> str:
@@ -16140,8 +16239,8 @@ def phase_scoping(run: RunState, repo_root: Path) -> str:
     print(f"Tip: when scoping is done, {exit_hint} to start implementation.")
 
     try:
-        completed = _run_interactive_agent_owned(
-            cmd,
+        completed = _run_interactive_usage(
+            run, repo_root, run.agent, cmd,
             cwd=worktree_path,
             env=authoring_env,
         )
@@ -18132,14 +18231,6 @@ def _launch_implement_attempt(
         for key, value in plan.popen_kwargs.items()
         if key not in {"cwd", "env"}
     }
-    request = AgentRequest(
-        argv=plan.agent_cmd,
-        cwd=worktree_path,
-        env=plan.agent_env,
-        popen_kwargs=popen_extras,
-        redactions=plan.agent_env_redactions,
-        declared_env_keys=plan.declared_agent_env_keys,
-    )
 
     def _supervise(proc: subprocess.Popen) -> int:
         _set_active_agent_process(proc)
@@ -18175,8 +18266,21 @@ def _launch_implement_attempt(
             _set_active_agent_process(None)
             _prune_registered_worktree_processes(repo_root, worktree_path)
 
+    launch: dict | None = None
     live_sessions_recorded = _record_live_provider_sessions(repo_root, run, plan)
     try:
+        plan.agent_cmd = _model_command(plan.agent_cmd, "implement", run.agent,
+                                        run.implement_failures + run.verify_failures + run.review_changes)
+        plan.agent_cmd = _budget_command(plan.agent_cmd, run)
+        launch = _begin_usage(run, repo_root, "implement", run.agent, plan.agent_cmd)
+        request = AgentRequest(
+            argv=plan.agent_cmd,
+            cwd=worktree_path,
+            env=plan.agent_env,
+            popen_kwargs=popen_extras,
+            redactions=plan.agent_env_redactions,
+            declared_env_keys=plan.declared_agent_env_keys,
+        )
         result = backend.launch_agent(request, monitor=_supervise)
         # backend.launch_agent returns only after its monitor has confirmed the
         # provider-owned process tree is gone. Import private commits before
@@ -18247,6 +18351,13 @@ def _launch_implement_attempt(
                     cleanup_agent_git_isolation(plan.git_isolation)
                 except BaseException as exc:
                     git_cleanup_error = exc
+            if launch is not None:
+                from .usage import update_launch
+
+                if plan.progress_tracker is not None:
+                    for event in plan.progress_tracker.usage_events:
+                        update_launch(launch, event)
+                run.save(repo_root)
             if git_cleanup_error is not None:
                 raise git_cleanup_error
 
@@ -20442,6 +20553,10 @@ def _handle_claude_stream_line(
             tracker.heartbeat()
         return
 
+    from .usage import parse_event
+    parsed_usage = parse_event("claude", event)
+    if tracker is not None and parsed_usage is not None:
+        tracker.usage_events.append(parsed_usage)
     event_type = event.get("type")
     if tracker is not None:
         _track_claude_inflight_tools(event, tracker)
@@ -20650,6 +20765,10 @@ def _handle_codex_stream_line(line: str, tracker: AgentProgressTracker) -> None:
         tracker.record(line)
         return
 
+    from .usage import parse_event
+    parsed_usage = parse_event("codex", event)
+    if parsed_usage is not None:
+        tracker.usage_events.append(parsed_usage)
     _track_codex_inflight_items(event, tracker)
     tracker.record_sandbox_denials(codex_event_denials(event))
     if isinstance(event, dict):
@@ -21541,7 +21660,7 @@ def _build_agent_command(
         implement_kwargs["session_id"] = session_id
     if completion_schema_path is not None:
         implement_kwargs["completion_schema_path"] = completion_schema_path
-    return adapter.build_implement_command(**implement_kwargs)
+    return _model_command(adapter.build_implement_command(**implement_kwargs), "implement", agent)
 
 
 def _is_git_merge_conflict_output(text: str) -> bool:
@@ -23085,7 +23204,7 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
     body = (
         f"## Spec\nSpec-ID: {run.spec_id}\n{spec_block}\n\n"
         f"## Summary\n{summary}\n\n"
-        f"## Review\n{format_pr_review_owner()}\n\n"
+        f"## Review\n{format_pr_review_owner(SPEC_RUNTIME_CONFIG.review.source)}\n\n"
         f"## Acceptance Criteria\n{checklist}\n\n"
         f"## Known Issues\n{known_issues}\n"
     )
@@ -23110,13 +23229,26 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
                 body = (
                     f"## Spec\nSpec-ID: {run.spec_id}\n{spec_block}\n\n"
                     f"## Summary\n{summary}\n\n"
-                    f"## Review\n{format_pr_review_owner()}\n\n"
+                    f"## Review\n{format_pr_review_owner(SPEC_RUNTIME_CONFIG.review.source)}\n\n"
                     f"## Acceptance Criteria\n{checklist}\n\n"
                     f"## Known Issues\n{known_issues}\n"
                 )
             if outbox_metadata.body:
                 body = outbox_metadata.body
             labels = outbox_metadata.labels
+
+    if SPEC_RUNTIME_CONFIG.review.source == "ci":
+        rounds = review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+        if rounds:
+            result = ImplementResult.load(repo_root, run.run_id)
+            context = review_convergence.render_prior_findings_section(
+                rounds[-1].outstanding_findings,
+                round_number=len(rounds) + 1,
+                implementer_summary=result.summary if result is not None else "",
+            )
+            body = _ci_review_pr_body(
+                body, context=context, previous_head=rounds[-1].reviewed_head_sha,
+            )
 
     # Refresh an existing PR body before push so synchronize sees the local-review marker.
     if not publication_transition_is_safe():
@@ -24484,6 +24616,18 @@ def _local_review_diff_text(
     return diff_result.stdout
 
 
+def _ci_review_pr_body(body: str, *, context: str, previous_head: str) -> str:
+    """Keep PR metadata bounded; CI reconstructs diffs from the recorded head."""
+    if len(context) > 24000:
+        context = context[:24000] + (
+            "\nHistory truncated; consult the prior sticky review for full findings."
+        )
+    return (
+        body[:30000] + "\n\n<!-- spec-ci-rereview-context -->\n"
+        f"Previous-reviewed-head: {previous_head}\n" + context
+    )
+
+
 def _local_review_incremental_diff(
     review_worktree: Path,
     *,
@@ -24804,8 +24948,8 @@ def _run_local_review(
         try:
             for attempt_index, attempt_timeout in enumerate(review_timeouts):
                 try:
-                    review_exec = _run_local_review_subprocess(
-                        repo_root,
+                    review_exec = _run_usage_subprocess(
+                        run, "review", review_agent, repo_root,
                         review_cmd,
                         cwd=review_process_cwd,
                         env=review_env,
@@ -25486,6 +25630,122 @@ def _phase_review_local(
     return outcome
 
 
+def _publish_ci_decision_status(repo_root: Path, repo_slug: str, result: ReviewResult, name: str) -> None:
+    response = run_subprocess(
+        ["gh", "api", f"repos/{repo_slug}/statuses/{result.reviewed_head_sha}", "-X", "POST",
+         "--input", "-"], cwd=repo_root, env=_gh_repo_environment(repo_slug),
+        input_text=json.dumps({"context": name, "state": "success",
+                               "description": "Spec Butler effective review: approved"}),
+    )
+    if response.returncode:
+        raise ValueError(f"Cannot publish effective review status for {name}: {response.stderr}")
+
+
+def _publish_effective_ci_approval(run: RunState, repo_root: Path, result: ReviewResult) -> None:
+    """Update only configured review checks; fail closed without checks:write."""
+    repo_slug = _trusted_publication_repo_slug(run)
+    for name in SPEC_RUNTIME_CONFIG.review.checks:
+        check = _find_check_run_for_sha(repo_root, result.reviewed_head_sha, name, repo_slug=repo_slug)
+        if not check or check.get("head_sha", result.reviewed_head_sha) != result.reviewed_head_sha:
+            raise ValueError(f"Cannot publish effective review approval: missing current-head check {name}")
+        if check.get("conclusion") == "success":
+            _publish_ci_decision_status(repo_root, repo_slug, result, name)
+            continue
+        if check.get("status") != "completed" or not check.get("id"):
+            raise ValueError(f"Cannot publish effective review approval: incomplete check {name}")
+        response = run_subprocess(
+            ["gh", "api", f"repos/{repo_slug}/check-runs/{check['id']}", "-X", "PATCH", "--input", "-"],
+            cwd=repo_root, env=_gh_repo_environment(repo_slug),
+            input_text=json.dumps({"conclusion": "success", "output": {
+                "title": "Effective Spec Butler review decision", "summary": result.summary}}),
+        )
+        if response.returncode:
+            raise ValueError(f"Cannot publish effective review approval for {name}: {response.stderr}")
+        _publish_ci_decision_status(repo_root, repo_slug, result, name)
+
+
+def _apply_ci_review_results(run: RunState, repo_root: Path, results: list) -> str:
+    """Use the same computed decision, round ledger and cap as local review."""
+    from .review_gate import compute_review_decision
+
+    review_run_dir = _state_root(repo_root) / "runs" / run.run_id
+    rounds = review_convergence.load_review_rounds(review_run_dir)
+    last = rounds[-1] if rounds else None
+    changed_ranges = None
+    if last:
+        _, changed_ranges = _local_review_incremental_diff(
+            resolve_worktree_path(run, repo_root),
+            last_reviewed_head_sha=last.reviewed_head_sha,
+            head_sha=results[0].reviewed_head_sha,
+        )
+    findings = []
+    classifications = []
+    for review in results:
+        prefix = review.source_check_name + "::"
+        for finding in review.findings:
+            item = asdict(finding)
+            if not item["id"].startswith(prefix):
+                item["id"] = prefix + item["id"]
+            findings.append(item)
+        for classification in review.prior_findings:
+            item = dict(classification)
+            if not str(item.get("id", "")).startswith(prefix):
+                item["id"] = prefix + str(item.get("id", ""))
+            classifications.append(item)
+    model_decision = next(
+        (status for status in ("failed", "blocked", "request_changes")
+         if any(r.status == status for r in results)), "approved")
+    computed = compute_review_decision(
+        model_decision=model_decision, findings=findings,
+        prior_findings=last.outstanding_findings if last else None,
+        prior_classifications=classifications,
+        changed_ranges=changed_ranges,
+    )
+    result = ReviewResult(
+        status=computed.decision, model_decision=model_decision,
+        summary="; ".join(r.summary for r in results),
+        findings=[ReviewFinding(**f) for f in findings],
+        reviewed_head_sha=results[0].reviewed_head_sha,
+        reviewed_base_sha=results[0].reviewed_base_sha,
+        source_check_name=", ".join(r.source_check_name for r in results),
+        source_check_url=results[0].source_check_url,
+        review_round=len(rounds) + 1,
+        outstanding_findings=computed.outstanding_findings,
+        blocking_finding_ids=computed.blocking_ids,
+    )
+    if result.status == "approved":
+        try:
+            _publish_effective_ci_approval(run, repo_root, result)
+        except ValueError as exc:
+            run.last_error = str(exc)
+            return "failed"
+    outcome = _apply_review_result(
+        run, repo_root, result,
+        conclusion="success" if result.status == "approved" else "failure",
+    )
+    if result.status in {"failed", "blocked"}:
+        # An incomplete reviewer must not replace the last completed round or
+        # erase its outstanding blockers when the review is retried.
+        return outcome
+    _record_local_review_round(review_run_dir, result)
+    max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
+    if result.status == "request_changes" and review_convergence.round_cap_reached(
+        review_run_dir, max_rounds=max_rounds,
+    ):
+        request = _review_round_cap_operator_request(
+            run, result.outstanding_findings,
+            rounds_used=review_convergence.request_changes_round_count(
+                review_convergence.load_review_rounds(review_run_dir)),
+            max_rounds=max_rounds,
+        )
+        request.save(repo_root, run.run_id)
+        run.last_error = request.prompt
+        run.status = "waiting-for-input"
+        run.save(repo_root)
+        return "waiting-for-input"
+    return outcome
+
+
 def _phase_review_action(
     run: RunState,
     repo_root: Path,
@@ -25493,10 +25753,47 @@ def _phase_review_action(
     expected_head_sha: str,
     expected_base_sha: str,
 ) -> str:
+    accepted = _accepted_review_round_cap_request(repo_root, run)
+    if accepted is not None:
+        result = ReviewResult.load(repo_root, run.run_id)
+        rounds = review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+        matches = _round_cap_accept_matches_head(result, rounds, expected_head_sha)
+        def consume_acceptance():
+            accepted.status = "consumed"
+            accepted.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+            accepted.consumed_at = _now_iso()
+            accepted.response_consumed_attempt_number = _current_attempt_number(run)
+            accepted.save(repo_root, run.run_id)
+
+        if matches and result is not None:
+            result.status = "approved"
+            result.summary += " [Accepted by the operator at the review round cap.]"
+            try:
+                _publish_effective_ci_approval(run, repo_root, result)
+            except ValueError as exc:
+                run.last_error = str(exc)
+                return "failed"
+            repo_slug = _trusted_publication_repo_slug(run)
+            pr, _ = _find_open_pr_for_branch(repo_root, run.branch, repo_slug=repo_slug)
+            if pr is None or pr.get("headRefOid") != expected_head_sha:
+                run.last_error = "PR head changed before accepted follow-up publication"
+                return "failed"
+            _publish_review_followups(
+                run, repo_root, rounds[-1].outstanding_findings,
+                pr_number=int(pr["number"]), pr_body=str(pr.get("body", "") or ""),
+                repo_slug=repo_slug, accepted_at_cap=True,
+            )
+            consume_acceptance()
+            return _apply_review_result(run, repo_root, result, conclusion="success")
+        consume_acceptance()
+
     deadline = time.time() + REVIEW_TIMEOUT_SECONDS
     poll_interval = max(1, REVIEW_POLL_INTERVAL_SECONDS)
     last_state = "not_started"
     last_url = ""
+    completed_results = {}
+    check_names = SPEC_RUNTIME_CONFIG.review.checks
+    check_name = check_names[0]
 
     while time.time() <= deadline:
         repo_slug = _trusted_publication_repo_slug(run)
@@ -25547,14 +25844,14 @@ def _phase_review_action(
         check_run = _find_check_run_for_sha(
             repo_root,
             expected_head_sha,
-            REVIEW_GATE_CHECK_NAME,
+            check_name,
             repo_slug=repo_slug,
         )
         if check_run is None:
             last_state = "not_found"
         elif "__error__" in check_run:
             run.last_error = (
-                f"Could not query {REVIEW_GATE_CHECK_NAME} check run: {check_run.get('__error__', 'unknown error')}"
+                f"Could not query {check_name} check run: {check_run.get('__error__', 'unknown error')}"
             )
             return "failed"
         else:
@@ -25564,7 +25861,7 @@ def _phase_review_action(
             last_url = str(check_run.get("details_url", "")).strip()
 
             if status == "completed":
-                require_payload = conclusion != "success"
+                require_payload = True
                 try:
                     review_result = _extract_review_result_from_check_run(
                         check_run,
@@ -25575,20 +25872,44 @@ def _phase_review_action(
                         repo_slug=repo_slug,
                     )
                 except ValueError as exc:
-                    run.last_error = f"Review decision payload invalid for {REVIEW_GATE_CHECK_NAME}: {exc}"
+                    try:
+                        payload = review_feedback._load_sticky_review_comment_payload(
+                            repo_root, int(latest_pr["number"]),
+                            run_subprocess=_repo_pinned_run_subprocess(repo_slug),
+                            expected_check=check_run,
+                        )
+                        if payload is None:
+                            raise ValueError(str(exc))
+                        review_result = review_feedback.normalize_review_payload(
+                            payload, expected_head_sha=expected_head_sha,
+                            expected_base_sha=expected_base_sha, check_run=check_run,
+                        )
+                    except (ValueError, KeyError) as sticky_exc:
+                        run.last_error = f"Review decision payload invalid for {check_name}: {sticky_exc}"
+                        return "failed"
+                if conclusion != "success" and review_result.status == "approved":
+                    run.last_error = f"Review check {check_name} failed with an approved payload"
                     return "failed"
 
-                return _apply_review_result(
-                    run,
-                    repo_root,
-                    review_result,
-                    conclusion=conclusion,
-                    fallback_check_url=last_url,
-                )
+                completed_results[check_name] = review_result
+                remaining_checks = [n for n in check_names if n not in completed_results]
+                if remaining_checks:
+                    check_name = remaining_checks[0]
+                    continue
+                outcome = _apply_ci_review_results(run, repo_root, list(completed_results.values()))
+                saved = ReviewResult.load(repo_root, run.run_id)
+                if outcome == "passed" and saved is not None:
+                    _publish_review_followups(
+                        run, repo_root,
+                        review_convergence.non_blocking_followups(saved.outstanding_findings),
+                        pr_number=int(latest_pr["number"]),
+                        pr_body=str(latest_pr.get("body", "") or ""), repo_slug=repo_slug,
+                    )
+                return outcome
 
         logger.info(
             "Waiting for %s on %s (state=%s)...",
-            REVIEW_GATE_CHECK_NAME,
+            check_name,
             _short_sha(expected_head_sha),
             last_state,
         )
@@ -25601,7 +25922,7 @@ def _phase_review_action(
     if last_url:
         timeout_detail = f"{timeout_detail} ({last_url})"
     run.last_error = (
-        f"Timed out waiting for {REVIEW_GATE_CHECK_NAME} on {_short_sha(expected_head_sha)}: {timeout_detail}"
+        f"Timed out waiting for {check_name} on {_short_sha(expected_head_sha)}: {timeout_detail}"
     )
     return "failed"
 
@@ -25687,7 +26008,13 @@ def phase_review(run: RunState, repo_root: Path) -> str:
     run.review_decision_check_url = ""
     run.save(repo_root)
 
-    # Always use local review — no CI review-decision-gate dependency.
+    if SPEC_RUNTIME_CONFIG.review.source == "ci":
+        return _phase_review_action(
+            run, repo_root, expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha,
+        )
+
+    # Local review is the default.
     return _phase_review_local(
         run,
         repo_root,
@@ -27195,6 +27522,9 @@ def _classify_phase_result(
         "gate_name": "",
         "warnings": warnings,
     }
+    if "budget_exceeded" in run.last_error:
+        metadata.update(failure_type="budget", failure_subtype="budget_exceeded", retryable=False)
+        return metadata
     if warnings:
         first_warning = warnings[0]
         metadata.update(
@@ -27560,7 +27890,12 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
     _emit_phase_progress(run, phase, "started")
 
     try:
+        _check_budget(run)
         result_status = handler(run, repo_root)
+        _check_budget(run)
+    except BudgetExceeded:
+        result_status = "blocked"
+        run.last_error = "budget_exceeded: estimated run cost reached the configured limit"
     except Exception as exc:
         result_status = "failed"
         run.last_error = f"Exception in {phase}: {exc}"
@@ -28018,6 +28353,9 @@ def _transition_to_blocked_with_debugger(
     # failure reason, not a generic retry-cap message (F3).
     original_last_error = run.last_error
     run.status = "blocked"
+    if "budget_exceeded" in original_last_error:
+        run.save(repo_root)
+        return "blocked"
     _maybe_run_block_debugger(
         run,
         repo_root,
@@ -28485,14 +28823,22 @@ def cmd_spec(args: argparse.Namespace) -> int:
             cleanup_agent_git_isolation(git_isolation)
         raise
 
+    authoring_run = RunState(
+        run_id=_run_id(spec_id or "authoring"), spec_id=spec_id or "authoring",
+        branch=branch, worktree_path=str(worktree_path), phase="authoring",
+        run_mode="spec", agent=agent, status="passed",
+    )
+
     print(f"{'Resuming' if resumed else 'Launching'} spec authoring in {worktree_path}")
 
     try:
-        completed = _run_interactive_agent_owned(
-            author_cmd,
+        completed = _run_interactive_usage(
+            authoring_run, repo_root, agent, author_cmd,
             cwd=worktree_path,
             env=authoring_env,
         )
+        authoring_run.status = "passed" if completed.returncode == 0 else "failed"
+        authoring_run.save(repo_root)
         _reconcile_and_cleanup_agent_git(git_isolation)
     except FileNotFoundError as exc:
         if git_isolation is not None:
@@ -29033,7 +29379,7 @@ def cmd_input(args: argparse.Namespace) -> int:
             "git_isolation",
         ):
             authoring_kwargs["git_isolation"] = git_isolation
-        agent_cmd = adapter.build_authoring_command(**authoring_kwargs)
+        agent_cmd = _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
     except RuntimeError as exc:
         if git_isolation is not None:
             cleanup_agent_git_isolation(git_isolation)
@@ -29067,8 +29413,8 @@ def cmd_input(args: argparse.Namespace) -> int:
 
     try:
         try:
-            completed = _run_interactive_agent_owned(
-                agent_cmd,
+            completed = _run_interactive_usage(
+                run, repo_root, agent, agent_cmd,
                 cwd=worktree_path,
                 env=input_env,
             )
@@ -30192,6 +30538,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             if run.review_decision_check_url:
                 print(f"  Source Check: {run.review_decision_check_url}")
 
+    if run:
+        from .usage import grouped, totals
+        print("\nUsage (estimated API list prices):")
+        print(json.dumps({"run": totals(run.usage), "phases": grouped(run.usage, "phase")}, indent=2))
+
     # Show gate status
     gate_file, gate_data = _read_gate_status(repo_root, run) if run else (None, None)
     if gate_data is not None:
@@ -30397,6 +30748,7 @@ def _compute_orchestrator_analytics(
             "run_id": run_id or "",
             "since": since or "",
         },
+        "usage": _usage_analytics(runs),
         "run_counts_by_terminal_phase_status": dict(sorted(terminal_run_counts.items())),
         "phase_attempt_counts_by_outcome": {
             phase: dict(sorted(counts.items())) for phase, counts in sorted(phase_attempt_counts.items())

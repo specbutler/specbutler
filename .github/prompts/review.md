@@ -13,9 +13,8 @@ orchestrator adds to this prompt is authoritative. In every environment:
   findings, the implementer's response, and the diff since the last reviewed
   head.
 - A read-only checkout pinned to the reviewed head may be available for
-  context. The Claude reviewer uses Read, Glob and Grep on it. The Codex
-  reviewer has no shell and works from the inlined diff and spec. Custom
-  adapters expose their own inspection tools.
+  context. Use only the inspection tools allowed by the environment appendix.
+  Local adapters and CI may expose different capabilities.
 - Do not execute pull-request code: no tests, builds, installs, or scripts
   from the checkout. Rely on the orchestrator's gate results instead; the
   inability to rerun tests is not a finding and not a reason for `blocked`.

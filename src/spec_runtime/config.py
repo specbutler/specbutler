@@ -55,6 +55,21 @@ class AgentConfig:
     default: str = "claude"
     review_default: str = ""
     allowed: tuple[str, ...] = ("claude", "codex")
+    models: dict = field(default_factory=dict)
+
+    def model_for(self, role: str, provider: str, failed_attempts: int = 0) -> str:
+        role_config = self.models.get(role, {})
+        model = role_config.get(provider, "")
+        threshold = role_config.get("escalate_after_attempts")
+        if role == "implement" and threshold is not None and failed_attempts >= threshold:
+            escalation = role_config.get("escalate_model", "")
+            model = escalation.get(provider, model) if isinstance(escalation, dict) else escalation or model
+        return model
+
+
+@dataclass(frozen=True)
+class BudgetConfig:
+    max_cost_usd_per_run: float | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +95,8 @@ REVIEW_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high",
 
 @dataclass(frozen=True)
 class ReviewConfig:
+    source: str = "local"
+    checks: tuple[str, ...] = ("review-decision-gate",)
     # Review rounds one run may spend before the operator must decide: the
     # max_rounds-th request_changes moves the run to waiting-for-input instead
     # of starting another implement retry.
@@ -336,6 +353,7 @@ class SpecRuntimeConfig:
         VerifyGateConfig(name="e2e", command="make e2e", parallel=False),
     )
     agents: AgentConfig = AgentConfig()
+    budget: BudgetConfig = BudgetConfig()
     bootstrap_install_command: str = ""
     bootstrap_install: CommandVariants = CommandVariants()
     bootstrap_cache: BootstrapCacheConfig = BootstrapCacheConfig()
@@ -397,11 +415,11 @@ def _parse_review_section(payload: object) -> ReviewConfig:
         return ReviewConfig()
     if not isinstance(payload, dict):
         raise SpecConfigError("[review] must be a table")
-    unknown = sorted(set(payload) - {"max_rounds", "rereview_reasoning_effort"})
+    unknown = sorted(set(payload) - {"max_rounds", "rereview_reasoning_effort", "source", "checks"})
     if unknown:
         raise SpecConfigError(
             "Unknown [review] key(s): " + ", ".join(unknown)
-            + ". Allowed: max_rounds, rereview_reasoning_effort"
+            + ". Allowed: max_rounds, rereview_reasoning_effort, source, checks"
         )
     max_rounds = payload.get("max_rounds", ReviewConfig.max_rounds)
     if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1:
@@ -415,7 +433,18 @@ def _parse_review_section(payload: object) -> ReviewConfig:
             "[review].rereview_reasoning_effort must be one of: "
             + ", ".join(REVIEW_REASONING_EFFORTS)
         )
-    return ReviewConfig(max_rounds=max_rounds, rereview_reasoning_effort=effort)
+    source = payload.get("source", "local")
+    if source not in ("local", "ci"):
+        raise SpecConfigError('[review].source must be local or ci')
+    checks = payload.get("checks", list(ReviewConfig.checks))
+    if not isinstance(checks, list) or not checks or any(not isinstance(c, str) or not c.strip() for c in checks):
+        raise SpecConfigError("[review].checks must be a nonempty array of check names")
+    return ReviewConfig(
+        max_rounds=max_rounds,
+        rereview_reasoning_effort=effort,
+        source=source,
+        checks=tuple(dict.fromkeys(c.strip() for c in checks)),
+    )
 
 
 def _parse_review_evidence_paths(payload: object, *, gate_name: str) -> tuple[str, ...]:
@@ -980,7 +1009,31 @@ def load_spec_runtime_config(
     specs_payload = raw.get("specs", {})
     if not isinstance(specs_payload, dict) or not isinstance(specs_payload.get("require_merged_spec", True), bool):
         raise SpecConfigError("specs.require_merged_spec must be a boolean")
+    from .usage import ROLES, number
+
+    models = agents_payload.get("models", {})
+    if not isinstance(models, dict) or any(role not in ROLES for role in models):
+        raise SpecConfigError("agents.models must contain implement, review, debugger or authoring tables")
+    for role, settings in models.items():
+        if not isinstance(settings, dict):
+            raise SpecConfigError(f"agents.models.{role} must be a table keyed by provider")
+        for key, value in settings.items():
+            if key == "escalate_after_attempts":
+                if role != "implement" or isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise SpecConfigError("escalate_after_attempts must be a positive implement attempt count")
+            elif key == "escalate_model" and isinstance(value, dict):
+                if any(not isinstance(v, str) or not v.strip() for v in value.values()):
+                    raise SpecConfigError("escalate_model values must be nonempty models")
+            elif not isinstance(value, str) or not value.strip():
+                raise SpecConfigError(f"agents.models.{role}.{key} must be a nonempty model")
+    budget_payload = raw.get("budget", {})
+    if not isinstance(budget_payload, dict):
+        raise SpecConfigError("budget must be a table")
+    max_cost = budget_payload.get("max_cost_usd_per_run")
+    if max_cost is not None and (number(max_cost) is None or max_cost <= 0):
+        raise SpecConfigError("budget.max_cost_usd_per_run must be a positive finite number")
     return SpecRuntimeConfig(
+        budget=BudgetConfig(max_cost_usd_per_run=max_cost),
         specs=SpecsConfig(require_merged_spec=specs_payload.get("require_merged_spec", True)),
         paths=paths,
         base_ref=str(raw.get("base_ref", "origin/master")).strip() or "origin/master",
@@ -1001,6 +1054,7 @@ def load_spec_runtime_config(
             default=str(agents_payload.get("default", "claude")).strip() or "claude",
             review_default=str(agents_payload.get("review_default", "")).strip(),
             allowed=allowed_agents,
+            models=models,
         ),
         bootstrap_install_command=bootstrap_install_command,
         bootstrap_install=bootstrap_install,
