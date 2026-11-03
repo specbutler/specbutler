@@ -13896,7 +13896,8 @@ def _check_budget(run: RunState) -> None:
     limit = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
     if limit is not None and (
         (totals(run.usage)["estimated_cost_usd"] or 0) >= limit
-        or any(row.get("budget_exceeded") for row in run.usage)
+        or any(row.get("budget_exceeded") and limit <= (row.get("budget_limit_usd") or limit)
+               for row in run.usage)
     ):
         raise BudgetExceeded("budget_exceeded")
 
@@ -13927,9 +13928,22 @@ def _begin_usage(run: RunState, repo_root: Path, role: str, provider: str, cmd: 
     from .usage import new_launch
     model = cmd[cmd.index("--model") + 1] if "--model" in cmd else ""
     launch = new_launch(role, provider, model, run.phase)
+    launch["budget_limit_usd"] = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
     run.usage.append(launch)
     run.save(repo_root)
     return launch
+
+
+def _run_interactive_usage(run, repo_root, provider, cmd, *, cwd, env):
+    from .usage import collect_transcript_usage, transcript_snapshot
+    cmd = _budget_command(cmd, run)
+    launch = _begin_usage(run, repo_root, "authoring", provider, cmd)
+    snapshot = transcript_snapshot(provider, cwd, env)
+    try:
+        return _run_interactive_agent_owned(cmd, cwd=cwd, env=env)
+    finally:
+        collect_transcript_usage(launch, cwd, snapshot)
+        run.save(repo_root)
 
 
 def _run_usage_subprocess(run: RunState, role: str, provider: str, repo_root: Path,
@@ -16206,10 +16220,8 @@ def phase_scoping(run: RunState, repo_root: Path) -> str:
     print(f"Tip: when scoping is done, {exit_hint} to start implementation.")
 
     try:
-        _check_budget(run)
-        _begin_usage(run, repo_root, "authoring", run.agent, cmd)
-        completed = _run_interactive_agent_owned(
-            cmd,
+        completed = _run_interactive_usage(
+            run, repo_root, run.agent, cmd,
             cwd=worktree_path,
             env=authoring_env,
         )
@@ -18238,7 +18250,8 @@ def _launch_implement_attempt(
     launch: dict | None = None
     live_sessions_recorded = _record_live_provider_sessions(repo_root, run, plan)
     try:
-        plan.agent_cmd = _model_command(plan.agent_cmd, "implement", run.agent, run.attempts)
+        plan.agent_cmd = _model_command(plan.agent_cmd, "implement", run.agent,
+                                        run.implement_failures + run.verify_failures + run.review_changes)
         plan.agent_cmd = _budget_command(plan.agent_cmd, run)
         launch = _begin_usage(run, repo_root, "implement", run.agent, plan.agent_cmd)
         request = AgentRequest(
@@ -28588,9 +28601,8 @@ def cmd_spec(args: argparse.Namespace) -> int:
     print(f"{'Resuming' if resumed else 'Launching'} spec authoring in {worktree_path}")
 
     try:
-        _begin_usage(authoring_run, repo_root, "authoring", agent, author_cmd)
-        completed = _run_interactive_agent_owned(
-            author_cmd,
+        completed = _run_interactive_usage(
+            authoring_run, repo_root, agent, author_cmd,
             cwd=worktree_path,
             env=authoring_env,
         )
@@ -29136,7 +29148,7 @@ def cmd_input(args: argparse.Namespace) -> int:
             "git_isolation",
         ):
             authoring_kwargs["git_isolation"] = git_isolation
-        agent_cmd = _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", run.agent)
+        agent_cmd = _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
     except RuntimeError as exc:
         if git_isolation is not None:
             cleanup_agent_git_isolation(git_isolation)
@@ -29170,10 +29182,8 @@ def cmd_input(args: argparse.Namespace) -> int:
 
     try:
         try:
-            _check_budget(run)
-            _begin_usage(run, repo_root, "authoring", run.agent, agent_cmd)
-            completed = _run_interactive_agent_owned(
-                agent_cmd,
+            completed = _run_interactive_usage(
+                run, repo_root, agent, agent_cmd,
                 cwd=worktree_path,
                 env=input_env,
             )

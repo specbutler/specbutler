@@ -35698,7 +35698,8 @@ class TestWaitingForInputWorkflow:
         args = argparse.Namespace(spec="my-feature", agent="codex")
         config_with_claude_default = replace(
             orch.SPEC_RUNTIME_CONFIG,
-            agents=replace(orch.SPEC_RUNTIME_CONFIG.agents, default="claude"),
+            agents=replace(orch.SPEC_RUNTIME_CONFIG.agents, default="claude",
+                           models={"authoring": {"claude": "claude-model", "codex": "codex-model"}}),
         )
         with (
             patch.object(orch, "SPEC_RUNTIME_CONFIG", config_with_claude_default),
@@ -35721,6 +35722,7 @@ class TestWaitingForInputWorkflow:
 
         assert len(captured_cmd) == 1
         assert captured_cmd[0][0] == "codex"
+        assert captured_cmd[0][captured_cmd[0].index("--model") + 1] == "codex-model"
         mock_write_sandbox.assert_called_once_with(
             "codex",
             worktree,
@@ -35729,6 +35731,8 @@ class TestWaitingForInputWorkflow:
         )
         reloaded = orch.RunState.find_latest(repo, "my-feature")
         assert reloaded.agent == "claude"
+        assert reloaded.usage[-1]["provider"] == "codex"
+        assert reloaded.usage[-1]["model"] == "codex-model"
 
     def test_cmd_input_uses_run_agent_when_override_omitted(self, repo: Path):
         """cmd_input preserves the existing run.agent behavior when --agent is omitted."""

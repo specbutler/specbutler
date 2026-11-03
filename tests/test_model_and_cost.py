@@ -214,7 +214,7 @@ def test_implement_launch_records_usage_and_escalates(monkeypatch, tmp_path):
         "type": "result", "usage": {"input_tokens": 10}, "total_cost_usd": 0.3,
         "session_id": "session"}), tracker)
     plan = orch.ImplementLaunchPlan(False, {}, ["claude", "-p"], {}, progress_tracker=tracker)
-    run = orch.RunState(run_id="r", spec_id="s", branch="b", attempts=2, phase="implement")
+    run = orch.RunState(run_id="r", spec_id="s", branch="b", attempts=5, implement_failures=2, phase="implement")
     assert orch._launch_implement_attempt(run, tmp_path, tmp_path, plan) == 0
     assert calls[0][1:3] == ["--model", "large"]
     saved = orch.RunState.load(tmp_path, "r")
@@ -247,3 +247,146 @@ def test_budget_block_does_not_launch_debugger(monkeypatch, tmp_path):
     run = orch.RunState(run_id="r", spec_id="s", branch="b", last_error="budget_exceeded")
     assert orch._transition_to_blocked_with_debugger(run, tmp_path, source_phase="implement") == "blocked"
     assert run.last_error == "budget_exceeded"
+
+
+def test_budget_limit_increase_clears_provider_stop(monkeypatch, tmp_path):
+    monkeypatch.setattr(orch, "SPEC_RUNTIME_CONFIG", replace(
+        orch.SPEC_RUNTIME_CONFIG, budget=BudgetConfig(max_cost_usd_per_run=1)))
+    run = orch.RunState(run_id="r", spec_id="s", branch="b")
+    launch = orch._begin_usage(run, tmp_path, "implement", "claude", ["claude"])
+    update_launch(launch, parse_event("claude", {"type": "result", "subtype": "error_max_budget_usd"}))
+    with pytest.raises(orch.BudgetExceeded):
+        orch._check_budget(run)
+    monkeypatch.setattr(orch, "SPEC_RUNTIME_CONFIG", replace(
+        orch.SPEC_RUNTIME_CONFIG, budget=BudgetConfig(max_cost_usd_per_run=2)))
+    orch._check_budget(run)
+
+
+def test_monthly_snapshots_keep_previous_month():
+    first = new_launch("implement", "claude", "test", "implement")
+    update_launch(first, parse_event("claude", {"type": "result", "session_id": "s", "total_cost_usd": 5,
+                                             "usage": {"input_tokens": 50}}))
+    first["recorded_at"] = "2026-10-01"
+    second = dict(first, recorded_at="2026-11-01", estimated_cost_usd=7, input_tokens=70)
+    months = grouped([second, first], "recorded_at")
+    assert months["2026-10"]["estimated_cost_usd"] == 5
+    assert months["2026-11"]["estimated_cost_usd"] == 2
+    assert months["2026-11"]["input_tokens"] == 20
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_interactive_usage_reads_provider_transcript(monkeypatch, tmp_path, provider):
+    from spec_runtime.usage import transcript_snapshot
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    env = {"HOME": str(tmp_path)}
+    root, _ = transcript_snapshot(provider, cwd, env)
+    root.mkdir(parents=True)
+    def launch(cmd, **kwargs):
+        if provider == "claude":
+            events = [{"type": "assistant", "uuid": "a", "message": {
+                "id": "m", "model": "claude-sonnet-4-5", "usage": {"input_tokens": 100, "output_tokens": 10}}}]
+        else:
+            events = [{"type": "session_meta", "payload": {"cwd": str(cwd)}},
+                      {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                          "total_token_usage": {"input_tokens": 100, "output_tokens": 10}}}}]
+        (root / "session.jsonl").write_text("\n".join(json.dumps(e) for e in events))
+        return subprocess.CompletedProcess(cmd, 0)
+    monkeypatch.setattr(orch, "_run_interactive_agent_owned", launch)
+    run = orch.RunState(run_id="r", spec_id="s", branch="b")
+    orch._run_interactive_usage(run, tmp_path, provider, [provider], cwd=cwd, env=env)
+    assert run.usage[0]["input_tokens"] == 100
+    assert run.usage[0]["output_tokens"] == 10
+    assert run.usage[0]["usage_available"]
+    if provider == "claude":
+        assert run.usage[0]["estimated_cost_usd"] == pytest.approx(.00045)
+
+
+def test_successful_steering_does_not_escalate(monkeypatch):
+    agents = AgentConfig(models={"implement": {"claude": "small", "escalate_after_attempts": 1,
+                                               "escalate_model": "large"}})
+    monkeypatch.setattr(orch, "SPEC_RUNTIME_CONFIG", replace(orch.SPEC_RUNTIME_CONFIG, agents=agents))
+    run = orch.RunState(run_id="r", spec_id="s", branch="b", attempts=10)
+    failures = run.implement_failures + run.verify_failures + run.review_changes
+    assert orch._model_command(["claude"], "implement", run.agent, failures)[2] == "small"
+
+
+def test_authoring_receipts_are_excluded_from_workflow_readers(monkeypatch, tmp_path):
+    from spec_runtime import autopilot, spec_status
+    from spec_runtime.config import SpecRuntimeConfig
+    config = SpecRuntimeConfig()
+    monkeypatch.setattr(orch, "SPEC_RUNTIME_CONFIG", config)
+    run = orch.RunState(run_id="author", spec_id="s", branch="spec/s", phase="authoring", status="failed")
+    run.save(tmp_path)
+    monkeypatch.setattr(spec_status, "_state_runs_dir", lambda *a, **k: orch._state_root(tmp_path) / "runs")
+    assert spec_status._load_active_runs(tmp_path, config=config) == {}
+    assert spec_status._load_runs_for_spec(tmp_path, "s", config=config) == ()
+    monkeypatch.setattr(autopilot, "runs_dir", lambda *a, **k: orch._state_root(tmp_path) / "runs")
+    assert not autopilot.load_run_record_index(tmp_path, config=config).by_run_id
+
+
+def test_gc_does_not_publish_merge_tag_for_authoring(monkeypatch, tmp_path):
+    import argparse
+    from types import SimpleNamespace
+
+    from spec_runtime import autopilot
+    monkeypatch.setattr(autopilot, "resolve_repo_root", lambda *a: tmp_path)
+    monkeypatch.setattr(autopilot, "resolve_common_root", lambda *a: tmp_path)
+    monkeypatch.setattr(autopilot, "collect_git_spec_state", lambda *a: SimpleNamespace(merged_specs={"s"}))
+    run = orch.RunState(run_id="author", spec_id="s", branch="spec/s", phase="authoring", status="failed")
+    path = run.save(tmp_path)
+    before = path.read_text()
+    assert autopilot.gc_command(argparse.Namespace(repo_root=str(tmp_path), apply=True)) == 0
+    assert path.read_text() == before
+
+
+def test_interactive_claude_resume_keeps_subagents_and_months(monkeypatch, tmp_path):
+    from spec_runtime.usage import transcript_snapshot
+    env = {"HOME": str(tmp_path)}
+    root, _ = transcript_snapshot("claude", tmp_path, env)
+    sub = root / "session" / "subagents"
+    sub.mkdir(parents=True)
+    def message(tokens):
+        return json.dumps({"type": "assistant", "message": {"id": "m", "model": "claude-sonnet-4-5",
+                                                               "usage": {"input_tokens": tokens}}}) + "\n"
+    (sub / "agent-sub.jsonl").write_text(message(20))
+    main = root / "session.jsonl"
+    main.write_text(message(100))
+    run = orch.RunState(run_id="r", spec_id="s", branch="b")
+    def invoke(cmd, **kwargs):
+        with main.open("a") as stream:
+            stream.write(message(200))
+        return subprocess.CompletedProcess(cmd, 0)
+    # First launch creates the transcripts; snapshot must precede their creation.
+    from spec_runtime.usage import collect_transcript_usage
+    first = new_launch("authoring", "claude", "", "authoring")
+    collect_transcript_usage(first, tmp_path, (root, {}))
+    first["recorded_at"] = "2026-10-01"
+    run.usage.append(first)
+    monkeypatch.setattr(orch, "_run_interactive_agent_owned", invoke)
+    orch._run_interactive_usage(run, tmp_path, "claude", ["claude"], cwd=tmp_path, env=env)
+    run.usage[-1]["recorded_at"] = "2026-11-01"
+    assert totals(run.usage)["input_tokens"] == 220
+    assert grouped(run.usage, "recorded_at")["2026-11"]["input_tokens"] == 100
+
+
+def test_codex_interactive_resume_counts_delta_and_ignores_other_cwd(tmp_path):
+    from spec_runtime.usage import collect_transcript_usage, transcript_snapshot
+    env = {"HOME": str(tmp_path)}
+    root, _ = transcript_snapshot("codex", tmp_path, env)
+    root.mkdir(parents=True)
+    def rollout(cwd, tokens):
+        return "\n".join(json.dumps(e) for e in [
+            {"type": "session_meta", "payload": {"cwd": str(cwd)}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": tokens, "output_tokens": 10}}}}]) + "\n"
+    path = root / "session.jsonl"
+    path.write_text(rollout(tmp_path, 100))
+    snapshot = transcript_snapshot("codex", tmp_path, env)
+    with path.open("a") as stream:
+        stream.write(rollout(tmp_path, 150))
+    (root / "other.jsonl").write_text(rollout(tmp_path / "other", 999))
+    launch = new_launch("authoring", "codex", "", "scoping")
+    collect_transcript_usage(launch, tmp_path, snapshot)
+    assert launch["input_tokens"] == 50
+    assert launch["output_tokens"] == 0

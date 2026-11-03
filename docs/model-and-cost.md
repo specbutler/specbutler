@@ -43,10 +43,15 @@ includes `usage.total`, `usage.months`, `usage.roles`, and `usage.providers`, wi
 its existing spec, run and date filters. `unknown_cost_launches` makes missing
 cost information visible rather than treating unknown costs as free.
 
-Interactive authoring launches also create receipts (standalone spec authoring
-has an authoring run). Terminal-mode CLIs do not emit machine-readable result
-usage: their receipts have `usage_available = false`, zero observed tokens and
-null cost. Interrupted or older CLIs that do not emit usage likewise retain a receipt without a cost.
+Interactive authoring launches read usage from provider session transcripts after
+exit. Claude message usage includes subagent transcripts and uses standard API
+list prices for recognized models; unknown models retain null cost. Codex rollout
+counters contribute only usage appended during the launch. Missing or unreadable
+transcripts retain `usage_available = false` and null cost. Standalone authoring
+receipts are included in analytics but excluded from workflow status, dispatch,
+and garbage collection. Task scoping usage belongs to the task run and reduces
+its remaining budget. Monthly analytics attribute increases in whole-session
+Claude counters to the month of each launch, preserving earlier months.
 
 Budgets are disabled by default. A configured budget checks observed estimated
 cost before launches and between phases. Claude receives `--max-budget-usd` with
