@@ -241,6 +241,7 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                         "--no-sandbox",
                         "--disable-gpu",
                         "--disable-dev-shm-usage",
+                        "--disable-background-networking",
                         "--no-first-run",
                         "--no-default-browser-check",
                         f"--user-data-dir={profile}",
@@ -253,7 +254,11 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                     stderr=browser_stderr,
                 )
                 try:
-                    deadline = time.monotonic() + 30
+                    # A cold Chrome on a shared runner may publish its port
+                    # before DevTools responds. Allow startup time, but stay
+                    # within the one-time browser URL's 60-second lifetime.
+                    deadline = time.monotonic() + 45
+                    targets: list[dict[str, object]] = []
                     page_target: dict[str, object] | None = None
                     last_browser_error: Exception | None = None
                     debug_port: int | None = None
@@ -268,7 +273,7 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                                 )
                             with urllib.request.urlopen(
                                 f"http://127.0.0.1:{debug_port}/json/list",
-                                timeout=1,
+                                timeout=5,
                             ) as response:
                                 targets = json.load(response)
                             page_target = next(
@@ -299,7 +304,7 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                         time.sleep(0.05)
                     assert page_target is not None, (
                         "Chrome did not load the authenticated clean URL: "
-                        f"debug_port={debug_port}, error={last_browser_error}\n"
+                        f"debug_port={debug_port}, error={last_browser_error}, targets={targets}\n"
                         f"{browser_stderr_path.read_text(errors='replace')[-2000:]}"
                     )
                     current_url = str(page_target["url"])
@@ -314,7 +319,7 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                         ),
                         method="PUT",
                     )
-                    with urllib.request.urlopen(close_request, timeout=2) as response:
+                    with urllib.request.urlopen(close_request, timeout=5) as response:
                         assert response.read().decode() == "Target is closing"
 
                     # Closing the page through the browser protocol gives
@@ -327,7 +332,7 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                             break
                         with urllib.request.urlopen(
                             f"http://127.0.0.1:{debug_port}/json/list",
-                            timeout=1,
+                            timeout=5,
                         ) as response:
                             targets = json.load(response)
                         if all(target.get("id") != target_id for target in targets):
