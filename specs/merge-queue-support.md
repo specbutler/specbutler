@@ -36,18 +36,22 @@ recommended, not required: personal-account and many private repos can't enable 
     merge-group run rather than the PR head;
   - a timeout or a removal by someone else is retried a bounded number of times, then
     fails with a clear message.
-- [ ] **The review gate works with the queue.** Either the local-review status is
-  also reported for the merge-group commit, or `spec doctor` verifies the review gate
-  is required to enter the queue but isn't a required check inside it. Pick one,
-  document it in the PR, and test it.
+- [ ] **The review gate guards entry to the queue.** `review-decision-gate` stays a
+  required check on the PR head, so a PR can join the queue only after independent
+  review approved that exact head, like a required human review. It isn't a required
+  check inside the queue, so nothing needs to post review status on merge-group
+  commits. If the queue's base sync changes the head (a conflict resolution, or a
+  push after removal from the queue), local review reruns before the PR rejoins. `spec
+  doctor` warns when a queued base branch requires the review gate inside the queue,
+  or doesn't require it on PRs at all.
 - [ ] **`spec doctor` advises.** It reports whether the base branch has a queue. When
   the branch requires up-to-date PRs, has no queue, and the repo's autopilot
   concurrency is above 1, it recommends enabling one as a warning, not a blocker. When
   a queue is configured, it checks that the required workflows trigger on
   `merge_group`.
-- [ ] **This repo's workflows are queue-ready.** The `ci`, `spec-pr-policy` and
-  review-gate workflows run on `merge_group` events, and `ci-evidence` accepts
-  merge-group runs. The workflow changes work with and without a queue, so nothing
+- [ ] **This repo's workflows are queue-ready.** The `ci` and `spec-pr-policy`
+  workflows run on `merge_group` events, `ci-evidence` accepts merge-group runs, and
+  the review-gate workflow skips cleanly on `merge_group`. The workflow changes work with and without a queue, so nothing
   breaks before the repo enables one.
 - [ ] **Hermetic tests cover:** queue detection on and off; a queued merge that
   succeeds; removal for a conflict, for failing checks and for a timeout; the
