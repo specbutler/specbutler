@@ -429,6 +429,8 @@ def _git_checks(
             )
         )
     remote = base_ref.removeprefix("refs/remotes/").split("/", 1)[0] if "/" in base_ref else "origin"
+    if remote == "origin" and origin.returncode != 0:
+        return checks
     local = run(["git", "tag", "--list", "spec/merged/*"], repo_root, 10.0)
     upstream = run(
         ["git", "ls-remote", "--tags", "--refs", remote, "refs/tags/spec/merged/*"],
@@ -436,7 +438,8 @@ def _git_checks(
         DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
     )
     if local.returncode != 0 or upstream.returncode != 0:
-        checks.append(_warning("merge tags", f"Could not compare local merge tags with {remote}"))
+        # An unavailable comparison does not establish that any tags are missing.
+        return checks
     else:
         local_tags = set(local.stdout.splitlines())
         remote_tags = {

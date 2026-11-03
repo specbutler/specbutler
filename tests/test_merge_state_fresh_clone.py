@@ -129,3 +129,28 @@ def test_fetch_timeout_is_reported(clone, monkeypatch):
     blockers = orch.check_dependencies_merged(root, "feature")
     assert "merge tags could not be fetched" in blockers[0]
     assert "30.0s timeout" in blockers[0]
+
+
+@pytest.mark.parametrize("remote_kind", ["none", "empty", "unavailable"])
+def test_doctor_fresh_repo_has_no_merge_tag_warning(tmp_path, remote_kind):
+    root = tmp_path / "fresh"
+    root.mkdir()
+    git(root, "init", "-b", "main")
+    git(root, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "base")
+    if remote_kind != "none":
+        remote = tmp_path / "remote.git"
+        if remote_kind == "empty":
+            git(tmp_path, "init", "--bare", str(remote))
+        git(root, "remote", "add", "origin", str(remote))
+
+    def run(cmd, cwd, timeout):
+        if remote_kind == "none":
+            assert cmd[1] != "ls-remote", "Do not query a nonexistent remote"
+        return subprocess.run(cmd, cwd=cwd, timeout=timeout, capture_output=True, text=True)
+
+    checks = doctor._git_checks(root, SimpleNamespace(base_ref="main"), run)
+    merge_checks = [check for check in checks if check.name == "merge tags"]
+    assert all(check.status == "ok" for check in merge_checks)
+    if remote_kind == "empty":
+        assert len(merge_checks) == 1
+        assert "All 0 remote merge tags" in merge_checks[0].detail
