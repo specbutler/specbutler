@@ -19255,7 +19255,10 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
     head_before = _head_sha(worktree_path)
     _migrate_legacy_publication_base(run)
     if not run.publication_base_sha:
-        if run.implement_launches == 0 and head_before:
+        if (
+            run.implement_launches == 0 and head_before
+            and not run.implement_head_sha_before and not run.implement_head_sha_after
+        ):
             run.publication_base_sha = head_before
         else:
             run.last_error = (

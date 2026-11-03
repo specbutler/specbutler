@@ -2485,6 +2485,27 @@ class TestPhaseImplementHandshake:
         assert run.implement_unstaged_changes is False
         assert run.implement_tree_status == "new_commit"
 
+    @pytest.mark.parametrize("launches", [0, 2])
+    def test_legacy_launch_does_not_recapture_latest_head_as_original_base(self, repo: Path, launches: int):
+        run = self._make_run()
+        run.attempts = 2
+        run.implement_launches = launches
+        run.implement_head_sha_before = "c" * 40
+        run.implement_head_sha_after = "c" * 40
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True)
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch, "_head_sha", return_value="c" * 40),
+            patch.object(orch, "_claude_supports_stream_json", return_value=False),
+            patch.object(orch, "_build_agent_command") as build_command,
+        ):
+            status = orch.phase_implement(run, repo)
+        assert status == "failed"
+        assert "Cannot establish the immutable pre-agent publication base" in run.last_error
+        assert not run.publication_base_sha
+        build_command.assert_not_called()
+
     @pytest.mark.requires_ps
     def test_reused_branch_syncs_origin_master_before_first_implement(self, repo: Path):
         run = self._make_run()
@@ -3203,6 +3224,7 @@ class TestPhaseImplementHandshake:
         run.attempts = 0
         # The counter has not advanced yet, but the blocked launch produced
         # work. A first launch without code now receives initial framing.
+        run.publication_base_sha = "base123"
         run.implement_head_sha_before = "base123"
         run.implement_head_sha_after = "abc123"
         run.pending_block_debugger_signature = "sig-first"
