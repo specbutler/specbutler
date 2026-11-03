@@ -6428,7 +6428,7 @@ class TestReviewWorktreeBootstrap:
                 orch,
                 "SPEC_RUNTIME_CONFIG",
                 self._config_with_install(
-                    f"env > {marker}",
+                    f"env > {shlex.quote(str(marker))}",
                     windows_argv=(sys.executable, "-c", dump_env, str(marker)),
                 ),
             ),
@@ -6534,8 +6534,8 @@ class TestReviewWorktreeBootstrap:
         found_marker = worktree / "found-secret.txt"
         observed_home = worktree / "observed-home.txt"
         install_cmd = (
-            f'echo "$HOME" > {observed_home}; '
-            f'[ -f "$HOME/.codex/auth.json" ] && cp "$HOME/.codex/auth.json" {found_marker} || true'
+            f'echo "$HOME" > {shlex.quote(str(observed_home))}; '
+            f'[ -f "$HOME/.codex/auth.json" ] && cp "$HOME/.codex/auth.json" {shlex.quote(str(found_marker))} || true'
         )
         windows_probe = (
             "import shutil, sys; "
@@ -6693,7 +6693,7 @@ class TestReviewWorktreeBootstrap:
         marker = worktree / "child-alive"
         # The backgrounded child inherits stdout/stderr (kept open) and, absent
         # a group kill, would keep running/writing long past the timeout.
-        install_cmd = f"(sleep 5; touch {marker}) & sleep 30"
+        install_cmd = f"(sleep 5; touch {shlex.quote(str(marker))}) & sleep 30"
         windows_child = (
             "import sys, time; "
             "from pathlib import Path; "

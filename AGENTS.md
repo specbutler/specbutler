@@ -109,7 +109,8 @@ failures show up before the `windows-probe` CI job: `Path.read_text()`,
 `write_text()` and `Path.open()` without `encoding=` use cp1252, and every
 `tmp_path` contains a backslash. A `'charmap' codec` error means a missing
 `encoding="utf-8"`. A path mismatch means the test rendered a path itself
-instead of using the code's quoting helper (for example `_toml_quote`).
+instead of using the code's quoting helper (for example `_toml_quote`, or
+`shlex.quote` for a path inside a shell command).
 `tests/test_windows_fixture_parity.py` lints the fixture specs in Windows-only
 tests and runs `test_windows_probe.py`'s fake `gh` and `codex` through
 `spec doctor`. When doctor gains a provider probe, extend those fakes.
