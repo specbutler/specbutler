@@ -80,7 +80,7 @@ def _review_routing(
     )
     assert result.returncode == 0, result.stderr or result.stdout
     output = dict(line.partition("=")[::2] for line in github_output.read_text().splitlines())
-    assert output.keys() == {"local_review_owned", "dependabot_owned"}
+    assert output.keys() == {"local_review_owned", "dependabot_owned", "ci_approved"}
     return {key: value == "true" for key, value in output.items()}
 
 

@@ -1434,7 +1434,7 @@ def test_attach_fork_reads_the_running_codex_rollout(
     registered = threading.Event()
     register_process = orch._register_worktree_process_from_popen
 
-    def register_and_signal(*args, **kwargs) -> None:
+    def register_and_signal(*args: object, **kwargs: object) -> None:
         register_process(*args, **kwargs)
         registered.set()
 
