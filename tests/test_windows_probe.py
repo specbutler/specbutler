@@ -1081,8 +1081,16 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
         check=True,
         capture_output=True,
     )
+    # Doctor compares merge tags with origin; keep that query hermetic.
+    remote = tmp_path / "fixture-remote.git"
     subprocess.run(
-        ["git", "remote", "add", "origin", "https://github.com/example/spec-windows-probe.git"],
+        ["git", "init", "--bare", str(remote)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
         cwd=tmp_path,
         check=True,
     )
@@ -1113,6 +1121,7 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
     )
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
     assert "0 warning(s)" in doctor.stdout
+    assert "[ok] merge tags: All 0 remote merge tags are present locally" in doctor.stdout
     assert "agent version (codex)" in doctor.stdout
     assert "codex-cli 0.156.1" in doctor.stdout
 
