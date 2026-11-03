@@ -23100,11 +23100,15 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
     if SPEC_RUNTIME_CONFIG.review.source == "ci":
         rounds = review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
         if rounds:
-            context, _ = _local_review_rereview_context(
-                repo_root, run, worktree_path, last_round=rounds[-1],
-                round_number=len(rounds) + 1, head_sha=_head_sha(worktree_path),
+            result = ImplementResult.load(repo_root, run.run_id)
+            context = review_convergence.render_prior_findings_section(
+                rounds[-1].outstanding_findings,
+                round_number=len(rounds) + 1,
+                implementer_summary=result.summary if result is not None else "",
             )
-            body += "\n\n<!-- spec-ci-rereview-context -->\n" + context
+            body = _ci_review_pr_body(
+                body, context=context, previous_head=rounds[-1].reviewed_head_sha,
+            )
 
     # Refresh an existing PR body before push so synchronize sees the local-review marker.
     if not publication_transition_is_safe():
@@ -24470,6 +24474,18 @@ def _local_review_diff_text(
             f"`git diff --unified=80 {base_sha}...{head_sha}`: {detail}"
         )
     return diff_result.stdout
+
+
+def _ci_review_pr_body(body: str, *, context: str, previous_head: str) -> str:
+    """Keep PR metadata bounded; CI reconstructs diffs from the recorded head."""
+    if len(context) > 24000:
+        context = context[:24000] + (
+            "\nHistory truncated; consult the prior sticky review for full findings."
+        )
+    return (
+        body[:30000] + "\n\n<!-- spec-ci-rereview-context -->\n"
+        f"Previous-reviewed-head: {previous_head}\n" + context
+    )
 
 
 def _local_review_incremental_diff(

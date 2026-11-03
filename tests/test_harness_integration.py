@@ -534,3 +534,80 @@ def test_ci_new_spec_authoring_uses_diff_without_base_spec(tmp_path, monkeypatch
     assert "new spec diff" in rendered
     assert "No canonical specs/new-spec.md exists at the base commit" in rendered
     assert "spec-authoring PR" in rendered
+
+
+def test_ci_workflow_bootstrap_is_self_contained_and_matches_helper():
+    import ast
+
+    import yaml
+
+    root = Path(__file__).parents[1]
+    workflow = yaml.safe_load((root / '.github/workflows/codex-review.yml').read_text())
+    steps = workflow['jobs']['review-decision-gate']['steps']
+    shell = next(s['run'] for s in steps if s.get('name') == 'Materialize trusted review code and prompt')
+    script = shell.split("<<'PY'\n", 1)[1].rsplit('\nPY', 1)[0]
+    tree = ast.parse(script)
+    helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'render_ci_evidence')
+    source = ast.parse((root / 'src/spec_runtime/ci_review_prompt.py').read_text())
+    expected = next(n for n in source.body if isinstance(n, ast.FunctionDef))
+    assert ast.dump(helper) == ast.dump(expected)
+    imports = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
+    assert imports == ['pathlib', 'spec_runtime.spec_identity']
+    # Compile the embedded helper with stdlib only: no new base module is needed.
+    namespace = {'Path': Path, 'subprocess': subprocess, 're': __import__('re')}
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), '<bootstrap>', 'exec'), namespace)
+    assert callable(namespace['render_ci_evidence'])
+
+
+def test_ci_prompt_reconstructs_large_incremental_diff(tmp_path, monkeypatch):
+    from spec_runtime.ci_review_prompt import render_ci_evidence
+
+    previous = 'a' * 40
+    calls = []
+
+    def invoke(argv, **kwargs):
+        calls.append(argv)
+        output = 'x' * 80000 if f'{previous}..head' in argv else 'evidence'
+        return subprocess.CompletedProcess(argv, 0, output, '')
+
+    monkeypatch.setattr(subprocess, 'run', invoke)
+    rendered = render_ci_evidence(
+        tmp_path, base_sha='base', head_sha='head', spec_id='', repo='owner/repo',
+        pr_body=f'<!-- spec-ci-rereview-context -->\nPrevious-reviewed-head: {previous}\nF1',
+    )
+    assert 'x' * 80000 in rendered
+    assert calls[-1][-2:] == [f'{previous}..head', '--']
+    assert '--no-ext-diff' in calls[-1]
+    assert 'Re-review blocking rule' in rendered
+
+
+def test_ci_pr_metadata_is_bounded_and_records_previous_head():
+    body = orch._ci_review_pr_body('b' * 80000, context='f' * 80000, previous_head='a' * 40)
+    assert len(body) < 65536
+    assert 'Previous-reviewed-head: ' + 'a' * 40 in body
+    assert 'History truncated' in body
+    assert 'BEGIN_INCREMENTAL_DIFF' not in body
+    assert orch._ci_review_pr_body('description', context='F1', previous_head='a' * 40).endswith('F1')
+
+
+@pytest.mark.parametrize('previous', ['a' * 40, '--output=/tmp/untrusted'])
+def test_ci_prompt_unavailable_or_invalid_previous_head(tmp_path, monkeypatch, previous):
+    from spec_runtime.ci_review_prompt import render_ci_evidence
+
+    calls = []
+
+    def invoke(argv, **kwargs):
+        calls.append(argv)
+        if f'{previous}..head' in argv:
+            raise subprocess.CalledProcessError(128, argv)
+        return subprocess.CompletedProcess(argv, 0, 'evidence', '')
+
+    monkeypatch.setattr(subprocess, 'run', invoke)
+    rendered = render_ci_evidence(
+        tmp_path, base_sha='base', head_sha='head', spec_id='', repo='owner/repo',
+        pr_body=f'<!-- spec-ci-rereview-context -->\nPrevious-reviewed-head: {previous}\n',
+    )
+    if previous.startswith('--'):
+        assert len(calls) == 2
+    else:
+        assert 'Previous head unavailable' in rendered
