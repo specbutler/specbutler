@@ -144,12 +144,15 @@ spec report --status ok                # report completion (from inside implemen
 spec stop --spec ID                    # stop an active run; preserve its workspace
 spec clean --spec ID                   # remove execution workspaces/branches
 spec task                              # quick task without a full spec
-spec steer --spec ID --message TEXT    # guidance for the next attempt boundary
+spec steer --spec ID --message TEXT    # append guidance for the next attempt boundary
+spec steer --spec ID --message TEXT --replace  # replace active notes
+spec steer --spec ID --message TEXT --answer   # answer a pending request
 spec attach --spec ID [--exec]         # resume the latest run's agent session
 
 # Advanced/debug
 spec phase --spec ID --phase NAME      # run a single phase
 spec input --spec ID [--agent A]       # resolve ambiguity for a waiting-for-input run
+spec input --spec ID --message TEXT    # answer a pending request without a TTY
 spec analytics                         # summarize history
 
 # Optional coordinator

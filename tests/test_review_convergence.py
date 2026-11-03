@@ -1314,13 +1314,56 @@ def test_round_cap_moves_run_to_waiting_for_input(tmp_path: Path):
             accept=False,
             message="Fix F1 by validating input.",
         )
-    assert rc == 0 and cmd_run.called
+    assert rc == 0
+    cmd_run.assert_not_called()
     assert review_convergence.load_extra_rounds_granted(run_dir) == 1
     assert not review_convergence.round_cap_reached(
         run_dir, max_rounds=orch.SPEC_RUNTIME_CONFIG.review.max_rounds
     )
     resumed = orch.RunState.find_latest(tmp_path, run.spec_id)
     assert resumed is not None and resumed.phase == "implement"
+
+
+@pytest.mark.parametrize("command", ["input", "steer", "resolver"])
+def test_round_cap_answers_grant_one_round_without_launching(tmp_path: Path, command: str):
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    _record_rounds(run_dir, orch.SPEC_RUNTIME_CONFIG.review.max_rounds)
+    assert _run_phase(tmp_path, run, _request_changes_result(), []) == "waiting-for-input"
+    with (
+        patch.object(orch, "resolve_repo_root", return_value=tmp_path),
+        patch.object(orch.sys.stdin, "isatty", return_value=False),
+        patch.object(orch, "cmd_run") as launch,
+    ):
+        if command == "resolver":
+            orch.resolve_operator_request(tmp_path, run, "Fix F1", source="tui-chat")
+        else:
+            handler = orch.cmd_input if command == "input" else orch.cmd_steer
+            assert handler(argparse.Namespace(spec=run.spec_id, message="Fix F1", answer=True)) == 0
+    launch.assert_not_called()
+    saved = orch.RunState.find_latest(tmp_path, run.spec_id)
+    request = orch.OperatorRequest.load(tmp_path, run.run_id)
+    assert saved.status == "pending" and saved.phase == "implement"
+    assert request.status == "resolved" and request.response == "Fix F1"
+    assert request.continuation == orch.OPERATOR_CONTINUATION_RESUME_IMPLEMENT
+    assert review_convergence.load_extra_rounds_granted(run_dir) == 1
+    assert not review_convergence.round_cap_reached(
+        run_dir, max_rounds=orch.SPEC_RUNTIME_CONFIG.review.max_rounds,
+    )
+    # Revising an answer on the same resolved request is not a new round grant.
+    orch.resolve_operator_request(tmp_path, saved, "Clarified F1 guidance", source="test")
+    assert review_convergence.load_extra_rounds_granted(run_dir) == 1
+
+
+def test_invalid_round_cap_answer_does_not_grant_a_round(tmp_path: Path):
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    _record_rounds(run_dir, orch.SPEC_RUNTIME_CONFIG.review.max_rounds)
+    assert _run_phase(tmp_path, run, _request_changes_result(), []) == "waiting-for-input"
+    with pytest.raises(RuntimeError, match="cannot be empty"):
+        orch.resolve_operator_request(tmp_path, run, " ", source="test")
+    assert review_convergence.load_extra_rounds_granted(run_dir) == 0
+    assert orch.OperatorRequest.load(tmp_path, run.run_id).status == "pending"
 
 
 def test_operator_accept_at_cap_approves_and_records_followups(tmp_path: Path):
