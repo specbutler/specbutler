@@ -80,6 +80,8 @@ REVIEW_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high",
 
 @dataclass(frozen=True)
 class ReviewConfig:
+    source: str = "local"
+    checks: tuple[str, ...] = ("review-decision-gate",)
     # Review rounds one run may spend before the operator must decide: the
     # max_rounds-th request_changes moves the run to waiting-for-input instead
     # of starting another implement retry.
@@ -397,11 +399,11 @@ def _parse_review_section(payload: object) -> ReviewConfig:
         return ReviewConfig()
     if not isinstance(payload, dict):
         raise SpecConfigError("[review] must be a table")
-    unknown = sorted(set(payload) - {"max_rounds", "rereview_reasoning_effort"})
+    unknown = sorted(set(payload) - {"max_rounds", "rereview_reasoning_effort", "source", "checks"})
     if unknown:
         raise SpecConfigError(
             "Unknown [review] key(s): " + ", ".join(unknown)
-            + ". Allowed: max_rounds, rereview_reasoning_effort"
+            + ". Allowed: max_rounds, rereview_reasoning_effort, source, checks"
         )
     max_rounds = payload.get("max_rounds", ReviewConfig.max_rounds)
     if isinstance(max_rounds, bool) or not isinstance(max_rounds, int) or max_rounds < 1:
@@ -415,7 +417,18 @@ def _parse_review_section(payload: object) -> ReviewConfig:
             "[review].rereview_reasoning_effort must be one of: "
             + ", ".join(REVIEW_REASONING_EFFORTS)
         )
-    return ReviewConfig(max_rounds=max_rounds, rereview_reasoning_effort=effort)
+    source = payload.get("source", "local")
+    if source not in ("local", "ci"):
+        raise SpecConfigError('[review].source must be local or ci')
+    checks = payload.get("checks", list(ReviewConfig.checks))
+    if not isinstance(checks, list) or not checks or any(not isinstance(c, str) or not c.strip() for c in checks):
+        raise SpecConfigError("[review].checks must be a nonempty array of check names")
+    return ReviewConfig(
+        max_rounds=max_rounds,
+        rereview_reasoning_effort=effort,
+        source=source,
+        checks=tuple(dict.fromkeys(c.strip() for c in checks)),
+    )
 
 
 def _parse_review_evidence_paths(payload: object, *, gate_name: str) -> tuple[str, ...]:

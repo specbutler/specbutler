@@ -14273,11 +14273,10 @@ def _mark_local_review_for_rerun_after_sync(
     pr_body: str,
     current_head_sha: str,
 ) -> bool:
-    # phase_review always reviews locally, so a missing Review-Owner marker
-    # (e.g. an agent-supplied PR body) still means local review; only a PR
-    # that names another owner is exempt from the post-sync rerun.
+    # In local mode, an explicit external owner exempts the PR from reruns.
+    # CI mode also invalidates computed decisions when the head changes.
     review_owner = extract_review_owner_from_pr_body(pr_body)
-    if review_owner and review_owner != LOCAL_REVIEW_OWNER:
+    if SPEC_RUNTIME_CONFIG.review.source == "local" and review_owner and review_owner != LOCAL_REVIEW_OWNER:
         return False
     if not current_head_sha:
         return False
@@ -14354,6 +14353,8 @@ def _restore_approved_local_review_status_if_pending(
     merge polling, re-publish the saved decision only when that exact required
     check is pending and the approval still covers the expected head.
     """
+    if SPEC_RUNTIME_CONFIG.review.source != "local":
+        return False, ""
     if REVIEW_GATE_CHECK_NAME.lower() not in checks_error.lower():
         return False, ""
     if run.review_decision_status != "approved":
@@ -23037,7 +23038,7 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
     body = (
         f"## Spec\nSpec-ID: {run.spec_id}\n{spec_block}\n\n"
         f"## Summary\n{summary}\n\n"
-        f"## Review\n{format_pr_review_owner()}\n\n"
+        f"## Review\n{format_pr_review_owner(SPEC_RUNTIME_CONFIG.review.source)}\n\n"
         f"## Acceptance Criteria\n{checklist}\n\n"
         f"## Known Issues\n{known_issues}\n"
     )
@@ -23062,7 +23063,7 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
                 body = (
                     f"## Spec\nSpec-ID: {run.spec_id}\n{spec_block}\n\n"
                     f"## Summary\n{summary}\n\n"
-                    f"## Review\n{format_pr_review_owner()}\n\n"
+                    f"## Review\n{format_pr_review_owner(SPEC_RUNTIME_CONFIG.review.source)}\n\n"
                     f"## Acceptance Criteria\n{checklist}\n\n"
                     f"## Known Issues\n{known_issues}\n"
                 )
@@ -25428,6 +25429,63 @@ def _phase_review_local(
     return outcome
 
 
+def _apply_ci_review_results(run: RunState, repo_root: Path, results: list) -> str:
+    """Use the same computed decision, round ledger and cap as local review."""
+    from .review_gate import compute_review_decision
+
+    review_run_dir = _state_root(repo_root) / "runs" / run.run_id
+    rounds = review_convergence.load_review_rounds(review_run_dir)
+    last = rounds[-1] if rounds else None
+    changed_ranges = None
+    if last:
+        _, changed_ranges = _local_review_incremental_diff(
+            resolve_worktree_path(run, repo_root),
+            last_reviewed_head_sha=last.reviewed_head_sha,
+            head_sha=results[0].reviewed_head_sha,
+        )
+    findings = [asdict(f) for result in results for f in result.findings]
+    model_decision = next((r.status for r in results if r.status != "approved"), "approved")
+    computed = compute_review_decision(
+        model_decision=model_decision, findings=findings,
+        prior_findings=last.outstanding_findings if last else None,
+        prior_classifications=[f for r in results for f in getattr(r, "prior_findings", [])],
+        changed_ranges=changed_ranges,
+    )
+    result = ReviewResult(
+        status=computed.decision, model_decision=model_decision,
+        summary="; ".join(r.summary for r in results),
+        findings=[ReviewFinding(**f) for f in findings],
+        reviewed_head_sha=results[0].reviewed_head_sha,
+        reviewed_base_sha=results[0].reviewed_base_sha,
+        source_check_name=", ".join(r.source_check_name for r in results),
+        source_check_url=results[0].source_check_url,
+        review_round=len(rounds) + 1,
+        outstanding_findings=computed.outstanding_findings,
+        blocking_finding_ids=computed.blocking_ids,
+    )
+    outcome = _apply_review_result(
+        run, repo_root, result,
+        conclusion="success" if result.status == "approved" else "failure",
+    )
+    _record_local_review_round(review_run_dir, result)
+    max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
+    if result.status == "request_changes" and review_convergence.round_cap_reached(
+        review_run_dir, max_rounds=max_rounds,
+    ):
+        request = _review_round_cap_operator_request(
+            run, result.outstanding_findings,
+            rounds_used=review_convergence.request_changes_round_count(
+                review_convergence.load_review_rounds(review_run_dir)),
+            max_rounds=max_rounds,
+        )
+        request.save(repo_root, run.run_id)
+        run.last_error = request.prompt
+        run.status = "waiting-for-input"
+        run.save(repo_root)
+        return "waiting-for-input"
+    return outcome
+
+
 def _phase_review_action(
     run: RunState,
     repo_root: Path,
@@ -25435,10 +25493,28 @@ def _phase_review_action(
     expected_head_sha: str,
     expected_base_sha: str,
 ) -> str:
+    accepted = _accepted_review_round_cap_request(repo_root, run)
+    if accepted is not None:
+        result = ReviewResult.load(repo_root, run.run_id)
+        rounds = review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+        matches = _round_cap_accept_matches_head(result, rounds, expected_head_sha)
+        accepted.status = "consumed"
+        accepted.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+        accepted.consumed_at = _now_iso()
+        accepted.response_consumed_attempt_number = _current_attempt_number(run)
+        accepted.save(repo_root, run.run_id)
+        if matches and result is not None:
+            result.status = "approved"
+            result.summary += " [Accepted by the operator at the review round cap.]"
+            return _apply_review_result(run, repo_root, result, conclusion="success")
+
     deadline = time.time() + REVIEW_TIMEOUT_SECONDS
     poll_interval = max(1, REVIEW_POLL_INTERVAL_SECONDS)
     last_state = "not_started"
     last_url = ""
+    completed_results = {}
+    check_names = SPEC_RUNTIME_CONFIG.review.checks
+    check_name = check_names[0]
 
     while time.time() <= deadline:
         repo_slug = _trusted_publication_repo_slug(run)
@@ -25489,14 +25565,14 @@ def _phase_review_action(
         check_run = _find_check_run_for_sha(
             repo_root,
             expected_head_sha,
-            REVIEW_GATE_CHECK_NAME,
+            check_name,
             repo_slug=repo_slug,
         )
         if check_run is None:
             last_state = "not_found"
         elif "__error__" in check_run:
             run.last_error = (
-                f"Could not query {REVIEW_GATE_CHECK_NAME} check run: {check_run.get('__error__', 'unknown error')}"
+                f"Could not query {check_name} check run: {check_run.get('__error__', 'unknown error')}"
             )
             return "failed"
         else:
@@ -25517,20 +25593,43 @@ def _phase_review_action(
                         repo_slug=repo_slug,
                     )
                 except ValueError as exc:
-                    run.last_error = f"Review decision payload invalid for {REVIEW_GATE_CHECK_NAME}: {exc}"
+                    try:
+                        payload = review_feedback._load_sticky_review_comment_payload(
+                            repo_root, int(latest_pr["number"]),
+                            run_subprocess=_repo_pinned_run_subprocess(repo_slug),
+                        )
+                        if payload is None:
+                            raise ValueError(str(exc))
+                        review_result = review_feedback.normalize_review_payload(
+                            payload, expected_head_sha=expected_head_sha,
+                            expected_base_sha=expected_base_sha, check_run=check_run,
+                        )
+                    except (ValueError, KeyError) as sticky_exc:
+                        run.last_error = f"Review decision payload invalid for {check_name}: {sticky_exc}"
+                        return "failed"
+                if conclusion != "success" and review_result.status == "approved":
+                    run.last_error = f"Review check {check_name} failed with an approved payload"
                     return "failed"
 
-                return _apply_review_result(
-                    run,
-                    repo_root,
-                    review_result,
-                    conclusion=conclusion,
-                    fallback_check_url=last_url,
-                )
+                completed_results[check_name] = review_result
+                remaining_checks = [n for n in check_names if n not in completed_results]
+                if remaining_checks:
+                    check_name = remaining_checks[0]
+                    continue
+                outcome = _apply_ci_review_results(run, repo_root, list(completed_results.values()))
+                saved = ReviewResult.load(repo_root, run.run_id)
+                if outcome == "passed" and saved is not None:
+                    _publish_review_followups(
+                        run, repo_root,
+                        review_convergence.non_blocking_followups(saved.outstanding_findings),
+                        pr_number=int(latest_pr["number"]),
+                        pr_body=str(latest_pr.get("body", "") or ""), repo_slug=repo_slug,
+                    )
+                return outcome
 
         logger.info(
             "Waiting for %s on %s (state=%s)...",
-            REVIEW_GATE_CHECK_NAME,
+            check_name,
             _short_sha(expected_head_sha),
             last_state,
         )
@@ -25543,7 +25642,7 @@ def _phase_review_action(
     if last_url:
         timeout_detail = f"{timeout_detail} ({last_url})"
     run.last_error = (
-        f"Timed out waiting for {REVIEW_GATE_CHECK_NAME} on {_short_sha(expected_head_sha)}: {timeout_detail}"
+        f"Timed out waiting for {check_name} on {_short_sha(expected_head_sha)}: {timeout_detail}"
     )
     return "failed"
 
@@ -25629,7 +25728,13 @@ def phase_review(run: RunState, repo_root: Path) -> str:
     run.review_decision_check_url = ""
     run.save(repo_root)
 
-    # Always use local review — no CI review-decision-gate dependency.
+    if SPEC_RUNTIME_CONFIG.review.source == "ci":
+        return _phase_review_action(
+            run, repo_root, expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha,
+        )
+
+    # Local review is the default.
     return _phase_review_local(
         run,
         repo_root,

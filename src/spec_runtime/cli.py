@@ -1627,6 +1627,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Filter to records updated on/after this date",
     )
 
+    p_mcp = subparsers.add_parser("mcp", help="Serve workflow tools over stdio MCP")
+    p_mcp.add_subparsers(dest="mcp_command", required=True).add_parser("serve")
+
     # ----- Parse and dispatch -----
 
     args = parser.parse_args(argv)
@@ -1643,6 +1646,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.command:
         parser.print_help()
         return 1
+
+    if args.command == "mcp":
+        from .mcp_server import serve
+        return serve(_resolve_repo_root())
 
     commands = {
         # Primary

@@ -85,6 +85,7 @@ class ReviewResult:
     reviewed_base_sha: str = ""
     reviewer_role: str = ""
     reviewer_agent: str = ""
+    prior_findings: list[dict] = field(default_factory=list)
     source_check_name: str = REVIEW_GATE_CHECK_NAME
     source_check_url: str = ""
     reviewed_at: str = field(default_factory=_now_iso)
@@ -305,6 +306,7 @@ def normalize_review_payload(
         status=decision,
         summary=summary,
         findings=findings,
+        prior_findings=[f for f in payload.get("prior_findings", []) or [] if isinstance(f, dict)],
         reviewed_head_sha=reviewed_head_sha,
         reviewed_base_sha=reviewed_base_sha,
         reviewer_role=str(payload.get("reviewer_role", "independent-review")).strip(),

@@ -199,6 +199,14 @@ spec gc --apply                        # apply the proposed cleanup
 The interactive TUI requires the `tui` extra. The browser dashboard requires
 the `web` extra; see [Web dashboard and chat](docs/web.md).
 
+### Session integration
+
+Run `spec mcp serve` to expose spec listing, lint, status, detached dispatch,
+steering, stop and takeover tools to Claude Code or Codex. See the
+[Claude Code plugin and Codex setup](integrations/claude-code/README.md) for
+installation and configuration. Dispatched runs survive the calling session;
+poll the status tool to watch them.
+
 ### Container backend
 
 > **Alpha: container mode has known reliability issues (image builds, in-worker services such as Postgres, credential refresh, nested provider sandboxing). Prefer the clone or worktree backend.**
@@ -405,8 +413,9 @@ the retry cap is reached.
 
 All implementation happens in an isolated workspace selected by the configured
 backend: a git worktree, a separate clone, or a container-backed workspace. The
-review phase runs locally using the configured agent — no CI review workflow
-setup required.
+review phase defaults to running locally using the configured agent. Set
+`[review] source = "ci"` with `checks = ["review-decision-gate"]` to wait for
+structured CI findings instead, using the same convergence rules and round cap.
 
 ## GitHub Enforcement
 
