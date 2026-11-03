@@ -37191,7 +37191,10 @@ class TestCodexIsolatedHome:
         (home / "config.toml").write_text(
             '[mcp_servers.private]\nargs = ["literal-mcp-secret"]\n'
         )
-        run = SimpleNamespace(agent="codex", implement_launches=1, attempts=1, run_id="run-1")
+        run = orch.RunState(
+            agent="codex", implement_launches=1, attempts=1, run_id="run-1",
+            spec_id="feature", branch="code/feature--run-1", phase="implement",
+        )
         plan = orch.ImplementLaunchPlan(
             use_stream_json=False,
             agent_env={},
