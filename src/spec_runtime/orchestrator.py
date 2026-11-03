@@ -765,10 +765,31 @@ def _repo_pinned_run_subprocess(repo_slug: str):
 
 def _check_forge_auth() -> str:
     """Verify forge authentication. Returns empty string on success, error message on failure."""
-    gh_check = run_subprocess(["gh", "auth", "status"])
-    if gh_check.returncode != 0:
-        return "GitHub CLI not authenticated. Run 'gh auth login'."
-    return ""
+    network_error = ""
+    for attempt in range(3):
+        if attempt:
+            _poll_sleep(20.0 * attempt)
+        gh_check = run_subprocess(["gh", "auth", "status"])
+        if gh_check.returncode == 0:
+            return ""
+        output = f"{gh_check.stdout or ''}\n{gh_check.stderr or ''}".strip()
+        if any(marker in output.lower() for marker in _FORGE_NETWORK_MARKERS):
+            network_error = output
+    if network_error:
+        return f"Forge auth preflight failed: {network_error}"
+    return "GitHub CLI not authenticated. Run 'gh auth login'."
+
+
+def _check_run_forge_auth(run: RunState, phase: str) -> str:
+    """Keep a same-phase forge outage on the infrastructure retry path."""
+    error = _check_forge_auth()
+    if (
+        error
+        and run.last_failure_phase == phase
+        and run.last_failure_signature.startswith("forge_network:")
+    ):
+        return "Forge auth preflight failed: error connecting to forge after a network failure."
+    return error
 
 
 def _mcp_config_path(worktree_path: Path) -> Path:
@@ -4619,6 +4640,8 @@ def _infrastructure_failure_kind(text: str) -> tuple[str, bool, str] | None:
     if "container codex sandbox preflight failed" in text:
         return "container_sandbox", False, "backend"
     if _is_forge_auth_failure_message(text):
+        if any(marker in text for marker in _FORGE_NETWORK_MARKERS):
+            return "forge_network", True, "backend"
         return "forge_auth", False, "backend"
     if _is_agent_auth_failure_message(text) or "credentials are not authenticated" in text:
         return "agent_auth", False, "backend"
@@ -9310,6 +9333,7 @@ class RunState:
     # Autopilot keys infrastructure backoff and its circuit breaker on these.
     last_failure_category: str = ""
     last_failure_signature: str = ""
+    last_failure_phase: str = ""
     # Consecutive infrastructure failures of this run with
     # ``last_failure_signature``; reset by a passing phase or a new signature.
     # Drives the in-process infrastructure backoff and never touches
@@ -23180,7 +23204,7 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
     except RuntimeError as exc:
         run.last_error = f"Refusing host publication: {exc}"
         return "failed"
-    auth_error = _check_forge_auth()
+    auth_error = _check_run_forge_auth(run, "publish")
     if auth_error:
         run.last_error = auth_error
         return "failed"
@@ -25935,7 +25959,7 @@ def phase_review(run: RunState, repo_root: Path) -> str:
     except RuntimeError as exc:
         run.last_error = f"Refusing host review operation: {exc}"
         return "failed"
-    auth_error = _check_forge_auth()
+    auth_error = _check_run_forge_auth(run, "review")
     if auth_error:
         run.last_error = auth_error
         return "failed"
@@ -26940,7 +26964,7 @@ def phase_merge(run: RunState, repo_root: Path) -> str:
     publication_env = host_publication_git_environment()
 
     # Check forge auth
-    auth_error = _check_forge_auth()
+    auth_error = _check_run_forge_auth(run, "merge")
     if auth_error:
         run.last_error = auth_error
         return "failed"
@@ -27932,6 +27956,7 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.last_failure_subtype = ""
         run.last_failure_category = ""
         run.last_failure_signature = ""
+        run.last_failure_phase = ""
         run.last_sandbox_denial = ""
         run.infra_failure_streak = 0
     else:
@@ -27967,6 +27992,7 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.last_failure_subtype = str(metadata.get("failure_subtype") or "")
         run.last_failure_category = classification.category.value
         run.last_failure_signature = classification.signature
+        run.last_failure_phase = phase
         run.last_sandbox_denial = (
             sandbox_denial_summary(run.last_error) or "unknown target"
             if classification.category is FailureCategory.SANDBOX_DENIED
