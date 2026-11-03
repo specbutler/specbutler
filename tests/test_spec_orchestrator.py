@@ -5628,6 +5628,28 @@ class TestEnvironmentBlockDetection:
         with patch.object(orch, "VERIFY_GATE_COMMANDS", gates):
             assert orch.is_non_actionable_gate_environment_block(summary) is True
 
+    def test_observed_sandbox_denial_counts_without_matching_wording(self):
+        # Real harness-integration attempt 4 summary: no "sandbox" or
+        # "permission denied" in the agent's own words.
+        summary = (
+            "Committed as 7c637bf on top of the reviewed head. Targeted harness, workflow and convergence "
+            "tests: 155 passed. Required foreground pytest: 3933 passed, 99 failed, 71 skipped; failures "
+            "include denied provider config reads and browser startup errors under session restrictions. "
+            "Blocked on a green full verification gate in a runnable environment."
+        )
+        gates = {"test": ".venv/bin/python -m pytest", "lint": ".venv/bin/python -m ruff check ."}
+        with patch.object(orch, "VERIFY_GATE_COMMANDS", gates):
+            assert orch.is_non_actionable_gate_environment_block(summary) is False
+            assert orch.is_non_actionable_gate_environment_block(summary, sandbox_denial_observed=True) is True
+            # A block that never mentions a verify gate stays a real block.
+            assert (
+                orch.is_non_actionable_gate_environment_block(
+                    "The spec does not say which provider owns the session.",
+                    sandbox_denial_observed=True,
+                )
+                is False
+            )
+
     def test_sandbox_wording_without_a_gate_is_not_an_environment_block(self):
         summary = "Blocked: the spec asks for a sandbox mode but does not say which provider to target."
         gates = {"test": ".venv/bin/python -m pytest", "lint": ".venv/bin/python -m ruff check ."}
