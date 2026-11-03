@@ -17652,29 +17652,97 @@ def _prior_branch_review(
     return None, None
 
 
+def _phase_failure_resolutions(run: RunState, repo_root: Path) -> dict[str, datetime]:
+    """Return the latest successful completion of each phase in this run."""
+    resolutions: dict[str, datetime] = {}
+
+    def record(phase: str, timestamp: str) -> None:
+        resolved_at = _parse_iso_datetime(timestamp)
+        if resolved_at is not None and (phase not in resolutions or resolved_at > resolutions[phase]):
+            resolutions[phase] = resolved_at
+
+    for item in run.superseded_failures:
+        record(item.get("phase", ""), item.get("resolved_at", ""))
+    for path in _orchestrator_phase_result_paths(repo_root, run.run_id):
+        payload = _read_optional_json_payload(repo_root / path)
+        if not isinstance(payload, dict) or payload.get("run_id") != run.run_id:
+            continue
+        result = payload.get("result")
+        if isinstance(result, dict) and result.get("status") == "passed":
+            record(str(payload.get("phase") or ""), str(result.get("finished_at") or result.get("started_at") or ""))
+    return resolutions
+
+
+def _failure_predates_phase_success(phase: str, timestamp: str, resolutions: dict[str, datetime]) -> bool:
+    resolved_at = resolutions.get(phase)
+    observed_at = _parse_iso_datetime(timestamp)
+    # Undated legacy history is obsolete once its owning phase passes.
+    return resolved_at is not None and (observed_at is None or observed_at <= resolved_at)
+
+
+def _failure_artifact_observed_at(
+    run: RunState, repo_root: Path, filename: str, timestamp_field: str, fallback: str,
+) -> str:
+    payload = _read_optional_json_payload(_state_root(repo_root) / "runs" / run.run_id / filename)
+    # Artifact loaders supply today's time for missing legacy timestamps.
+    # Supersession must use the persisted observation, not that load time.
+    return str(payload.get(timestamp_field) or "") if isinstance(payload, dict) else fallback
+
+
+def _operator_request_for_implement_prompt(
+    run: RunState, repo_root: Path, request: OperatorRequest | None,
+) -> OperatorRequest | None:
+    if (
+        request is not None
+        and request.kind == "debugger_guidance"
+        and _is_resolved_operator_request(request)
+        and _failure_predates_phase_success(
+            request.requested_by_phase,
+            _failure_artifact_observed_at(run, repo_root, OPERATOR_REQUEST_FILENAME, "requested_at", request.requested_at),
+            _phase_failure_resolutions(run, repo_root),
+        )
+    ):
+        # Preserve the human response, but do not repeat a resolved failure or
+        # old debugger advice. The original request remains in run history.
+        return replace(request, prompt="The earlier blocker has been resolved.", context={}, suggested_action="", options=[])
+    return request
+
+
 def _cleared_initial_blocker_note(run: RunState, repo_root: Path) -> str:
     """Keep a short non-code explanation, without reviving the retry package."""
-    candidates = [(run.last_error, run.phase)]
+    # Each source carries its observation time. Passing a phase supersedes
+    # every earlier failure of that phase, not only the last error string.
+    candidates = [(run.last_error, run.last_failure_phase or run.phase, _now_iso())]
+    resolutions = _phase_failure_resolutions(run, repo_root)
     diagnosis = BlockDiagnosis.load(repo_root, run.run_id)
     if diagnosis is not None:
-        candidates.append((diagnosis.block_reason or diagnosis.summary, diagnosis.source_phase))
+        candidates.append((
+            diagnosis.block_reason or diagnosis.summary, diagnosis.source_phase,
+            _failure_artifact_observed_at(run, repo_root, BLOCK_DIAGNOSIS_FILENAME, "debugged_at", diagnosis.debugged_at),
+        ))
     request = _load_operator_request(repo_root, run)
     if _is_resolved_operator_request(request):
-        candidates.append((request.prompt, request.requested_by_phase))
-    # Successful bootstrap clears last_error. The phase audit is the historical
-    # source of truth when neither a diagnosis nor operator request survives.
+        candidates.append((
+            request.prompt, request.requested_by_phase,
+            _failure_artifact_observed_at(run, repo_root, OPERATOR_REQUEST_FILENAME, "requested_at", request.requested_at),
+        ))
+    # The audit history also covers legacy runs and phases whose last_error
+    # was cleared by an intervening phase. Filenames group by phase, so use
+    # result timestamps rather than file ordering to establish supersession.
     for path in reversed(_orchestrator_phase_result_paths(repo_root, run.run_id)):
         payload = _read_optional_json_payload(repo_root / path)
-        if isinstance(payload, dict) and payload.get("run_id") == run.run_id:
-            result = payload.get("result")
-            if isinstance(result, dict) and result.get("status") in {"blocked", "failed", "error"}:
-                candidates.append((str(result.get("error_code") or ""), str(payload.get("phase") or "")))
+        if not isinstance(payload, dict) or payload.get("run_id") != run.run_id:
+            continue
+        result = payload.get("result")
+        if not isinstance(result, dict):
+            continue
+        phase = str(payload.get("phase") or "")
+        timestamp = str(result.get("finished_at") or result.get("started_at") or "")
+        if result.get("status") in {"blocked", "failed", "error"}:
+            candidates.append((str(result.get("error_code") or ""), phase, timestamp))
     pre_implement_phases = PHASES[:PHASES.index("implement")]
-    for message, phase in candidates:
-        if any(
-            item.get("phase") == phase and item.get("error", "").splitlines()[:1] == message.splitlines()[:1]
-            for item in run.superseded_failures
-        ):
+    for message, phase, timestamp in candidates:
+        if _failure_predates_phase_success(phase, timestamp, resolutions):
             continue
         if not message.strip():
             continue
@@ -17786,14 +17854,15 @@ def _build_implement_attempt_context(
         # not inherit it (e.g. "do not change code for those failures").
         consumed_attempt = operator_request.response_consumed_attempt_number
         if _is_resolved_operator_request(operator_request) and consumed_attempt in {None, ctx.attempt_number}:
-            ctx.operator_request_kind = operator_request.kind
-            ctx.operator_request_prompt = operator_request.prompt
-            ctx.operator_request_context = dict(operator_request.context)
-            ctx.operator_request_suggested_action = operator_request.suggested_action
-            ctx.operator_request_options = list(operator_request.options)
-            ctx.operator_request_requires_full_session = operator_request.requires_full_session
-            ctx.operator_request_response = operator_request.response
-            ctx.operator_request_response_source = operator_request.response_source
+            prompt_request = _operator_request_for_implement_prompt(run, repo_root, operator_request)
+            ctx.operator_request_kind = prompt_request.kind
+            ctx.operator_request_prompt = prompt_request.prompt
+            ctx.operator_request_context = dict(prompt_request.context)
+            ctx.operator_request_suggested_action = prompt_request.suggested_action
+            ctx.operator_request_options = list(prompt_request.options)
+            ctx.operator_request_requires_full_session = prompt_request.requires_full_session
+            ctx.operator_request_response = prompt_request.response
+            ctx.operator_request_response_source = prompt_request.response_source
             if operator_request.response_consumed_attempt_number is None:
                 operator_request.response_consumed_attempt_number = ctx.attempt_number
                 operator_request.consumed_at = _now_iso()
@@ -18305,7 +18374,7 @@ def _prepare_implement_launch_plan(
 
     ctx.save(repo_root, run.run_id)
     run.save(repo_root)
-    operator_request = _load_operator_request(repo_root, run)
+    operator_request = _operator_request_for_implement_prompt(run, repo_root, _load_operator_request(repo_root, run))
 
     agent_command_kwargs = {
         "retry_context": (
@@ -19971,7 +20040,7 @@ def _attempt_no_handshake_recovery(
 
         recovery_ctx.save(repo_root, run.run_id)
         run.save(repo_root)
-        operator_request = _load_operator_request(repo_root, run)
+        operator_request = _operator_request_for_implement_prompt(run, repo_root, _load_operator_request(repo_root, run))
 
         recovery_cmd_kwargs = {
             "retry_context": recovery_ctx,
@@ -28240,7 +28309,7 @@ def _persist_audit(
     """Save request+result audit entry."""
     audit_dir = _state_root(repo_root) / "orchestrator"
     audit_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
     audit_path = audit_dir / f"{run.run_id}-{phase}-{ts}.json"
     audit_data = {
         "run_id": run.run_id,

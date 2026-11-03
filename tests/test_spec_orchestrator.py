@@ -42628,3 +42628,170 @@ def test_resumed_code_verify_failure_remains_retry_evidence(repo: Path):
     assert "make test" in package.active_gates_or_checks
     assert "feature is broken" in "\n".join(package.gate_output_parts)
     assert not resumed.superseded_failures
+
+
+@pytest.mark.parametrize("phase,kind", [("bootstrap", "dependency")] + [
+    (phase, "infrastructure") for phase in orch.PHASES
+])
+@pytest.mark.parametrize("source", ["audit", "diagnosis", "operator_request"])
+def test_phase_success_supersedes_all_earlier_failures(repo: Path, phase: str, kind: str, source: str):
+    errors = (
+        ["Unmet dependencies: A", "Unmet dependencies: B"]
+        if kind == "dependency" else ["provider_network: old outage A", "provider_network: old outage B"]
+    )
+    run = orch.RunState(
+        run_id="repeated-phase-failure", spec_id="my-feature", branch="spec/my-feature",
+        publication_base_sha=orch._head_sha(repo),
+    )
+
+    def fail(r, root):
+        r.last_error = errors.pop(0)
+        return "blocked" if kind == "dependency" else "failed"
+
+    first, second = errors
+    with patch.dict(orch.PHASE_HANDLERS, {phase: fail}):
+        orch.run_single_phase(run, phase, repo)
+        if source == "diagnosis":
+            orch.BlockDiagnosis(
+                summary=first, root_cause="Unavailable infrastructure", category="environment",
+                next_best_action="Retry", blocker_signature="old-failure", evidence=[first],
+                block_reason=first, source_phase=phase,
+            ).save(repo, run.run_id)
+            assert orch.BlockDiagnosis.load(repo, run.run_id) is not None
+        elif source == "operator_request":
+            orch.OperatorRequest(
+                kind="debugger_guidance", prompt=first, requested_by_phase=phase,
+                status="resolved", response="Try again.",
+            ).save(repo, run.run_id)
+        orch.run_single_phase(run, phase, repo)
+    with (
+        patch.object(orch, "resolve_worktree_path", return_value=repo),
+        patch.dict(orch.PHASE_HANDLERS, {phase: MagicMock(return_value="passed")}),
+    ):
+        assert orch.run_single_phase(run, phase, repo) == "passed"
+        run = orch.RunState.load(repo, run.run_id)
+        run.phase = "implement"
+        ctx = orch._build_implement_attempt_context(run, repo).context
+        prompt = orch._build_agent_command("claude", repo, retry_context=ctx)[-1]
+    assert ctx.implement_reason == "initial"
+    assert not ctx.cleared_blocker_note
+    assert first not in prompt
+    assert second not in prompt
+    # Even rapid failures of the same phase remain available for inspection.
+    audits = [json.loads((repo / path).read_text()) for path in orch._orchestrator_phase_result_paths(repo, run.run_id)]
+    assert len(audits) == 3
+    assert {item["result"]["error_code"] for item in audits} == {first, second, ""}
+    assert run.superseded_failures[0]["error"] == second
+    if source == "operator_request":
+        stored = orch.OperatorRequest.load(repo, run.run_id)
+        assert stored.prompt == first
+        assert ctx.operator_request_response == stored.response == "Try again."
+        # Normal and recovery launches pass the request independently of the
+        # context snapshot and must apply the same filter.
+        prompt_request = orch._operator_request_for_implement_prompt(run, repo, stored)
+        direct_prompt = orch._build_agent_command("claude", repo, operator_request=prompt_request)[-1]
+        assert first not in direct_prompt
+        assert "Try again." in direct_prompt
+
+
+@pytest.mark.parametrize("source", ["last_error", "diagnosis", "operator_request", "audit"])
+@pytest.mark.parametrize("same_phase", [True, False])
+def test_phase_success_keeps_new_or_other_phase_failure(repo: Path, source: str, same_phase: bool):
+    message = "provider_network: repeated outage"
+    run = orch.RunState(run_id="later-failure", spec_id="my-feature", branch="spec/my-feature")
+    owner = "bootstrap" if same_phase else "publish"
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status="passed", started_at="2026-01-02T00:00:00+00:00", finished_at="2026-01-02T00:00:01+00:00",
+    ))
+    # Reuse the exact message of a previously superseded failure to ensure
+    # filtering depends on time and owning phase, rather than matching text.
+    run.superseded_failures = [{
+        "phase": "bootstrap", "error": message, "resolved_at": "2026-01-02T00:00:01+00:00",
+    }]
+    observed_at = "2026-01-03T00:00:00+00:00" if same_phase else "2026-01-01T00:00:00+00:00"
+    if source == "last_error":
+        run.last_error = message
+        run.last_failure_phase = owner
+    elif source == "diagnosis":
+        orch.BlockDiagnosis(
+            summary=message, root_cause="Unavailable infrastructure", category="environment",
+            next_best_action="Retry", blocker_signature="new-failure", evidence=[message],
+            block_reason=message, source_phase=owner, debugged_at=observed_at,
+        ).save(repo, run.run_id)
+    elif source == "operator_request":
+        orch.OperatorRequest(
+            kind="debugger_guidance", prompt=message, requested_by_phase=owner, requested_at=observed_at,
+            status="resolved", response="Try again.",
+        ).save(repo, run.run_id)
+    else:
+        orch._persist_audit(repo, run, owner, orch.OrchestratorResult(
+            status="failed", error_code=message, started_at=observed_at, finished_at=observed_at,
+        ))
+    assert orch._cleared_initial_blocker_note(run, repo) == message
+    if source == "operator_request":
+        stored = orch.OperatorRequest.load(repo, run.run_id)
+        assert orch._operator_request_for_implement_prompt(run, repo, stored).prompt == message
+
+
+@pytest.mark.parametrize("status", ["blocked", "failed", "error"])
+@pytest.mark.parametrize("dated", [True, False])
+def test_legacy_audit_failure_is_superseded_by_phase_success(repo: Path, status: str, dated: bool):
+    run = orch.RunState(run_id="legacy-phase-failure", spec_id="my-feature", branch="spec/my-feature")
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status=status, error_code="Unmet dependencies: A",
+        started_at="2026-01-01T00:00:00+00:00" if dated else "",
+    ))
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status="passed", finished_at="2026-01-02T00:00:00+00:00",
+    ))
+    assert not run.superseded_failures
+    assert not orch._cleared_initial_blocker_note(run, repo)
+
+
+@pytest.mark.parametrize("source", ["diagnosis", "operator_request"])
+@pytest.mark.parametrize("timestamp", [None, "", "invalid legacy time"])
+def test_phase_success_suppresses_undated_legacy_failure_artifact(repo: Path, source: str, timestamp: str | None):
+    run = orch.RunState(run_id="legacy-failure-artifact", spec_id="my-feature", branch="spec/my-feature")
+    message = "Unmet dependencies: A"
+    if source == "diagnosis":
+        artifact = orch.BlockDiagnosis(
+            summary=message, root_cause="Missing dependency", category="environment",
+            next_best_action="Retry", blocker_signature="old-block", evidence=[message],
+            block_reason=message, source_phase="bootstrap",
+        ).save(repo, run.run_id)
+        key = "debugged_at"
+    else:
+        artifact = orch.OperatorRequest(
+            kind="debugger_guidance", prompt=message, requested_by_phase="bootstrap",
+            status="resolved", response="Try again.",
+        ).save(repo, run.run_id)
+        key = "requested_at"
+    payload = json.loads(artifact.read_text())
+    if timestamp is None:
+        payload.pop(key)
+    else:
+        payload[key] = timestamp
+    artifact.write_text(json.dumps(payload))
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status="passed", finished_at="2026-01-02T00:00:00+00:00",
+    ))
+    assert not orch._cleared_initial_blocker_note(run, repo)
+    if source == "operator_request":
+        stored = orch.OperatorRequest.load(repo, run.run_id)
+        assert orch._operator_request_for_implement_prompt(run, repo, stored).prompt != message
+        assert json.loads(artifact.read_text())["prompt"] == message
+
+
+@pytest.mark.parametrize("kind,status", [
+    ("debugger_guidance", "pending"), ("agent_question", "pending"), ("agent_question", "resolved"),
+])
+def test_resolved_phase_does_not_rewrite_pending_or_agent_question(repo: Path, kind: str, status: str):
+    run = orch.RunState(run_id="unrelated-operator-input", spec_id="my-feature", branch="spec/my-feature")
+    request = orch.OperatorRequest(
+        kind=kind, status=status, prompt="Choose the feature behavior.", response="Option A",
+        requested_by_phase="bootstrap", requested_at="2026-01-01T00:00:00+00:00",
+    )
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status="passed", finished_at="2026-01-02T00:00:00+00:00",
+    ))
+    assert orch._operator_request_for_implement_prompt(run, repo, request) is request
