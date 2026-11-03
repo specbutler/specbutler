@@ -1041,6 +1041,7 @@ class ClaudeAgent:
             "--allowedTools",
             "Read,Glob,Grep",
             "--strict-mcp-config",
+            "--output-format", "json",
             "--no-session-persistence",
         ]
         if writable_temp_dir is not None:
@@ -1400,6 +1401,7 @@ class CodexAgent:
             "codex",
             "exec",
             "--ephemeral",
+            "--json",
             "--ignore-user-config",
             "--ignore-rules",
             "--strict-config",
