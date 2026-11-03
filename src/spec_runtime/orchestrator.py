@@ -9337,6 +9337,8 @@ class RunState:
     prior_review_findings: list[dict] = field(default_factory=list)
     base_ref: str = BASE_REF
     retry_cap: int = RETRY_CAP
+    base_sync_cap: int = 10
+    base_syncs: int = 0
     pgid: int | None = None
     process_started_at: str = ""
     supervision_token: dict[str, object] = field(default_factory=dict)
@@ -10473,6 +10475,17 @@ def _record_operator_steering(
         source=str(source or "").strip(),
         status="active",
     )
+    if previous is not None:
+        # Windows clocks can return the same instant for successive commands.
+        # Preserve recording order instead of letting random event IDs order
+        # replacements when timestamps tie (or the wall clock moves backward).
+        try:
+            previous_at = datetime.fromisoformat(previous.provided_at)
+            provided_at = datetime.fromisoformat(steering.provided_at)
+            if provided_at <= previous_at:
+                steering.provided_at = (previous_at + timedelta(microseconds=1)).isoformat()
+        except (ValueError, TypeError):
+            pass  # Legacy records may lack a valid, timezone-aware timestamp.
     if previous is not None and previous.status == "active":
         previous.status = "superseded"
         previous.superseded_by_event_id = steering.event_id
@@ -14502,10 +14515,13 @@ def _mark_local_review_for_rerun_after_sync(
     prior = _short_sha(previous_review_head) if previous_review_head else "none"
     current = _short_sha(current_head_sha)
     status_note = previous_review_status or "pending"
-    run.last_error = (
-        f"{LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX}: "
+    detail = (
         f"review status {status_note} covered {prior}, but the branch now points to {current}."
+        if previous_review_head != current_head_sha
+        else f"review is pending for head {current}."
     )
+    run.last_error = f"{LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX}: {detail}"
+    run.save(repo_root)
     return True
 
 
@@ -28488,6 +28504,24 @@ def _apply_workflow_failure_policy(
     merge_race_retries: int,
     policy: WorkflowFailurePolicy,
 ) -> tuple[str | None, int, int]:
+    # Mechanical syncs rerun gates within the current implement attempt.
+    # Persist the destination before returning so interruption cannot resume merge.
+    if phase == "merge" and _is_local_review_rerun_after_sync(run.last_error):
+        if run.base_syncs >= run.base_sync_cap:
+            run.last_error = (
+                f"Base sync cap reached ({run.base_syncs}/{run.base_sync_cap}); "
+                "cannot rerun verify and review after another base sync."
+            )
+            run.status = "failed"
+            run.save(repo_root)
+            return "failed", phase_order.index(phase), merge_race_retries
+        run.base_syncs += 1
+        run.phase = "verify"
+        run.status = "pending"
+        run.last_error = ""
+        run.save(repo_root)
+        return None, phase_order.index("verify"), merge_race_retries
+
     retry_reason = policy.retry_reason
     if phase == "verify":
         guided_retry_prepared = _maybe_prepare_debugger_guided_retry(
@@ -28731,6 +28765,12 @@ def run_full_workflow(
             phase_order = list(PHASES)
             phase_idx = phase_order.index(run.phase) if run.phase in phase_order else 0
             merge_race_retries = 0
+            if run.phase == "merge" and _is_local_review_rerun_after_sync(run.last_error):
+                run.phase = "verify"
+                run.status = "pending"
+                run.last_error = ""
+                run.save(repo_root)
+                phase_idx = phase_order.index("verify")
             if run.status == "passed" and run.phase in phase_order:
                 if _passed_implement_run_requires_fresh_attempt(repo_root, run):
                     current_retry_cap = _refresh_run_retry_cap_from_disk(
