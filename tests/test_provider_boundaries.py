@@ -682,6 +682,7 @@ def test_codex_profile_deduplicates_nested_denies_without_losing_restrictions(
     assert (f'{json.dumps(str(launch_root))}="write"' in policy) is writable_between
 
 
+@pytest.mark.requires_ps
 def test_local_review_transports_large_prompt_over_stdin(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     cwd = tmp_path / "scratch"

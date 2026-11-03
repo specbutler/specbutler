@@ -18,6 +18,7 @@ Primary commands (happy-path)::
     spec report      — report implement-phase completion
     spec clean       — remove worktrees and branches for a spec
     spec steer       — attach proactive steering guidance to a run
+    spec attach      — resume the latest run's agent session interactively
     spec task        — describe and execute a quick task
     spec watch       — interactive TUI dashboard
     spec gc          — reconcile stale run state
@@ -771,6 +772,12 @@ def _cmd_steer(args: argparse.Namespace) -> int:
     return orch.cmd_steer(args)
 
 
+def _cmd_attach(args: argparse.Namespace) -> int:
+    """Print or run the command that resumes the latest run's agent session."""
+    orch = _lazy_orchestrator()
+    return orch.cmd_attach(args)
+
+
 def _cmd_analytics(args: argparse.Namespace) -> int:
     """Summarize local orchestrator history."""
     orch = _lazy_orchestrator()
@@ -953,10 +960,25 @@ def _cmd_container(args: argparse.Namespace) -> int:
     return cmd_container(args)
 
 
+def _cmd_lint(args: argparse.Namespace) -> int:
+    from .spec_lint import cmd_lint
+    if args.critique and not args.spec:
+        print("--critique requires --spec", file=sys.stderr)
+        return 1
+    return cmd_lint(args, repo_root=_resolve_repo_root())
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     """Run the read-only repository onboarding preflight."""
+    from .config import SpecConfigError
     from .doctor import cmd_doctor
+    from .spec_lint import format_lint, lint_specs
 
+    root = Path(args.repo_root) if args.repo_root else _resolve_repo_root()
+    try:
+        print(format_lint(lint_specs(root)))
+    except (SpecConfigError, OSError) as exc:
+        print(f"Lint unavailable: {exc}")
     return cmd_doctor(args)
 
 
@@ -1286,6 +1308,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Check for and install the latest Spec Butler version",
     )
 
+    p_lint = subparsers.add_parser("lint", help="Validate spec structure and dependencies")
+    p_lint.add_argument("--spec", default=None)
+    p_lint.add_argument("--json", action="store_true")
+    p_lint.add_argument("--critique", action="store_true")
+
     # doctor — read-only onboarding preflight
     p_doctor = subparsers.add_parser(
         "doctor",
@@ -1553,6 +1580,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_input.add_argument("--spec", required=True, help="Spec ID")
     p_input.add_argument("--agent", default=None, help="Agent: claude|codex")
+    p_input.add_argument(
+        "--accept",
+        action="store_true",
+        help="Review round cap: accept the change as-is (findings become follow-ups)",
+    )
+    p_input.add_argument(
+        "--message",
+        default="",
+        help="Review round cap: guidance for one more implement and review round",
+    )
 
     p_steer = subparsers.add_parser(
         "steer",
@@ -1560,6 +1597,22 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_steer.add_argument("--spec", required=True, help="Spec ID")
     p_steer.add_argument("--message", required=True, help="Advisory guidance for the next implement attempt")
+
+    p_attach = subparsers.add_parser(
+        "attach",
+        help="Resume the latest run's agent session interactively in its workspace",
+    )
+    p_attach.add_argument("--spec", required=True, help="Spec ID")
+    p_attach.add_argument(
+        "--exec",
+        action="store_true",
+        help="Run the resume command instead of only printing it",
+    )
+    p_attach.add_argument(
+        "--fork",
+        action="store_true",
+        help="Fork the session (allowed while the run's agent is still running)",
+    )
 
     # analytics
     p_analytics = subparsers.add_parser(
@@ -1603,8 +1656,10 @@ def main(argv: list[str] | None = None) -> int:
         "report": _cmd_report,
         "clean": _cmd_clean,
         "steer": _cmd_steer,
+        "attach": _cmd_attach,
         "task": _cmd_task,
         "update": _cmd_update,
+        "lint": _cmd_lint,
         "doctor": _cmd_doctor,
         # Autopilot
         "watch": _cmd_watch,

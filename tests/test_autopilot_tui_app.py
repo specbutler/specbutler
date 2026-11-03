@@ -218,6 +218,7 @@ def _stream_synthetic_chat_provider(tmp_path: Path, script: str):
     )
 
 
+@pytest.mark.requires_ps
 def test_chat_provider_process_streams_ordinary_success(tmp_path: Path) -> None:
     chunks = list(
         _stream_synthetic_chat_provider(
@@ -229,6 +230,7 @@ def test_chat_provider_process_streams_ordinary_success(tmp_path: Path) -> None:
     assert chunks == ["first", "second"]
 
 
+@pytest.mark.requires_ps
 def test_chat_provider_large_stderr_cannot_deadlock_stdout(tmp_path: Path) -> None:
     chunks = list(
         _stream_synthetic_chat_provider(
@@ -241,6 +243,7 @@ def test_chat_provider_large_stderr_cannot_deadlock_stdout(tmp_path: Path) -> No
     assert chunks == ["stdout-ready"]
 
 
+@pytest.mark.requires_ps
 def test_chat_provider_silent_hang_times_out_and_reaps_process(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -273,6 +276,7 @@ def test_chat_provider_silent_hang_times_out_and_reaps_process(
     assert started[0].wait(timeout=0.1) == started[0].returncode
 
 
+@pytest.mark.requires_ps
 def test_chat_provider_generator_cancel_terminates_and_reaps_process(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -899,6 +903,26 @@ image = "example/spec-worker:latest"
     assert "podman" in rendered
     assert "Worker Source" in rendered
     assert "image:example/spec-worker:latest" in rendered
+
+
+def test_render_run_detail_includes_agent_session(tmp_path: Path) -> None:
+    run = tui_app.orch.RunState(
+        run_id="web-chat-123",
+        spec_id="web-chat",
+        branch="code/web-chat",
+        status="running",
+        phase="implement",
+        agent="claude",
+        agent_session_id="11111111-1111-4111-8111-111111111111",
+        agent_session_agent="claude",
+    )
+
+    console = Console(record=True, width=160)
+    console.print(tui_app._render_run_detail(tmp_path, run))
+    rendered = console.export_text()
+
+    assert "Agent Session" in rendered
+    assert "11111111-1111-4111-8111-111111111111" in rendered
 
 
 def test_load_dashboard_snapshot_uses_repo_retry_cap_fallback(

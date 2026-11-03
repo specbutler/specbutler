@@ -121,6 +121,10 @@ cap = 20                        # max retries across verify/review/merge failure
 no_progress_retry_threshold = 2 # consecutive no-progress retries before giving up
 infra_retry_attempts = 2        # in-place reruns after a transient infrastructure failure
 
+[review]
+max_rounds = 3                  # request_changes rounds before the run waits for operator input
+rereview_reasoning_effort = ""  # empty keeps the first review's reasoning effort
+
 [agents]
 default = "claude"
 review_default = "codex"
@@ -296,6 +300,25 @@ context:
   agent.
 - **Merge conflict** -- the agent is asked to resolve conflicts only.
 
+Each run keeps one provider session (a Claude session id or a Codex thread
+id). Retries resume that session and send only the failure package, so the
+agent keeps the context of its earlier attempts. If the session cannot be
+resumed (it is missing, or the CLI errors before starting), the attempt falls
+back to a fresh session with the full prompt and the reason is logged and
+shown by `spec status`. Provider CLIs without the session flags keep the older
+behaviour of a fresh session per attempt; `spec doctor` warns about them.
+
+The agent's final response is schema-constrained structured output (`status`,
+`summary`, optional `question`), which is the primary completion signal.
+`spec report` from inside the session is optional and still works as a
+fallback; a report does not cut the session short while the final structured
+response is still being written. Resuming after operator input (or after an
+interrupted launch) also continues the same session.
+
+Guidance from `spec steer` takes effect at attempt boundaries: it is delivered
+through the resumed session when the next attempt starts. Injecting guidance
+into a turn that is already running is not supported.
+
 Retries continue until the spec passes all phases or the retry cap is reached
 (default: 20). If the cap is exceeded, a **draft PR** is created so you can
 inspect the state manually.
@@ -363,7 +386,26 @@ Check the status of a specific spec run:
 spec status --spec my-first-feature
 ```
 
-This shows the current phase, gate results, retry count, and any errors.
+This shows the current phase, gate results, retry count, any errors, and the
+provider session id of each run.
+
+To take over a run interactively, resume its agent session in its workspace:
+
+```bash
+spec attach --spec my-first-feature          # print the resume command
+spec attach --spec my-first-feature --exec   # run it
+```
+
+This runs `claude --resume <id>` or `codex resume <id>`. It refuses while the
+run's agent is still running, because one session must not be driven headless
+and interactively at once; `--fork` branches the session instead
+(`--fork-session` for Claude, `codex fork` for Codex).
+
+Sessions from launches whose provider home does not outlive the launch (every
+Codex launch, and Claude in a container worker) are archived with the run.
+Before printing the command, `spec attach` copies the session into your own
+Codex home or Claude config directory. While the agent is still running,
+`--fork` takes a snapshot of the live session first.
 
 List all specs with their status:
 
@@ -443,9 +485,37 @@ spec create --spec <id>                    # author a spec
 spec implement --spec <id>                 # run full lifecycle
 spec stop --spec <id>                      # stop a live run, preserving work
 spec status --spec <id>                    # check run state
+spec attach --spec <id> [--exec] [--fork]  # resume the run's agent session
 spec list                                  # list all specs
 spec show --spec <id>                      # display spec content
 spec task                                  # quick task (no spec file needed)
 spec clean --spec <id>                     # remove execution workspaces and branches
 spec analytics                             # summarize run history
 ```
+
+
+### Spec quality and single-PR authoring
+
+Run `spec lint` to validate all specs, or `spec lint --spec my-feature --json`
+for machine-readable diagnostics. Errors block implementation and autopilot;
+warnings (including more than eight criteria) are advisory. `spec doctor` also
+prints a lint summary. `spec lint --critique --spec my-feature` asks the configured
+review agent for read-only, advisory suggestions about ambiguity, testability,
+out-of-scope gaps, and decomposition. Critique suggestions never block a run.
+
+`spec init` installs authoring prompts under `prompts/`. Repositories can override
+`prompts/spec-creation.md` and `prompts/task-scoping.md`; otherwise bundled prompts
+are used. They guide intent discovery, code exploration, and focused criteria.
+
+By default the spec must already exist on the remote base. To include a local
+spec and its implementation in one PR, configure:
+
+```toml
+[specs]
+require_merged_spec = false
+```
+
+Write the spec in the local base checkout before starting the run. Spec Butler
+pins it, restores it into the implementation workspace, and commits it into the
+implementation branch. The implementation PR policy accepts its own new spec file.
+Publication remains operator/orchestrator owned.
