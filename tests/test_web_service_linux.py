@@ -253,7 +253,10 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                     stderr=browser_stderr,
                 )
                 try:
-                    deadline = time.monotonic() + 30
+                    # A shared CI runner under xdist load can take well over
+                    # 30s to start headless Chrome and answer DevTools, so the
+                    # budget is generous; a healthy run finishes in seconds.
+                    deadline = time.monotonic() + 120
                     page_target: dict[str, object] | None = None
                     last_browser_error: Exception | None = None
                     debug_port: int | None = None
@@ -268,7 +271,7 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                                 )
                             with urllib.request.urlopen(
                                 f"http://127.0.0.1:{debug_port}/json/list",
-                                timeout=1,
+                                timeout=5,
                             ) as response:
                                 targets = json.load(response)
                             page_target = next(
