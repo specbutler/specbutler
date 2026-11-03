@@ -36,6 +36,14 @@ from spec_runtime.process_supervisor import (
 )
 
 
+def _pid_file_written(path: Path) -> bool:
+    """True once a helper process has written its pid (it opens the file first)."""
+    try:
+        return bool(path.read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        return False
+
+
 def test_token_round_trip_preserves_reopenable_identity() -> None:
     identity = ProcessIdentity(42, "created", "python.exe", "python child.py")
     token = SupervisionToken(LifetimeMode.ADOPTABLE, identity, 7, "owner", "token", 9)
@@ -3369,7 +3377,7 @@ def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: 
     )
     supervisor = ProcessSupervisor(LifetimeMode.RUN_OWNED)
     managed = supervisor.spawn([sys.executable, str(script), "0", str(pid_file)])
-    while not all(Path(f"{pid_file}-{level}").exists() for level in range(3)):
+    while not all(_pid_file_written(Path(f"{pid_file}-{level}")) for level in range(3)):
         time.sleep(0.05)
     if action == "normal":
         managed.wait(timeout=10)
@@ -3654,7 +3662,7 @@ def test_windows_async_run_owned_owner_close_kills_complete_tree(tmp_path: Path)
     async def exercise() -> None:
         supervisor = ProcessSupervisor(LifetimeMode.RUN_OWNED)
         managed = await supervisor.spawn_async([sys.executable, str(script), "0", str(pid_file)])
-        while not all(Path(f"{pid_file}-{level}").exists() for level in range(3)):
+        while not all(_pid_file_written(Path(f"{pid_file}-{level}")) for level in range(3)):
             await asyncio.sleep(0.05)
         supervisor.close()
         await asyncio.wait_for(managed.wait(), timeout=10)
