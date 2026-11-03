@@ -42540,3 +42540,91 @@ def test_implement_framing_does_not_resurrect_superseded_inherited_review(repo: 
     assert not ctx.unresolved_review_findings
     assert "Old request for changes" not in ctx.failure_summary
     assert ctx.triggering_phase != "review"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_resume_rechecks_bootstrap_and_archives_dependency_block(repo: Path, legacy: bool):
+    error = "Unmet dependencies: prerequisite"
+    run = orch.RunState(
+        run_id="my-feature-20260101T000000", spec_id="my-feature",
+        branch="spec/my-feature", phase="bootstrap", status="blocked",
+        last_error=error, last_failure_phase="" if legacy else "bootstrap",
+        publication_base_sha=orch._head_sha(repo),
+    )
+    run.save(repo)
+    seen = []
+
+    def bootstrap(r, root):
+        seen.append("bootstrap")
+        assert not orch.check_dependencies_merged(root, r.spec_id)
+        return "passed"
+
+    def implement(r, root):
+        seen.append("implement")
+        package = orch._build_retry_failure_package(r, root)
+        assert error not in "\n".join(package.summary_parts)
+        assert not orch._cleared_initial_blocker_note(r, root)
+        assert r.superseded_failures[0]["error"] == error
+        return "passed"
+
+    handlers = {phase: MagicMock(return_value="passed") for phase in orch.PHASES}
+    handlers.update(bootstrap=bootstrap, implement=implement)
+    with (
+        patch.object(orch, "resolve_repo_root", return_value=repo),
+        patch.object(orch, "resolve_worktree_path", return_value=repo),
+        patch.object(orch, "check_dependencies_merged", return_value=[]) as dependencies,
+        patch.dict(orch.PHASE_HANDLERS, handlers),
+    ):
+        assert orch.cmd_run(argparse.Namespace(spec="my-feature", agent="codex", base="origin/master")) == 0
+    assert seen == ["bootstrap", "implement"]
+    dependencies.assert_called_once()
+    assert orch.RunState.load(repo, run.run_id).superseded_failures[0]["error"] == error
+
+
+@pytest.mark.parametrize("error", [
+    "error connecting to api.github.com",
+    "Agent exited with code 1: provider_network, ECONNRESET",
+    "You have reached your usage limit. Try again later.",
+    "sandbox denied: /tmp/restricted",
+])
+@pytest.mark.parametrize("phase", ["bootstrap", "implement", "publish"])
+@pytest.mark.parametrize("backoff_cleared_error", [False, True])
+def test_passing_phase_archives_infrastructure_failure(
+    repo: Path, error: str, phase: str, backoff_cleared_error: bool,
+):
+    assert orch.classify_failure(error, phase=phase).is_infrastructure
+    run = orch.RunState(
+        run_id="resolved-infra", spec_id="my-feature", branch="spec/my-feature", phase=phase,
+        status="failed", last_error=error, last_failure_phase=phase,
+    )
+    if backoff_cleared_error:
+        with patch.dict(orch.PHASE_HANDLERS, {phase: MagicMock(return_value="failed")}):
+            assert orch.run_single_phase(run, phase, repo) == "failed"
+        # In-process backoff clears prompt evidence before relaunching the phase.
+        run.last_error = ""
+    with patch.dict(orch.PHASE_HANDLERS, {phase: MagicMock(return_value="passed")}):
+        assert orch.run_single_phase(run, phase, repo) == "passed"
+    package = orch._build_retry_failure_package(run, repo)
+    assert error not in "\n".join(package.summary_parts)
+    assert not orch._cleared_initial_blocker_note(run, repo)
+    assert run.superseded_failures[0]["error"] == error
+
+
+def test_resumed_code_verify_failure_remains_retry_evidence(repo: Path):
+    run = orch.RunState(
+        run_id="code-verify-resume", spec_id="my-feature", branch="spec/my-feature", phase="implement",
+        status="failed", attempts=2, last_error="Gate 'test' failed (exit 1).",
+        last_failure_phase="verify",
+    )
+    gate_path = repo / ".spec-state" / "runs" / run.run_id / "gate-status.json"
+    gate_path.parent.mkdir(parents=True)
+    gate_path.write_text(json.dumps({"gates": {"test": {
+        "last_status": "failed", "last_stdout": "AssertionError: feature is broken",
+        "last_exit_code": 1,
+    }}}))
+    run.save(repo)
+    resumed = orch.RunState.load(repo, run.run_id)
+    package = orch._build_retry_failure_package(resumed, repo)
+    assert "make test" in package.active_gates_or_checks
+    assert "feature is broken" in "\n".join(package.gate_output_parts)
+    assert not resumed.superseded_failures

@@ -9334,6 +9334,10 @@ class RunState:
     last_failure_category: str = ""
     last_failure_signature: str = ""
     last_failure_phase: str = ""
+    # Retain the failure while infrastructure backoff clears prompt evidence.
+    last_failure_error: str = ""
+    # Failures resolved by a successful rerun of their owning phase.
+    superseded_failures: list[dict[str, str]] = field(default_factory=list)
     # Consecutive infrastructure failures of this run with
     # ``last_failure_signature``; reset by a passing phase or a new signature.
     # Drives the in-process infrastructure backoff and never touches
@@ -17667,6 +17671,11 @@ def _cleared_initial_blocker_note(run: RunState, repo_root: Path) -> str:
                 candidates.append((str(result.get("error_code") or ""), str(payload.get("phase") or "")))
     pre_implement_phases = PHASES[:PHASES.index("implement")]
     for message, phase in candidates:
+        if any(
+            item.get("phase") == phase and item.get("error", "").splitlines()[:1] == message.splitlines()[:1]
+            for item in run.superseded_failures
+        ):
+            continue
         if not message.strip():
             continue
         classification = classify_failure(message, phase=phase)
@@ -28070,6 +28079,8 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.save(repo_root)
         return "failed"
 
+    prior_error = run.last_error or run.last_failure_error
+    prior_failure_phase = run.last_failure_phase or run.phase
     run.phase = phase
     run.status = "running"
     run.save(repo_root)
@@ -28127,6 +28138,14 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
     # and autopilot can consult retryability without scanning audit files.
     metadata = _classify_phase_result(run, phase, result_status)
     if result_status == "passed":
+        if prior_error and prior_failure_phase == phase:
+            run.superseded_failures.append({
+                "phase": phase,
+                "error": prior_error,
+                "resolved_at": _now_iso(),
+            })
+            run.pending_block_debugger_signature = ""
+            run.last_block_debugger_guided_retry_signature = ""
         # A successful phase clears any prior failure classification so the
         # retryable hint / circuit breaker resets on forward progress. The
         # historical detail remains in per-phase audit records; keeping it in
@@ -28139,6 +28158,7 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.last_failure_category = ""
         run.last_failure_signature = ""
         run.last_failure_phase = ""
+        run.last_failure_error = ""
         run.last_sandbox_denial = ""
         run.infra_failure_streak = 0
     else:
@@ -28175,6 +28195,7 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.last_failure_category = classification.category.value
         run.last_failure_signature = classification.signature
         run.last_failure_phase = phase
+        run.last_failure_error = run.last_error
         run.last_sandbox_denial = (
             sandbox_denial_summary(run.last_error) or "unknown target"
             if classification.category is FailureCategory.SANDBOX_DENIED
@@ -30027,12 +30048,12 @@ def cmd_run(args: argparse.Namespace) -> int:
                         run.run_id,
                     )
                     run.status = "failed"
-                    # Always reset to implement so the next attempt gets a
-                    # full implement pass, regardless of which phase was
-                    # blocked.  The human-attention flag only prevents
-                    # *automatic* retry — explicit `spec implement` should
-                    # still land in implement.
-                    run.phase = "implement"
+                    # Bootstrap owns dependency and environment checks. Re-run
+                    # it before launching an agent after a bootstrap block.
+                    source_phase = run.last_failure_phase or (
+                        diagnosis.source_phase if diagnosis is not None else ""
+                    ) or run.phase
+                    run.phase = "bootstrap" if source_phase == "bootstrap" else "implement"
                     if diagnosis is not None and not diagnosis.requires_human_attention:
                         current_sig = _compute_blocker_signature(
                             run,
