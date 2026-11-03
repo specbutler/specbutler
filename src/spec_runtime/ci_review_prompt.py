@@ -19,7 +19,14 @@ def render_ci_evidence(
     spec = "(No implementation spec identified.)"
     if spec_id:
         # Canonical spec is read from the base commit, never executed from the PR.
-        spec = git("show", f"{base_sha}:specs/{spec_id}.md")
+        try:
+            spec = git("show", f"{base_sha}:specs/{spec_id}.md")
+        except subprocess.CalledProcessError:
+            spec = (
+                f"(No canonical specs/{spec_id}.md exists at the base commit. "
+                "For a spec-authoring PR, review the new spec in the diff. "
+                "For an implementation PR, report the missing canonical evidence.)"
+            )
     checks = subprocess.run(
         ["gh", "api", f"repos/{repo}/commits/{head_sha}/check-runs"],
         cwd=checkout, capture_output=True, text=True, check=True,

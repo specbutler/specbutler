@@ -517,3 +517,20 @@ def test_ci_metadata_events_preserve_exact_head_host_approval(
     assert f"ci_approved={'true' if approved else 'false'}" in output.read_text()
     assert runner.call_args.args[0][-1] == "repos/owner/repo/commits/head/statuses"
     assert "ci_approved != 'true'" in workflow["jobs"]["review-decision-gate"]["if"]
+
+
+def test_ci_new_spec_authoring_uses_diff_without_base_spec(tmp_path, monkeypatch):
+    from spec_runtime.ci_review_prompt import render_ci_evidence
+
+    def invoke(argv, **kwargs):
+        if "show" in argv:
+            raise subprocess.CalledProcessError(128, argv, stderr="path does not exist at base")
+        return subprocess.CompletedProcess(argv, 0, "new spec diff", "")
+
+    monkeypatch.setattr(subprocess, "run", invoke)
+    rendered = render_ci_evidence(
+        tmp_path, base_sha="base", head_sha="head", spec_id="new-spec", repo="owner/repo", pr_body="",
+    )
+    assert "new spec diff" in rendered
+    assert "No canonical specs/new-spec.md exists at the base commit" in rendered
+    assert "spec-authoring PR" in rendered
