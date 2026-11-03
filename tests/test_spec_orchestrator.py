@@ -36354,15 +36354,27 @@ class TestWaitingForInputWorkflow:
     # (3) proactive steering and resume behavior
     # -------------------------------------------------------------------
 
-    def test_cmd_steer_records_and_supersedes_guidance(self, repo: Path, capsys):
+    @pytest.mark.parametrize("second_timestamp", [
+        "2026-11-03T21:00:00+00:00",
+        "2026-11-03T20:59:59+00:00",
+    ])
+    def test_cmd_steer_records_and_supersedes_guidance(self, repo: Path, capsys, second_timestamp: str):
         run = self._make_run()
         run.status = "blocked"
         run.phase = "verify"
         run.save(repo)
 
         args = argparse.Namespace(spec="my-feature", message="Start with the smallest retry.")
-        with patch.object(orch, "resolve_repo_root", return_value=repo):
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch, "_now_iso", return_value="2026-11-03T21:00:00+00:00") as now,
+            # Reverse lexical order so equal clock readings cannot pass by luck.
+            patch.object(orch, "datetime", wraps=orch.datetime) as clock,
+        ):
+            clock.now.return_value = orch.datetime.fromisoformat("2026-11-03T21:00:02+00:00")
             first_code = orch.cmd_steer(args)
+            now.return_value = second_timestamp
+            clock.now.return_value = orch.datetime.fromisoformat("2026-11-03T21:00:01+00:00")
             second_code = orch.cmd_steer(argparse.Namespace(spec="my-feature", message="Actually, fix lint first."))
 
         assert first_code == 0

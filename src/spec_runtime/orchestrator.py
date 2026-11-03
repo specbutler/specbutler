@@ -10441,6 +10441,17 @@ def _record_operator_steering(
         source=str(source or "").strip(),
         status="active",
     )
+    if previous is not None:
+        # Windows clocks can return the same instant for successive commands.
+        # Preserve recording order instead of letting random event IDs order
+        # replacements when timestamps tie (or the wall clock moves backward).
+        try:
+            previous_at = datetime.fromisoformat(previous.provided_at)
+            provided_at = datetime.fromisoformat(steering.provided_at)
+            if provided_at <= previous_at:
+                steering.provided_at = (previous_at + timedelta(microseconds=1)).isoformat()
+        except (ValueError, TypeError):
+            pass  # Legacy records may lack a valid, timezone-aware timestamp.
     if previous is not None and previous.status == "active":
         previous.status = "superseded"
         previous.superseded_by_event_id = steering.event_id
