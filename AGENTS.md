@@ -199,7 +199,7 @@ When launched by the orchestrator for `implement`, follow this contract:
    Wait for `Completion recorded for <spec-id>:` before exiting.
    When the provider supports it, the final response is also captured as
    structured output (`status`, `summary`, optional `question`); that result
-   takes precedence and `spec report` is the fallback.
+   takes precedence and `spec report` becomes an optional fallback.
 7. **Retries resume the same session** — verify, review and merge-conflict
    retries continue the run's provider session with only the new failure
    package and any operator steering. Earlier context still applies.

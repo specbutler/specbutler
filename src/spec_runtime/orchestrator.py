@@ -503,7 +503,7 @@ SPEC_PROMPT = (
     "the orchestrator verify phase handles e2e outside the sandbox.\n"
     "5. Do NOT run orchestrator lifecycle commands (`spec implement`, `spec phase`) "
     "and do NOT run publish/merge/cleanup actions. The only orchestrator command "
-    "you should run is `spec report` (see completion step below).\n"
+    "you may run is `spec report` (see the completion step below).\n"
     "6. If local environment limits block test infrastructure (for example Playwright "
     "MachPort/sandbox launch failures), do not report STATUS=blocked for that alone; "
     "report STATUS=ok with the environment note and let the orchestrator verify phase run gates.\n"
@@ -16771,9 +16771,11 @@ RESUMED_SESSION_PREAMBLE = (
     "still apply; what follows is only what changed since your last turn."
 )
 STRUCTURED_COMPLETION_INSTRUCTION = (
-    "Your final response is captured as the structured completion result: set status "
-    "(ok, blocked, error or needs-input), a plain-text summary, and question when you "
-    "need operator input (otherwise null). `spec report` remains available as a fallback."
+    "Report completion through your final response, which is captured as the "
+    "structured completion result: set status (ok, blocked, error or needs-input), a "
+    "plain-text summary, and question when you need operator input (otherwise null). "
+    "Running `spec report` is optional and only a fallback; if you run it anyway, still "
+    "end with that final response, which takes precedence over the report."
 )
 
 
@@ -16823,13 +16825,19 @@ def _fresh_agent_session_plan(run: RunState, *, structured_output: bool) -> Agen
 
 def _plan_agent_session(
     run: RunState,
-    reason: str,
     *,
     use_stream_json: bool,
     backend: ExecutionBackend | None = None,
     worktree_path: Path | None = None,
 ) -> AgentSessionPlan:
-    """Decide whether this launch starts, resumes, or skips a provider session."""
+    """Decide whether this launch starts, resumes, or skips a provider session.
+
+    The run record only carries a session id once an earlier launch of this
+    run started one, so that id (not the attempt count or implement reason)
+    decides whether to resume: answering operator input or retrying an
+    interrupted first launch leaves ``run.attempts`` at zero but must still
+    continue the existing session.
+    """
     support = _provider_session_support(run.agent, backend, worktree_path)
     # Claude's structured result arrives on the stream-json result event, so
     # it is only readable when the orchestrator owns stdout.
@@ -16839,8 +16847,7 @@ def _plan_agent_session(
     if not support.persist:
         return AgentSessionPlan(structured_output=structured_output)
     if (
-        reason != "initial"
-        and support.resume
+        support.resume
         and run.agent_session_id
         and run.agent_session_agent == run.agent
     ):
@@ -18118,6 +18125,7 @@ def _launch_implement_attempt(
                 progress_thread=progress_thread,
                 progress_tracker=plan.progress_tracker,
                 spec_id=run.spec_id,
+                structured_completion=plan.session.structured_output,
             )
         finally:
             _set_active_agent_process(None)
@@ -18978,7 +18986,6 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
                 use_stream_json = _claude_supports_stream_json(backend, worktree_path)
             session_plan = _plan_agent_session(
                 run,
-                reason,
                 use_stream_json=use_stream_json,
                 backend=backend,
                 worktree_path=worktree_path,
@@ -20768,20 +20775,32 @@ def _wait_for_agent_exit(
     progress_thread: threading.Thread | None = None,
     progress_tracker: AgentProgressTracker | None = None,
     spec_id: str | None = None,
+    structured_completion: bool = False,
 ) -> int:
-    """Wait for agent exit, but stop waiting once completion is recorded."""
+    """Wait for agent exit, but stop waiting once completion is recorded.
+
+    With ``structured_completion`` the provider's final structured response is
+    the completion signal, so a ``spec report`` fallback alone does not start
+    the exit grace period: the final response may still be on its way and
+    would take precedence over the report.
+    """
     completion_seen_at: float | None = None
+    structured_tracker = progress_tracker if structured_completion else None
 
     while True:
-        impl_result, _ = _load_matching_implement_result(
-            repo_root=repo_root,
-            worktree_path=worktree_path,
-            run_id=run_id,
-            attempt=attempt,
-            launch_number=launch_number,
-            spec_id=spec_id,
-        )
-        if impl_result is not None and completion_seen_at is None:
+        if structured_tracker is not None:
+            completed = structured_tracker.structured_completion() is not None
+        else:
+            impl_result, _ = _load_matching_implement_result(
+                repo_root=repo_root,
+                worktree_path=worktree_path,
+                run_id=run_id,
+                attempt=attempt,
+                launch_number=launch_number,
+                spec_id=spec_id,
+            )
+            completed = impl_result is not None
+        if completed and completion_seen_at is None:
             completion_seen_at = time.monotonic()
             logger.info(
                 "Detected completion handshake for %s (%s); allowing %.1fs for clean exit.",
@@ -20883,17 +20902,33 @@ def _format_spec_contract_for_prompt(
     )
 
 
-def _format_exit_checklist(spec_id: str | None = None) -> str:
+def _format_exit_checklist(
+    spec_id: str | None = None,
+    *,
+    structured_completion: bool = False,
+) -> str:
     spec_token = spec_id or "<spec-id>"
+    common = [
+        "Exit Checklist:",
+        "1. Commit any completed code changes in this worktree.",
+        f"2. Run {_format_verify_commands(_non_e2e_verify_commands())} before reporting completion.",
+        "   Run these commands in the FOREGROUND and wait for their output in-band. "
+        "Never launch them as background tasks or monitors and end your turn "
+        "'waiting for the notification' — this session terminates with your final "
+        "message and is NEVER re-invoked, so work left waiting is discarded.",
+    ]
+    if structured_completion:
+        return "\n".join(
+            [
+                *common,
+                "3. Report completion through your final response (the structured "
+                "completion result: status, summary and question). `spec report` is an "
+                "optional fallback only; if you run it, still finish with the final response.",
+            ]
+        )
     return "\n".join(
         [
-            "Exit Checklist:",
-            "1. Commit any completed code changes in this worktree.",
-            f"2. Run {_format_verify_commands(_non_e2e_verify_commands())} before reporting completion.",
-            "   Run these commands in the FOREGROUND and wait for their output in-band. "
-            "Never launch them as background tasks or monitors and end your turn "
-            "'waiting for the notification' — this session terminates with your final "
-            "message and is NEVER re-invoked, so work left waiting is discarded.",
+            *common,
             "3. Report completion with "
             "`spec report --status ok|blocked|error|needs-input "
             f"--summary 'plain text summary'` (explicit fallback: "
@@ -21047,9 +21082,10 @@ def _build_agent_command(
 ) -> list[str]:
     """Build the command to launch the agent.
 
-    With ``resume_session_id`` a retry continues the run's provider session,
-    so the prompt is only the delta: the failure package, operator input and
-    steering, without the spec contract the session already holds.
+    With ``resume_session_id`` the launch continues the run's provider
+    session, so the prompt is only the delta: the failure package (on a
+    retry), operator input and steering, without the spec contract the
+    session already holds.
     """
     adapter = get_agent_adapter(agent)
 
@@ -21057,11 +21093,7 @@ def _build_agent_command(
         return _adapter_method_accepts_kwarg(adapter.build_implement_command, name)
 
     resume_session_id = resume_session_id if _accepts("resume_session_id") else ""
-    delta_prompt = bool(
-        resume_session_id
-        and retry_context is not None
-        and retry_context.implement_reason != "initial"
-    )
+    delta_prompt = bool(resume_session_id)
     acceptance_checklist = list(
         acceptance_checklist
         if acceptance_checklist is not None
@@ -21236,7 +21268,7 @@ def _build_agent_command(
                 )
             )
             prompt_lines.append(
-                "The next review sees your `spec report` summary as your response to "
+                "The next review sees your completion summary as your response to "
                 "these findings. Address each one by its id in that summary (for example "
                 "`<id>: fixed by ...` or `<id>: disagree because ...`)."
             )
@@ -21359,6 +21391,19 @@ def _build_agent_command(
             prompt_sections.append(debugger_section)
         prompt_sections.append("\n".join(instruction_lines))
         prompt = "\n\n".join(prompt_sections)
+    elif delta_prompt:
+        # A resumed launch that is not a failure retry: the session paused for
+        # operator input or its launch was interrupted before completing.
+        prompt_sections = [
+            section for section in (resolved_input, resolved_steering) if section
+        ]
+        prompt_sections.append(
+            f"Continue the IMPLEMENT phase for spec {spec_id or '<spec-id>'} from where "
+            "your previous turn in this session ended. Inspect the current branch and "
+            "worktree state first — do not assume earlier work is still present. If "
+            "there are already local changes, continue from them instead of starting over."
+        )
+        prompt = "\n\n".join(prompt_sections)
     else:
         spec_prompt = (
             SPEC_PROMPT.replace("<spec-id>", spec_id or "<spec-id>")
@@ -21382,18 +21427,25 @@ def _build_agent_command(
         prompt_sections.append(spec_prompt)
         prompt = "\n\n".join(prompt_sections)
 
-    completion_instruction = COMPLETE_HANDSHAKE_INSTRUCTION.replace("<spec-id>", spec_id or "<spec-id>")
     completion_schema_path = (
         completion_schema_path if _accepts("completion_schema_path") else None
     )
-    if completion_schema_path is not None:
-        completion_instruction = (
-            f"{completion_instruction} {STRUCTURED_COMPLETION_INSTRUCTION}"
+    structured_completion = completion_schema_path is not None
+    if structured_completion:
+        # The final response is the completion signal; `spec report` is only
+        # an optional fallback and must not read as the required last step.
+        completion_instruction = STRUCTURED_COMPLETION_INSTRUCTION
+    else:
+        completion_instruction = COMPLETE_HANDSHAKE_INSTRUCTION.replace(
+            "<spec-id>", spec_id or "<spec-id>"
         )
     if delta_prompt:
         prompt = f"{RESUMED_SESSION_PREAMBLE}\n\n{prompt}\n\n{completion_instruction}"
     else:
-        exit_checklist = _format_exit_checklist(spec_id)
+        exit_checklist = _format_exit_checklist(
+            spec_id,
+            structured_completion=structured_completion,
+        )
         prompt = f"{exit_checklist}\n\n{prompt}\n\n{completion_instruction}"
     # This adapter argument is a launch-scoped capability directory, never the
     # repository-wide control-plane state root. Out-of-tree adapters that use

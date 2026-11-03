@@ -119,7 +119,8 @@ class FakeProvider:
     ``transcripts`` makes Claude keep sessions only where the real CLI does,
     under its provider home, so resume depends on that home's contents.
     ``hold`` makes Codex wait, with a half-written rollout record, until the
-    ``release`` file appears.
+    ``release`` file appears. ``delay`` sleeps between the ``spec report``
+    fallback and the final structured response.
     """
 
     def __init__(self, root: Path, agent: str) -> None:
@@ -144,6 +145,7 @@ class FakeProvider:
         report: bool = False,
         transcripts: bool = False,
         hold: bool = False,
+        delay: float = 0.0,
     ) -> None:
         (self.state / "scenario.json").write_text(
             json.dumps(
@@ -152,6 +154,7 @@ class FakeProvider:
                     "report": report,
                     "transcripts": transcripts,
                     "hold": hold,
+                    "delay": delay,
                 }
             ),
             encoding="utf-8",
@@ -245,6 +248,7 @@ if scenario.get("report"):
             "completed_at": "2026-01-01T00:00:00Z",
         },
     }), encoding="utf-8")
+time.sleep(scenario.get("delay") or 0)
 
 structured = scenario.get("structured")
 if AGENT == "claude":
@@ -666,6 +670,118 @@ def test_structured_needs_input_uses_question(
 
     assert _implement(run, repo, worktree) == "waiting-for-input"
     assert run.input_question == "Option A or B?"
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+def test_spec_report_does_not_cut_off_a_delayed_structured_response(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent: str,
+) -> None:
+    """A fallback report must not end the launch before the final response."""
+    fake = FakeProvider(tmp_path, agent)
+    fake.scenario(
+        structured={"status": "blocked", "summary": "need creds", "question": None},
+        report=True,
+        delay=1.0,
+    )
+    _use_fake_binary(monkeypatch, fake)
+    monkeypatch.setattr(orch, "AGENT_EXIT_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(orch, "AGENT_COMPLETION_POLL_SECONDS", 0.05)
+    run, worktree = _make_run(repo, agent)
+
+    assert _implement(run, repo, worktree) == "blocked"
+    assert run.last_error == "need creds"
+    result = orch.ImplementResult.load(repo, run.run_id)
+    assert result is not None
+    assert result.result_source == "structured_output"
+
+
+def test_schema_launch_prompt_makes_spec_report_optional(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeProvider(tmp_path, "claude")
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, "claude")
+
+    assert _implement(run, repo, worktree) == "passed"
+    prompt = fake.calls()[-1][-1]
+    assert orch.STRUCTURED_COMPLETION_INSTRUCTION in prompt
+    assert "Wait for `Completion recorded for" not in prompt
+    assert "Before exiting, report implement-phase status" not in prompt
+
+
+def test_stateless_launch_prompt_still_requires_spec_report(tmp_path: Path) -> None:
+    cmd = orch._build_agent_command("claude", tmp_path, spec_id=SPEC_ID)
+    prompt = cmd[-1]
+    assert f"Wait for `Completion recorded for {SPEC_ID}:`" in prompt
+    assert orch.STRUCTURED_COMPLETION_INSTRUCTION not in prompt
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+def test_first_attempt_resumes_session_after_operator_input(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    agent: str,
+) -> None:
+    """Answering input keeps run.attempts at zero but continues the session."""
+    fake = FakeProvider(tmp_path, agent)
+    fake.scenario(
+        structured={"status": "needs-input", "summary": "ambiguous", "question": "A or B?"},
+    )
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, agent)
+    assert _implement(run, repo, worktree) == "waiting-for-input"
+    session_id = run.agent_session_id
+    assert session_id
+
+    orch.resolve_operator_request(repo, run, "Use option B.", source="spec input")
+    assert run.attempts == 0
+    fake.scenario(structured=OK_COMPLETION)
+    assert _implement(run, repo, worktree) == "passed"
+
+    resumed = fake.calls()[-1]
+    if agent == "claude":
+        assert _flag_value(resumed, "--resume") == session_id
+        assert "--session-id" not in resumed
+    else:
+        assert resumed[resumed.index("exec") + 1] == "resume"
+        assert resumed[-2] == session_id
+    prompt = resumed[-1]
+    assert prompt.startswith(orch.RESUMED_SESSION_PREAMBLE)
+    assert "Use option B." in prompt
+    assert "Exit Checklist:" not in prompt
+    assert run.agent_session_id == session_id
+    assert run.agent_session_fallback_reason == ""
+
+
+def test_first_attempt_relaunch_falls_back_when_session_is_gone(
+    repo: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An infrastructure relaunch at attempt zero resumes, then falls back."""
+    fake = FakeProvider(tmp_path, "claude")
+    _use_fake_binary(monkeypatch, fake)
+    run, worktree = _make_run(repo, "claude")
+    assert _implement(run, repo, worktree) == "passed"
+    old_session = run.agent_session_id
+
+    fake.forget_sessions()
+    run.status = "running"
+    run.save(repo)
+    assert run.attempts == 0
+    assert _implement(run, repo, worktree) == "passed"
+
+    resumed, fresh = fake.calls()[-2:]
+    assert _flag_value(resumed, "--resume") == old_session
+    assert _flag_value(fresh, "--session-id") == run.agent_session_id != old_session
+    assert "Exit Checklist:" in fresh[-1]
+    assert old_session in run.agent_session_fallback_reason
 
 
 def test_no_handshake_recovery_runs_only_without_any_completion(

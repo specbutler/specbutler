@@ -310,7 +310,10 @@ behaviour of a fresh session per attempt; `spec doctor` warns about them.
 
 The agent's final response is schema-constrained structured output (`status`,
 `summary`, optional `question`), which is the primary completion signal.
-`spec report` from inside the session still works as a fallback.
+`spec report` from inside the session is optional and still works as a
+fallback; a report does not cut the session short while the final structured
+response is still being written. Resuming after operator input (or after an
+interrupted launch) also continues the same session.
 
 Guidance from `spec steer` takes effect at attempt boundaries: it is delivered
 through the resumed session when the next attempt starts. Injecting guidance
