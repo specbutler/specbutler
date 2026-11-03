@@ -80,6 +80,23 @@ def _make_host_agent_availability_hermetic(
 
 
 @pytest.fixture(autouse=True)
+def _ignore_operator_mcp_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep interactive launches independent of the host's provider config.
+
+    Interactive sessions forward env names referenced by the operator's own
+    ``~/.codex/config.toml`` or ``~/.claude.json`` MCP registrations. Reading
+    those real files would make expected protected-key sets depend on the
+    machine running pytest; tests/test_interactive_authoring.py covers the
+    discovery itself.
+    """
+    monkeypatch.setattr(
+        interactive_authoring,
+        "user_mcp_environment_keys",
+        lambda _provider, _source=None: frozenset(),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _pin_worktree_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     """Lifecycle tests here build `.worktrees/` layouts; pin that backend.
 

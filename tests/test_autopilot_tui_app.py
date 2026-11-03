@@ -905,6 +905,26 @@ image = "example/spec-worker:latest"
     assert "image:example/spec-worker:latest" in rendered
 
 
+def test_render_run_detail_includes_agent_session(tmp_path: Path) -> None:
+    run = tui_app.orch.RunState(
+        run_id="web-chat-123",
+        spec_id="web-chat",
+        branch="code/web-chat",
+        status="running",
+        phase="implement",
+        agent="claude",
+        agent_session_id="11111111-1111-4111-8111-111111111111",
+        agent_session_agent="claude",
+    )
+
+    console = Console(record=True, width=160)
+    console.print(tui_app._render_run_detail(tmp_path, run))
+    rendered = console.export_text()
+
+    assert "Agent Session" in rendered
+    assert "11111111-1111-4111-8111-111111111111" in rendered
+
+
 def test_load_dashboard_snapshot_uses_repo_retry_cap_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

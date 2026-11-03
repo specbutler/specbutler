@@ -120,6 +120,74 @@ def claude_sandbox_unavailability_reason(
     )
 
 
+CLAUDE_SESSION_FLAGS = ("--session-id", "--resume", "--json-schema", "--fork-session")
+CODEX_RESUME_FLAGS = ("--json", "--output-schema")
+
+# Final-turn completion contract shared by both providers. Codex's
+# ``--output-schema`` uses strict structured outputs, which require every
+# property to be listed as required; ``question`` is therefore nullable rather
+# than absent when the agent has nothing to ask.
+COMPLETION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["ok", "blocked", "error", "needs-input"],
+        },
+        "summary": {"type": "string"},
+        "question": {"type": ["string", "null"]},
+    },
+    "required": ["status", "summary", "question"],
+}
+
+
+def claude_session_unavailability_reason(help_text: str) -> str:
+    """Return why Claude runs cannot keep and resume one session."""
+    missing = [flag for flag in CLAUDE_SESSION_FLAGS if flag not in help_text]
+    if not missing:
+        return ""
+    return (
+        "The installed Claude CLI lacks session controls "
+        f"({', '.join(missing)}); implement runs fall back to a fresh, "
+        "unpersisted session per attempt and completion relies on `spec report`."
+    )
+
+
+def codex_resume_unavailability_reason(resume_help_text: str) -> str:
+    """Return why Codex runs cannot resume their thread for retries."""
+    if not resume_help_text:
+        return (
+            "The installed Codex CLI lacks `codex exec resume`; implement retries "
+            "start a fresh thread."
+        )
+    missing = [flag for flag in CODEX_RESUME_FLAGS if flag not in resume_help_text]
+    if not missing:
+        return ""
+    return (
+        "The installed Codex CLI's `codex exec resume` lacks "
+        f"{', '.join(missing)}; implement retries start a fresh thread."
+    )
+
+
+def provider_attach_command(
+    agent_name: str,
+    session_id: str,
+    *,
+    fork: bool = False,
+) -> list[str]:
+    """Return the interactive command that takes over *session_id*."""
+    agent = agent_name.strip().lower()
+    if agent == "claude":
+        cmd = ["claude", "--resume", session_id]
+        if fork:
+            cmd.append("--fork-session")
+        return cmd
+    if agent == "codex":
+        return ["codex", "fork" if fork else "resume", session_id]
+    raise ValueError(f"Agent {agent_name!r} does not support interactive session takeover")
+
+
 def codex_isolation_unavailability_reason(
     exec_help_text: str,
     sandbox_help_text: str,
@@ -703,11 +771,18 @@ class AgentAdapter(Protocol):
         provider_home: Path | None = None,
         git_isolation: AgentGitIsolation | None = None,
         safety: LaunchSafety | None = None,
+        session_id: str | None = None,
+        resume_session_id: str | None = None,
+        completion_schema_path: Path | None = None,
     ) -> list[str]:
         """Build the shell command to launch the agent for an implement phase.
 
         The launch is unattended: the command must never wait for an
         approval. ``safety`` carries the resolved ``[execution]`` policy.
+        ``session_id`` names a new persisted provider session,
+        ``resume_session_id`` continues an earlier one, and
+        ``completion_schema_path`` constrains the final response to the
+        structured completion contract. Adapters may ignore all three.
         """
         ...
 
@@ -769,6 +844,7 @@ def _claude_unattended_args(
     mcp_config_path: Path | None,
     mcp_servers: dict[str, dict[str, object]] | None,
     safety: LaunchSafety | None,
+    session_args: list[str] | None = None,
 ) -> list[str]:
     """Return print-mode Claude flags for a launch nobody can answer.
 
@@ -777,6 +853,9 @@ def _claude_unattended_args(
     the file tools in the workspace. Otherwise (isolated mode, or a CLI
     without the native controls) restricted mode confines the file tools and
     acceptEdits denies anything that would prompt.
+
+    ``session_args`` replaces ``--no-session-persistence`` when the launch
+    keeps a provider session (``--session-id`` or ``--resume``).
     """
     tools = "Read,Write,Edit,Bash,Glob,Grep"
     mcp_tools = [
@@ -795,7 +874,7 @@ def _claude_unattended_args(
         allowed_tools,
         "--setting-sources",
         "",
-        "--no-session-persistence",
+        *(session_args or ["--no-session-persistence"]),
     ]
     # Even when the container supplies the OS sandbox, Claude still owns the
     # provider-aware credential filtering in this orchestrator-written file.
@@ -842,6 +921,9 @@ class ClaudeAgent:
         provider_home: Path | None = None,
         git_isolation: AgentGitIsolation | None = None,
         safety: LaunchSafety | None = None,
+        session_id: str | None = None,
+        resume_session_id: str | None = None,
+        completion_schema_path: Path | None = None,
     ) -> list[str]:
         # Claude consumes MCP via the pre-written mcp_config_path file. The
         # explicit settings guard applies with either host or outer-container
@@ -850,13 +932,26 @@ class ClaudeAgent:
         cmd = ["claude", "-p"]
         if stream_json:
             cmd += ["--output-format", "stream-json", "--verbose"]
+        session_args: list[str] = []
+        if resume_session_id:
+            session_args = ["--resume", resume_session_id]
+        elif session_id:
+            session_args = ["--session-id", session_id]
         cmd += _claude_unattended_args(
             worktree_path,
             state_dir=state_dir,
             mcp_config_path=mcp_config_path,
             mcp_servers=mcp_servers,
             safety=safety,
+            session_args=session_args,
         )
+        if completion_schema_path is not None:
+            # Claude takes the schema inline and reports the validated value
+            # as ``structured_output`` on the final result event.
+            cmd += [
+                "--json-schema",
+                completion_schema_path.read_text(encoding="utf-8").strip(),
+            ]
         cmd += ["--", prompt]
         return cmd
 
@@ -1178,8 +1273,13 @@ class CodexAgent:
         provider_home: Path | None = None,
         git_isolation: AgentGitIsolation | None = None,
         safety: LaunchSafety | None = None,
+        session_id: str | None = None,
+        resume_session_id: str | None = None,
+        completion_schema_path: Path | None = None,
     ) -> list[str]:
-        del mcp_config_path, externally_sandboxed
+        # Codex assigns the thread id itself and reports it in the
+        # ``thread.started`` event, so a new session needs no flag.
+        del mcp_config_path, externally_sandboxed, session_id
         policy = safety or LaunchSafety()
         writable_roots = [
             state_dir,
@@ -1194,6 +1294,8 @@ class CodexAgent:
             *codex_unattended_approval_args(policy.codex_auto_review),
             *_codex_add_dir_args(writable_roots),
             "exec",
+            # `exec resume` accepts the same JSON, schema and config flags.
+            *(["resume"] if resume_session_id else []),
             "--json",
             *_codex_implement_permission_overrides(
                 worktree_path,
@@ -1214,6 +1316,10 @@ class CodexAgent:
         # argv: setup manifests may contain literal MCP environment secrets,
         # and command lines are observable through process listings and
         # container inspection/logging.
+        if completion_schema_path is not None:
+            cmd += ["--output-schema", str(completion_schema_path)]
+        if resume_session_id:
+            cmd.append(resume_session_id)
         cmd.append(prompt)
         return cmd
 
