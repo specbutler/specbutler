@@ -9608,6 +9608,7 @@ class IntakeResult:
 @dataclass
 class ImplementContext:
     implement_reason: str = "initial"
+    framing_reason: str = ""
     objective: str = ""
     recovery_objective: str = ""
     run_id: str = ""
@@ -17546,6 +17547,39 @@ def _sync_reused_branch_before_implement(run: RunState, worktree_path: Path) -> 
     return "failed"
 
 
+def _implement_framing_evidence(run: RunState, repo_root: Path) -> tuple[bool, str]:
+    """Choose prompt framing independently of retry accounting.
+
+    Keep retry framing when legacy state cannot establish the base/head pair.
+    A launch counter alone is never evidence of completed implementation work.
+    """
+    state_dir = _state_root(repo_root) / "runs" / run.run_id
+    review_paths = [state_dir / "review-result.json", *state_dir.glob("review-result.attempt-*.json")]
+    if run.review_decision_status or any(
+        ReviewResult.load_from_path(path) is not None for path in review_paths
+    ):
+        return False, "prior review result for this run branch"
+    worktree = resolve_worktree_path(run, repo_root)
+    base = run.publication_base_sha or run.implement_head_sha_before
+    if not base and worktree.is_dir():
+        base = _resolve_git_ref_sha(worktree, run.base_ref or BASE_REF)
+    head = _head_sha(worktree) if worktree.is_dir() else ""
+    heads = [value for value in (head, run.implement_head_sha_after) if value]
+    if base and heads:
+        for candidate in heads:
+            result = run_subprocess(
+                ["git", "rev-list", "--count", f"{base}..{candidate}"], cwd=worktree,
+            )
+            if result.returncode != 0:
+                return False, "could not establish prior commit evidence"
+            if result.stdout.strip() != "0":
+                return False, "prior implementation commits beyond the base"
+        return True, "no commits beyond the base and no prior review result"
+    if run.attempts == 0 and run.implement_launches == 0 and not run.implement_head_sha_after:
+        return True, "no earlier agent launch or prior review result"
+    return False, "prior commit evidence unavailable; retaining retry framing"
+
+
 def _build_implement_attempt_context(
     run: RunState,
     repo_root: Path,
@@ -17559,10 +17593,16 @@ def _build_implement_attempt_context(
     else:
         reason = "initial"
 
+    initial, framing_reason = _implement_framing_evidence(run, repo_root)
+    framed_reason = "initial" if initial else ("retry" if reason == "initial" else reason)
+    if reason == "merge_conflict":
+        framed_reason = reason
+        framing_reason = "active merge conflict requires resolution"
     spec_path = _spec_path_for_run(run)
     spec_file = repo_root / spec_path
     ctx = ImplementContext(
-        implement_reason=reason,
+        implement_reason=framed_reason,
+        framing_reason=framing_reason,
         objective=f"Implement spec {run.spec_id}",
         run_id=run.run_id,
         attempt_number=run.attempts + 1,
@@ -17627,7 +17667,7 @@ def _build_implement_attempt_context(
             ctx.operator_steering_source = operator_steering.source
 
     pending_guided_retry_signature = ""
-    if reason != "initial":
+    if framed_reason != "initial":
         retry_package = _build_retry_failure_package(run, repo_root)
         ctx.triggering_phase = retry_package.triggering_phase
         ctx.previous_implement_attempt_number = retry_package.previous_implement_attempt_number
@@ -17691,6 +17731,18 @@ def _build_implement_attempt_context(
             ctx.debugger_needs_new_commit = diagnosis.needs_new_commit
             ctx.debugger_blocker_signature = diagnosis.blocker_signature
             ctx.debugger_diagnosis_stale = True
+
+    # Consuming a guided retry belongs to accounting, even when no code was
+    # produced and the prompt must describe initial implementation work.
+    if framed_reason == "initial" and reason != "initial":
+        diagnosis = BlockDiagnosis.load(repo_root, run.run_id)
+        if (
+            diagnosis is not None
+            and run.pending_block_debugger_signature
+            and diagnosis.blocker_signature == run.pending_block_debugger_signature
+            and not diagnosis.requires_human_attention
+        ):
+            pending_guided_retry_signature = diagnosis.blocker_signature
 
     return ImplementAttemptContextBundle(
         reason=reason,
@@ -18107,7 +18159,9 @@ def _prepare_implement_launch_plan(
     operator_request = _load_operator_request(repo_root, run)
 
     agent_command_kwargs = {
-        "retry_context": ctx if reason != "initial" else None,
+        "retry_context": (
+            ctx if reason != "initial" or ctx.implement_reason != "initial" or session.resumes else None
+        ),
         # Intake is durable implementation context even on an initial attempt;
         # retry_context intentionally remains None there because it also marks
         # no-handshake recovery launches throughout the existing interface.
@@ -19074,11 +19128,12 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
         and _claude_supports_stream_json()
     )
     logger.info(
-        "Launching %s in %s (run_id=%s, attempt=%d)",
+        "Launching %s in %s (run_id=%s, attempt=%d): %s",
         run.agent,
         worktree_path,
         run.run_id,
         run.attempts + 1,
+        "initial implementation" if ctx.implement_reason == "initial" else "retry",
     )
     head_before = _head_sha(worktree_path)
     _migrate_legacy_publication_base(run)
@@ -21260,7 +21315,9 @@ def _build_agent_command(
         return _adapter_method_accepts_kwarg(adapter.build_implement_command, name)
 
     resume_session_id = resume_session_id if _accepts("resume_session_id") else ""
-    delta_prompt = bool(resume_session_id)
+    delta_prompt = bool(resume_session_id) and not (
+        retry_context is not None and retry_context.implement_reason == "initial"
+    )
     acceptance_checklist = list(
         acceptance_checklist
         if acceptance_checklist is not None

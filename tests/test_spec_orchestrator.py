@@ -42239,3 +42239,52 @@ class TestFailureClassification:
             "requests.exceptions.ConnectionError: error connecting to localhost"
         )
         assert orch.classify_failure(message).category is orch.FailureCategory.CODE
+
+
+@pytest.mark.parametrize("scenario", ["bootstrap", "killed", "committed", "review", "archived_review"])
+def test_implement_prompt_framing_uses_prior_work(repo: Path, scenario: str):
+    base = orch._head_sha(repo)
+    run = orch.RunState(
+        run_id="framing-20261103", spec_id="my-feature", branch="spec/my-feature",
+        attempts=1, implement_launches=0 if scenario == "bootstrap" else 1,
+        publication_base_sha=base,
+    )
+    run.last_error = (
+        "Bootstrap dependency was unavailable" if scenario == "bootstrap"
+        else "Required checks failing: ci (https://example.com/checks/7)"
+    )
+    if scenario == "committed":
+        (repo / "implementation.txt").write_text("prior implementation\n")
+        _run_git("add", "implementation.txt", cwd=repo)
+        _run_git("commit", "-m", "Prior implementation", cwd=repo)
+    if scenario in {"review", "archived_review"}:
+        latest = orch.ReviewResult(
+            status="request_changes", attempt_number=1, summary="Fix the implementation",
+        ).save(repo, run.run_id)
+        if scenario == "review":
+            run.review_decision_status = "request_changes"
+        else:
+            latest.unlink()
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        bundle = orch._build_implement_attempt_context(run, repo)
+    ctx = bundle.context
+    initial = scenario in {"bootstrap", "killed"}
+    assert (ctx.implement_reason == "initial") is initial
+    assert ctx.framing_reason
+    assert run.attempts == 1
+    prompt = orch._build_agent_command(
+        "claude", repo, retry_context=ctx, spec_id=run.spec_id,
+        resume_session_id="interrupted-session",
+    )[-1]
+    if initial:
+        assert "Do NOT re-implement from scratch" not in prompt
+        assert "Continue the IMPLEMENT phase" not in prompt
+        assert "You are running the IMPLEMENT phase" in prompt
+        assert ctx.failure_summary == ""
+        assert ctx.previous_implement_result_path == ""
+        assert ctx.previous_implement_attempt_number == 0
+        assert ctx.gate_output == ""
+    else:
+        assert ctx.previous_implement_attempt_number == 1
+        assert ctx.failure_summary
+        assert "Do NOT re-implement from scratch" in prompt
