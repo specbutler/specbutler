@@ -5610,6 +5610,30 @@ class TestEnvironmentBlockDetection:
         summary = "make test failed: AssertionError in tests/test_api.py"
         assert orch.is_non_actionable_gate_environment_block(summary) is False
 
+    @pytest.mark.parametrize(
+        "summary",
+        [
+            # Real blocked summaries from dogfood runs whose only failures were
+            # provider-sandbox denials; host verify then passed.
+            "Required foreground .venv/bin/python -m pytest completed with 3288 passed, 458 failed and 96 skipped; "
+            "representative failures are denied provider-home writes and unavailable process identity in this "
+            "sandbox. Required .venv/bin/python -m ruff check . passed. Verification remains blocked by "
+            "environment failures.",
+            "Full pytest completed with 3250 passed, 464 failed, and 96 skipped. Validation is blocked by sandbox "
+            "permission errors creating provider homes and inability to inspect launched processes.",
+        ],
+    )
+    def test_detects_agent_described_sandbox_denials(self, summary: str):
+        gates = {"test": ".venv/bin/python -m pytest", "lint": ".venv/bin/python -m ruff check ."}
+        with patch.object(orch, "VERIFY_GATE_COMMANDS", gates):
+            assert orch.is_non_actionable_gate_environment_block(summary) is True
+
+    def test_sandbox_wording_without_a_gate_is_not_an_environment_block(self):
+        summary = "Blocked: the spec asks for a sandbox mode but does not say which provider to target."
+        gates = {"test": ".venv/bin/python -m pytest", "lint": ".venv/bin/python -m ruff check ."}
+        with patch.object(orch, "VERIFY_GATE_COMMANDS", gates):
+            assert orch.is_non_actionable_gate_environment_block(summary) is False
+
 
 class TestTailLines:
     def test_returns_last_n_lines(self):
