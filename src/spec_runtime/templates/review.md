@@ -12,14 +12,12 @@ orchestrator adds to this prompt is authoritative. In every environment:
   verify gate results. On a re-review it also supplies the previous round's
   findings, the implementer's response, and the diff since the last reviewed
   head.
-- A read-only checkout pinned to the reviewed head is available for context.
-  The Codex reviewer may run read-only inspection commands against it (for
-  example `cat`, `grep`, `rg`, `ls`, `git log`, `git show`, `git diff`). The
-  Claude reviewer uses Read, Glob and Grep. Custom adapters expose their own
-  inspection tools.
+- A read-only checkout pinned to the reviewed head may be available for
+  context. The Claude reviewer uses Read, Glob and Grep on it. The Codex
+  reviewer has no shell and works from the inlined diff and spec. Custom
+  adapters expose their own inspection tools.
 - Do not execute pull-request code: no tests, builds, installs, or scripts
-  from the checkout. For the Codex reviewer this is enforced: commands other
-  than read-only inspection are rejected. Rely on the orchestrator's gate results instead; the
+  from the checkout. Rely on the orchestrator's gate results instead; the
   inability to rerun tests is not a finding and not a reason for `blocked`.
 - Do not modify files, create commits, or publish changes. Provider and
   operator credential locations are deliberately unreadable.
