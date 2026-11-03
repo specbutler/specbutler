@@ -2014,6 +2014,53 @@ class TestPhaseImplementHandshake:
 
         assert status == "passed"
 
+    @pytest.mark.requires_ps
+    @pytest.mark.parametrize("changed", [False, True])
+    @pytest.mark.parametrize("retry_cap", [1, 10])
+    def test_midflight_steering_satisfied_noop_does_not_consume_retry_budget(
+        self, repo: Path, changed: bool, retry_cap: int,
+    ):
+        run = self._make_run()
+        run.phase = "implement"
+        run.status = "passed"
+        run.attempts = 1
+        run.retry_cap = retry_cap
+        worktree = repo / ".worktrees" / run.spec_id
+        _run_git("clone", str(repo), str(worktree), cwd=repo)
+        run.worktree_path = str(worktree)
+        orch.ImplementResult(status="passed", summary="Already implemented v2", attempt=1).save(repo, run.run_id)
+        orch._record_operator_steering(repo, run, "Use v2", source="test")
+        assert orch._schedule_operator_guided_implement_attempt(repo, run, retry_cap=retry_cap)
+        bundle = orch._build_implement_attempt_context(run, repo)
+        assert "Already implemented v2" in bundle.context.operator_steering_message
+        assert ("retry budget is exhausted" in bundle.context.operator_steering_message) == (retry_cap == 1)
+        orch.ImplementResult(status="passed", summary="Steering already satisfied", attempt=2).save(repo, run.run_id)
+        command = _portable_success_command()
+        if changed:
+            command = [sys.executable, "-c", "from pathlib import Path; Path('new.txt').write_text('change')"]
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch, "specbutler_user_state_root", return_value=repo / "user-state"),
+            patch.object(Path, "home", return_value=repo / "user-home"),
+            patch.object(orch, "_build_agent_command", return_value=command),
+        ):
+            status = orch.phase_implement(run, repo)
+        assert run.steering_noop_attempts == (0 if changed else 1)
+        assert orch._convergence_attempts(run) == (2 if changed else 1)
+        assert not orch._active_operator_steering(repo, run.run_id)
+        if changed and retry_cap == 1:
+            assert status == "blocked"
+            assert "steering assessment required changes" in run.last_error
+        else:
+            assert status == "passed", run.last_error
+            run.status = status
+            run.save(repo)
+            handlers = {phase: MagicMock(return_value="passed") for phase in orch.PHASES}
+            with patch.dict(orch.PHASE_HANDLERS, handlers):
+                assert orch.run_full_workflow(run, repo, retry_cap=retry_cap) == "passed"
+            handlers["implement"].assert_not_called()
+            handlers["verify"].assert_called_once()
+
     def test_review_retry_blocks_when_pinned_review_artifact_does_not_match_head(self, repo: Path):
         run = self._make_run()
         run.attempts = 1
@@ -2438,6 +2485,7 @@ class TestPhaseImplementHandshake:
                 "Actually, fix the schema retry first.",
                 source="spec steer",
                 provided_by="alice",
+                replace=True,
             )
             return 0
 
@@ -17088,16 +17136,18 @@ class TestPhaseTransitions:
         assert run.attempts == 1
 
     @pytest.mark.requires_ps
-    def test_operator_steering_does_not_bypass_retry_cap(self, repo: Path):
+    def test_resolved_operator_request_does_not_bypass_retry_cap(self, repo: Path):
         run = self._make_run(repo)
         run.phase = "implement"
         run.status = "passed"
         run.attempts = 1
         run.save(repo)
-        orch.OperatorSteering(
-            message="Apply one more correction.",
-            provided_by="thiago",
-            source="spec steer",
+        orch.OperatorRequest(
+            kind="agent_question",
+            prompt="Which correction?",
+            status="resolved",
+            response="Apply one more correction.",
+            continuation=orch.OPERATOR_CONTINUATION_RESUME_IMPLEMENT,
         ).save(repo, run.run_id)
 
         handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
@@ -36401,7 +36451,9 @@ class TestWaitingForInputWorkflow:
             first_code = orch.cmd_steer(args)
             now.return_value = second_timestamp
             clock.now.return_value = orch.datetime.fromisoformat("2026-11-03T21:00:01+00:00")
-            second_code = orch.cmd_steer(argparse.Namespace(spec="my-feature", message="Actually, fix lint first."))
+            second_code = orch.cmd_steer(argparse.Namespace(
+                spec="my-feature", message="Actually, fix lint first.", replace=True,
+            ))
 
         assert first_code == 0
         assert second_code == 0
@@ -36417,7 +36469,7 @@ class TestWaitingForInputWorkflow:
         assert "Recorded proactive steering for my-feature." in out
         assert "Replaced proactive steering for my-feature." in out
 
-    def test_cmd_steer_rejects_run_waiting_for_operator_intervention(self, repo: Path, capsys):
+    def test_cmd_steer_attaches_while_waiting_for_operator_intervention(self, repo: Path, capsys):
         run = self._make_run()
         run.status = "waiting-for-input"
         run.phase = "implement"
@@ -36428,9 +36480,65 @@ class TestWaitingForInputWorkflow:
         with patch.object(orch, "resolve_repo_root", return_value=repo):
             code = orch.cmd_steer(args)
 
-        assert code == 1
-        err = capsys.readouterr().err
-        assert "Resolve it with `spec input --spec my-feature` before adding proactive steering." in err
+        assert code == 0
+        assert orch.OperatorSteering.load(repo, run.run_id).message == "Try the minimal diff first."
+        assert orch.RunState.load(repo, run.run_id).status == "waiting-for-input"
+
+    def test_two_steers_are_delivered_in_order(self, repo: Path):
+        run = self._make_run()
+        run.save(repo)
+        orch._record_operator_steering(repo, run, "First note", source="test")
+        second = orch._record_operator_steering(repo, run, "Second note", source="test")
+        bundle = orch._build_implement_attempt_context(run, repo)
+        message = bundle.context.operator_steering_message
+        assert message.index("First note") < message.index("Second note")
+        orch._consume_operator_steering(
+            repo, run.run_id, attempt_number=1, expected_event_id=second.event_id,
+        )
+        assert not orch._active_operator_steering(repo, run.run_id)
+
+    def test_new_midflight_note_remains_active_after_snapshot_consumption(self, repo: Path):
+        run = self._make_run()
+        first = orch._record_operator_steering(repo, run, "First note", source="test")
+        second = orch._record_operator_steering(repo, run, "Midflight note", source="test")
+        orch._consume_operator_steering(
+            repo, run.run_id, attempt_number=1, expected_event_id=first.event_id,
+        )
+        assert [note.event_id for note in orch._active_operator_steering(repo, run.run_id)] == [second.event_id]
+
+    @pytest.mark.parametrize("command", ["input", "steer"])
+    @pytest.mark.parametrize("kind", ["agent_question", "debugger_guidance", "review_round_cap"])
+    def test_answer_pending_request_without_tty(self, repo: Path, command: str, kind: str):
+        run = self._make_run()
+        run.status = "waiting-for-input"
+        run.phase = "implement"
+        run.input_question = "Which API?"
+        run.save(repo)
+        orch.OperatorRequest(
+            kind=kind,
+            prompt="Which API?",
+            requested_by_phase="review" if kind == "review_round_cap" else "implement",
+        ).save(repo, run.run_id)
+        orch._record_operator_steering(repo, run, "Keep compatibility", source="test")
+        args = argparse.Namespace(spec=run.spec_id, message="Use v2", answer=True)
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch.sys.stdin, "isatty", return_value=False),
+            patch.object(orch, "cmd_run") as launch,
+        ):
+            handler = orch.cmd_input if command == "input" else orch.cmd_steer
+            assert handler(args) == 0
+        launch.assert_not_called()
+        saved = orch.RunState.load(repo, run.run_id)
+        request = orch.OperatorRequest.load(repo, run.run_id)
+        assert saved.status == "pending"
+        assert request.response == "Use v2"
+        assert orch.review_convergence.load_extra_rounds_granted(
+            orch._state_root(repo) / "runs" / run.run_id,
+        ) == (1 if kind == "review_round_cap" else 0)
+        assert request.continuation == orch.OPERATOR_CONTINUATION_RESUME_IMPLEMENT
+        bundle = orch._build_implement_attempt_context(saved, repo)
+        assert "Keep compatibility" in bundle.context.operator_steering_message
 
     def test_select_default_run_returns_waiting_for_input_run(self, repo: Path):
         """_select_default_run selects a run in waiting-for-input status."""
