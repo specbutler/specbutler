@@ -177,7 +177,7 @@ def collect_transcript_usage(launch, cwd, snapshot):
             if not changed and not (provider == "claude" and parent_session in changed_sessions):
                 continue
             events = []
-            for line in path.read_text().splitlines():
+            for line in path.read_text(encoding="utf-8", errors="surrogateescape").splitlines():
                 try:
                     event = json.loads(line)
                     if isinstance(event, dict):
@@ -194,8 +194,8 @@ def collect_transcript_usage(launch, cwd, snapshot):
             old = None
             latest = None
             offset = 0
-            for line in path.read_text().splitlines(keepends=True):
-                offset += len(line.encode())
+            for line in path.read_text(encoding="utf-8", errors="surrogateescape").splitlines(keepends=True):
+                offset += len(line.encode("utf-8", "surrogateescape"))
                 try:
                     e = json.loads(line)
                     info = e.get("payload", {}).get("info") or {}

@@ -146,7 +146,7 @@ from .execution_backend import (
     run_local_command_preserving_descendants,
 )
 from .execution_backend import get_execution_backend as _factory_get_execution_backend
-from .forge import GitHubForge, PushResult
+from .forge import GitHubForge, PushResult, get_forge_adapter
 from .git_common import resolve_common_root, run_git, subprocess_text_kwargs
 from .git_publish_guard import (
     UnsafeRepositoryGitConfigError,
@@ -765,10 +765,31 @@ def _repo_pinned_run_subprocess(repo_slug: str):
 
 def _check_forge_auth() -> str:
     """Verify forge authentication. Returns empty string on success, error message on failure."""
-    gh_check = run_subprocess(["gh", "auth", "status"])
-    if gh_check.returncode != 0:
-        return "GitHub CLI not authenticated. Run 'gh auth login'."
-    return ""
+    network_error = ""
+    for attempt in range(3):
+        if attempt:
+            _poll_sleep(20.0 * attempt)
+        gh_check = run_subprocess(["gh", "auth", "status"])
+        if gh_check.returncode == 0:
+            return ""
+        output = f"{gh_check.stdout or ''}\n{gh_check.stderr or ''}".strip()
+        if any(marker in output.lower() for marker in _FORGE_NETWORK_MARKERS):
+            network_error = output
+    if network_error:
+        return f"Forge auth preflight failed: {network_error}"
+    return "GitHub CLI not authenticated. Run 'gh auth login'."
+
+
+def _check_run_forge_auth(run: RunState, phase: str) -> str:
+    """Keep a same-phase forge outage on the infrastructure retry path."""
+    error = _check_forge_auth()
+    if (
+        error
+        and run.last_failure_phase == phase
+        and run.last_failure_signature.startswith("forge_network:")
+    ):
+        return "Forge auth preflight failed: error connecting to forge after a network failure."
+    return error
 
 
 def _mcp_config_path(worktree_path: Path) -> Path:
@@ -4619,6 +4640,8 @@ def _infrastructure_failure_kind(text: str) -> tuple[str, bool, str] | None:
     if "container codex sandbox preflight failed" in text:
         return "container_sandbox", False, "backend"
     if _is_forge_auth_failure_message(text):
+        if any(marker in text for marker in _FORGE_NETWORK_MARKERS):
+            return "forge_network", True, "backend"
         return "forge_auth", False, "backend"
     if _is_agent_auth_failure_message(text) or "credentials are not authenticated" in text:
         return "agent_auth", False, "backend"
@@ -4772,19 +4795,51 @@ def check_dependencies_merged(repo_root: Path, spec_id: str) -> list[str]:
     if isinstance(deps, str):
         deps = [deps]
     blockers = []
+    fetch_error = ""
+    remote = BASE_REF.removeprefix("refs/remotes/").split("/", 1)[0] if "/" in BASE_REF else "origin"
+    if any(not is_spec_merged(repo_root, dep) for dep in deps):
+        try:
+            outcome = run_git_fetch_with_timeout(
+                [remote, "refs/tags/spec/merged/*:refs/tags/spec/merged/*"],
+                cwd=repo_root,
+                timeout_seconds=DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
+                runner=_orchestrator_fetch_runner,
+            )
+            if not outcome.is_success:
+                fetch_error = f"merge tags could not be fetched from {remote}"
+        except (GitFetchTimeoutError, OSError) as exc:
+            fetch_error = f"merge tags could not be fetched from {remote}: {exc}"
+        if fetch_error:
+            logger.warning("%s", fetch_error)
     for dep in deps:
         dep_path = _resolve_dependency_spec_path(repo_root, dep)
+        if dep_path is not None:
+            dep_fm = parse_spec_frontmatter(dep_path)
+            superseded_by = str(dep_fm.get("superseded_by", "")).strip()
+            if superseded_by:
+                blockers.append(f"{dep} (superseded by {superseded_by})")
+                continue
+        if is_spec_merged(repo_root, dep):
+            continue
+        try:
+            merged = get_forge_adapter().is_spec_merged(dep, base_branch=PR_BASE_BRANCH, cwd=repo_root)
+        except (RuntimeError, OSError, AttributeError) as exc:
+            logger.warning("Could not check dependency %s on forge: %s", dep, exc)
+            merged = False
+        if merged:
+            logger.warning(
+                "Dependency %s merged but is missing a usable merge tag; run spec-backfill-merge-tags backfill",
+                dep,
+            )
+            continue
         if dep_path is None:
             blockers.append(f"{dep} (missing spec file)")
-            continue
-        dep_fm = parse_spec_frontmatter(dep_path)
-        superseded_by = str(dep_fm.get("superseded_by", "")).strip()
-        if superseded_by:
-            blockers.append(f"{dep} (superseded by {superseded_by})")
             continue
         dep_status = read_spec_status(repo_root, dep, dep_path)
         if dep_status != "merged":
             blockers.append(f"{dep} ({dep_status})")
+    if blockers and fetch_error:
+        blockers[-1] += f"; {fetch_error}. Fetch merge tags and retry"
     return blockers
 
 
@@ -9018,21 +9073,25 @@ def _schedule_operator_guided_implement_attempt(
     implement phase must loop back through implement instead of advancing to
     verification. Resolved operator requests use the same continuation path.
     Advancing ``run.attempts`` here gives the follow-up its own attempt-scoped
-    artifacts and keeps operator guidance inside the shared retry limit.
+    artifacts. Steering may be assessed at the cap, but only an unchanged,
+    explicitly successful assessment is excluded from the shared retry limit.
     """
     if not _passed_implement_run_requires_fresh_attempt(repo_root, run):
         return False
 
-    if _convergence_attempts(run) >= retry_cap:
+    steering_recheck = bool(_active_operator_steering(repo_root, run.run_id))
+    used = _convergence_attempts(run)
+    if used > retry_cap or (used == retry_cap and not steering_recheck):
         run.status = "blocked"
         run.last_error = (
-            f"Retry cap reached ({_convergence_attempts(run)}/{retry_cap}) before active "
+            f"Retry cap reached ({used}/{retry_cap}) before active "
             "operator guidance could be applied. Resume with "
             f"`spec implement --spec {run.spec_id} --retry-cap {retry_cap + 10}`."
         )
         run.save(repo_root)
         return False
 
+    run.steering_recheck = steering_recheck
     run.attempts += 1
     run.status = "pending"
     run.last_error = ""
@@ -9228,6 +9287,9 @@ class RunState:
     # another when the convergence count is intentionally unchanged.
     usage: list[dict] = field(default_factory=list)
     implement_launches: int = 0
+    # Preserve attempt artifact lineage while excluding satisfied rechecks from the cap.
+    steering_recheck: bool = False
+    steering_noop_attempts: int = 0
     implement_failures: int = 0
     verify_failures: int = 0
     merge_conflicts: int = 0
@@ -9282,6 +9344,8 @@ class RunState:
     prior_review_findings: list[dict] = field(default_factory=list)
     base_ref: str = BASE_REF
     retry_cap: int = RETRY_CAP
+    base_sync_cap: int = 10
+    base_syncs: int = 0
     pgid: int | None = None
     process_started_at: str = ""
     supervision_token: dict[str, object] = field(default_factory=dict)
@@ -9310,6 +9374,7 @@ class RunState:
     # Autopilot keys infrastructure backoff and its circuit breaker on these.
     last_failure_category: str = ""
     last_failure_signature: str = ""
+    last_failure_phase: str = ""
     # Consecutive infrastructure failures of this run with
     # ``last_failure_signature``; reset by a passing phase or a new signature.
     # Drives the in-process infrastructure backoff and never touches
@@ -9608,6 +9673,8 @@ class IntakeResult:
 @dataclass
 class ImplementContext:
     implement_reason: str = "initial"
+    framing_reason: str = ""
+    cleared_blocker_note: str = ""
     objective: str = ""
     recovery_objective: str = ""
     run_id: str = ""
@@ -10389,17 +10456,11 @@ def _record_operator_steering(
     *,
     source: str,
     provided_by: str = "",
+    replace: bool = False,
 ) -> OperatorSteering:
     guidance = str(message or "").strip()
     if not guidance:
         raise RuntimeError("Steering guidance cannot be empty.")
-
-    operator_request = _load_operator_request(repo_root, run)
-    if operator_request is not None and operator_request.status == "pending":
-        raise RuntimeError(
-            "This run is already waiting on a reactive operator request. "
-            f"Resolve it with `spec input --spec {run.spec_id}` before adding proactive steering."
-        )
 
     previous = OperatorSteering.load(repo_root, run.run_id)
     steering = OperatorSteering(
@@ -10415,11 +10476,23 @@ def _record_operator_steering(
         source=str(source or "").strip(),
         status="active",
     )
-    if previous is not None and previous.status == "active":
-        previous.status = "superseded"
-        previous.superseded_by_event_id = steering.event_id
-        previous.superseded_at = steering.provided_at
-        previous.save(repo_root, run.run_id, update_latest=False)
+    if previous is not None:
+        # Windows clocks can return the same instant for successive commands.
+        # Preserve recording order instead of letting random event IDs order
+        # replacements when timestamps tie (or the wall clock moves backward).
+        try:
+            previous_at = datetime.fromisoformat(previous.provided_at)
+            provided_at = datetime.fromisoformat(steering.provided_at)
+            if provided_at <= previous_at:
+                steering.provided_at = (previous_at + timedelta(microseconds=1)).isoformat()
+        except (ValueError, TypeError):
+            pass  # Legacy records may lack a valid, timezone-aware timestamp.
+    if replace:
+        for previous_note in _active_operator_steering(repo_root, run.run_id):
+            previous_note.status = "superseded"
+            previous_note.superseded_by_event_id = steering.event_id
+            previous_note.superseded_at = steering.provided_at
+            previous_note.save(repo_root, run.run_id, update_latest=False)
     steering.save(repo_root, run.run_id)
     return steering
 
@@ -10435,17 +10508,29 @@ def _consume_operator_steering(
         expected_event_id = expected_event_id.strip()
     if not expected_event_id:
         return
-    steering = OperatorSteering.load(repo_root, run_id)
-    if steering is None or steering.status != "active":
+    notes = _active_operator_steering(repo_root, run_id)
+    boundary = next((note for note in notes if note.event_id == expected_event_id), None)
+    if boundary is None:
         return
-    if steering.event_id != expected_event_id:
-        return
-    if steering.influenced_attempt_number is not None:
-        return
-    steering.influenced_attempt_number = attempt_number
-    steering.influenced_at = _now_iso()
-    steering.status = "consumed"
-    steering.save(repo_root, run_id)
+    latest = OperatorSteering.load(repo_root, run_id)
+    for note in notes:
+        if (note.provided_at, note.event_id) > (boundary.provided_at, boundary.event_id):
+            continue
+        note.influenced_attempt_number = attempt_number
+        note.influenced_at = _now_iso()
+        note.status = "consumed"
+        note.save(repo_root, run_id, update_latest=latest is not None and note.event_id == latest.event_id)
+
+
+def _active_operator_steering(repo_root: Path, run_id: str) -> list[OperatorSteering]:
+    events = OperatorSteering.list_events(repo_root, run_id)
+    latest = OperatorSteering.load(repo_root, run_id)
+    if latest is not None and not any(note.event_id == latest.event_id for note in events):
+        events.append(latest)
+    return sorted(
+        (note for note in events if note.status == "active"),
+        key=lambda note: (note.provided_at, note.event_id),
+    )
 
 
 def _format_operator_steering_for_prompt(
@@ -10790,6 +10875,11 @@ def resolve_operator_request(
         request,
         session_completed_implement=session_completed_implement,
     )
+    # Every answer surface (CLI, TUI, and direct callers) uses the same
+    # request-specific continuation. Re-answering a resolved request must not
+    # grant another round without a new pending request from review.
+    if request.kind == review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND and request.status == "pending":
+        review_convergence.grant_extra_review_round(_state_root(repo_root) / "runs" / run.run_id)
     now = _now_iso()
     request.response = resolved_response
     request.response_source = str(source or "").strip()
@@ -11503,6 +11593,12 @@ def _build_retry_failure_package(run: RunState, repo_root: Path) -> RetryFailure
         if has_later_approval:
             # Reset to avoid using a superseded request_changes result.
             review_result = None
+    inherited_review = False
+    if review_result is None and not _has_run_review_evidence(run, repo_root):
+        prior_review, prior_path = _prior_branch_review(run, repo_root)
+        if prior_review is not None:
+            review_result, review_result_path = prior_review, prior_path
+            inherited_review = prior_review.status == "request_changes"
     review_requested = False
     # If the reviewed head is not an ancestor of the current head (e.g. after a
     # force-push), discard the review result — its findings cover code that is no
@@ -11605,7 +11701,10 @@ def _build_retry_failure_package(run: RunState, repo_root: Path) -> RetryFailure
         package.active_gates_or_checks.append("implement agent session")
         package.summary_parts.append(run.last_error.strip())
 
-    if run.review_decision_status == "request_changes" and not package.stale_review_feedback:
+    if (
+        run.review_decision_status == "request_changes"
+        or (inherited_review and package.review_feedback_active)
+    ) and not package.stale_review_feedback:
         package.triggering_phase = "review"
     elif run.pending_block_debugger_signature:
         package.triggering_phase = "debugger"
@@ -14435,10 +14534,13 @@ def _mark_local_review_for_rerun_after_sync(
     prior = _short_sha(previous_review_head) if previous_review_head else "none"
     current = _short_sha(current_head_sha)
     status_note = previous_review_status or "pending"
-    run.last_error = (
-        f"{LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX}: "
+    detail = (
         f"review status {status_note} covered {prior}, but the branch now points to {current}."
+        if previous_review_head != current_head_sha
+        else f"review is pending for head {current}."
     )
+    run.last_error = f"{LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX}: {detail}"
+    run.save(repo_root)
     return True
 
 
@@ -17546,6 +17648,144 @@ def _sync_reused_branch_before_implement(run: RunState, worktree_path: Path) -> 
     return "failed"
 
 
+def _has_run_review_evidence(run: RunState, repo_root: Path) -> bool:
+    state_dir = _state_root(repo_root) / "runs" / run.run_id
+    paths = [state_dir / "review-result.json", *state_dir.glob("review-result.attempt-*.json")]
+    return bool(run.review_decision_status) or any(
+        ReviewResult.load_from_path(path) is not None for path in paths
+    )
+
+
+def _prior_branch_review(
+    run: RunState, repo_root: Path,
+) -> tuple[ReviewResult | None, Path | None]:
+    """Find review evidence on the branch being continued, across run IDs.
+
+    Reviews carried from an abandoned *different* branch remain initial-prompt
+    advice. Only the reused branch's reviews establish prior implementation.
+    """
+    branches = {branch for branch in (run.branch, run.resumed_from_branch) if branch}
+    all_runs = RunState.list_all(repo_root)
+    predecessors = [
+        candidate for candidate in all_runs
+        if candidate.run_id != run.run_id and candidate.branch in branches
+    ]
+    known_ids = {candidate.run_id for candidate in predecessors}
+    if run.prior_review_run_id and run.prior_review_run_id not in known_ids and run.resumed_from_branch:
+        # The predecessor's state/artifacts may have been cleaned up. The
+        # explicitly inherited snapshot still belongs to this reused branch.
+        if not any(prior.run_id == run.prior_review_run_id for prior in all_runs):
+            predecessors.append(RunState(
+                run_id=run.prior_review_run_id, spec_id=run.spec_id, branch=run.resumed_from_branch,
+            ))
+    for prior in predecessors:
+        state_dir = _state_root(repo_root) / "runs" / prior.run_id
+        latest = state_dir / "review-result.json"
+        archived = sorted(
+            state_dir.glob("review-result.attempt-*.json"),
+            key=lambda path: int(re.search(r"\.attempt-(\d+)\.json$", path.name).group(1)),
+            reverse=True,
+        )
+        for path in [latest, *archived]:
+            result = ReviewResult.load_from_path(path)
+            if result is not None:
+                return result, path
+        if prior.review_decision_status and prior.review_decision_status != "request_changes":
+            return ReviewResult(
+                status=prior.review_decision_status, summary=prior.review_decision_summary,
+                reviewed_head_sha=prior.review_expected_head_sha,
+                source_check_url=prior.review_decision_check_url,
+            ), latest
+        if prior.run_id == run.prior_review_run_id and (
+            run.prior_review_summary or run.prior_review_findings
+        ):
+            return ReviewResult(
+                status="request_changes", summary=run.prior_review_summary,
+                reviewed_head_sha=prior.review_expected_head_sha,
+                source_check_url=prior.review_decision_check_url,
+                findings=[ReviewFinding(**finding) for finding in
+                          _coerce_saved_review_findings(run.prior_review_findings)],
+            ), latest
+        if prior.review_decision_status:
+            return ReviewResult(
+                status=prior.review_decision_status, summary=prior.review_decision_summary,
+                reviewed_head_sha=prior.review_expected_head_sha,
+                source_check_url=prior.review_decision_check_url,
+            ), latest
+    return None, None
+
+
+def _cleared_initial_blocker_note(run: RunState, repo_root: Path) -> str:
+    """Keep a short non-code explanation, without reviving the retry package."""
+    candidates = [(run.last_error, run.phase)]
+    diagnosis = BlockDiagnosis.load(repo_root, run.run_id)
+    if diagnosis is not None:
+        candidates.append((diagnosis.block_reason or diagnosis.summary, diagnosis.source_phase))
+    request = _load_operator_request(repo_root, run)
+    if _is_resolved_operator_request(request):
+        candidates.append((request.prompt, request.requested_by_phase))
+    # Successful bootstrap clears last_error. The phase audit is the historical
+    # source of truth when neither a diagnosis nor operator request survives.
+    for path in reversed(_orchestrator_phase_result_paths(repo_root, run.run_id)):
+        payload = _read_optional_json_payload(repo_root / path)
+        if isinstance(payload, dict) and payload.get("run_id") == run.run_id:
+            result = payload.get("result")
+            if isinstance(result, dict) and result.get("status") in {"blocked", "failed", "error"}:
+                candidates.append((str(result.get("error_code") or ""), str(payload.get("phase") or "")))
+    pre_implement_phases = PHASES[:PHASES.index("implement")]
+    for message, phase in candidates:
+        if not message.strip():
+            continue
+        classification = classify_failure(message, phase=phase)
+        if classification.is_infrastructure or (
+            classification.category is FailureCategory.UNKNOWN
+            and (phase in pre_implement_phases or message.lower().startswith(("bootstrap", "unmet dependencies:")))
+        ):
+            return message.strip().splitlines()[0][:400]
+    return ""
+
+
+def _implement_framing_evidence(run: RunState, repo_root: Path) -> tuple[bool, str]:
+    """Choose prompt framing independently of retry accounting.
+
+    Keep retry framing when legacy state cannot establish the base/head pair.
+    A launch counter alone is never evidence of completed implementation work.
+    """
+    if _has_run_review_evidence(run, repo_root):
+        return False, "prior review result for this run branch"
+    prior_review, _ = _prior_branch_review(run, repo_root)
+    if prior_review is not None:
+        return False, "prior review result on the reused branch"
+    _migrate_legacy_publication_base(run)
+    base = run.publication_base_sha
+    if not base and (
+        run.implement_launches or run.implement_head_sha_before or run.implement_head_sha_after
+    ):
+        return False, "immutable original base unavailable; retaining retry framing"
+    worktree = resolve_worktree_path(run, repo_root)
+    # A missing workspace checkout must not borrow the enclosing repository's
+    # HEAD. Keep this evidence probe separate from the implement lifecycle's
+    # before/after snapshots, which describe the actual agent launch.
+    has_checkout = (worktree / ".git").exists()
+    if not base and has_checkout:
+        base = _resolve_git_ref_sha(worktree, run.base_ref or BASE_REF)
+    head = _resolve_git_ref_sha(worktree, "HEAD") if has_checkout else ""
+    heads = [value for value in (head, run.implement_head_sha_after) if value]
+    if has_checkout and base and heads:
+        for candidate in heads:
+            result = run_subprocess(
+                ["git", "rev-list", "--count", f"{base}..{candidate}"], cwd=worktree,
+            )
+            if result.returncode != 0:
+                return False, "could not establish prior commit evidence"
+            if result.stdout.strip() != "0":
+                return False, "prior implementation commits beyond the base"
+        return True, "no commits beyond the base and no prior review result"
+    if run.attempts == 0 and run.implement_launches == 0 and not run.implement_head_sha_after:
+        return True, "no earlier agent launch or prior review result"
+    return False, "prior commit evidence unavailable; retaining retry framing"
+
+
 def _build_implement_attempt_context(
     run: RunState,
     repo_root: Path,
@@ -17559,10 +17799,17 @@ def _build_implement_attempt_context(
     else:
         reason = "initial"
 
+    initial, framing_reason = _implement_framing_evidence(run, repo_root)
+    framed_reason = "initial" if initial else ("retry" if reason == "initial" else reason)
+    if reason == "merge_conflict":
+        framed_reason = reason
+        framing_reason = "active merge conflict requires resolution"
     spec_path = _spec_path_for_run(run)
     spec_file = repo_root / spec_path
     ctx = ImplementContext(
-        implement_reason=reason,
+        implement_reason=framed_reason,
+        framing_reason=framing_reason,
+        cleared_blocker_note=_cleared_initial_blocker_note(run, repo_root) if framed_reason == "initial" else "",
         objective=f"Implement spec {run.spec_id}",
         run_id=run.run_id,
         attempt_number=run.attempts + 1,
@@ -17620,14 +17867,29 @@ def _build_implement_attempt_context(
         )
         if operator_steering.status == "active":
             ctx.operator_steering_event_id = operator_steering.event_id
-            ctx.operator_steering_message = operator_steering.message
+            ctx.operator_steering_message = "\n\n".join(
+                note.message for note in _active_operator_steering(repo_root, run.run_id)
+            )
+            if run.steering_recheck:
+                previous_result = ImplementResult.load(repo_root, run.run_id)
+                ctx.operator_steering_message += (
+                    "\n\nAssess this guidance against the previous attempt result: "
+                    + (json.dumps(asdict(previous_result), sort_keys=True) if previous_result else "Implementation passed.")
+                    + "\nIf all guidance is already satisfied, report ok and explain that in the summary "
+                    "without changing files. A successful unchanged recheck costs no additional attempt."
+                )
+                if _convergence_attempts(run) > run.retry_cap:
+                    ctx.operator_steering_message += (
+                        "\nThe retry budget is exhausted. If the guidance requires changes, report blocked "
+                        "and describe the required work so the operator can raise the cap."
+                    )
             ctx.operator_steering_context = dict(operator_steering.context)
             ctx.operator_steering_provided_by = operator_steering.provided_by
             ctx.operator_steering_provided_at = operator_steering.provided_at
             ctx.operator_steering_source = operator_steering.source
 
     pending_guided_retry_signature = ""
-    if reason != "initial":
+    if framed_reason != "initial":
         retry_package = _build_retry_failure_package(run, repo_root)
         ctx.triggering_phase = retry_package.triggering_phase
         ctx.previous_implement_attempt_number = retry_package.previous_implement_attempt_number
@@ -17691,6 +17953,18 @@ def _build_implement_attempt_context(
             ctx.debugger_needs_new_commit = diagnosis.needs_new_commit
             ctx.debugger_blocker_signature = diagnosis.blocker_signature
             ctx.debugger_diagnosis_stale = True
+
+    # Consuming a guided retry belongs to accounting, even when no code was
+    # produced and the prompt must describe initial implementation work.
+    if framed_reason == "initial" and reason != "initial":
+        diagnosis = BlockDiagnosis.load(repo_root, run.run_id)
+        if (
+            diagnosis is not None
+            and run.pending_block_debugger_signature
+            and diagnosis.blocker_signature == run.pending_block_debugger_signature
+            and not diagnosis.requires_human_attention
+        ):
+            pending_guided_retry_signature = diagnosis.blocker_signature
 
     return ImplementAttemptContextBundle(
         reason=reason,
@@ -18107,11 +18381,14 @@ def _prepare_implement_launch_plan(
     operator_request = _load_operator_request(repo_root, run)
 
     agent_command_kwargs = {
-        "retry_context": ctx if reason != "initial" else None,
+        "retry_context": (
+            ctx if reason != "initial" or ctx.implement_reason != "initial" or session.resumes else None
+        ),
         # Intake is durable implementation context even on an initial attempt;
         # retry_context intentionally remains None there because it also marks
         # no-handshake recovery launches throughout the existing interface.
         "intake": ctx.intake,
+        "cleared_blocker_note": ctx.cleared_blocker_note,
         # Steering is launch context too, including before the first attempt.
         # Use the captured snapshot rather than rereading a midflight update.
         "operator_steering_message": ctx.operator_steering_message,
@@ -19033,6 +19310,7 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
     # prior failure details in the retry context, then clear the fatal channel.
     run.last_error = ""
 
+    steering_workspace_before = ""
     ctx.recent_commits = _recent_commit_lines(worktree_path)
 
     _clear_stale_implement_results(
@@ -19074,16 +19352,20 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
         and _claude_supports_stream_json()
     )
     logger.info(
-        "Launching %s in %s (run_id=%s, attempt=%d)",
+        "Launching %s in %s (run_id=%s, attempt=%d): %s",
         run.agent,
         worktree_path,
         run.run_id,
         run.attempts + 1,
+        "initial implementation" if ctx.implement_reason == "initial" else "retry",
     )
     head_before = _head_sha(worktree_path)
     _migrate_legacy_publication_base(run)
     if not run.publication_base_sha:
-        if run.implement_launches == 0 and head_before:
+        if (
+            run.implement_launches == 0 and head_before
+            and not run.implement_head_sha_before and not run.implement_head_sha_after
+        ):
             run.publication_base_sha = head_before
         else:
             run.last_error = (
@@ -19173,6 +19455,8 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
                     git_isolations_to_cleanup=git_isolations_to_cleanup,
                     session=session_plan,
                 )
+                if run.steering_recheck:
+                    steering_workspace_before = _worktree_change_fingerprint(worktree_path)
                 # Read while the worker is still suspended: a resume only
                 # counts as failed if the launch left the workspace as it was.
                 workspace_before = (
@@ -19286,6 +19570,27 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
             result = _validate_targeted_test_after_implement(
                 run, repo_root, worktree_path, ctx,
             )
+        if run.steering_recheck:
+            recheck_result = ImplementResult.load(repo_root, run.run_id)
+            if (
+                result == "passed"
+                and recheck_result is not None
+                and recheck_result.status == "passed"
+                and recheck_result.result_source != "orchestrator_inferred_clean_commit"
+                and recheck_result.launch_number == ctx.launch_number
+                and not outcome.has_new_commit
+                and steering_workspace_before == _worktree_change_fingerprint(worktree_path)
+            ):
+                run.steering_noop_attempts += 1
+            run.steering_recheck = False
+            if result == "passed" and _convergence_attempts(run) > run.retry_cap:
+                run.last_error = (
+                    f"Retry cap reached ({run.retry_cap}/{run.retry_cap}): "
+                    "the steering assessment required changes and consumed an additional attempt. "
+                    f"Resume with `spec implement --spec {run.spec_id} --retry-cap {run.retry_cap + 10}`."
+                )
+                result = "blocked"
+            run.save(repo_root)
         return result
     finally:
         git_cleanup_error: BaseException | None = None
@@ -21225,6 +21530,7 @@ def _build_agent_command(
     acceptance_checklist: list[str] | None = None,
     verification_expectations: list[str] | None = None,
     intake: dict | None = None,
+    cleared_blocker_note: str | None = None,
     operator_request: OperatorRequest | None = None,
     input_question: str | None = None,
     input_response: str | None = None,
@@ -21260,7 +21566,9 @@ def _build_agent_command(
         return _adapter_method_accepts_kwarg(adapter.build_implement_command, name)
 
     resume_session_id = resume_session_id if _accepts("resume_session_id") else ""
-    delta_prompt = bool(resume_session_id)
+    delta_prompt = bool(resume_session_id) and not (
+        retry_context is not None and retry_context.implement_reason == "initial"
+    )
     acceptance_checklist = list(
         acceptance_checklist
         if acceptance_checklist is not None
@@ -21572,6 +21880,8 @@ def _build_agent_command(
         )
         prompt = "\n\n".join(prompt_sections)
     else:
+        if cleared_blocker_note is None and retry_context is not None:
+            cleared_blocker_note = retry_context.cleared_blocker_note
         spec_prompt = (
             SPEC_PROMPT.replace("<spec-id>", spec_id or "<spec-id>")
             .replace("<spec-path>", spec_path or "<spec-path>")
@@ -21591,6 +21901,8 @@ def _build_agent_command(
             prompt_sections.append(resolved_steering)
         if prior_findings:
             prompt_sections.append(prior_findings)
+        if cleared_blocker_note:
+            prompt_sections.append(f"Cleared non-code blocker: {cleared_blocker_note}")
         prompt_sections.append(spec_prompt)
         prompt = "\n\n".join(prompt_sections)
 
@@ -23180,7 +23492,7 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
     except RuntimeError as exc:
         run.last_error = f"Refusing host publication: {exc}"
         return "failed"
-    auth_error = _check_forge_auth()
+    auth_error = _check_run_forge_auth(run, "publish")
     if auth_error:
         run.last_error = auth_error
         return "failed"
@@ -25935,7 +26247,7 @@ def phase_review(run: RunState, repo_root: Path) -> str:
     except RuntimeError as exc:
         run.last_error = f"Refusing host review operation: {exc}"
         return "failed"
-    auth_error = _check_forge_auth()
+    auth_error = _check_run_forge_auth(run, "review")
     if auth_error:
         run.last_error = auth_error
         return "failed"
@@ -26940,7 +27252,7 @@ def phase_merge(run: RunState, repo_root: Path) -> str:
     publication_env = host_publication_git_environment()
 
     # Check forge auth
-    auth_error = _check_forge_auth()
+    auth_error = _check_run_forge_auth(run, "merge")
     if auth_error:
         run.last_error = auth_error
         return "failed"
@@ -27932,6 +28244,7 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.last_failure_subtype = ""
         run.last_failure_category = ""
         run.last_failure_signature = ""
+        run.last_failure_phase = ""
         run.last_sandbox_denial = ""
         run.infra_failure_streak = 0
     else:
@@ -27967,6 +28280,7 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.last_failure_subtype = str(metadata.get("failure_subtype") or "")
         run.last_failure_category = classification.category.value
         run.last_failure_signature = classification.signature
+        run.last_failure_phase = phase
         run.last_sandbox_denial = (
             sandbox_denial_summary(run.last_error) or "unknown target"
             if classification.category is FailureCategory.SANDBOX_DENIED
@@ -28028,10 +28342,10 @@ def _convergence_attempts(run: RunState) -> int:
     """Attempts that say something about whether this run is converging.
 
     ``run.attempts`` also numbers per-attempt artifacts, so every retry has to
-    increment it. Merge conflicts are excluded here instead, so they neither
-    consume the shared cap directly nor inflate it for the failures that follow.
+    increment it. Merge conflicts and successful unchanged steering rechecks
+    are excluded so they do not inflate the budget for later failures.
     """
-    return max(0, int(run.attempts) - int(run.merge_conflicts))
+    return max(0, int(run.attempts) - int(run.merge_conflicts) - int(run.steering_noop_attempts))
 
 
 def _consume_retry_budget(
@@ -28248,6 +28562,24 @@ def _apply_workflow_failure_policy(
     merge_race_retries: int,
     policy: WorkflowFailurePolicy,
 ) -> tuple[str | None, int, int]:
+    # Mechanical syncs rerun gates within the current implement attempt.
+    # Persist the destination before returning so interruption cannot resume merge.
+    if phase == "merge" and _is_local_review_rerun_after_sync(run.last_error):
+        if run.base_syncs >= run.base_sync_cap:
+            run.last_error = (
+                f"Base sync cap reached ({run.base_syncs}/{run.base_sync_cap}); "
+                "cannot rerun verify and review after another base sync."
+            )
+            run.status = "failed"
+            run.save(repo_root)
+            return "failed", phase_order.index(phase), merge_race_retries
+        run.base_syncs += 1
+        run.phase = "verify"
+        run.status = "pending"
+        run.last_error = ""
+        run.save(repo_root)
+        return None, phase_order.index("verify"), merge_race_retries
+
     retry_reason = policy.retry_reason
     if phase == "verify":
         guided_retry_prepared = _maybe_prepare_debugger_guided_retry(
@@ -28491,6 +28823,12 @@ def run_full_workflow(
             phase_order = list(PHASES)
             phase_idx = phase_order.index(run.phase) if run.phase in phase_order else 0
             merge_race_retries = 0
+            if run.phase == "merge" and _is_local_review_rerun_after_sync(run.last_error):
+                run.phase = "verify"
+                run.status = "pending"
+                run.last_error = ""
+                run.save(repo_root)
+                phase_idx = phase_order.index("verify")
             if run.status == "passed" and run.phase in phase_order:
                 if _passed_implement_run_requires_fresh_attempt(repo_root, run):
                     current_retry_cap = _refresh_run_retry_cap_from_disk(
@@ -28958,19 +29296,26 @@ def cmd_steer(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        if getattr(args, "answer", False):
+            resolve_operator_request(repo_root, run, message, source="spec steer --answer")
+            print(f"Resolved operator request for {spec_id}.")
+            print(f"  Active notes: {len(_active_operator_steering(repo_root, run.run_id))}")
+            return 0
         previous = OperatorSteering.load(repo_root, run.run_id)
         steering = _record_operator_steering(
             repo_root,
             run,
             message,
             source="spec steer",
+            replace=bool(getattr(args, "replace", False)),
         )
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    action = "Replaced" if previous is not None and previous.status == "active" else "Recorded"
+    action = "Replaced" if getattr(args, "replace", False) and previous is not None else "Recorded"
     print(f"{action} proactive steering for {spec_id}.")
+    print(f"  Active notes: {len(_active_operator_steering(repo_root, run.run_id))}")
     print(f"  Guidance: {steering.message}")
     print(f"  Provided By: {steering.provided_by or 'unknown'}")
     print(f"  Provided At: {steering.provided_at}")
@@ -29161,13 +29506,13 @@ def _cmd_input_review_round_cap(
         run.save(repo_root)
         print(f"Accepted {spec_id} at the review round cap. Resuming workflow...")
     else:
-        review_convergence.grant_extra_review_round(_state_root(repo_root) / "runs" / run.run_id)
         try:
             resolve_operator_request(repo_root, run, message, source="spec input --message")
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        print(f"Granted {spec_id} one more review round. Resuming implement with guidance...")
+        print(f"Granted {spec_id} one more review round. Implementation is ready to resume with guidance.")
+        return 0
     resume_args = argparse.Namespace(
         spec=spec_id,
         agent=run.agent or SPEC_RUNTIME_CONFIG.agents.default,
@@ -29188,6 +29533,17 @@ def cmd_input(args: argparse.Namespace) -> int:
 
     accept = bool(getattr(args, "accept", False))
     message = str(getattr(args, "message", "") or "").strip()
+    if message and not accept:
+        run = _latest_non_superseded_run(repo_root, spec_id)
+        try:
+            if run is None:
+                raise RuntimeError(f"No run found for spec {spec_id}")
+            resolve_operator_request(repo_root, run, message, source="spec input --message")
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Resolved operator request for {spec_id}.")
+        return 0
     if accept or message:
         return _cmd_input_review_round_cap(repo_root, args, accept=accept, message=message)
 
@@ -31039,13 +31395,15 @@ def main(argv: list[str] | None = None) -> int:
     p_input.add_argument("--spec", required=True, help="Spec ID")
     p_input.add_argument("--agent", default=None, help="Agent: claude|codex")
     p_input.add_argument("--accept", action="store_true", help="Review round cap: accept as-is")
-    p_input.add_argument("--message", default="", help="Review round cap: guidance for one more round")
+    p_input.add_argument("--message", default="", help="Answer a pending operator request without an interactive session")
 
     p_steer = subparsers.add_parser(
         "steer",
         help="Attach proactive steering to the latest run for a spec",
     )
     p_steer.add_argument("--spec", required=True, help="Spec ID")
+    p_steer.add_argument("--replace", action="store_true", help="Replace active steering notes")
+    p_steer.add_argument("--answer", action="store_true", help="Resolve the pending operator request")
     p_steer.add_argument("--message", required=True, help="Advisory guidance for the next implement attempt")
 
     # task (describe + execute in one shot)
