@@ -136,6 +136,8 @@ ruff check .            # lint gate
 | `spec show --spec ID` | Display a spec's content |
 | `spec report --status ok\|blocked\|error\|needs-input` | Report implement-phase completion |
 | `spec stop --spec ID` | Stop an active run without deleting its workspace |
+| `spec steer --spec ID --message TEXT` | Attach guidance delivered through the resumed session at the next attempt |
+| `spec attach --spec ID [--exec] [--fork]` | Print or run the command that resumes the latest run's agent session in its workspace |
 | `spec clean --spec ID` | Remove execution workspaces and branches |
 | `spec task [--agent A] [--review-agent R]` | Describe and execute a quick task |
 | `spec doctor` | Validate repository configuration and local dependencies without mutation |
@@ -195,6 +197,12 @@ When launched by the orchestrator for `implement`, follow this contract:
    would waste retry cycles. Describe the ambiguity and include specific
    options when possible.
    Wait for `Completion recorded for <spec-id>:` before exiting.
+   When the provider supports it, the final response is also captured as
+   structured output (`status`, `summary`, optional `question`); that result
+   takes precedence and `spec report` becomes an optional fallback.
+7. **Retries resume the same session** — verify, review and merge-conflict
+   retries continue the run's provider session with only the new failure
+   package and any operator steering. Earlier context still applies.
 
 ## Default Worktree-Backend Conventions
 

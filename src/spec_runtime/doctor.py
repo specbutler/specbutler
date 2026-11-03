@@ -626,6 +626,7 @@ def _agent_checks(
             from .agent_adapter import (
                 claude_restricted_mode_unavailability_reason,
                 claude_sandbox_unavailability_reason,
+                claude_session_unavailability_reason,
             )
 
             sandbox_reason = claude_sandbox_unavailability_reason(which=which)
@@ -666,6 +667,24 @@ def _agent_checks(
                         "restricted read-only review mode is available",
                     )
                 )
+            session_reason = claude_session_unavailability_reason(
+                f"{help_result.stdout}\n{help_result.stderr}"
+                if help_result.returncode == 0
+                else ""
+            )
+            checks.append(
+                _warning(
+                    "agent sessions (claude)",
+                    session_reason,
+                    "Upgrade Claude Code: `npm install -g @anthropic-ai/claude-code`.",
+                )
+                if session_reason
+                else _ok(
+                    "agent sessions (claude)",
+                    "implement runs keep one session, resume it for retries, and "
+                    "report completion as structured output",
+                )
+            )
             if config.execution.safety_mode == "native":
                 from .safety_policy import claude_native_unavailability_reason
 
@@ -694,12 +713,31 @@ def _agent_checks(
                 codex_capability_probe_command,
                 codex_capability_probe_unavailability_reason,
                 codex_isolation_unavailability_reason,
+                codex_resume_unavailability_reason,
                 codex_windows_sandbox_probe_command,
                 codex_windows_sandbox_probe_unavailability_reason,
             )
 
             exec_help = run([path, "exec", "--help"], repo_root, 10.0)
             sandbox_help = run([path, "sandbox", "--help"], repo_root, 10.0)
+            resume_help = run([path, "exec", "resume", "--help"], repo_root, 10.0)
+            resume_reason = codex_resume_unavailability_reason(
+                f"{resume_help.stdout}\n{resume_help.stderr}"
+                if resume_help.returncode == 0
+                else ""
+            )
+            checks.append(
+                _warning(
+                    "agent sessions (codex)",
+                    resume_reason,
+                    "Upgrade Codex: `npm install -g @openai/codex`.",
+                )
+                if resume_reason
+                else _ok(
+                    "agent sessions (codex)",
+                    "implement retries resume the run's Codex thread",
+                )
+            )
             isolation_reason = codex_isolation_unavailability_reason(
                 f"{exec_help.stdout}\n{exec_help.stderr}"
                 if exec_help.returncode == 0

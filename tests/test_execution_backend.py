@@ -7892,6 +7892,69 @@ class TestContainerBackend:
         assert "cp -a" not in joined
 
     @pytest.mark.requires_ps
+    def test_export_workspace_path_to_host_reads_volume_read_only(self, tmp_path: Path):
+        """Provider state written inside the volume (a container Claude home's
+        transcripts) is exported through a read-only volume mount."""
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, workspace_mode="volume")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        destination = tmp_path / "export"
+        destination.mkdir()
+        runner.calls.clear()
+
+        assert backend.export_workspace_path_to_host(
+            handle.path,
+            ".spec-claude-home/.claude/projects",
+            destination,
+        )
+
+        export_calls = [call for call in runner.calls if f"{destination}:/workspace/host" in call]
+        assert export_calls, runner.calls
+        last = export_calls[-1]
+        host_state = json.loads(Path(handle.metadata["container_state_path"]).read_text())
+        assert f"{host_state['volumes'][0]}:/workspace/source:ro" in last
+        assert (
+            "cp -a /workspace/source/.spec-claude-home/.claude/projects/. /workspace/host/"
+            in " ".join(last)
+        )
+        with pytest.raises(ValueError):
+            backend.export_workspace_path_to_host(handle.path, "../outside", destination)
+
+    @pytest.mark.requires_ps
+    def test_export_workspace_path_to_host_skips_bind_mode(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        _init_clone_source(repo)
+        runner = _FakeContainerRunner()
+        backend = self._make(runner, workspace_mode="bind")
+
+        with patch("shutil.which", return_value="/usr/bin/docker"):
+            handle = backend.prepare_workspace(
+                run_id="my-feature-abc",
+                spec_id="my-feature",
+                branch="code/my-feature--abc",
+                repo_root=repo,
+                base_ref="master",
+            )
+        runner.calls.clear()
+
+        assert not backend.export_workspace_path_to_host(
+            handle.path,
+            ".spec-claude-home/.claude/projects",
+            tmp_path / "export",
+        )
+        assert runner.calls == []
+
+    @pytest.mark.requires_ps
     @pytest.mark.skipif(os.name == "nt", reason="non-elevated Windows cannot create file symlinks")
     def test_snapshot_restore_and_cleanup_are_idempotent(self, tmp_path: Path):
         repo = tmp_path / "repo"
@@ -9423,6 +9486,7 @@ class TestContainerBackend:
             "resume",
             "reseed",
             "sync-host-paths",
+            "export-workspace-path",
         ],
     )
     def test_existing_phase_entrypoints_refuse_changed_engine_before_contact(
@@ -9468,6 +9532,11 @@ class TestContainerBackend:
             "sync-host-paths": lambda: podman_backend.sync_host_paths_into_workspace(
                 handle.path,
                 ["README.md"],
+            ),
+            "export-workspace-path": lambda: podman_backend.export_workspace_path_to_host(
+                handle.path,
+                ".spec-claude-home/.claude/projects",
+                handle.outbox_path.parent / "export",
             ),
         }
 

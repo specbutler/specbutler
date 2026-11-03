@@ -1515,6 +1515,8 @@ def _render_run_detail(repo_root: Path, run: orch.RunState) -> Table:
     table.add_row("Status", Text(run.status, style=_status_style(run.status)))
     table.add_row("Phase", run.phase or "—")
     table.add_row("Agent", run.agent or "—")
+    if run.agent_session_id:
+        table.add_row("Agent Session", run.agent_session_id)
     if run.backend or run.safety_mode:
         backend = run.backend or "unknown"
         if run.backend_source:
@@ -1956,6 +1958,7 @@ class SpecDetailScreen(Screen[None]):
         header.update(
             f"{row.display_spec_id}  phase={row.phase}  attempts={row.retries}  "
             f"agent={row.agent}  elapsed={row.elapsed}  branch={row.branch}"
+            + (f"  session={row.agent_session_id}" if row.agent_session_id else "")
         )
         if row.requires_human_attention:
             hint.update(

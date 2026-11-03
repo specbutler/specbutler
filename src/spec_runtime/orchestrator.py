@@ -54,6 +54,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
@@ -66,17 +67,21 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import review_convergence, review_feedback, worktree_process_registry
 from .agent_adapter import (
+    COMPLETION_SCHEMA,
     HostAgentUnavailableError,
     _render_codex_mcp_toml,
     claude_isolated_home,
     claude_restricted_mode_unavailability_reason,
+    claude_session_unavailability_reason,
     codex_capability_probe_command,
     codex_capability_probe_unavailability_reason,
     codex_isolated_home,
+    codex_resume_unavailability_reason,
     codex_windows_sandbox_probe_command,
     codex_windows_sandbox_probe_unavailability_reason,
     codex_windows_sandbox_toml,
     get_agent_adapter,
+    provider_attach_command,
     require_host_agent_available,
 )
 from .agent_git_access import (
@@ -498,7 +503,7 @@ SPEC_PROMPT = (
     "the orchestrator verify phase handles e2e outside the sandbox.\n"
     "5. Do NOT run orchestrator lifecycle commands (`spec implement`, `spec phase`) "
     "and do NOT run publish/merge/cleanup actions. The only orchestrator command "
-    "you should run is `spec report` (see completion step below).\n"
+    "you may run is `spec report` (see the completion step below).\n"
     "6. If local environment limits block test infrastructure (for example Playwright "
     "MachPort/sandbox launch failures), do not report STATUS=blocked for that alone; "
     "report STATUS=ok with the environment note and let the orchestrator verify phase run gates.\n"
@@ -9270,6 +9275,12 @@ class RunState:
     # ``no_progress_retries`` (reset when verify next passes) this survives a
     # resumed run, so history shows the breaker fired.
     no_progress_trips: int = 0
+    # Provider session (Claude session id / Codex thread id) kept across this
+    # run's implement attempts, the agent that owns it, and why the most
+    # recent resume fell back to a fresh session.
+    agent_session_id: str = ""
+    agent_session_agent: str = ""
+    agent_session_fallback_reason: str = ""
 
     def save(self, repo_root: Path) -> Path:
         p = _run_state_path(repo_root, self.run_id)
@@ -9773,6 +9784,27 @@ class ImplementResult:
 
 HEARTBEAT_PERSIST_INTERVAL_SECONDS = 60
 
+STRUCTURED_COMPLETION_STATUS_MAP = {
+    "ok": "passed",
+    "blocked": "blocked",
+    "error": "failed",
+    "needs-input": "needs-input",
+}
+
+
+def _validated_structured_completion(payload: object) -> dict | None:
+    """Return *payload* when it satisfies the completion schema contract."""
+    if not isinstance(payload, dict):
+        return None
+    status = payload.get("status")
+    summary = payload.get("summary")
+    question = payload.get("question")
+    if status not in STRUCTURED_COMPLETION_STATUS_MAP or not isinstance(summary, str):
+        return None
+    if question is not None and not isinstance(question, str):
+        return None
+    return {"status": status, "summary": summary, "question": question or ""}
+
 
 @dataclass
 class AgentProgressTracker:
@@ -9792,10 +9824,70 @@ class AgentProgressTracker:
     _sandbox_denial: SandboxDenial | None = field(default=None, repr=False)
     _auth_failure_summary: str = field(default="", repr=False)
     _network_failure_summary: str = field(default="", repr=False)
+    _provider_session_id: str = field(default="", repr=False)
+    _structured_output: object = field(default=None, repr=False)
+    _final_agent_message: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         if not self.last_event_summary:
             self.last_event_summary = f"{self.agent} launch"
+
+    def record_provider_session(self, session_id: str) -> None:
+        """Remember the provider session/thread id the CLI reported.
+
+        The id is persisted onto the run record immediately so ``spec status``
+        and ``spec watch`` can show it while the agent is still running.
+        """
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return
+        with self._lock:
+            if self._provider_session_id == session_id:
+                return
+            self._provider_session_id = session_id
+        if not self.run_id or self.repo_root is None:
+            return
+        p = _run_state_path(self.repo_root, self.run_id)
+        if not p.exists():
+            return
+        try:
+            with _locked_state_path(p):
+                data = _read_json_dict(p)
+                if data is None:
+                    return
+                data["agent_session_id"] = session_id
+                data["agent_session_agent"] = self.agent
+                _write_json_file_atomically(p, data)
+        except OSError:
+            pass
+
+    def provider_session_id(self) -> str:
+        with self._lock:
+            return self._provider_session_id
+
+    def record_structured_output(self, payload: object) -> None:
+        with self._lock:
+            self._structured_output = payload
+
+    def record_final_agent_message(self, text: str) -> None:
+        with self._lock:
+            self._final_agent_message = text
+
+    def structured_completion(self) -> dict | None:
+        """Return the final structured completion payload, if one is valid.
+
+        Claude reports it as ``structured_output`` on the result event; Codex
+        emits the schema-constrained JSON as its final agent message.
+        """
+        with self._lock:
+            payload = self._structured_output
+            final_message = self._final_agent_message
+        if payload is None and final_message:
+            try:
+                payload = json.loads(final_message)
+            except json.JSONDecodeError:
+                return None
+        return _validated_structured_completion(payload)
 
     def record_sandbox_denials(self, denials: list[SandboxDenial]) -> None:
         """Remember the most recent sandbox or permission denial."""
@@ -10785,6 +10877,33 @@ class RetryFailurePackage:
     rescue_snapshot_summary: str = ""
 
 
+@dataclass(frozen=True)
+class ProviderSessionSupport:
+    """What the installed provider CLI supports for persistent sessions."""
+
+    persist: bool = False
+    resume: bool = False
+    structured_output: bool = False
+
+
+@dataclass(frozen=True)
+class AgentSessionPlan:
+    """How one implement launch uses the run's provider session.
+
+    ``session_id`` names a new Claude session (Codex assigns its own thread
+    id). ``resume_session_id`` continues the run's existing session with a
+    delta prompt.
+    """
+
+    session_id: str = ""
+    resume_session_id: str = ""
+    structured_output: bool = False
+
+    @property
+    def resumes(self) -> bool:
+        return bool(self.resume_session_id)
+
+
 @dataclass
 class ImplementLaunchPlan:
     use_stream_json: bool
@@ -10800,6 +10919,12 @@ class ImplementLaunchPlan:
     claude_private_home: Path | None = None
     claude_private_home_context: tempfile.TemporaryDirectory[str] | None = None
     git_isolation: AgentGitIsolation | None = None
+    session: AgentSessionPlan = field(default_factory=AgentSessionPlan)
+    completion_outbox_path: Path | None = None
+    codex_home: Path | None = None
+    # Transient ``.spec-claude-home`` of a container launch; its transcripts
+    # are archived before the home is removed.
+    claude_isolated_home: Path | None = None
 
 
 @dataclass
@@ -16589,15 +16714,554 @@ def _unattended_launch_safety(agent: str, backend: ExecutionBackend) -> LaunchSa
     )
 
 
-def _claude_supports_stream_json() -> bool:
-    """Return True if the installed Claude CLI supports --output-format stream-json."""
+PROVIDER_HELP_PROBE_TIMEOUT = 60
+
+
+def _provider_help_text(
+    argv: list[str],
+    *,
+    backend: ExecutionBackend | None = None,
+    worktree_path: Path | None = None,
+) -> str:
+    """Return a provider CLI's help output, or "" when the probe fails.
+
+    The probe runs where the agent will run: on the host for host backends,
+    and inside the worker for container backends, whose provider CLI is the
+    image's, not the operator's.
+    """
     try:
-        result = run_subprocess(["claude", "--help"])
-        if result.returncode == 0 and "stream-json" in (result.stdout or ""):
-            return True
-    except FileNotFoundError:
-        pass
+        if (
+            backend is not None
+            and worktree_path is not None
+            and not _backend_launches_agent_on_host(backend)
+        ):
+            result = backend.run_command(
+                CommandRequest(
+                    argv=argv,
+                    cwd=worktree_path,
+                    inherit_env=False,
+                    timeout=PROVIDER_HELP_PROBE_TIMEOUT,
+                )
+            )
+        else:
+            result = run_subprocess(argv)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return f"{result.stdout or ''}\n{result.stderr or ''}"
+
+
+def _claude_supports_stream_json(
+    backend: ExecutionBackend | None = None,
+    worktree_path: Path | None = None,
+) -> bool:
+    """Return True if the Claude CLI that will run supports stream-json output."""
+    return "stream-json" in _provider_help_text(
+        ["claude", "--help"],
+        backend=backend,
+        worktree_path=worktree_path,
+    )
+
+
+COMPLETION_SCHEMA_FILENAME = "completion-schema.json"
+RESUMED_SESSION_PREAMBLE = (
+    "This message continues your earlier implement session for this run. The spec "
+    "contract, exit checklist and project instructions from the start of the session "
+    "still apply; what follows is only what changed since your last turn."
+)
+STRUCTURED_COMPLETION_INSTRUCTION = (
+    "Report completion through your final response, which is captured as the "
+    "structured completion result: set status (ok, blocked, error or needs-input), a "
+    "plain-text summary, and question when you need operator input (otherwise null). "
+    "Running `spec report` is optional and only a fallback; if you run it anyway, still "
+    "end with that final response, which takes precedence over the report."
+)
+
+
+def _provider_session_support(
+    agent: str,
+    backend: ExecutionBackend | None = None,
+    worktree_path: Path | None = None,
+) -> ProviderSessionSupport:
+    """Probe the provider CLI that will run for persistent-session controls.
+
+    A missing flag degrades to the stateless behaviour (a fresh, unpersisted
+    session per attempt and completion through ``spec report``) rather than
+    failing the launch; ``spec doctor`` reports the gap as a warning.
+    """
+
+    def help_text(argv: list[str]) -> str:
+        return _provider_help_text(argv, backend=backend, worktree_path=worktree_path)
+
+    if agent == "claude":
+        supported = not claude_session_unavailability_reason(help_text(["claude", "--help"]))
+        return ProviderSessionSupport(
+            persist=supported,
+            resume=supported,
+            structured_output=supported,
+        )
+    if agent == "codex":
+        exec_text = help_text(["codex", "exec", "--help"])
+        resume_text = help_text(["codex", "exec", "resume", "--help"])
+        # Codex implement threads are already persisted (no --ephemeral);
+        # only resuming them needs the `exec resume` subcommand.
+        return ProviderSessionSupport(
+            persist=True,
+            resume=not codex_resume_unavailability_reason(resume_text),
+            structured_output="--output-schema" in exec_text,
+        )
+    return ProviderSessionSupport()
+
+
+def _fresh_agent_session_plan(run: RunState, *, structured_output: bool) -> AgentSessionPlan:
+    # Claude accepts a caller-chosen id; Codex reports its thread id once the
+    # thread starts.
+    return AgentSessionPlan(
+        session_id=str(uuid.uuid4()) if run.agent == "claude" else "",
+        structured_output=structured_output,
+    )
+
+
+def _plan_agent_session(
+    run: RunState,
+    *,
+    use_stream_json: bool,
+    backend: ExecutionBackend | None = None,
+    worktree_path: Path | None = None,
+) -> AgentSessionPlan:
+    """Decide whether this launch starts, resumes, or skips a provider session.
+
+    The run record only carries a session id once an earlier launch of this
+    run started one, so that id (not the attempt count or implement reason)
+    decides whether to resume: answering operator input or retrying an
+    interrupted first launch leaves ``run.attempts`` at zero but must still
+    continue the existing session.
+    """
+    support = _provider_session_support(run.agent, backend, worktree_path)
+    # Claude's structured result arrives on the stream-json result event, so
+    # it is only readable when the orchestrator owns stdout.
+    structured_output = support.structured_output and (
+        run.agent != "claude" or use_stream_json
+    )
+    if not support.persist:
+        return AgentSessionPlan(structured_output=structured_output)
+    if (
+        support.resume
+        and run.agent_session_id
+        and run.agent_session_agent == run.agent
+    ):
+        return AgentSessionPlan(
+            resume_session_id=run.agent_session_id,
+            structured_output=structured_output,
+        )
+    return _fresh_agent_session_plan(run, structured_output=structured_output)
+
+
+def _record_planned_agent_session(
+    run: RunState,
+    repo_root: Path,
+    session: AgentSessionPlan,
+) -> None:
+    """Store the session a launch is about to use on the run record."""
+    if session.resumes:
+        return
+    # A fresh session replaces the old one; Codex fills its id in once the
+    # thread.started event arrives.
+    run.agent_session_id = session.session_id if run.agent == "claude" else ""
+    run.agent_session_agent = run.agent if run.agent_session_id else ""
+    run.save(repo_root)
+
+
+def _record_agent_session_after_launch(
+    run: RunState,
+    repo_root: Path,
+    plan: ImplementLaunchPlan,
+) -> None:
+    tracker = plan.progress_tracker
+    observed = tracker.provider_session_id() if tracker is not None else ""
+    session_id = observed or plan.session.resume_session_id or (
+        plan.session.session_id if run.agent == "claude" else ""
+    )
+    if not session_id:
+        return
+    run.agent_session_id = session_id
+    run.agent_session_agent = run.agent
+    run.save(repo_root)
+
+
+def _resume_failure_reason(
+    run: RunState,
+    plan: ImplementLaunchPlan,
+    exit_code: int,
+    worktree_path: Path,
+    workspace_before: str,
+) -> str:
+    """Explain why a resumed launch never got its session going, or return "".
+
+    A resume counts as failed when the CLI exited nonzero without confirming
+    the session, reporting completion, or changing the workspace relative to
+    *workspace_before* (changes that predate the launch, such as an unresolved
+    merge or unfinished edits, do not count). Provider authentication,
+    capacity and network failures are excluded: a fresh session would hit
+    them too.
+    """
+    if not plan.session.resumes or exit_code == 0:
+        return ""
+    tracker = plan.progress_tracker
+    last_event = ""
+    if tracker is not None:
+        if tracker.provider_session_id() or tracker.structured_completion() is not None:
+            return ""
+        if tracker.auth_failure_summary() or tracker.network_failure_summary():
+            return ""
+        _, last_event = tracker.snapshot()
+        if _is_agent_capacity_failure_message(last_event):
+            return ""
+    if plan.completion_outbox_path is not None and plan.completion_outbox_path.exists():
+        return ""
+    if _worktree_change_fingerprint(worktree_path) != workspace_before:
+        return ""
+    detail = f"; last output: {last_event}" if last_event else ""
+    return (
+        f"{run.agent} could not resume session {plan.session.resume_session_id} "
+        f"(exit code {exit_code}{detail})"
+    )
+
+
+def _worktree_change_fingerprint(worktree_path: Path) -> str:
+    """Digest HEAD plus the content of every changed or untracked path.
+
+    Unlike the dirty-file list alone, this notices further edits to files that
+    were already dirty, so a launch can be judged on what it changed.
+    """
+    digest = hashlib.sha256()
+    digest.update((_head_sha(worktree_path) or "").encode())
+    for line in sorted(_worktree_dirty_files(worktree_path)):
+        digest.update(b"\0" + line.encode("utf-8", "surrogateescape"))
+        # Porcelain v1: "XY path" or "XY old -> new".
+        relative = line[3:].split(" -> ")[-1].strip().strip('"')
+        path = worktree_path / relative
+        if not relative or not path.is_relative_to(worktree_path):
+            continue
+        files = (
+            sorted(item for item in path.rglob("*") if item.is_file() and not item.is_symlink())
+            if path.is_dir() and not path.is_symlink()
+            else [path]
+        )
+        for item in files:
+            digest.update(b"\0" + item.relative_to(worktree_path).as_posix().encode())
+            try:
+                if item.is_symlink():
+                    digest.update(os.readlink(item).encode())
+                else:
+                    digest.update(hashlib.sha256(item.read_bytes()).digest())
+            except OSError:
+                digest.update(b"<missing>")
+    return digest.hexdigest()
+
+
+def _codex_session_archive_dir(repo_root: Path, run_id: str) -> Path:
+    """Run-scoped copy of Codex rollouts that outlives the launch home."""
+    return _state_root(repo_root) / "runs" / run_id / "codex-sessions"
+
+
+def _claude_session_archive_dir(repo_root: Path, run_id: str) -> Path:
+    """Run-scoped copy of Claude transcripts from a disposable isolated home.
+
+    Mirrors the provider's ``projects/`` tree. Only launches whose ``HOME`` is
+    the transient ``.spec-claude-home`` (container workers) are archived; host
+    launches already write into the operator's Claude config directory.
+    """
+    return _state_root(repo_root) / "runs" / run_id / "claude-sessions"
+
+
+# Relative to the workspace: where a container Claude launch keeps transcripts.
+CLAUDE_ISOLATED_PROJECTS_RELPATH = ".spec-claude-home/.claude/projects"
+
+
+def _live_provider_sessions_path(repo_root: Path, run_id: str) -> Path:
+    """Pointer to where the running launch's provider writes its sessions."""
+    return _state_root(repo_root) / "runs" / run_id / "live-provider-sessions.json"
+
+
+def _copy_codex_sessions(source: Path, destination: Path) -> None:
+    _copy_provider_sessions(source, destination)
+
+
+def _copy_provider_sessions(
+    source: Path,
+    destination: Path,
+    *,
+    trim_partial_lines: bool = False,
+) -> None:
+    """Copy a provider session tree without following links.
+
+    With *trim_partial_lines*, each copied ``.jsonl`` file ends at its last
+    complete line, so a snapshot of a file the provider is still appending
+    to never carries a half-written record.
+    """
+    if not source.is_dir() or source.is_symlink():
+        return
+
+    def skip_links(directory: str, names: list[str]) -> list[str]:
+        # Rollouts are plain files; never follow or carry a link out of a
+        # provider home (a container worker's home included).
+        return [name for name in names if os.path.islink(os.path.join(directory, name))]
+
+    def copy_complete_lines(src: str, dst: str) -> str:
+        if not src.endswith(".jsonl"):
+            return shutil.copy2(src, dst)
+        data = Path(src).read_bytes()
+        Path(dst).write_bytes(data[: data.rfind(b"\n") + 1])
+        return dst
+
+    try:
+        shutil.copytree(
+            source,
+            destination,
+            ignore=skip_links,
+            dirs_exist_ok=True,
+            copy_function=copy_complete_lines if trim_partial_lines else shutil.copy2,
+        )
+    except OSError as exc:
+        logger.warning("Could not copy provider sessions %s -> %s: %s", source, destination, exc)
+
+
+def _merge_operator_session_file(source: Path, target: Path) -> str:
+    """Place one session file into an operator-owned store without losing history.
+
+    The operator may have resumed the session interactively since an earlier
+    attach, so an existing file is only replaced when the incoming copy
+    extends it (provider transcripts are append-only). Returns ``restored``,
+    ``current`` (already identical), ``kept-newer`` (the operator's copy
+    extends the incoming one, or a non-transcript file already exists) or
+    ``kept-diverged`` (both gained different records, or the target is a link).
+    """
+    if target.is_symlink():
+        return "kept-diverged"
+    if target.exists():
+        if not target.is_file():
+            return "kept-diverged"
+        if source.suffix != ".jsonl":
+            return "kept-newer"
+        incoming = source.read_bytes()
+        existing = target.read_bytes()
+        if incoming == existing:
+            return "current"
+        if existing.startswith(incoming):
+            return "kept-newer"
+        if not incoming.startswith(existing):
+            return "kept-diverged"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(f".{target.name}.spec-restore")
+    shutil.copyfile(source, staging)
+    os.replace(staging, target)
+    return "restored"
+
+
+def _merge_operator_sessions(source: Path, destination: Path) -> dict[str, list[Path]]:
+    """Merge a provider session tree into the operator's own provider home.
+
+    Unlike :func:`_copy_provider_sessions` (which refreshes run-owned launch
+    homes and archives), this never overwrites operator progress; see
+    :func:`_merge_operator_session_file`. Returns the targets per outcome.
+    """
+    outcomes: dict[str, list[Path]] = {}
+    if not source.is_dir() or source.is_symlink():
+        return outcomes
+    for directory, dirnames, filenames in os.walk(source, followlinks=False):
+        current = Path(directory)
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        for name in filenames:
+            path = current / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            target = destination / path.relative_to(source)
+            try:
+                outcome = _merge_operator_session_file(path, target)
+            except OSError as exc:
+                logger.warning("Could not restore session file %s -> %s: %s", path, target, exc)
+                continue
+            outcomes.setdefault(outcome, []).append(target)
+    for target in outcomes.get("kept-diverged", []):
+        print(
+            f"Warning: Kept your existing {target} instead of the run's copy; "
+            "both have history the other lacks.",
+            file=sys.stderr,
+        )
+    return outcomes
+
+
+def _export_workspace_sessions(
+    backend: ExecutionBackend,
+    worktree_path: Path,
+    relative_path: str,
+    destination: Path,
+    *,
+    trim_partial_lines: bool = False,
+) -> None:
+    """Copy a provider session tree that lives inside the workspace to the host.
+
+    A volume-mode container workspace is only reachable through the backend;
+    bind-mode and host workspaces are read directly from the host checkout.
+    """
+    export = getattr(backend, "export_workspace_path_to_host", None)
+    if callable(export):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".export-", dir=destination.parent))
+        try:
+            if export(worktree_path, relative_path, staging):
+                _copy_provider_sessions(
+                    staging,
+                    destination,
+                    trim_partial_lines=trim_partial_lines,
+                )
+                return
+        except (OSError, RuntimeError) as exc:
+            logger.warning(
+                "Could not export %s from workspace %s: %s",
+                relative_path,
+                worktree_path,
+                exc,
+            )
+            return
+        finally:
+            remove_tree(staging, ignore_errors=True)
+    _copy_provider_sessions(
+        worktree_path / relative_path,
+        destination,
+        trim_partial_lines=trim_partial_lines,
+    )
+
+
+def _record_live_provider_sessions(
+    repo_root: Path,
+    run: RunState,
+    plan: ImplementLaunchPlan,
+) -> bool:
+    """Note where this launch's provider keeps its sessions while it runs."""
+    if run.agent == "codex" and plan.codex_home is not None:
+        payload = {"agent": "codex", "sessions_dir": str(plan.codex_home / "sessions")}
+    elif run.agent == "claude" and plan.claude_isolated_home is not None:
+        payload = {"agent": "claude", "workspace_path": CLAUDE_ISOLATED_PROJECTS_RELPATH}
+    else:
+        return False
+    atomic_write_text(
+        _live_provider_sessions_path(repo_root, run.run_id),
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return True
+
+
+def _snapshot_live_provider_sessions(
+    repo_root: Path,
+    run: RunState,
+    worktree_path: Path,
+    agent: str,
+    destination: Path,
+) -> bool:
+    """Copy the running launch's current sessions to *destination*.
+
+    Returns False when the live launch keeps no separate session store (host
+    Claude launches write straight into the operator's config directory).
+    """
+    try:
+        payload = json.loads(
+            _live_provider_sessions_path(repo_root, run.run_id).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get("agent") != agent:
+        return False
+    if agent == "codex" and isinstance(payload.get("sessions_dir"), str):
+        _copy_provider_sessions(
+            Path(payload["sessions_dir"]),
+            destination,
+            trim_partial_lines=True,
+        )
+        return True
+    if agent == "claude" and payload.get("workspace_path") == CLAUDE_ISOLATED_PROJECTS_RELPATH:
+        _export_workspace_sessions(
+            _resolve_execution_backend(),
+            worktree_path,
+            CLAUDE_ISOLATED_PROJECTS_RELPATH,
+            destination,
+            trim_partial_lines=True,
+        )
+        return True
     return False
+
+
+def _claude_project_dir_name(cwd: Path) -> str:
+    """Claude Code's per-project transcript directory name for *cwd*."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+def _operator_claude_config_dir() -> Path:
+    configured = str(os.environ.get("CLAUDE_CONFIG_DIR", "")).strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def _install_claude_session(source: Path, session_id: str, worktree_path: Path) -> Path | None:
+    """Place one archived Claude transcript where ``claude --resume`` finds it.
+
+    Transcripts are filed per working directory; a container worker's copy is
+    filed under the container path, so it is re-filed under the host
+    workspace the attach command runs in. An operator transcript that already
+    has newer interactive turns is kept. Returns the installed transcript.
+    """
+    if not source.is_dir() or source.is_symlink():
+        return None
+    candidates = sorted(
+        path
+        for path in source.glob(f"*/{session_id}.jsonl")
+        if path.is_file() and not path.is_symlink() and not path.parent.is_symlink()
+    )
+    if not candidates:
+        return None
+    transcript = max(candidates, key=lambda path: path.stat().st_mtime)
+    target_dir = (
+        _operator_claude_config_dir()
+        / "projects"
+        / _claude_project_dir_name(worktree_path.resolve())
+    )
+    target = target_dir / transcript.name
+    if _merge_operator_session_file(transcript, target) == "kept-diverged":
+        print(
+            f"Warning: Kept your existing {target} instead of the run's copy; "
+            "both have history the other lacks.",
+            file=sys.stderr,
+        )
+    # Subagent transcripts and tool results live beside the main transcript.
+    _merge_operator_sessions(transcript.parent / session_id, target_dir / session_id)
+    return target
+
+
+def _structured_completion_result(
+    run: RunState,
+    worktree_path: Path,
+    ctx: ImplementContext,
+    tracker: AgentProgressTracker | None,
+) -> ImplementResult | None:
+    """Convert the provider's structured final response into an ImplementResult."""
+    payload = tracker.structured_completion() if tracker is not None else None
+    if payload is None:
+        return None
+    status = STRUCTURED_COMPLETION_STATUS_MAP[payload["status"]]
+    summary = payload["summary"]
+    if status == "needs-input" and payload["question"]:
+        summary = payload["question"]
+    return ImplementResult(
+        status=status,
+        summary=summary,
+        commits=_recent_commit_lines(worktree_path),
+        attempt=run.attempts,
+        launch_number=ctx.launch_number,
+        result_source="structured_output",
+        completed_at=_now_iso(),
+    )
 
 
 def _validate_codex_exec(run: RunState, *, require_output_schema: bool = False) -> bool:
@@ -17029,7 +17693,9 @@ def _prepare_implement_launch_plan(
         tuple[tempfile.TemporaryDirectory[str] | None, Path, bool]
     ] | None = None,
     git_isolations_to_cleanup: list[AgentGitIsolation] | None = None,
+    session: AgentSessionPlan | None = None,
 ) -> ImplementLaunchPlan:
+    session = session or AgentSessionPlan()
     backend = _resolve_execution_backend()
     _require_agent_available_for_backend(run.agent, backend)
     launch_safety = _unattended_launch_safety(run.agent, backend)
@@ -17166,6 +17832,7 @@ def _prepare_implement_launch_plan(
     codex_preserve_home = False
     claude_private_home: Path | None = None
     claude_private_home_context: tempfile.TemporaryDirectory[str] | None = None
+    claude_isolated_home: Path | None = None
     if run.agent == "codex" and adapter.capabilities.supports_mcp:
         # Remove legacy checkout-local provider state before allocating the
         # external home. In volume mode this also deletes any old copied
@@ -17193,6 +17860,14 @@ def _prepare_implement_launch_plan(
             api_key=agent_env.get("OPENAI_API_KEY")
             or agent_env.get("CODEX_API_KEY"),
         )
+        if session.resumes:
+            # Launch homes are emptied after every launch (host homes are
+            # deleted, preserved container homes cleared); bring back the
+            # run's archived rollouts so `codex exec resume` finds the thread.
+            _copy_codex_sessions(
+                _codex_session_archive_dir(repo_root, run.run_id),
+                codex_home / "sessions",
+            )
         _strip_codex_provider_secret_env(agent_env)
         agent_env = _subprocess_env_with_codex_home(agent_env, codex_home)
         # The isolated config.toml is the sole transport for the complete MCP
@@ -17224,6 +17899,15 @@ def _prepare_implement_launch_plan(
                 worktree_path,
                 include_auth=False,
             )
+            claude_isolated_home = claude_home
+            if session.resumes:
+                # The isolated home is removed after every launch; bring back
+                # the run's archived transcripts so `claude --resume` finds
+                # the session. The sync below pushes them into the worker.
+                _copy_provider_sessions(
+                    _claude_session_archive_dir(repo_root, run.run_id),
+                    worktree_path / CLAUDE_ISOLATED_PROJECTS_RELPATH,
+                )
         agent_env = _subprocess_env_with_home(agent_env, claude_home)
         if use_provider_sandbox and canonical_claude_config is not None:
             agent_env["CLAUDE_CONFIG_DIR"] = str(canonical_claude_config)
@@ -17315,6 +17999,17 @@ def _prepare_implement_launch_plan(
         agent_command_kwargs["git_isolation"] = git_isolation
     if use_stream_json:
         agent_command_kwargs["stream_json"] = True
+    if session.session_id:
+        agent_command_kwargs["session_id"] = session.session_id
+    if session.resumes:
+        agent_command_kwargs["resume_session_id"] = session.resume_session_id
+    if session.structured_output:
+        schema_path = completion_outbox_path.parent / COMPLETION_SCHEMA_FILENAME
+        schema_path.write_text(
+            json.dumps(COMPLETION_SCHEMA, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        agent_command_kwargs["completion_schema_path"] = schema_path
     agent_cmd = _build_agent_command(
         run.agent,
         worktree_path,
@@ -17366,6 +18061,10 @@ def _prepare_implement_launch_plan(
         claude_private_home=claude_private_home,
         claude_private_home_context=claude_private_home_context,
         git_isolation=git_isolation,
+        session=session,
+        completion_outbox_path=completion_outbox_path,
+        codex_home=codex_home if codex_auth_root is not None else None,
+        claude_isolated_home=claude_isolated_home,
     )
 
 
@@ -17426,11 +18125,13 @@ def _launch_implement_attempt(
                 progress_thread=progress_thread,
                 progress_tracker=plan.progress_tracker,
                 spec_id=run.spec_id,
+                structured_completion=plan.session.structured_output,
             )
         finally:
             _set_active_agent_process(None)
             _prune_registered_worktree_processes(repo_root, worktree_path)
 
+    live_sessions_recorded = _record_live_provider_sessions(repo_root, run, plan)
     try:
         result = backend.launch_agent(request, monitor=_supervise)
         # backend.launch_agent returns only after its monitor has confirmed the
@@ -17444,6 +18145,14 @@ def _launch_implement_attempt(
             # Provider credentials must be retired even if disposable Git
             # metadata was poisoned into a form that cannot be removed.
             if run.agent == "codex":
+                if plan.codex_home is not None:
+                    # Keep the thread resumable (and attachable from the host)
+                    # after the launch home is deleted or cleared, including
+                    # a container worker's preserved provider home.
+                    _copy_codex_sessions(
+                        plan.codex_home / "sessions",
+                        _codex_session_archive_dir(repo_root, run.run_id),
+                    )
                 if plan.codex_auth_root is not None:
                     _remove_codex_launch_home(
                         plan.codex_home_context,
@@ -17459,6 +18168,15 @@ def _launch_implement_attempt(
                         required=True,
                     )
             elif run.agent == "claude":
+                if plan.claude_isolated_home is not None:
+                    # Keep the session resumable by the next container launch
+                    # and attachable from the host after the home is removed.
+                    _export_workspace_sessions(
+                        backend,
+                        worktree_path,
+                        CLAUDE_ISOLATED_PROJECTS_RELPATH,
+                        _claude_session_archive_dir(repo_root, run.run_id),
+                    )
                 if (
                     plan.claude_private_home_context is not None
                     and plan.claude_private_home is not None
@@ -17475,6 +18193,9 @@ def _launch_implement_attempt(
                     required=True,
                 )
         finally:
+            if live_sessions_recorded:
+                # Sessions are archived by now; attach reads the archive.
+                _live_provider_sessions_path(repo_root, run.run_id).unlink(missing_ok=True)
             if plan.git_isolation is not None:
                 try:
                     # Idempotent after successful reconciliation; also removes
@@ -18186,7 +18907,8 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
             run.last_error = credentials_error
             return "failed"
 
-    # Probe Claude CLI for stream-json support (graceful fallback)
+    # Probe Claude CLI for stream-json support (graceful fallback). Container
+    # workers are probed once the worker is up, below.
     use_stream_json = (
         run.agent == "claude"
         and _backend_launches_agent_on_host(backend)
@@ -18258,28 +18980,81 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
                 worktree_path,
                 setup_manifest,
             )
-            if backend.identity.backend == "container":
-                suspend_workspace_for_host_access(workspace)
-            launch_plan = _prepare_implement_launch_plan(
+            if run.agent == "claude" and not _backend_launches_agent_on_host(backend):
+                # The worker's Claude CLI streams its result event (and the
+                # structured completion on it) through the backend's pipe.
+                use_stream_json = _claude_supports_stream_json(backend, worktree_path)
+            session_plan = _plan_agent_session(
                 run,
-                repo_root,
-                worktree_path,
-                ctx,
-                reason=reason,
                 use_stream_json=use_stream_json,
-                setup_manifest=setup_manifest,
-                private_homes_to_cleanup=claude_private_homes_to_cleanup,
-                codex_homes_to_cleanup=codex_homes_to_cleanup,
-                git_isolations_to_cleanup=git_isolations_to_cleanup,
+                backend=backend,
+                worktree_path=worktree_path,
             )
-            if backend.identity.backend == "container":
-                resume_workspace_after_host_access(workspace)
-            exit_code = _launch_implement_attempt(
-                run,
-                repo_root,
-                worktree_path,
-                launch_plan,
-            )
+            for session_attempt in range(2):
+                if session_attempt:
+                    # The resumed session could not start: retry this launch
+                    # once in a fresh session with the full prompt.
+                    session_plan = _fresh_agent_session_plan(
+                        run,
+                        structured_output=session_plan.structured_output,
+                    )
+                _record_planned_agent_session(run, repo_root, session_plan)
+                if backend.identity.backend == "container":
+                    suspend_workspace_for_host_access(workspace)
+                launch_plan = _prepare_implement_launch_plan(
+                    run,
+                    repo_root,
+                    worktree_path,
+                    ctx,
+                    reason=reason,
+                    use_stream_json=use_stream_json,
+                    setup_manifest=setup_manifest,
+                    private_homes_to_cleanup=claude_private_homes_to_cleanup,
+                    codex_homes_to_cleanup=codex_homes_to_cleanup,
+                    git_isolations_to_cleanup=git_isolations_to_cleanup,
+                    session=session_plan,
+                )
+                # Read while the worker is still suspended: a resume only
+                # counts as failed if the launch left the workspace as it was.
+                workspace_before = (
+                    _worktree_change_fingerprint(worktree_path)
+                    if session_plan.resumes
+                    else ""
+                )
+                if backend.identity.backend == "container":
+                    resume_workspace_after_host_access(workspace)
+                exit_code = _launch_implement_attempt(
+                    run,
+                    repo_root,
+                    worktree_path,
+                    launch_plan,
+                )
+                resume_failure = _resume_failure_reason(
+                    run,
+                    launch_plan,
+                    exit_code,
+                    worktree_path,
+                    workspace_before,
+                )
+                if not resume_failure:
+                    _record_agent_session_after_launch(run, repo_root, launch_plan)
+                    break
+                logger.warning(
+                    "Falling back to a fresh %s session for %s: %s",
+                    run.agent,
+                    run.run_id,
+                    resume_failure,
+                )
+                run.agent_session_fallback_reason = resume_failure
+                _record_nonfatal_warning(
+                    run,
+                    phase="implement",
+                    failure_type="session",
+                    failure_subtype="resume_failed",
+                    summary=f"Resume failed; started a fresh session: {resume_failure}"[:400],
+                    retryable=True,
+                )
+                run.save(repo_root)
             _consume_operator_steering(
                 repo_root,
                 run.run_id,
@@ -18314,7 +19089,18 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
             progress_tracker=launch_plan.progress_tracker,
         )
         prefetched_result: tuple[ImplementResult | None, bool] | None = None
-        if outcome.has_uncommitted_changes:
+        structured_result = _structured_completion_result(
+            run,
+            worktree_path,
+            ctx,
+            launch_plan.progress_tracker,
+        )
+        if structured_result is not None:
+            # The provider's schema-validated final response is the primary
+            # completion signal; `spec report` is only consulted without it.
+            structured_result.save(repo_root, run.run_id)
+            prefetched_result = (structured_result, False)
+        elif outcome.has_uncommitted_changes:
             # Preserve a worktree-local completion handshake before teardown
             # potentially removes it from disk.
             prefetched_result = _load_matching_implement_result(
@@ -19612,6 +20398,10 @@ def _handle_claude_stream_line(
     if tracker is not None:
         _track_claude_inflight_tools(event, tracker)
         tracker.record_sandbox_denials(claude_event_denials(event))
+        if event_type in ("system", "result") and isinstance(event.get("session_id"), str):
+            tracker.record_provider_session(event["session_id"])
+        if event_type == "result" and "structured_output" in event:
+            tracker.record_structured_output(event.get("structured_output"))
     if event_type == "assistant":
         content = _claude_message_content(event)
         if not content and tracker is not None:
@@ -19814,6 +20604,20 @@ def _handle_codex_stream_line(line: str, tracker: AgentProgressTracker) -> None:
 
     _track_codex_inflight_items(event, tracker)
     tracker.record_sandbox_denials(codex_event_denials(event))
+    if isinstance(event, dict):
+        event_type = str(event.get("type", "")).strip()
+        if event_type == "thread.started" and isinstance(event.get("thread_id"), str):
+            tracker.record_provider_session(event["thread_id"])
+        item = event.get("item")
+        if (
+            event_type == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+        ):
+            # With --output-schema the last agent message is the structured
+            # completion JSON.
+            tracker.record_final_agent_message(item["text"])
     summary = _summarize_codex_event(event)
     if summary is None:
         tracker.heartbeat()
@@ -19971,20 +20775,32 @@ def _wait_for_agent_exit(
     progress_thread: threading.Thread | None = None,
     progress_tracker: AgentProgressTracker | None = None,
     spec_id: str | None = None,
+    structured_completion: bool = False,
 ) -> int:
-    """Wait for agent exit, but stop waiting once completion is recorded."""
+    """Wait for agent exit, but stop waiting once completion is recorded.
+
+    With ``structured_completion`` the provider's final structured response is
+    the completion signal, so a ``spec report`` fallback alone does not start
+    the exit grace period: the final response may still be on its way and
+    would take precedence over the report.
+    """
     completion_seen_at: float | None = None
+    structured_tracker = progress_tracker if structured_completion else None
 
     while True:
-        impl_result, _ = _load_matching_implement_result(
-            repo_root=repo_root,
-            worktree_path=worktree_path,
-            run_id=run_id,
-            attempt=attempt,
-            launch_number=launch_number,
-            spec_id=spec_id,
-        )
-        if impl_result is not None and completion_seen_at is None:
+        if structured_tracker is not None:
+            completed = structured_tracker.structured_completion() is not None
+        else:
+            impl_result, _ = _load_matching_implement_result(
+                repo_root=repo_root,
+                worktree_path=worktree_path,
+                run_id=run_id,
+                attempt=attempt,
+                launch_number=launch_number,
+                spec_id=spec_id,
+            )
+            completed = impl_result is not None
+        if completed and completion_seen_at is None:
             completion_seen_at = time.monotonic()
             logger.info(
                 "Detected completion handshake for %s (%s); allowing %.1fs for clean exit.",
@@ -20086,17 +20902,33 @@ def _format_spec_contract_for_prompt(
     )
 
 
-def _format_exit_checklist(spec_id: str | None = None) -> str:
+def _format_exit_checklist(
+    spec_id: str | None = None,
+    *,
+    structured_completion: bool = False,
+) -> str:
     spec_token = spec_id or "<spec-id>"
+    common = [
+        "Exit Checklist:",
+        "1. Commit any completed code changes in this worktree.",
+        f"2. Run {_format_verify_commands(_non_e2e_verify_commands())} before reporting completion.",
+        "   Run these commands in the FOREGROUND and wait for their output in-band. "
+        "Never launch them as background tasks or monitors and end your turn "
+        "'waiting for the notification' — this session terminates with your final "
+        "message and is NEVER re-invoked, so work left waiting is discarded.",
+    ]
+    if structured_completion:
+        return "\n".join(
+            [
+                *common,
+                "3. Report completion through your final response (the structured "
+                "completion result: status, summary and question). `spec report` is an "
+                "optional fallback only; if you run it, still finish with the final response.",
+            ]
+        )
     return "\n".join(
         [
-            "Exit Checklist:",
-            "1. Commit any completed code changes in this worktree.",
-            f"2. Run {_format_verify_commands(_non_e2e_verify_commands())} before reporting completion.",
-            "   Run these commands in the FOREGROUND and wait for their output in-band. "
-            "Never launch them as background tasks or monitors and end your turn "
-            "'waiting for the notification' — this session terminates with your final "
-            "message and is NEVER re-invoked, so work left waiting is discarded.",
+            *common,
             "3. Report completion with "
             "`spec report --status ok|blocked|error|needs-input "
             f"--summary 'plain text summary'` (explicit fallback: "
@@ -20244,8 +21076,24 @@ def _build_agent_command(
     operator_steering_provided_by: str = "",
     operator_steering_provided_at: str = "",
     safety: LaunchSafety | None = None,
+    session_id: str = "",
+    resume_session_id: str = "",
+    completion_schema_path: Path | None = None,
 ) -> list[str]:
-    """Build the command to launch the agent."""
+    """Build the command to launch the agent.
+
+    With ``resume_session_id`` the launch continues the run's provider
+    session, so the prompt is only the delta: the failure package (on a
+    retry), operator input and steering, without the spec contract the
+    session already holds.
+    """
+    adapter = get_agent_adapter(agent)
+
+    def _accepts(name: str) -> bool:
+        return _adapter_method_accepts_kwarg(adapter.build_implement_command, name)
+
+    resume_session_id = resume_session_id if _accepts("resume_session_id") else ""
+    delta_prompt = bool(resume_session_id)
     acceptance_checklist = list(
         acceptance_checklist
         if acceptance_checklist is not None
@@ -20420,7 +21268,7 @@ def _build_agent_command(
                 )
             )
             prompt_lines.append(
-                "The next review sees your `spec report` summary as your response to "
+                "The next review sees your completion summary as your response to "
                 "these findings. Address each one by its id in that summary (for example "
                 "`<id>: fixed by ...` or `<id>: disagree because ...`)."
             )
@@ -20530,8 +21378,9 @@ def _build_agent_command(
             "Read AGENTS.md for project conventions. Do NOT re-implement from scratch "
             "— only address the active failures summarized above."
         )
-        prompt_sections = [spec_contract]
-        if resolved_intake:
+        # A resumed session already holds the contract and intake.
+        prompt_sections = [] if delta_prompt else [spec_contract]
+        if resolved_intake and not delta_prompt:
             prompt_sections.append(resolved_intake)
         if resolved_input:
             prompt_sections.append(resolved_input)
@@ -20541,6 +21390,19 @@ def _build_agent_command(
         if debugger_section:
             prompt_sections.append(debugger_section)
         prompt_sections.append("\n".join(instruction_lines))
+        prompt = "\n\n".join(prompt_sections)
+    elif delta_prompt:
+        # A resumed launch that is not a failure retry: the session paused for
+        # operator input or its launch was interrupted before completing.
+        prompt_sections = [
+            section for section in (resolved_input, resolved_steering) if section
+        ]
+        prompt_sections.append(
+            f"Continue the IMPLEMENT phase for spec {spec_id or '<spec-id>'} from where "
+            "your previous turn in this session ended. Inspect the current branch and "
+            "worktree state first — do not assume earlier work is still present. If "
+            "there are already local changes, continue from them instead of starting over."
+        )
         prompt = "\n\n".join(prompt_sections)
     else:
         spec_prompt = (
@@ -20565,15 +21427,31 @@ def _build_agent_command(
         prompt_sections.append(spec_prompt)
         prompt = "\n\n".join(prompt_sections)
 
-    completion_instruction = COMPLETE_HANDSHAKE_INSTRUCTION.replace("<spec-id>", spec_id or "<spec-id>")
-    exit_checklist = _format_exit_checklist(spec_id)
-    prompt = f"{exit_checklist}\n\n{prompt}\n\n{completion_instruction}"
+    completion_schema_path = (
+        completion_schema_path if _accepts("completion_schema_path") else None
+    )
+    structured_completion = completion_schema_path is not None
+    if structured_completion:
+        # The final response is the completion signal; `spec report` is only
+        # an optional fallback and must not read as the required last step.
+        completion_instruction = STRUCTURED_COMPLETION_INSTRUCTION
+    else:
+        completion_instruction = COMPLETE_HANDSHAKE_INSTRUCTION.replace(
+            "<spec-id>", spec_id or "<spec-id>"
+        )
+    if delta_prompt:
+        prompt = f"{RESUMED_SESSION_PREAMBLE}\n\n{prompt}\n\n{completion_instruction}"
+    else:
+        exit_checklist = _format_exit_checklist(
+            spec_id,
+            structured_completion=structured_completion,
+        )
+        prompt = f"{exit_checklist}\n\n{prompt}\n\n{completion_instruction}"
     # This adapter argument is a launch-scoped capability directory, never the
     # repository-wide control-plane state root. Out-of-tree adapters that use
     # it therefore inherit the same narrow boundary as the built-ins.
     state_dir = agent_state_dir or (worktree_path / ".spec-agent-outbox")
 
-    adapter = get_agent_adapter(agent)
     setup_prompt = str(setup_prompt or "").strip()
     setup_mcp_prompt = str(setup_mcp_prompt or "").strip()
     if setup_prompt:
@@ -20609,6 +21487,12 @@ def _build_agent_command(
         "safety",
     ):
         implement_kwargs["safety"] = safety
+    if resume_session_id:
+        implement_kwargs["resume_session_id"] = resume_session_id
+    elif session_id and _accepts("session_id"):
+        implement_kwargs["session_id"] = session_id
+    if completion_schema_path is not None:
+        implement_kwargs["completion_schema_path"] = completion_schema_path
     return adapter.build_implement_command(**implement_kwargs)
 
 
@@ -27686,8 +28570,146 @@ def cmd_steer(args: argparse.Namespace) -> int:
     print(f"  Guidance: {steering.message}")
     print(f"  Provided By: {steering.provided_by or 'unknown'}")
     print(f"  Provided At: {steering.provided_at}")
-    print("  Effect: advisory context for the next implement attempt")
+    print(
+        "  Effect: advisory context for the next implement attempt, delivered "
+        "through the resumed agent session at that attempt boundary"
+    )
     return 0
+
+
+def _run_agent_process_alive(repo_root: Path, worktree_path: Path) -> bool:
+    """Return True while an implement agent registered for *worktree_path* runs."""
+    entries = worktree_process_registry.load_registered_processes(
+        _worktree_registry_state_root(repo_root, worktree_path),
+        worktree_path,
+    )
+    return any(
+        entry.kind == "agent"
+        and worktree_process_registry.is_process_alive(entry.pid, entry.started_at)
+        for entry in entries
+    )
+
+
+def _operator_codex_home() -> Path:
+    configured = str(os.environ.get("CODEX_HOME", "")).strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".codex"
+
+
+def _expose_run_sessions_to_operator(
+    repo_root: Path,
+    run: RunState,
+    worktree_path: Path,
+    agent: str,
+    *,
+    live: bool,
+) -> None:
+    """Make the run's session visible to the operator's own provider CLI.
+
+    Launch provider homes (a host Codex home, a container worker's Codex or
+    Claude home) do not outlive the launch, so the run's archived sessions are
+    restored into the operator's home first; the printed command then works on
+    its own as well. While the launch still runs (``--fork``) its live
+    sessions are newer than the archive, so a snapshot of them is laid on top.
+    Files already in the operator's home are only replaced by copies that
+    extend them, so turns added in an earlier attach are never lost.
+    """
+    archive = (
+        _codex_session_archive_dir(repo_root, run.run_id)
+        if agent == "codex"
+        else _claude_session_archive_dir(repo_root, run.run_id)
+    )
+    with tempfile.TemporaryDirectory(prefix="spec-attach-") as scratch:
+        sources = [archive] if archive.is_dir() else []
+        live_snapshot = Path(scratch) / "live"
+        if live and _snapshot_live_provider_sessions(
+            repo_root, run, worktree_path, agent, live_snapshot
+        ):
+            sources.append(live_snapshot)
+        if agent == "codex":
+            operator_sessions = _operator_codex_home() / "sessions"
+            for source in sources:
+                # Never the plain copy: the operator's home may hold turns
+                # added interactively since an earlier attach.
+                _merge_operator_sessions(source, operator_sessions)
+            if any(
+                any(source.rglob(f"*{run.agent_session_id}*.jsonl")) for source in sources
+            ):
+                origin = "live" if live_snapshot in sources else "archived"
+                print(f"Restored {origin} Codex rollouts for {run.run_id} into {operator_sessions}")
+            else:
+                print(
+                    f"Warning: No archived Codex rollouts for run {run.run_id}; "
+                    f"`codex resume` may not find thread {run.agent_session_id}.",
+                    file=sys.stderr,
+                )
+            return
+        installed: Path | None = None
+        for source in sources:
+            installed = (
+                _install_claude_session(source, run.agent_session_id, worktree_path)
+                or installed
+            )
+        if installed is not None:
+            print(f"Restored Claude session {run.agent_session_id} into {installed}")
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    """Print (or run) the command that resumes the latest run's agent session."""
+    repo_root = resolve_repo_root()
+    spec_id = args.spec
+    fork = bool(getattr(args, "fork", False))
+    run = _latest_non_superseded_run(repo_root, spec_id)
+    if run is None:
+        print(f"Error: No run found for spec {spec_id}", file=sys.stderr)
+        return 1
+    if not run.agent_session_id:
+        print(
+            f"Error: Run {run.run_id} has no recorded {run.agent} session to attach to.",
+            file=sys.stderr,
+        )
+        return 1
+    agent = run.agent_session_agent or run.agent
+    try:
+        attach_cmd = provider_attach_command(agent, run.agent_session_id, fork=fork)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    worktree_path = resolve_worktree_path(run, repo_root)
+    if not worktree_path.is_dir():
+        print(f"Error: Workspace missing: {worktree_path}", file=sys.stderr)
+        return 1
+    alive = _run_agent_process_alive(repo_root, worktree_path)
+    if alive and not fork:
+        # One session must not be driven headless and interactively at once.
+        print(
+            f"Error: The {agent} agent for run {run.run_id} is still running. "
+            "Stop it with `spec stop`, wait for the attempt to finish, or pass "
+            "--fork to branch the session.",
+            file=sys.stderr,
+        )
+        return 1
+    if fork and agent == "codex":
+        print("Note: --fork uses `codex fork` for Codex sessions.")
+    if agent in {"codex", "claude"}:
+        _expose_run_sessions_to_operator(
+            repo_root,
+            run,
+            worktree_path,
+            agent,
+            live=alive,
+        )
+
+    print(f"Run: {run.run_id}")
+    print(f"  Agent Session: {run.agent_session_id} ({agent})")
+    print(f"  Workspace: {worktree_path}")
+    print(f"  Command: cd {shlex.quote(str(worktree_path))} && {shlex.join(attach_cmd)}")
+    if not getattr(args, "exec", False):
+        return 0
+    try:
+        return subprocess.run(attach_cmd, cwd=worktree_path, check=False).returncode
+    except FileNotFoundError as exc:
+        print(f"Error: Agent binary not found: {exc}", file=sys.stderr)
+        return 1
 
 
 def _cmd_input_review_round_cap(
@@ -28913,9 +29935,13 @@ def cmd_status(args: argparse.Namespace) -> int:
                 previous_phase = candidate.superseded_from_phase or candidate.phase
                 print(f"  Run {candidate.run_id} — superseded (was: {previous_status}, phase: {previous_phase})")
                 continue
+            session_text = (
+                f", session {candidate.agent_session_id}" if candidate.agent_session_id else ""
+            )
             print(
                 f"  Run {candidate.run_id} — {candidate.status} "
-                f"(phase: {candidate.phase}, attempt {format_attempt_progress(candidate.attempts, candidate.retry_cap)})"
+                f"(phase: {candidate.phase}, attempt {format_attempt_progress(candidate.attempts, candidate.retry_cap)}"
+                f"{session_text})"
             )
 
     # Show latest run state
@@ -28939,6 +29965,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             for warning in canonical.warnings:
                 print(f"  Warning: {warning}")
         print(f"  Agent: {run.agent}")
+        if run.agent_session_id:
+            print(f"  Agent Session: {run.agent_session_id} ({run.agent_session_agent or run.agent})")
+            if run.agent_session_fallback_reason:
+                print(f"  Session Fallback: {run.agent_session_fallback_reason}")
         if run.backend or run.safety_mode:
             backend_text = run.backend or "unknown"
             source_text = f" ({run.backend_source})" if run.backend_source else ""

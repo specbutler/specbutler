@@ -8388,6 +8388,77 @@ class ContainerExecutionBackend(CloneExecutionBackend):
                 f"{volume}. See {logs / 'volume-host-sync.log'}"
             )
 
+    def export_workspace_path_to_host(
+        self,
+        workspace_path: Path,
+        relative_path: str,
+        destination: Path,
+    ) -> bool:
+        """Copy one workspace directory's contents into host *destination*.
+
+        Returns False when the host worktree already is the workspace (bind
+        mode), so the caller reads the host path directly. In volume mode a
+        one-shot container mounts the source volume read-only; the worker may
+        still be running. Links are copied as links, never followed, so the
+        caller must still skip them.
+        """
+        posix_path = PurePosixPath(relative_path.strip().replace("\\", "/"))
+        if not posix_path.parts or posix_path.is_absolute() or ".." in posix_path.parts:
+            raise ValueError(f"Invalid workspace-relative path: {relative_path!r}")
+        run_root = self._workspace_run_root(workspace_path)
+        if run_root is None:
+            return False
+        state = self._read_container_state(run_root, missing_ok=True)
+        if state.get("workspace_mode") != "volume":
+            return False
+        volumes = state.get("workspace_volumes") or state.get("volumes", [])
+        if not volumes:
+            return False
+        volume = str(volumes[0])
+        labels = self._canonical_state_resource_labels(run_root, state)
+        if labels is None:
+            raise RuntimeError(
+                "Container backend refuses source-volume export with "
+                "non-canonical resource labels."
+            )
+        self._require_volume_safe_to_use(run_root, volume, labels)
+        source = shlex.quote(f"/workspace/source/{posix_path.as_posix()}")
+        script = (
+            f"if [ -d {source} ] && [ ! -L {source} ]; then "
+            f"cp -a {source}/. /workspace/host/; fi"
+        )
+        argv = [
+            self._container.engine,
+            "run",
+            "--rm",
+            *self._label_argv(state),
+        ]
+        user_mapping = self._container_user_mapping()
+        if user_mapping:
+            argv.extend(["--user", user_mapping])
+            argv.extend(self._container_passwd_shim_argv(run_root))
+        argv.extend(
+            [
+                "-v",
+                f"{volume}:/workspace/source:ro",
+                "-v",
+                f"{destination}:/workspace/host",
+                state["image"],
+                "sh",
+                "-lc",
+                script,
+            ]
+        )
+        export = self._runner.run(argv, cwd=run_root)
+        logs = run_root / "logs"
+        self._write_image_log(logs, "volume-path-export.log", export)
+        if export.returncode != 0:
+            raise RuntimeError(
+                f"Container backend could not export {relative_path} from source "
+                f"volume {volume}. See {logs / 'volume-path-export.log'}"
+            )
+        return True
+
     def _sync_volume_workspace_to_host(self, run_root: Path, state: dict[str, Any]) -> None:
         if state.get("workspace_mode") != "volume":
             return
