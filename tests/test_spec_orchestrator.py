@@ -3198,9 +3198,13 @@ class TestPhaseImplementHandshake:
         assert run.last_block_debugger_guided_retry_signature == "sig-123"
 
     def test_phase_implement_attaches_diagnosis_on_first_attempt_block(self, repo: Path):
-        """F1: when the very first attempt blocks (attempts==0), the diagnosis must still be attached."""
+        """A first attempt that produced code keeps its diagnosis even at attempts==0."""
         run = self._make_run()
         run.attempts = 0
+        # The counter has not advanced yet, but the blocked launch produced
+        # work. A first launch without code now receives initial framing.
+        run.implement_head_sha_before = "base123"
+        run.implement_head_sha_after = "abc123"
         run.pending_block_debugger_signature = "sig-first"
         run.last_error = "Gate 'lint' failed (exit 1). output: see gate-status.json"
         run.save(repo)
@@ -42288,3 +42292,16 @@ def test_implement_prompt_framing_uses_prior_work(repo: Path, scenario: str):
         assert ctx.previous_implement_attempt_number == 1
         assert ctx.failure_summary
         assert "Do NOT re-implement from scratch" in prompt
+
+
+def test_implement_framing_does_not_use_enclosing_repository(repo: Path):
+    missing_checkout = repo / "missing-checkout"
+    missing_checkout.mkdir()
+    run = orch.RunState(
+        run_id="framing-missing-checkout", spec_id="my-feature", branch="spec/my-feature",
+        attempts=1, implement_launches=1, publication_base_sha=orch._head_sha(repo),
+    )
+    with patch.object(orch, "resolve_worktree_path", return_value=missing_checkout):
+        initial, reason = orch._implement_framing_evidence(run, repo)
+    assert not initial
+    assert "evidence unavailable" in reason

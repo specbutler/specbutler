@@ -17560,12 +17560,16 @@ def _implement_framing_evidence(run: RunState, repo_root: Path) -> tuple[bool, s
     ):
         return False, "prior review result for this run branch"
     worktree = resolve_worktree_path(run, repo_root)
+    # A missing workspace checkout must not borrow the enclosing repository's
+    # HEAD. Keep this evidence probe separate from the implement lifecycle's
+    # before/after snapshots, which describe the actual agent launch.
+    has_checkout = (worktree / ".git").exists()
     base = run.publication_base_sha or run.implement_head_sha_before
-    if not base and worktree.is_dir():
+    if not base and has_checkout:
         base = _resolve_git_ref_sha(worktree, run.base_ref or BASE_REF)
-    head = _head_sha(worktree) if worktree.is_dir() else ""
+    head = _resolve_git_ref_sha(worktree, "HEAD") if has_checkout else ""
     heads = [value for value in (head, run.implement_head_sha_after) if value]
-    if base and heads:
+    if has_checkout and base and heads:
         for candidate in heads:
             result = run_subprocess(
                 ["git", "rev-list", "--count", f"{base}..{candidate}"], cwd=worktree,
