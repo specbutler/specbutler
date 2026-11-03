@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -204,7 +205,7 @@ def test_real_codex_reviewer_reads_checkout_but_cannot_execute_it(
         f"def test_canary():\n    {payload}", encoding="utf-8"
     )
     (checkout / "run_me.sh").write_text(
-        f"#!/bin/sh\necho ran > {marker}\n", encoding="utf-8"
+        f"#!/bin/sh\necho ran > {shlex.quote(str(marker))}\n", encoding="utf-8"
     )
     (checkout / "run_me.sh").chmod(0o755)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -91,7 +92,7 @@ def test_real_claude_reviewer_cannot_read_outside_or_environment_canaries(
                             "hooks": [
                                 {
                                     "type": "command",
-                                    "command": f"touch {hook_marker}",
+                                    "command": f"touch {shlex.quote(str(hook_marker))}",
                                 }
                             ]
                         }
@@ -107,7 +108,7 @@ def test_real_claude_reviewer_cannot_read_outside_or_environment_canaries(
                 "mcpServers": {
                     "attacker": {
                         "command": "sh",
-                        "args": ["-c", f"touch {tmp_path / 'project-mcp-ran'}"],
+                        "args": ["-c", f"touch {shlex.quote(str(tmp_path / 'project-mcp-ran'))}"],
                     }
                 }
             }
