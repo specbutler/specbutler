@@ -146,7 +146,7 @@ from .execution_backend import (
     run_local_command_preserving_descendants,
 )
 from .execution_backend import get_execution_backend as _factory_get_execution_backend
-from .forge import GitHubForge, PushResult
+from .forge import GitHubForge, PushResult, get_forge_adapter
 from .git_common import resolve_common_root, run_git, subprocess_text_kwargs
 from .git_publish_guard import (
     UnsafeRepositoryGitConfigError,
@@ -4795,19 +4795,51 @@ def check_dependencies_merged(repo_root: Path, spec_id: str) -> list[str]:
     if isinstance(deps, str):
         deps = [deps]
     blockers = []
+    fetch_error = ""
+    remote = BASE_REF.removeprefix("refs/remotes/").split("/", 1)[0] if "/" in BASE_REF else "origin"
+    if any(not is_spec_merged(repo_root, dep) for dep in deps):
+        try:
+            outcome = run_git_fetch_with_timeout(
+                [remote, "refs/tags/spec/merged/*:refs/tags/spec/merged/*"],
+                cwd=repo_root,
+                timeout_seconds=DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
+                runner=_orchestrator_fetch_runner,
+            )
+            if not outcome.is_success:
+                fetch_error = f"merge tags could not be fetched from {remote}"
+        except (GitFetchTimeoutError, OSError) as exc:
+            fetch_error = f"merge tags could not be fetched from {remote}: {exc}"
+        if fetch_error:
+            logger.warning("%s", fetch_error)
     for dep in deps:
         dep_path = _resolve_dependency_spec_path(repo_root, dep)
+        if dep_path is not None:
+            dep_fm = parse_spec_frontmatter(dep_path)
+            superseded_by = str(dep_fm.get("superseded_by", "")).strip()
+            if superseded_by:
+                blockers.append(f"{dep} (superseded by {superseded_by})")
+                continue
+        if is_spec_merged(repo_root, dep):
+            continue
+        try:
+            merged = get_forge_adapter().is_spec_merged(dep, base_branch=PR_BASE_BRANCH, cwd=repo_root)
+        except (RuntimeError, OSError, AttributeError) as exc:
+            logger.warning("Could not check dependency %s on forge: %s", dep, exc)
+            merged = False
+        if merged:
+            logger.warning(
+                "Dependency %s merged but is missing a usable merge tag; run spec-backfill-merge-tags backfill",
+                dep,
+            )
+            continue
         if dep_path is None:
             blockers.append(f"{dep} (missing spec file)")
-            continue
-        dep_fm = parse_spec_frontmatter(dep_path)
-        superseded_by = str(dep_fm.get("superseded_by", "")).strip()
-        if superseded_by:
-            blockers.append(f"{dep} (superseded by {superseded_by})")
             continue
         dep_status = read_spec_status(repo_root, dep, dep_path)
         if dep_status != "merged":
             blockers.append(f"{dep} ({dep_status})")
+    if blockers and fetch_error:
+        blockers[-1] += f"; {fetch_error}. Fetch merge tags and retry"
     return blockers
 
 

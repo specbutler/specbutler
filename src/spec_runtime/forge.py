@@ -23,6 +23,7 @@ from typing import Protocol, runtime_checkable
 
 from .config import load_spec_runtime_config
 from .git_common import subprocess_text_kwargs
+from .spec_identity import implementation_branch_identity
 
 AUTO_MERGE_ARM_TIMEOUT_SECONDS = 30
 
@@ -100,6 +101,10 @@ class ForgeAdapter(Protocol):
         (``--force-with-lease=<branch>:<expect_sha>``), so it succeeds only if
         the remote branch still points at exactly that commit.
         """
+        ...
+
+    def is_spec_merged(self, spec_id: str, *, base_branch: str, cwd: Path) -> bool:
+        """Whether an implementation PR for this spec merged into the base."""
         ...
 
     def find_pr_for_branch(
@@ -305,6 +310,33 @@ class GitHubForge:
         if result.returncode != 0:
             return PushResult(ok=False, message=result.stderr.strip())
         return PushResult(ok=True)
+
+    def is_spec_merged(self, spec_id: str, *, base_branch: str, cwd: Path) -> bool:
+        # Paginate all closed PRs: search indexes and fixed limits can omit old merges.
+        from urllib.parse import quote
+
+        endpoint = "repos/{owner}/{repo}/pulls?state=closed&per_page=100&base=" + quote(base_branch, safe="")
+        try:
+            result = self._gh(["api", endpoint, "--paginate", "--slurp"], cwd=cwd, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Merged dependency PR lookup timed out") from exc
+        if result.returncode != 0:
+            raise RuntimeError("Could not query merged dependency PRs")
+        try:
+            pages = json.loads(result.stdout)
+            for page in pages:
+                for pr in page:
+                    identity = implementation_branch_identity(pr["head"]["ref"])
+                    if (
+                        identity is not None
+                        and identity.spec_id == spec_id
+                        and pr.get("merged_at")
+                        and pr["base"]["ref"] == base_branch
+                    ):
+                        return True
+        except (ValueError, TypeError, KeyError) as exc:
+            raise RuntimeError("Invalid merged dependency PR response") from exc
+        return False
 
     def find_pr_for_branch(
         self,
