@@ -1506,6 +1506,9 @@ def test_codex_review_profile_reads_checkout_and_denies_credentials(
     for path in (checkout, scratch, provider_home, operator_secret):
         path.mkdir(parents=True)
     monkeypatch.setattr(agent_adapter, "protected_operator_paths", lambda: [operator_secret])
+    # The checkout shell is off by default (see the no-shell test below); this
+    # pins the profile the shell path would use once Codex can bound it.
+    monkeypatch.setattr(agent_adapter, "CODEX_REVIEW_CHECKOUT_SHELL", True)
 
     cmd = CodexAgent().build_review_command(
         prompt="p",
@@ -1531,8 +1534,34 @@ def test_codex_review_profile_reads_checkout_and_denies_credentials(
     assert 'model_reasoning_effort="high"' in cmd
 
 
-def test_codex_review_with_checkout_enforces_inspection_only_commands(tmp_path: Path):
-    """A read-only filesystem alone would still let checkout code execute."""
+def test_codex_review_with_checkout_has_no_shell_by_default(tmp_path: Path):
+    """codex-cli 0.164 cannot limit the shell to inspection, so review keeps none."""
+    checkout = tmp_path / "review-checkout"
+    scratch = tmp_path / "scratch"
+    checkout.mkdir()
+    scratch.mkdir()
+
+    cmd = CodexAgent().build_review_command(
+        prompt="p",
+        output_path=scratch / "out.json",
+        writable_temp_dir=scratch,
+        review_checkout=checkout,
+    )
+
+    assert "features.shell_tool=false" in cmd
+    assert "features.unified_exec=false" in cmd
+    assert cmd[cmd.index("-s") + 1] == "read-only"
+    assert not any(c.startswith("permissions.specbutler-review") for c in cmd)
+    assert not any(c.startswith("approval_policy=") for c in cmd)
+    assert str(checkout) not in cmd
+    assert cmd[cmd.index("-C") + 1] == str(scratch)
+
+
+def test_codex_review_checkout_shell_path_pins_never_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """When the checkout shell is enabled, nothing may escalate past the profile."""
+    monkeypatch.setattr(agent_adapter, "CODEX_REVIEW_CHECKOUT_SHELL", True)
     checkout = tmp_path / "review-checkout"
     scratch = tmp_path / "scratch"
     checkout.mkdir()

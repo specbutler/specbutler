@@ -628,6 +628,13 @@ _CODEX_REVIEW_PERMISSION_PROFILE = "specbutler-review"
 # ``.rules`` file can pre-approve one. codex-cli 0.164.0 rejects the older
 # ``untrusted`` policy ("no longer supported") under --strict-config, which
 # made every local Codex review fail to start.
+# codex-cli 0.164 has no approval policy that limits the shell to inspection
+# commands (``untrusted`` was removed), and the review contract forbids
+# executing pull-request code. Until Codex offers such an allowlist, a review
+# keeps the no-tool boundary even when a pinned checkout exists; the
+# orchestrator inlines the full diff and the canonical spec instead.
+CODEX_REVIEW_CHECKOUT_SHELL = False
+
 CODEX_REVIEW_COMMAND_POLICY_OVERRIDES = (
     'approval_policy="never"',
     'approvals_reviewer="user"',
@@ -1393,6 +1400,8 @@ class CodexAgent:
         reasoning_effort: str = "",
     ) -> list[str]:
         del prompt, mcp_config_path  # Prompt arrives on stdin; review is MCP-free.
+        if not CODEX_REVIEW_CHECKOUT_SHELL:
+            review_checkout = None
         cmd = [
             "codex",
             "exec",

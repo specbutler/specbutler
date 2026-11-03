@@ -45,7 +45,6 @@ from spec_runtime import spec_merge_tags as merge_tags
 from spec_runtime import worktree_process_registry as process_registry
 from spec_runtime.agent_adapter import (
     HostAgentUnavailableError,
-    _toml_quote,
     host_agent_unavailability_reason,
 )
 from spec_runtime.command_runtime import CommandVariants
@@ -19562,7 +19561,7 @@ class TestLocalReviewHelpers:
 
         assert prompt == bundled_prompt
         assert "Review evidence access is provider-specific" in prompt
-        assert "The Codex reviewer may run read-only inspection commands" in prompt
+        assert "reviewer has no shell and works from the inlined diff and spec" in prompt
         assert "Do not execute pull-request code" in prompt
         assert "Local shell command execution is available" not in prompt
         assert (
@@ -21028,13 +21027,11 @@ class TestLocalReviewPhase:
             observed_scratch.append(scratch_dir)
             assert scratch_dir.is_dir()
             assert scratch_dir != review_worktree
-            # The pinned checkout is readable through the review profile.
-            assert "-s" not in cmd
-            assert 'default_permissions="specbutler-review"' in cmd
-            filesystem = next(c for c in cmd if c.startswith("permissions.specbutler-review.filesystem="))
-            assert _toml_quote(str(review_worktree.resolve())) + '="read"' in filesystem
-            assert 'approval_policy="never"' in cmd
-            assert 'approvals_reviewer="user"' in cmd
+            # Codex cannot bound a checkout shell to inspection, so the review
+            # keeps the no-tool boundary and reads the inlined diff instead.
+            assert cmd[cmd.index("-s") + 1] == "read-only"
+            assert "features.shell_tool=false" in cmd
+            assert not any(c.startswith("permissions.specbutler-review") for c in cmd)
             assert "--skip-git-repo-check" in cmd
             assert "--add-dir" not in cmd
             assert env["TMPDIR"] == str(scratch_dir)
