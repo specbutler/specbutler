@@ -444,6 +444,8 @@ def _remote_names(repo_root: Path) -> tuple[str, ...]:
             cwd=repo_root,
             env=_git_inspection_environment(),
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=5,
             check=False,
@@ -466,7 +468,12 @@ def _remote_config_values(repo_root: Path, remote: str, key: str) -> tuple[str, 
             ["git", "config", "--get-all", f"remote.{remote}.{key}"],
             cwd=repo_root,
             env=_git_inspection_environment(),
+            # Git prints config values as UTF-8 bytes. The locale default
+            # (cp1252 on Windows) would mangle a non-ASCII remote path, and the
+            # fence would then never match the URL Git pushes to.
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=5,
             check=False,
