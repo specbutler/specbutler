@@ -1105,6 +1105,8 @@ def load_run_record_index(repo_root: Path, *, config: SpecRuntimeConfig | None =
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
             continue
+        if data.get("phase") == "authoring":
+            continue
         all_records.append(data)
         run_id = str(data.get("run_id", "")).strip()
         if run_id:
@@ -1113,6 +1115,8 @@ def load_run_record_index(repo_root: Path, *, config: SpecRuntimeConfig | None =
     # Populate latest_by_spec: latest non-superseded record per spec
     grouped: dict[str, list[dict]] = {}
     for data in all_records:
+        if data.get("phase") == "authoring":
+            continue
         spec_id = str(data.get("spec_id", "")).strip()
         if not spec_id:
             continue
@@ -1270,6 +1274,7 @@ def spec_graph_skip_reasons(
     merged_specs: frozenset[str] | set[str] | None = None,
     hidden_specs: set[str] | None = None,
     config: SpecRuntimeConfig | None = None,
+    run_index: RunRecordIndex | None = None,
 ) -> dict[str, str]:
     """Map each dispatchable spec with an invalid ``depends_on`` graph to a skip reason.
 
@@ -1283,7 +1288,7 @@ def spec_graph_skip_reasons(
         merged_spec_ids=merged,
         external_spec_ids=task_spec_ids(repo_root, config=config),
     )
-    return {
+    reasons = {
         spec.spec_id: format_spec_graph_problems(problems[spec.spec_id])
         for spec in specs
         if spec.spec_id in problems
@@ -1292,6 +1297,31 @@ def spec_graph_skip_reasons(
         and spec.spec_id not in hidden
         and spec.spec_id not in merged
     }
+    from .orchestrator import _command_spec_path
+    from .spec_lint import lint_specs
+
+    if run_index is None:
+        run_index = load_run_record_index(repo_root, config=config)
+    results = {result.spec_id: result for result in lint_specs(repo_root, merged_spec_ids=merged)}
+    for spec in specs:
+        run_id, _ = resolve_resume_run(repo_root, spec, run_index=run_index)
+        if not run_id:
+            continue
+        record = read_latest_run_record(repo_root, spec.spec_id, run_id=run_id, run_index=run_index)
+        if not record:
+            continue
+        run = RunState.from_dict({"spec_id": spec.spec_id, "branch": "", **record})
+        source = _command_spec_path(repo_root, spec.spec_id, run)
+        results[spec.spec_id] = lint_specs(
+            repo_root, spec.spec_id, merged_spec_ids=merged, source_path=source
+        )[0]
+        # The pinned contract replaces catalog graph diagnostics as well.
+        reasons.pop(spec.spec_id, None)
+    for result in results.values():
+        if result.errors and result.spec_id not in merged and result.spec_id not in hidden:
+            reasons[result.spec_id] = "; ".join(result.errors)
+    return reasons
+
 
 
 def _block_debugger_auto_resume_available(run_record: dict) -> bool:
@@ -1408,6 +1438,7 @@ def build_dispatch_queue(
         merged_specs=git_state.merged_specs,
         hidden_specs=hidden_specs,
         config=repo_config,
+        run_index=run_index,
     )
     backend_policy = resolve_autopilot_backend_policy(repo_config)
 
@@ -1472,7 +1503,17 @@ def build_dispatch_queue(
         # the reason via ``spec_graph_skip_reasons`` instead of waiting silently.
         if spec.spec_id in graph_skip_reasons:
             continue
-        if not dependencies_are_merged(repo_root, spec.depends_on, git_state=git_state):
+        dependencies = spec.depends_on
+        if run_id:
+            from .orchestrator import _command_spec_path
+            from .spec_metadata import parse_spec_metadata
+
+            record = read_latest_run_record(repo_root, spec.spec_id, run_id=run_id, run_index=run_index)
+            if record:
+                run = RunState.from_dict({"spec_id": spec.spec_id, "branch": "", **record})
+                source = _command_spec_path(repo_root, spec.spec_id, run)
+                dependencies = parse_spec_metadata(source).depends_on
+        if not dependencies_are_merged(repo_root, dependencies, git_state=git_state):
             continue
 
         if not run_id:
@@ -2951,11 +2992,13 @@ def run_loop(args: argparse.Namespace) -> int:
                     last_refresh_error = ""
 
                 git_state = collect_git_spec_state(repo_root)
+                run_index = load_run_record_index(repo_root)
                 graph_skip_reasons = spec_graph_skip_reasons(
                     repo_root,
                     iter_spec_metadata(repo_root),
                     merged_specs=git_state.merged_specs,
                     hidden_specs=hidden_spec_ids(repo_root),
+                    run_index=run_index,
                 )
                 for skipped_spec_id, skip_reason in sorted(graph_skip_reasons.items()):
                     if last_graph_skip_reasons.get(skipped_spec_id) != skip_reason:
@@ -2967,7 +3010,6 @@ def run_loop(args: argparse.Namespace) -> int:
                             )
                         )
                 last_graph_skip_reasons = graph_skip_reasons
-                run_index = load_run_record_index(repo_root)
                 coordinator_snapshot = fetch_coordinator_lease_snapshot(repo_root)
                 full_queue = [
                     candidate
@@ -3487,6 +3529,8 @@ def _collect_run_rows(
     seen_specs: set[str] = set()
 
     for data in run_index.records:
+        if data.get("phase") == "authoring":
+            continue
         spec_id = str(data.get("spec_id", "")).strip()
         run_id = str(data.get("run_id", "")).strip()
         status = str(data.get("status", "")).strip()
@@ -4084,6 +4128,8 @@ def gc_command(args: argparse.Namespace) -> int:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, TypeError):
+            continue
+        if data.get("phase") == "authoring":
             continue
         spec_id = str(data.get("spec_id", "")).strip()
         if not spec_id:

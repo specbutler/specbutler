@@ -298,7 +298,14 @@ def run_doctor_checks(
     checks.extend(_runtime_path_overlap_checks(runtime_paths))
     checks.extend(_container_checks(repo_root, config, run, resolve_executable))
     checks.extend(_spec_graph_checks(repo_root, config))
+    checks.append(_review_prompt_check(repo_root))
     return DoctorReport(tuple(checks))
+
+
+def _review_prompt_check(repo_root: Path) -> DoctorCheck:
+    from .review_convergence import review_prompt_source_label
+
+    return _ok("review prompt", review_prompt_source_label(repo_root))
 
 
 def _execution_policy_checks(config: SpecRuntimeConfig) -> list[DoctorCheck]:
@@ -477,6 +484,22 @@ def _provider_auth_check(
         logged_in = True
 
     name = f"agent authentication ({agent})"
+    from .provider_env import minimal_provider_environment
+
+    passed_env = minimal_provider_environment(agent)
+    if agent == "claude" and passed_env.get("ANTHROPIC_API_KEY"):
+        return _warning(
+            name, "ANTHROPIC_API_KEY is passed to Claude; in -p mode it takes priority over subscription login and incurs API billing",
+            "Remove ANTHROPIC_API_KEY from the launch environment to use subscription login.",
+        )
+    output = f"{result.stdout} {result.stderr}".casefold()
+    if agent == "codex" and logged_in and "chatgpt" in output and any(
+        passed_env.get(key) for key in ("OPENAI_API_KEY", "CODEX_API_KEY")
+    ):
+        return _warning(
+            name, "OPENAI_API_KEY or CODEX_API_KEY is present alongside a ChatGPT login; launches may incur API billing",
+            "Remove API keys from the launch environment to use ChatGPT login.",
+        )
     if logged_in is True:
         return _ok(name, "provider CLI reports an authenticated session")
 
@@ -619,6 +642,7 @@ def _agent_checks(
             from .agent_adapter import (
                 claude_restricted_mode_unavailability_reason,
                 claude_sandbox_unavailability_reason,
+                claude_session_unavailability_reason,
             )
 
             sandbox_reason = claude_sandbox_unavailability_reason(which=which)
@@ -659,6 +683,24 @@ def _agent_checks(
                         "restricted read-only review mode is available",
                     )
                 )
+            session_reason = claude_session_unavailability_reason(
+                f"{help_result.stdout}\n{help_result.stderr}"
+                if help_result.returncode == 0
+                else ""
+            )
+            checks.append(
+                _warning(
+                    "agent sessions (claude)",
+                    session_reason,
+                    "Upgrade Claude Code: `npm install -g @anthropic-ai/claude-code`.",
+                )
+                if session_reason
+                else _ok(
+                    "agent sessions (claude)",
+                    "implement runs keep one session, resume it for retries, and "
+                    "report completion as structured output",
+                )
+            )
             if config.execution.safety_mode == "native":
                 from .safety_policy import claude_native_unavailability_reason
 
@@ -687,12 +729,31 @@ def _agent_checks(
                 codex_capability_probe_command,
                 codex_capability_probe_unavailability_reason,
                 codex_isolation_unavailability_reason,
+                codex_resume_unavailability_reason,
                 codex_windows_sandbox_probe_command,
                 codex_windows_sandbox_probe_unavailability_reason,
             )
 
             exec_help = run([path, "exec", "--help"], repo_root, 10.0)
             sandbox_help = run([path, "sandbox", "--help"], repo_root, 10.0)
+            resume_help = run([path, "exec", "resume", "--help"], repo_root, 10.0)
+            resume_reason = codex_resume_unavailability_reason(
+                f"{resume_help.stdout}\n{resume_help.stderr}"
+                if resume_help.returncode == 0
+                else ""
+            )
+            checks.append(
+                _warning(
+                    "agent sessions (codex)",
+                    resume_reason,
+                    "Upgrade Codex: `npm install -g @openai/codex`.",
+                )
+                if resume_reason
+                else _ok(
+                    "agent sessions (codex)",
+                    "implement retries resume the run's Codex thread",
+                )
+            )
             isolation_reason = codex_isolation_unavailability_reason(
                 f"{exec_help.stdout}\n{exec_help.stderr}"
                 if exec_help.returncode == 0

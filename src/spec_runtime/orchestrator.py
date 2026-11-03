@@ -54,6 +54,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import uuid
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
@@ -64,19 +65,24 @@ from pathlib import Path, PurePosixPath
 from urllib import parse as urllib_parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import review_feedback, worktree_process_registry
+from . import review_convergence, review_feedback, worktree_process_registry
 from .agent_adapter import (
+    CODEX_REVIEW_CHECKOUT_SHELL,
+    COMPLETION_SCHEMA,
     HostAgentUnavailableError,
     _render_codex_mcp_toml,
     claude_isolated_home,
     claude_restricted_mode_unavailability_reason,
+    claude_session_unavailability_reason,
     codex_capability_probe_command,
     codex_capability_probe_unavailability_reason,
     codex_isolated_home,
+    codex_resume_unavailability_reason,
     codex_windows_sandbox_probe_command,
     codex_windows_sandbox_probe_unavailability_reason,
     codex_windows_sandbox_toml,
     get_agent_adapter,
+    provider_attach_command,
     require_host_agent_available,
 )
 from .agent_git_access import (
@@ -219,12 +225,13 @@ from .sandbox_denials import (
     sandbox_denial_summary,
 )
 from .spec_identity import (
+    LOCAL_REVIEW_OWNER,
     SPEC_ID_RE,
     authoring_branch_identity,
+    extract_review_owner_from_pr_body,
     format_pr_review_owner,
     implementation_branch_identity,
     is_authoring_branch,
-    pr_body_uses_local_review,
     resolve_spec_id_for_pr,
     spec_run_branch,
     spec_run_worktree_name,
@@ -345,7 +352,10 @@ REVIEW_TIMEOUT_SECONDS = 900
 # provider home before the phase gives up (and may fall back to Claude).
 CODEX_REVIEW_STALL_RETRY_TIMEOUT_SECONDS = max(60, REVIEW_TIMEOUT_SECONDS // 2)
 LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT = "high"
-LOCAL_REVIEW_REASONING_EFFORT = "low"
+# Re-reviews keep the first pass's effort unless [review]
+# rereview_reasoning_effort overrides it: a cheaper re-review was a source of
+# goalpost-moving findings.
+LOCAL_REVIEW_REASONING_EFFORT = LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT
 LOCAL_REVIEW_TIMEOUT_STDIO_MAX_LINES = 40
 LOCAL_REVIEW_TIMEOUT_STDIO_MAX_CHARS = 4000
 LOCAL_REVIEW_TIMEOUT_RAW_REVIEW_MAX_CHARS = 4000
@@ -494,7 +504,7 @@ SPEC_PROMPT = (
     "the orchestrator verify phase handles e2e outside the sandbox.\n"
     "5. Do NOT run orchestrator lifecycle commands (`spec implement`, `spec phase`) "
     "and do NOT run publish/merge/cleanup actions. The only orchestrator command "
-    "you should run is `spec report` (see completion step below).\n"
+    "you may run is `spec report` (see the completion step below).\n"
     "6. If local environment limits block test infrastructure (for example Playwright "
     "MachPort/sandbox launch failures), do not report STATUS=blocked for that alone; "
     "report STATUS=ok with the environment note and let the orchestrator verify phase run gates.\n"
@@ -526,7 +536,7 @@ BLOCK_DEBUGGER_PROMPT = (
     "Return a single JSON object matching the required schema."
 )
 MERGE_CONFLICT_PROMPT = (
-    "The PR could not be merged due to conflicts with master. "
+    f"The PR could not be merged due to conflicts with {PR_BASE_BRANCH}. "
     "Resolve the conflicts by running: "
     f"git fetch origin && git merge {BASE_REF}. "
     f"Fix any merge conflicts, run {_format_verify_commands(_non_e2e_verify_commands())} "
@@ -1124,49 +1134,6 @@ def _ensure_local_branch_available(repo_root: Path, branch: str) -> str:
     return f"Branch '{branch}' is not available locally and could not be fetched from origin: {detail}"
 
 
-def _resolve_pg_ctl() -> str | None:
-    """Return a trusted pg_ctl binary path when available."""
-    pg_bin = os.environ.get("SIM_LOCAL_PG_BIN", "").rstrip("/")
-    if pg_bin:
-        candidate = Path(pg_bin) / "pg_ctl"
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-
-    homebrew_pg = Path("/opt/homebrew/opt/postgresql@16/bin/pg_ctl")
-    if homebrew_pg.is_file() and os.access(homebrew_pg, os.X_OK):
-        return str(homebrew_pg)
-
-    return shutil.which("pg_ctl")
-
-
-def _stop_worktree_postgres_if_present(worktree_path: Path) -> None:
-    """Best-effort stop for a worktree-local Postgres cluster before removal."""
-    data_dir = worktree_path / ".local" / "postgres" / "data"
-    if not (data_dir / "postmaster.pid").is_file():
-        return
-
-    pg_ctl = _resolve_pg_ctl()
-    if not pg_ctl:
-        logger.warning(
-            "Cleanup could not stop local Postgres for %s because pg_ctl was not found",
-            worktree_path,
-        )
-        return
-
-    status_result = run_subprocess([pg_ctl, "-D", str(data_dir), "status"])
-    if status_result.returncode != 0:
-        return
-
-    stop_result = run_subprocess([pg_ctl, "-D", str(data_dir), "stop", "-m", "fast"])
-    if stop_result.returncode != 0:
-        detail = redact_sensitive(tail_lines(stop_result.stderr or stop_result.stdout))
-        logger.warning(
-            "Cleanup could not stop local Postgres for %s (non-blocking): %s",
-            worktree_path,
-            detail[-240:],
-        )
-
-
 def _validated_worktree_cleanup_target(
     repo_root: Path,
     worktree_path: Path,
@@ -1221,7 +1188,6 @@ def _cleanup_worktree_checkout(
     except UnsafeWorktreePathError as exc:
         return f"Refusing unsafe worktree cleanup for {worktree_path}: {exc}"
 
-    _stop_worktree_postgres_if_present(worktree_path)
     reap_report = _reap_registered_worktree_processes(
         repo_root,
         worktree_path,
@@ -3589,8 +3555,50 @@ def _diagnostic_note(message: str) -> str:
     return f"{TEST_GATE_DIAGNOSTIC_UNAVAILABLE_PREFIX} {message.strip()}"
 
 
+def _command_is_pytest(args: list[str]) -> bool:
+    """Recognize executable invocation forms, never script or test operands."""
+    if not args:
+        return False
+    executable = args[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if executable in {"pytest", "pytest.exe", "py.test", "py.test.exe"}:
+        return True
+    if not re.fullmatch(r"(?:python(?:\d+(?:\.\d+)*)?|py)(?:\.exe)?", executable):
+        return False
+    index = 1
+    while index < len(args):
+        arg = args[index]
+        if arg == "-m":
+            return args[index + 1:index + 2] == ["pytest"]
+        if arg in {"-W", "-X"}:
+            index += 2
+        elif arg in {"-B", "-E", "-I", "-s", "-S", "-u", "-O", "-OO", "-q"}:
+            index += 1
+        else:
+            return False
+    return False
+
+
+def _gate_is_pytest_like(gate: str) -> bool:
+    config = _verify_gate_config(gate)
+    args = (shlex.split(config.diagnostic_command)
+            if config and config.diagnostic_command else _verify_gate_command_args(gate))
+    return _command_is_pytest(args)
+
+
+def _gate_diagnostic_command(worktree_path: Path, gate: str) -> list[str]:
+    config = _verify_gate_config(gate)
+    if config is not None and config.diagnostic_command:
+        return shlex.split(config.diagnostic_command)
+    args = _verify_gate_command_args(gate)
+    if _command_is_pytest(args):
+        # Preserve interpreter, options, and selection, including a literal --.
+        index = args.index("--") if "--" in args else len(args)
+        return [*args[:index], "--tb=short", "--no-header", "-q", "--maxfail=20", *args[index:]]
+    return []
+
+
 def _test_gate_diagnostic_command(worktree_path: Path) -> list[str]:
-    """Mirror `make test` by running pytest via the worktree virtualenv."""
+    """Run pytest diagnostics through the worktree virtualenv."""
     return [str(_worktree_venv_python(worktree_path)), *TEST_GATE_DIAGNOSTIC_ARGS]
 
 
@@ -3622,8 +3630,14 @@ def _run_failed_test_diagnostic(
     *,
     env: dict[str, str] | None = None,
     backend: ExecutionBackend | None = None,
+    gate: str | None = None,
 ) -> str:
-    diagnostic_command = _test_gate_diagnostic_command(worktree_path)
+    diagnostic_command = (
+        _gate_diagnostic_command(worktree_path, gate)
+        if gate is not None else _test_gate_diagnostic_command(worktree_path)
+    )
+    if not diagnostic_command:
+        return ""
     command = shlex.join(diagnostic_command)
     if backend is None:
         backend = _resolve_execution_backend()
@@ -3641,6 +3655,9 @@ def _run_failed_test_diagnostic(
         return _diagnostic_note(f"timed out after {TEST_GATE_DIAGNOSTIC_TIMEOUT_SECONDS}s while running {command}.")
     except OSError as exc:
         return _diagnostic_note(f"could not start {command}: {exc}.")
+
+    if gate is not None and not _gate_is_pytest_like(gate):
+        return "\n".join(part for part in (result.stdout, result.stderr) if part)
 
     if result.returncode not in {0, 1}:
         detail_parts: list[str] = []
@@ -3896,19 +3913,53 @@ def _format_gate_retry_output(gate_name: str, gate_data: dict) -> str:
     return "\n".join(sections)
 
 
-def is_non_actionable_gate_environment_block(summary: str) -> bool:
-    """Return True when blocked text indicates local sandbox/runtime constraints."""
-    text = (summary or "").lower()
-    if not text:
-        return False
+def _verify_gate_tool_names() -> list[str]:
+    """Tool names agents use for the configured gates ("pytest" for ``python -m pytest``)."""
+    names: list[str] = []
+    for command in VERIFY_GATE_COMMANDS.values():
+        try:
+            tokens = shlex.split(command)
+        except ValueError:
+            continue
+        if "-m" in tokens[:-1]:
+            names.append(tokens[tokens.index("-m") + 1].lower())
+        elif tokens:
+            names.append(Path(tokens[0]).name.lower())
+    return [name for name in names if len(name) >= 4]
 
+
+def _mentions_verify_gate(text: str) -> bool:
     gate_context = (
         *VERIFY_GATE_COMMANDS.values(),
+        *_verify_gate_tool_names(),
         "playwright",
         "browser",
         "pg_ctl",
         "postgres",
     )
+    return any(marker in text for marker in gate_context)
+
+
+def is_non_actionable_gate_environment_block(
+    summary: str,
+    *,
+    sandbox_denial_observed: bool = False,
+) -> bool:
+    """Return True when blocked text indicates local sandbox/runtime constraints.
+
+    ``sandbox_denial_observed`` is the structural signal: the launch's progress
+    tracker saw the provider sandbox deny something. Agents describe those
+    denials in unpredictable words ("denied provider config reads ... under
+    session restrictions"), so when the session really hit the sandbox, a
+    block about the verify gates counts without any wording match.
+    """
+    text = (summary or "").lower()
+    if not text:
+        return False
+    if not _mentions_verify_gate(text):
+        return False
+    if sandbox_denial_observed:
+        return True
     env_signatures = (
         "machport",
         "permission denied",
@@ -3918,8 +3969,17 @@ def is_non_actionable_gate_environment_block(summary: str) -> bool:
         "shmat",
         "bootstrap_check_in",
         "browsers cannot launch",
+        # Agents describe the provider sandbox's denials in their own words
+        # ("denied provider-home writes and unavailable process identity in
+        # this sandbox"). A false positive only sends a clean commit to host
+        # verify, which stays authoritative.
+        "sandbox",
+        "process identity",
+        "inspect launched process",
+        "provider home",
+        "provider-home",
     )
-    return any(marker in text for marker in gate_context) and any(sig in text for sig in env_signatures)
+    return any(sig in text for sig in env_signatures)
 
 
 CLAUDE_CREDENTIALS_PREFLIGHT_MARGIN_SECONDS = 120
@@ -4607,6 +4667,8 @@ def classify_failure(
     """
     raw = str(message or "").strip()
     text = raw.lower()
+    if "budget_exceeded" in text:
+        return FailureClassification(FailureCategory.INFRASTRUCTURE, kind="budget_exceeded")
     infra = _infrastructure_failure_kind(text) if text else None
     if infra is not None:
         kind, transient, scope = infra
@@ -4665,7 +4727,8 @@ def _required_checks_from_error(error: str) -> list[str]:
     idx = lowered.find(marker)
     if idx < 0:
         return []
-    detail = error[idx + len(marker) :].strip()
+    # The check list is one line; callers may append multi-line log summaries.
+    detail = error[idx + len(marker) :].strip().split("\n", 1)[0].strip()
     if not detail:
         return []
     return [part.strip() for part in detail.split(",") if part.strip()]
@@ -7113,13 +7176,8 @@ def _load_spec_creation_prompt(
     if prompt_path.exists():
         prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
-        prompt = (
-            "Author a focused spec for this repository. Read AGENTS.md and "
-            f"`{PurePosixPath(SPEC_RUNTIME_CONFIG.paths.specs_dir) / 'TEMPLATE.md'}` "
-            "first, then write "
-            f"`{PurePosixPath(SPEC_RUNTIME_CONFIG.paths.specs_dir) / '<spec-id>.md'}`, "
-            "commit it locally. Do not run `git push` or create a pull request."
-        )
+        from .init import _read_bundled_template
+        prompt = _read_bundled_template("spec-creation.md").strip()
 
     effective_spec_id = spec_id or _spec_id_from_authoring_branch(branch)
     resume_note = (
@@ -7321,7 +7379,7 @@ def _build_spec_authoring_command(
         "git_isolation",
     ):
         authoring_kwargs["git_isolation"] = git_isolation
-    return adapter.build_authoring_command(**authoring_kwargs)
+    return _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
 
 
 def _print_spec_authoring_summary(
@@ -9168,6 +9226,7 @@ class RunState:
     # remains the convergence/retry budget for compatibility; launch_numbered
     # artifacts keep recovery and post-cap operator resumes from overwriting one
     # another when the convergence count is intentionally unchanged.
+    usage: list[dict] = field(default_factory=list)
     implement_launches: int = 0
     implement_failures: int = 0
     verify_failures: int = 0
@@ -9263,6 +9322,12 @@ class RunState:
     # ``no_progress_retries`` (reset when verify next passes) this survives a
     # resumed run, so history shows the breaker fired.
     no_progress_trips: int = 0
+    # Provider session (Claude session id / Codex thread id) kept across this
+    # run's implement attempts, the agent that owns it, and why the most
+    # recent resume fell back to a fresh session.
+    agent_session_id: str = ""
+    agent_session_agent: str = ""
+    agent_session_fallback_reason: str = ""
 
     def save(self, repo_root: Path) -> Path:
         p = _run_state_path(repo_root, self.run_id)
@@ -9410,12 +9475,12 @@ class RunState:
 
     @property
     def is_resumable(self) -> bool:
-        return self.status in RESUMABLE_RUN_STATUSES
+        return self.phase != "authoring" and self.status in RESUMABLE_RUN_STATUSES
 
     @property
     def is_step_selectable(self) -> bool:
         # Manual phase stepping should continue a run that just passed its prior phase.
-        return self.status in STEP_SELECTABLE_RUN_STATUSES
+        return self.phase != "authoring" and self.status in STEP_SELECTABLE_RUN_STATUSES
 
     @property
     def is_auto_resumable(self) -> bool:
@@ -9449,7 +9514,7 @@ class RunState:
                 data = json.loads(candidate.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
-            if data.get("spec_id") != spec_id:
+            if data.get("spec_id") != spec_id or data.get("phase") == "authoring":
                 continue
             runs.append(cls.from_dict(data))
 
@@ -9766,6 +9831,27 @@ class ImplementResult:
 
 HEARTBEAT_PERSIST_INTERVAL_SECONDS = 60
 
+STRUCTURED_COMPLETION_STATUS_MAP = {
+    "ok": "passed",
+    "blocked": "blocked",
+    "error": "failed",
+    "needs-input": "needs-input",
+}
+
+
+def _validated_structured_completion(payload: object) -> dict | None:
+    """Return *payload* when it satisfies the completion schema contract."""
+    if not isinstance(payload, dict):
+        return None
+    status = payload.get("status")
+    summary = payload.get("summary")
+    question = payload.get("question")
+    if status not in STRUCTURED_COMPLETION_STATUS_MAP or not isinstance(summary, str):
+        return None
+    if question is not None and not isinstance(question, str):
+        return None
+    return {"status": status, "summary": summary, "question": question or ""}
+
 
 @dataclass
 class AgentProgressTracker:
@@ -9785,10 +9871,71 @@ class AgentProgressTracker:
     _sandbox_denial: SandboxDenial | None = field(default=None, repr=False)
     _auth_failure_summary: str = field(default="", repr=False)
     _network_failure_summary: str = field(default="", repr=False)
+    _provider_session_id: str = field(default="", repr=False)
+    _structured_output: object = field(default=None, repr=False)
+    _final_agent_message: str = field(default="", repr=False)
+    usage_events: list[dict] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         if not self.last_event_summary:
             self.last_event_summary = f"{self.agent} launch"
+
+    def record_provider_session(self, session_id: str) -> None:
+        """Remember the provider session/thread id the CLI reported.
+
+        The id is persisted onto the run record immediately so ``spec status``
+        and ``spec watch`` can show it while the agent is still running.
+        """
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return
+        with self._lock:
+            if self._provider_session_id == session_id:
+                return
+            self._provider_session_id = session_id
+        if not self.run_id or self.repo_root is None:
+            return
+        p = _run_state_path(self.repo_root, self.run_id)
+        if not p.exists():
+            return
+        try:
+            with _locked_state_path(p):
+                data = _read_json_dict(p)
+                if data is None:
+                    return
+                data["agent_session_id"] = session_id
+                data["agent_session_agent"] = self.agent
+                _write_json_file_atomically(p, data)
+        except OSError:
+            pass
+
+    def provider_session_id(self) -> str:
+        with self._lock:
+            return self._provider_session_id
+
+    def record_structured_output(self, payload: object) -> None:
+        with self._lock:
+            self._structured_output = payload
+
+    def record_final_agent_message(self, text: str) -> None:
+        with self._lock:
+            self._final_agent_message = text
+
+    def structured_completion(self) -> dict | None:
+        """Return the final structured completion payload, if one is valid.
+
+        Claude reports it as ``structured_output`` on the result event; Codex
+        emits the schema-constrained JSON as its final agent message.
+        """
+        with self._lock:
+            payload = self._structured_output
+            final_message = self._final_agent_message
+        if payload is None and final_message:
+            try:
+                payload = json.loads(final_message)
+            except json.JSONDecodeError:
+                return None
+        return _validated_structured_completion(payload)
 
     def record_sandbox_denials(self, denials: list[SandboxDenial]) -> None:
         """Remember the most recent sandbox or permission denial."""
@@ -9918,6 +10065,13 @@ class ReviewResult:
     source_check_name: str = REVIEW_GATE_CHECK_NAME
     source_check_url: str = ""
     reviewed_at: str = field(default_factory=_now_iso)
+    # Convergence bookkeeping. ``status`` is the orchestrator-computed
+    # decision; ``model_decision`` is what the reviewer itself returned.
+    model_decision: str = ""
+    review_round: int = 0
+    prior_findings: list[dict] = field(default_factory=list)
+    outstanding_findings: list[dict] = field(default_factory=list)
+    blocking_finding_ids: list[str] = field(default_factory=list)
 
     def save(self, repo_root: Path, run_id: str) -> Path:
         d = _state_root(repo_root) / "runs" / run_id
@@ -9943,10 +10097,18 @@ class ReviewResult:
         except (json.JSONDecodeError, TypeError):
             return None
 
-        findings = data.get("findings", [])
-        data["findings"] = [ReviewFinding(**f) for f in findings if isinstance(f, dict)]
+        if not isinstance(data, dict):
+            return None
+        findings = data.get("findings", None) or []
+        finding_keys = {f.name for f in fields(ReviewFinding)}
+        result_keys = {f.name for f in fields(cls)}
         try:
-            return cls(**data)
+            data["findings"] = [
+                ReviewFinding(**{k: v for k, v in f.items() if k in finding_keys})
+                for f in findings
+                if isinstance(f, dict)
+            ]
+            return cls(**{k: v for k, v in data.items() if k in result_keys})
         except TypeError:
             return None
 
@@ -10763,6 +10925,33 @@ class RetryFailurePackage:
     rescue_snapshot_summary: str = ""
 
 
+@dataclass(frozen=True)
+class ProviderSessionSupport:
+    """What the installed provider CLI supports for persistent sessions."""
+
+    persist: bool = False
+    resume: bool = False
+    structured_output: bool = False
+
+
+@dataclass(frozen=True)
+class AgentSessionPlan:
+    """How one implement launch uses the run's provider session.
+
+    ``session_id`` names a new Claude session (Codex assigns its own thread
+    id). ``resume_session_id`` continues the run's existing session with a
+    delta prompt.
+    """
+
+    session_id: str = ""
+    resume_session_id: str = ""
+    structured_output: bool = False
+
+    @property
+    def resumes(self) -> bool:
+        return bool(self.resume_session_id)
+
+
 @dataclass
 class ImplementLaunchPlan:
     use_stream_json: bool
@@ -10778,6 +10967,12 @@ class ImplementLaunchPlan:
     claude_private_home: Path | None = None
     claude_private_home_context: tempfile.TemporaryDirectory[str] | None = None
     git_isolation: AgentGitIsolation | None = None
+    session: AgentSessionPlan = field(default_factory=AgentSessionPlan)
+    completion_outbox_path: Path | None = None
+    codex_home: Path | None = None
+    # Transient ``.spec-claude-home`` of a container launch; its transcripts
+    # are archived before the home is removed.
+    claude_isolated_home: Path | None = None
 
 
 @dataclass
@@ -12030,8 +12225,8 @@ def _maybe_run_block_debugger(
                             debugger_env, debugger_codex_home
                         )
                     try:
-                        completed = _run_local_review_subprocess(
-                            repo_root,
+                        completed = _run_usage_subprocess(
+                            run, "debugger", debugger_agent, repo_root,
                             cmd,
                             cwd=(
                                 output_dir
@@ -12612,13 +12807,24 @@ def _check_name_matches(actual: str, expected: str) -> bool:
     return review_feedback.check_name_matches(actual, expected)
 
 
+class PrLookupUnavailable(RuntimeError):
+    """Neither GitHub frontend answered a PR lookup (an outage, not "no PR")."""
+
+
 def _find_pr_for_branch(
     repo_root: Path,
     branch: str,
     *,
     state: str = "open",
     repo_slug: str = "",
+    raise_on_error: bool = False,
 ) -> dict | None:
+    """Return the newest PR for ``branch``, or None when there is none.
+
+    With ``raise_on_error``, a lookup that no forge frontend answered raises
+    :class:`PrLookupUnavailable` instead of returning None, so pollers can
+    tell a network outage from a PR that really is gone.
+    """
     pr_check = run_subprocess(
         [
             "gh",
@@ -12646,6 +12852,7 @@ def _find_pr_for_branch(
             branch,
             state=state,
             repo_slug=repo_slug,
+            raise_on_error=raise_on_error,
         )
     pr_info = pr_check.stdout.strip()
     if not pr_info:
@@ -12662,6 +12869,7 @@ def _find_pr_for_branch(
             branch,
             state=state,
             repo_slug=repo_slug,
+            raise_on_error=raise_on_error,
         )
     return parsed if isinstance(parsed, dict) else None
 
@@ -12672,6 +12880,7 @@ def _find_pr_for_branch_via_rest(
     *,
     state: str,
     repo_slug: str = "",
+    raise_on_error: bool = False,
 ) -> dict | None:
     """Fall back to GitHub REST when ``gh pr list`` GraphQL is unavailable.
 
@@ -12711,12 +12920,16 @@ def _find_pr_for_branch_via_rest(
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
         logger.warning("PR REST fallback failed for branch %s: %s", branch, detail)
+        if raise_on_error:
+            raise PrLookupUnavailable(detail)
         return None
 
     try:
         payload = json.loads(result.stdout or "[]")
     except json.JSONDecodeError:
         logger.warning("Could not decode PR REST fallback response for branch %s", branch)
+        if raise_on_error:
+            raise PrLookupUnavailable("undecodable PR REST response")
         return None
     if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
         return None
@@ -12782,7 +12995,7 @@ def _post_merge_commit_candidates(
     current_master_ref: str,
 ) -> tuple[list[str], str]:
     if not previous_master_sha:
-        return [], "pre-merge origin/master SHA is unavailable"
+        return [], f"pre-merge {BASE_REF} SHA is unavailable"
 
     current_master_sha = _resolve_git_ref_sha(repo_root, current_master_ref)
     if not current_master_sha:
@@ -12843,7 +13056,7 @@ def _infer_merge_commit_from_post_merge_history(
         )
 
     return "", (
-        "multiple commits landed after the pre-merge origin/master SHA, and none "
+        f"multiple commits landed after the pre-merge {BASE_REF} SHA, and none "
         f"uniquely reference spec {run.spec_id!r} for PR #{pr_number}: "
         f"{', '.join(_short_sha(sha) for sha in candidates)}"
     )
@@ -13092,6 +13305,45 @@ def _local_review_agent_label(agent_name: str) -> str:
     return aliases.get(normalized.lower(), normalized)
 
 
+def _bundled_review_schema_path() -> Path:
+    import importlib.resources
+
+    return Path(str(importlib.resources.files("spec_runtime") / "templates" / "review-schema.json"))
+
+
+def _resolve_local_review_schema_path(repo_root: Path, output_dir: Path) -> Path:
+    """Return the review schema used for both the launch and validation.
+
+    A repo-level ``.github/schemas/codex-review.schema.json`` wins over the
+    bundled schema. Repositories initialised before re-review classification
+    existed keep a copy whose ``additionalProperties: false`` forbids
+    ``prior_findings``, so the reviewer could never classify prior findings.
+    Such schemas are upgraded with the bundled ``prior_findings`` definition
+    into a run-local copy; the repository file itself is left untouched.
+    """
+    repo_schema_path = repo_root / ".github" / "schemas" / "codex-review.schema.json"
+    if not repo_schema_path.is_file():
+        return _bundled_review_schema_path()
+    try:
+        repo_schema = json.loads(repo_schema_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        # Leave malformed schemas to the review gate, which reports them.
+        return repo_schema_path
+    from .review_gate import upgrade_legacy_review_schema
+
+    upgraded = upgrade_legacy_review_schema(repo_schema) if isinstance(repo_schema, dict) else None
+    if upgraded is None:
+        return repo_schema_path
+    logger.info(
+        "Upgrading legacy review schema %s with prior_findings for this review",
+        repo_schema_path,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    upgraded_path = output_dir / "review-schema.effective.json"
+    upgraded_path.write_text(json.dumps(upgraded, indent=2) + "\n", encoding="utf-8")
+    return upgraded_path
+
+
 def _configured_review_agent_default() -> str:
     return str(SPEC_RUNTIME_CONFIG.agents.review_default or "").strip()
 
@@ -13323,6 +13575,7 @@ def _format_gate_evidence_for_review(
     run: "RunState",
     *,
     expected_head_sha: str = "",
+    review_agent: str = "",
 ) -> str:
     """Summarize the orchestrator's own gate run for the reviewer.
 
@@ -13378,15 +13631,28 @@ def _format_gate_evidence_for_review(
             attachments.extend(rendered)
     if not lines:
         return ""
+    if review_agent == "codex":
+        capability_note = (
+            "The Codex reviewer may run read-only commands against the review "
+            "checkout, but cannot install packages or reach the network, and "
+            "commands outside read-only inspection (interpreters, test runners, "
+            "builds, checkout scripts) are rejected, so do not rerun these gates. "
+            "Do not report that limitation as a product finding."
+        )
+    else:
+        capability_note = (
+            "Built-in reviewers do not receive executable shell capabilities and "
+            "cannot run additional commands. Do not report that limitation as a "
+            "product finding."
+        )
     return (
         "## Verification already performed by the orchestrator\n\n"
         "These gates were run against this exact head commit by the orchestrator, "
         "outside your sandbox, before review started:\n\n"
         + "\n".join(lines)
-        + "\n\nTreat these as authoritative. Built-in reviewers do not receive executable "
-        "shell capabilities and cannot run additional commands. Do not report that "
-        "limitation as a product finding. Judge the supplied diff on correctness "
-        "against the spec and rely on the results above for required-gate status.\n"
+        + f"\n\nTreat these as authoritative. {capability_note} Judge the supplied diff "
+        "on correctness against the spec and rely on the results above for "
+        "required-gate status.\n"
         + (
             "\n## Host-materialized gate attachments\n\n"
             "The orchestrator read only configured, bounded receipt paths; verified "
@@ -13412,12 +13678,11 @@ def _render_local_review_prompt(
     pr_body: str,
     review_changes: int = 0,
     gate_evidence: str = "",
+    rereview_context: str = "",
 ) -> str:
     # Look for repo-level override, then bundled template
-    template_path = repo_root / ".github" / "prompts" / "review.md"
-    if not template_path.is_file():
-        template_path = repo_root / ".github" / "prompts" / "codex-review.md"
-    if template_path.is_file():
+    template_path = review_convergence.resolve_review_prompt_path(repo_root)
+    if template_path is not None:
         # Current ``spec init`` writes repository templates as UTF-8. Older
         # native-Windows releases used the active ANSI code page, though, and
         # the bundled em dash therefore became an invalid UTF-8 byte. Keep
@@ -13449,7 +13714,11 @@ def _render_local_review_prompt(
             rendered = f"{rendered.rstrip()}\n\n{gate_evidence}"
     else:
         rendered = rendered.replace("${GATE_RESULTS}", "")
-    if review_changes == 0:
+    if rereview_context:
+        # Appended rather than templated so repo-level prompts that predate
+        # re-review context still receive it.
+        rendered = f"{rendered.rstrip()}\n\n{rereview_context}"
+    elif review_changes == 0:
         rendered = f"{LOCAL_REVIEW_FIRST_PASS_EXHAUSTIVE_INSTRUCTION}\n\n{rendered}"
     return rendered
 
@@ -13636,6 +13905,96 @@ def _build_local_review_env(
     return env
 
 
+class BudgetExceeded(RuntimeError):
+    """The configured estimated run budget has been consumed."""
+
+
+def _check_budget(run: RunState) -> None:
+    from .usage import totals
+    limit = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
+    if limit is not None and (
+        (totals(run.usage)["estimated_cost_usd"] or 0) >= limit
+        or any(row.get("budget_exceeded") and limit <= (row.get("budget_limit_usd") or limit)
+               for row in run.usage)
+    ):
+        raise BudgetExceeded("budget_exceeded")
+
+
+def _model_command(cmd: list[str], role: str, provider: str, failures: int = 0) -> list[str]:
+    model = SPEC_RUNTIME_CONFIG.agents.model_for(role, provider, failures)
+    if not model:
+        return cmd
+    cmd = list(cmd)
+    if "--model" in cmd:
+        cmd[cmd.index("--model") + 1] = model
+    else:
+        cmd[1:1] = ["--model", model]
+    return cmd
+
+
+def _budget_command(cmd: list[str], run: RunState) -> list[str]:
+    from .usage import totals
+    _check_budget(run)
+    limit = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
+    if limit is None or not cmd or Path(cmd[0]).stem != "claude":
+        return cmd
+    remaining = limit - (totals(run.usage)["estimated_cost_usd"] or 0)
+    return [cmd[0], "--max-budget-usd", str(remaining), *cmd[1:]]
+
+
+def _begin_usage(run: RunState, repo_root: Path, role: str, provider: str, cmd: list[str]) -> dict:
+    from .usage import new_launch
+    model = cmd[cmd.index("--model") + 1] if "--model" in cmd else ""
+    launch = new_launch(role, provider, model, run.phase)
+    launch["budget_limit_usd"] = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
+    run.usage.append(launch)
+    run.save(repo_root)
+    return launch
+
+
+def _run_interactive_usage(run, repo_root, provider, cmd, *, cwd, env):
+    from .usage import collect_transcript_usage, transcript_snapshot
+    cmd = _budget_command(cmd, run)
+    launch = _begin_usage(run, repo_root, "authoring", provider, cmd)
+    snapshot = transcript_snapshot(provider, cwd, env)
+    try:
+        return _run_interactive_agent_owned(cmd, cwd=cwd, env=env)
+    finally:
+        collect_transcript_usage(launch, cwd, snapshot)
+        run.save(repo_root)
+
+
+def _run_usage_subprocess(run: RunState, role: str, provider: str, repo_root: Path,
+                          cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    from .usage import parse_event, update_launch
+    cmd = _budget_command(cmd, run)
+    launch = _begin_usage(run, repo_root, role, provider, cmd)
+    try:
+        result = _run_local_review_subprocess(repo_root, cmd, **kwargs)
+        for line in (result.stdout or "").splitlines():
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            parsed = parse_event(provider, event)
+            if parsed is not None:
+                update_launch(launch, parsed)
+                # Keep the provider envelope in the receipt, while existing
+                # review/debugger consumers receive their requested JSON body.
+                if provider == "claude" and isinstance(event.get("result"), str):
+                    result.stdout = event["result"]
+        return result
+    finally:
+        run.save(repo_root)
+
+
+def _usage_analytics(runs: list[RunState]) -> dict:
+    from .usage import grouped, totals
+    rows = [row for run in runs for row in run.usage]
+    return {"total": totals(rows), "months": grouped(rows, "recorded_at"),
+            "roles": grouped(rows, "role"), "providers": grouped(rows, "provider")}
+
+
 def _build_local_review_command(
     *,
     prompt: str,
@@ -13645,6 +14004,8 @@ def _build_local_review_command(
     reasoning_effort: str = LOCAL_REVIEW_REASONING_EFFORT,
     mcp_config_path: Path | None = None,
     writable_temp_dir: Path | None = None,
+    review_checkout: Path | None = None,
+    provider_home: Path | None = None,
 ) -> list[str]:
     from .agent_adapter import get_agent_adapter
 
@@ -13658,7 +14019,18 @@ def _build_local_review_command(
         review_kwargs["mcp_config_path"] = mcp_config_path
     if _adapter_method_accepts_kwarg(agent.build_review_command, "writable_temp_dir"):
         review_kwargs["writable_temp_dir"] = writable_temp_dir
-    return agent.build_review_command(**review_kwargs)
+    optional_kwargs = {
+        "review_checkout": review_checkout,
+        "provider_home": provider_home,
+        "reasoning_effort": reasoning_effort,
+    }
+    for key, value in optional_kwargs.items():
+        if value and _adapter_method_accepts_kwarg(agent.build_review_command, key):
+            review_kwargs[key] = value
+    return _model_command(
+        agent.build_review_command(**review_kwargs), "review",
+        agent_name or _configured_review_agent_default() or SPEC_RUNTIME_CONFIG.agents.default,
+    )
 
 
 def _block_debugger_artifact_paths(repo_root: Path, run_id: str) -> dict[str, Path]:
@@ -13700,7 +14072,7 @@ def _build_block_debugger_command(
     agent = get_agent_adapter(agent_name or _configured_review_agent_default() or SPEC_RUNTIME_CONFIG.agents.default)
     if agent.name == "claude":
         del prompt, writable_output_dir, mcp_config_path
-        return [
+        return _model_command([
             "claude",
             "-p",
             "--restricted",
@@ -13711,14 +14083,15 @@ def _build_block_debugger_command(
             "",
             "--strict-mcp-config",
             "--no-session-persistence",
-        ]
+            "--output-format", "json",
+        ], "debugger", agent.name)
     if agent.name == "codex":
-        return agent.build_review_command(
+        return _model_command(agent.build_review_command(
             prompt=prompt,
             output_path=output_path,
             schema_path=schema_path,
             writable_temp_dir=writable_output_dir,
-        )
+        ), "debugger", agent.name)
     review_kwargs: dict[str, object] = {
         "prompt": prompt,
         "output_path": output_path,
@@ -13726,7 +14099,7 @@ def _build_block_debugger_command(
     }
     if _adapter_method_accepts_kwarg(agent.build_review_command, "mcp_config_path"):
         review_kwargs["mcp_config_path"] = mcp_config_path
-    return agent.build_review_command(**review_kwargs)
+    return _model_command(agent.build_review_command(**review_kwargs), "debugger", agent.name)
 
 
 def _render_block_debugger_prompt(
@@ -13872,6 +14245,17 @@ def _load_review_result_from_gate_output(result_path: Path) -> ReviewResult:
         source_check_name=str(payload.get("source_check_name", REVIEW_GATE_CHECK_NAME)).strip()
         or REVIEW_GATE_CHECK_NAME,
         source_check_url=str(payload.get("source_check_url", "")).strip(),
+        model_decision=str(payload.get("model_decision", "") or "").strip(),
+        review_round=_coerce_optional_int(payload.get("review_round")) or 0,
+        prior_findings=[
+            item for item in payload.get("prior_findings", None) or [] if isinstance(item, dict)
+        ],
+        outstanding_findings=[
+            item for item in payload.get("outstanding_findings", None) or [] if isinstance(item, dict)
+        ],
+        blocking_finding_ids=[
+            str(item) for item in payload.get("blocking_finding_ids", None) or []
+        ],
         reviewed_at=str(payload.get("reviewed_at", _now_iso())).strip(),
     )
 
@@ -14031,7 +14415,10 @@ def _mark_local_review_for_rerun_after_sync(
     pr_body: str,
     current_head_sha: str,
 ) -> bool:
-    if not pr_body_uses_local_review(pr_body):
+    # In local mode, an explicit external owner exempts the PR from reruns.
+    # CI mode also invalidates computed decisions when the head changes.
+    review_owner = extract_review_owner_from_pr_body(pr_body)
+    if SPEC_RUNTIME_CONFIG.review.source == "local" and review_owner and review_owner != LOCAL_REVIEW_OWNER:
         return False
     if not current_head_sha:
         return False
@@ -14108,6 +14495,8 @@ def _restore_approved_local_review_status_if_pending(
     merge polling, re-publish the saved decision only when that exact required
     check is pending and the approval still covers the expected head.
     """
+    if SPEC_RUNTIME_CONFIG.review.source != "local":
+        return False, ""
     if REVIEW_GATE_CHECK_NAME.lower() not in checks_error.lower():
         return False, ""
     if run.review_decision_status != "approved":
@@ -14953,13 +15342,13 @@ def _dirty_pr_state_allows_continue(
     if mergeability_check.status in {"success", "noop"}:
         issue = (
             f"PR for branch {run.branch} reports mergeStateStatus=DIRTY during {context}, "
-            "but a local merge against origin/master is clean. Treating this as stale "
+            f"but a local merge against {BASE_REF} is clean. Treating this as stale "
             "or remote-only DIRTY PR state."
         )
         if isinstance(pr_number, int):
             issue = (
                 f"PR #{pr_number} for branch {run.branch} reports mergeStateStatus=DIRTY "
-                f"during {context}, but a local merge against origin/master is clean. "
+                f"during {context}, but a local merge against {BASE_REF} is clean. "
                 "Treating this as stale or remote-only DIRTY PR state."
             )
         run.merge_conflict_error = ""
@@ -14968,8 +15357,8 @@ def _dirty_pr_state_allows_continue(
         return True
 
     if mergeability_check.status == "conflict":
-        detail = mergeability_check.stderr or "git merge origin/master reported conflicts"
-        issue = f"Confirmed local merge conflict with origin/master during {context}: {detail}"
+        detail = mergeability_check.stderr or f"git merge {BASE_REF} reported conflicts"
+        issue = f"Confirmed local merge conflict with {BASE_REF} during {context}: {detail}"
         run.merge_conflict_error = issue
         run.mergeability_issue = issue
         run.last_error = issue
@@ -15068,12 +15457,21 @@ def _wait_for_pr_merged(
     poll_interval = max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS)
 
     while True:
-        pr_data = _find_pr_for_branch(
-            repo_root,
-            branch,
-            state="all",
-            repo_slug=repo_slug,
-        )
+        try:
+            pr_data = _find_pr_for_branch(
+                repo_root,
+                branch,
+                state="all",
+                repo_slug=repo_slug,
+                raise_on_error=True,
+            )
+        except PrLookupUnavailable as exc:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False, f"Could not query PR #{pr_number} while waiting for merge: {exc}"
+            logger.warning("PR #%s lookup failed while waiting for merge; retrying: %s", pr_number, exc)
+            _poll_sleep(min(poll_interval, remaining))
+            continue
         if pr_data is None:
             return False, f"Could not query PR #{pr_number} while waiting for merge"
 
@@ -15479,15 +15877,11 @@ def _load_task_scoping_prompt(
 ) -> str:
     """Build the prompt for the task-scoping conversation."""
     prompt_path = repo_root / TASK_SCOPING_PROMPT_FILE
-    top_level_spec_pattern = f"{SPEC_RUNTIME_CONFIG.paths.specs_dir}/*.md"
     if prompt_path.exists():
         prompt = prompt_path.read_text(encoding="utf-8").strip()
     else:
-        prompt = (
-            "You are a task-scoping assistant. Ask the user what they want to build, "
-            f"explore the codebase, agree on scope, then write exactly one task spec at "
-            f"{TASK_SPEC_DIR}/<spec-id>.md. Do not write top-level {top_level_spec_pattern} files in task mode."
-        )
+        from .init import _read_bundled_template
+        prompt = _read_bundled_template("task-scoping.md").strip()
     slug_note = (
         "Slug: choose a slug during the conversation, then write the spec to "
         f"`{TASK_SPEC_DIR}/<slug>.md` with matching frontmatter `id: <slug>`. "
@@ -15741,7 +16135,7 @@ def _build_task_scoping_command(
         "git_isolation",
     ):
         authoring_kwargs["git_isolation"] = git_isolation
-    return adapter.build_authoring_command(**authoring_kwargs)
+    return _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
 
 
 def _agent_exit_suffix(agent: str) -> str:
@@ -15845,8 +16239,8 @@ def phase_scoping(run: RunState, repo_root: Path) -> str:
     print(f"Tip: when scoping is done, {exit_hint} to start implementation.")
 
     try:
-        completed = _run_interactive_agent_owned(
-            cmd,
+        completed = _run_interactive_usage(
+            run, repo_root, run.agent, cmd,
             cwd=worktree_path,
             env=authoring_env,
         )
@@ -16463,15 +16857,554 @@ def _unattended_launch_safety(agent: str, backend: ExecutionBackend) -> LaunchSa
     )
 
 
-def _claude_supports_stream_json() -> bool:
-    """Return True if the installed Claude CLI supports --output-format stream-json."""
+PROVIDER_HELP_PROBE_TIMEOUT = 60
+
+
+def _provider_help_text(
+    argv: list[str],
+    *,
+    backend: ExecutionBackend | None = None,
+    worktree_path: Path | None = None,
+) -> str:
+    """Return a provider CLI's help output, or "" when the probe fails.
+
+    The probe runs where the agent will run: on the host for host backends,
+    and inside the worker for container backends, whose provider CLI is the
+    image's, not the operator's.
+    """
     try:
-        result = run_subprocess(["claude", "--help"])
-        if result.returncode == 0 and "stream-json" in (result.stdout or ""):
-            return True
-    except FileNotFoundError:
-        pass
+        if (
+            backend is not None
+            and worktree_path is not None
+            and not _backend_launches_agent_on_host(backend)
+        ):
+            result = backend.run_command(
+                CommandRequest(
+                    argv=argv,
+                    cwd=worktree_path,
+                    inherit_env=False,
+                    timeout=PROVIDER_HELP_PROBE_TIMEOUT,
+                )
+            )
+        else:
+            result = run_subprocess(argv)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    return f"{result.stdout or ''}\n{result.stderr or ''}"
+
+
+def _claude_supports_stream_json(
+    backend: ExecutionBackend | None = None,
+    worktree_path: Path | None = None,
+) -> bool:
+    """Return True if the Claude CLI that will run supports stream-json output."""
+    return "stream-json" in _provider_help_text(
+        ["claude", "--help"],
+        backend=backend,
+        worktree_path=worktree_path,
+    )
+
+
+COMPLETION_SCHEMA_FILENAME = "completion-schema.json"
+RESUMED_SESSION_PREAMBLE = (
+    "This message continues your earlier implement session for this run. The spec "
+    "contract, exit checklist and project instructions from the start of the session "
+    "still apply; what follows is only what changed since your last turn."
+)
+STRUCTURED_COMPLETION_INSTRUCTION = (
+    "Report completion through your final response, which is captured as the "
+    "structured completion result: set status (ok, blocked, error or needs-input), a "
+    "plain-text summary, and question when you need operator input (otherwise null). "
+    "Running `spec report` is optional and only a fallback; if you run it anyway, still "
+    "end with that final response, which takes precedence over the report."
+)
+
+
+def _provider_session_support(
+    agent: str,
+    backend: ExecutionBackend | None = None,
+    worktree_path: Path | None = None,
+) -> ProviderSessionSupport:
+    """Probe the provider CLI that will run for persistent-session controls.
+
+    A missing flag degrades to the stateless behaviour (a fresh, unpersisted
+    session per attempt and completion through ``spec report``) rather than
+    failing the launch; ``spec doctor`` reports the gap as a warning.
+    """
+
+    def help_text(argv: list[str]) -> str:
+        return _provider_help_text(argv, backend=backend, worktree_path=worktree_path)
+
+    if agent == "claude":
+        supported = not claude_session_unavailability_reason(help_text(["claude", "--help"]))
+        return ProviderSessionSupport(
+            persist=supported,
+            resume=supported,
+            structured_output=supported,
+        )
+    if agent == "codex":
+        exec_text = help_text(["codex", "exec", "--help"])
+        resume_text = help_text(["codex", "exec", "resume", "--help"])
+        # Codex implement threads are already persisted (no --ephemeral);
+        # only resuming them needs the `exec resume` subcommand.
+        return ProviderSessionSupport(
+            persist=True,
+            resume=not codex_resume_unavailability_reason(resume_text),
+            structured_output="--output-schema" in exec_text,
+        )
+    return ProviderSessionSupport()
+
+
+def _fresh_agent_session_plan(run: RunState, *, structured_output: bool) -> AgentSessionPlan:
+    # Claude accepts a caller-chosen id; Codex reports its thread id once the
+    # thread starts.
+    return AgentSessionPlan(
+        session_id=str(uuid.uuid4()) if run.agent == "claude" else "",
+        structured_output=structured_output,
+    )
+
+
+def _plan_agent_session(
+    run: RunState,
+    *,
+    use_stream_json: bool,
+    backend: ExecutionBackend | None = None,
+    worktree_path: Path | None = None,
+) -> AgentSessionPlan:
+    """Decide whether this launch starts, resumes, or skips a provider session.
+
+    The run record only carries a session id once an earlier launch of this
+    run started one, so that id (not the attempt count or implement reason)
+    decides whether to resume: answering operator input or retrying an
+    interrupted first launch leaves ``run.attempts`` at zero but must still
+    continue the existing session.
+    """
+    support = _provider_session_support(run.agent, backend, worktree_path)
+    # Claude's structured result arrives on the stream-json result event, so
+    # it is only readable when the orchestrator owns stdout.
+    structured_output = support.structured_output and (
+        run.agent != "claude" or use_stream_json
+    )
+    if not support.persist:
+        return AgentSessionPlan(structured_output=structured_output)
+    if (
+        support.resume
+        and run.agent_session_id
+        and run.agent_session_agent == run.agent
+    ):
+        return AgentSessionPlan(
+            resume_session_id=run.agent_session_id,
+            structured_output=structured_output,
+        )
+    return _fresh_agent_session_plan(run, structured_output=structured_output)
+
+
+def _record_planned_agent_session(
+    run: RunState,
+    repo_root: Path,
+    session: AgentSessionPlan,
+) -> None:
+    """Store the session a launch is about to use on the run record."""
+    if session.resumes:
+        return
+    # A fresh session replaces the old one; Codex fills its id in once the
+    # thread.started event arrives.
+    run.agent_session_id = session.session_id if run.agent == "claude" else ""
+    run.agent_session_agent = run.agent if run.agent_session_id else ""
+    run.save(repo_root)
+
+
+def _record_agent_session_after_launch(
+    run: RunState,
+    repo_root: Path,
+    plan: ImplementLaunchPlan,
+) -> None:
+    tracker = plan.progress_tracker
+    observed = tracker.provider_session_id() if tracker is not None else ""
+    session_id = observed or plan.session.resume_session_id or (
+        plan.session.session_id if run.agent == "claude" else ""
+    )
+    if not session_id:
+        return
+    run.agent_session_id = session_id
+    run.agent_session_agent = run.agent
+    run.save(repo_root)
+
+
+def _resume_failure_reason(
+    run: RunState,
+    plan: ImplementLaunchPlan,
+    exit_code: int,
+    worktree_path: Path,
+    workspace_before: str,
+) -> str:
+    """Explain why a resumed launch never got its session going, or return "".
+
+    A resume counts as failed when the CLI exited nonzero without confirming
+    the session, reporting completion, or changing the workspace relative to
+    *workspace_before* (changes that predate the launch, such as an unresolved
+    merge or unfinished edits, do not count). Provider authentication,
+    capacity and network failures are excluded: a fresh session would hit
+    them too.
+    """
+    if not plan.session.resumes or exit_code == 0:
+        return ""
+    tracker = plan.progress_tracker
+    last_event = ""
+    if tracker is not None:
+        if tracker.provider_session_id() or tracker.structured_completion() is not None:
+            return ""
+        if tracker.auth_failure_summary() or tracker.network_failure_summary():
+            return ""
+        _, last_event = tracker.snapshot()
+        if _is_agent_capacity_failure_message(last_event):
+            return ""
+    if plan.completion_outbox_path is not None and plan.completion_outbox_path.exists():
+        return ""
+    if _worktree_change_fingerprint(worktree_path) != workspace_before:
+        return ""
+    detail = f"; last output: {last_event}" if last_event else ""
+    return (
+        f"{run.agent} could not resume session {plan.session.resume_session_id} "
+        f"(exit code {exit_code}{detail})"
+    )
+
+
+def _worktree_change_fingerprint(worktree_path: Path) -> str:
+    """Digest HEAD plus the content of every changed or untracked path.
+
+    Unlike the dirty-file list alone, this notices further edits to files that
+    were already dirty, so a launch can be judged on what it changed.
+    """
+    digest = hashlib.sha256()
+    digest.update((_head_sha(worktree_path) or "").encode())
+    for line in sorted(_worktree_dirty_files(worktree_path)):
+        digest.update(b"\0" + line.encode("utf-8", "surrogateescape"))
+        # Porcelain v1: "XY path" or "XY old -> new".
+        relative = line[3:].split(" -> ")[-1].strip().strip('"')
+        path = worktree_path / relative
+        if not relative or not path.is_relative_to(worktree_path):
+            continue
+        files = (
+            sorted(item for item in path.rglob("*") if item.is_file() and not item.is_symlink())
+            if path.is_dir() and not path.is_symlink()
+            else [path]
+        )
+        for item in files:
+            digest.update(b"\0" + item.relative_to(worktree_path).as_posix().encode())
+            try:
+                if item.is_symlink():
+                    digest.update(os.readlink(item).encode())
+                else:
+                    digest.update(hashlib.sha256(item.read_bytes()).digest())
+            except OSError:
+                digest.update(b"<missing>")
+    return digest.hexdigest()
+
+
+def _codex_session_archive_dir(repo_root: Path, run_id: str) -> Path:
+    """Run-scoped copy of Codex rollouts that outlives the launch home."""
+    return _state_root(repo_root) / "runs" / run_id / "codex-sessions"
+
+
+def _claude_session_archive_dir(repo_root: Path, run_id: str) -> Path:
+    """Run-scoped copy of Claude transcripts from a disposable isolated home.
+
+    Mirrors the provider's ``projects/`` tree. Only launches whose ``HOME`` is
+    the transient ``.spec-claude-home`` (container workers) are archived; host
+    launches already write into the operator's Claude config directory.
+    """
+    return _state_root(repo_root) / "runs" / run_id / "claude-sessions"
+
+
+# Relative to the workspace: where a container Claude launch keeps transcripts.
+CLAUDE_ISOLATED_PROJECTS_RELPATH = ".spec-claude-home/.claude/projects"
+
+
+def _live_provider_sessions_path(repo_root: Path, run_id: str) -> Path:
+    """Pointer to where the running launch's provider writes its sessions."""
+    return _state_root(repo_root) / "runs" / run_id / "live-provider-sessions.json"
+
+
+def _copy_codex_sessions(source: Path, destination: Path) -> None:
+    _copy_provider_sessions(source, destination)
+
+
+def _copy_provider_sessions(
+    source: Path,
+    destination: Path,
+    *,
+    trim_partial_lines: bool = False,
+) -> None:
+    """Copy a provider session tree without following links.
+
+    With *trim_partial_lines*, each copied ``.jsonl`` file ends at its last
+    complete line, so a snapshot of a file the provider is still appending
+    to never carries a half-written record.
+    """
+    if not source.is_dir() or source.is_symlink():
+        return
+
+    def skip_links(directory: str, names: list[str]) -> list[str]:
+        # Rollouts are plain files; never follow or carry a link out of a
+        # provider home (a container worker's home included).
+        return [name for name in names if os.path.islink(os.path.join(directory, name))]
+
+    def copy_complete_lines(src: str, dst: str) -> str:
+        if not src.endswith(".jsonl"):
+            return shutil.copy2(src, dst)
+        data = Path(src).read_bytes()
+        Path(dst).write_bytes(data[: data.rfind(b"\n") + 1])
+        return dst
+
+    try:
+        shutil.copytree(
+            source,
+            destination,
+            ignore=skip_links,
+            dirs_exist_ok=True,
+            copy_function=copy_complete_lines if trim_partial_lines else shutil.copy2,
+        )
+    except OSError as exc:
+        logger.warning("Could not copy provider sessions %s -> %s: %s", source, destination, exc)
+
+
+def _merge_operator_session_file(source: Path, target: Path) -> str:
+    """Place one session file into an operator-owned store without losing history.
+
+    The operator may have resumed the session interactively since an earlier
+    attach, so an existing file is only replaced when the incoming copy
+    extends it (provider transcripts are append-only). Returns ``restored``,
+    ``current`` (already identical), ``kept-newer`` (the operator's copy
+    extends the incoming one, or a non-transcript file already exists) or
+    ``kept-diverged`` (both gained different records, or the target is a link).
+    """
+    if target.is_symlink():
+        return "kept-diverged"
+    if target.exists():
+        if not target.is_file():
+            return "kept-diverged"
+        if source.suffix != ".jsonl":
+            return "kept-newer"
+        incoming = source.read_bytes()
+        existing = target.read_bytes()
+        if incoming == existing:
+            return "current"
+        if existing.startswith(incoming):
+            return "kept-newer"
+        if not incoming.startswith(existing):
+            return "kept-diverged"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = target.with_name(f".{target.name}.spec-restore")
+    shutil.copyfile(source, staging)
+    os.replace(staging, target)
+    return "restored"
+
+
+def _merge_operator_sessions(source: Path, destination: Path) -> dict[str, list[Path]]:
+    """Merge a provider session tree into the operator's own provider home.
+
+    Unlike :func:`_copy_provider_sessions` (which refreshes run-owned launch
+    homes and archives), this never overwrites operator progress; see
+    :func:`_merge_operator_session_file`. Returns the targets per outcome.
+    """
+    outcomes: dict[str, list[Path]] = {}
+    if not source.is_dir() or source.is_symlink():
+        return outcomes
+    for directory, dirnames, filenames in os.walk(source, followlinks=False):
+        current = Path(directory)
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        for name in filenames:
+            path = current / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            target = destination / path.relative_to(source)
+            try:
+                outcome = _merge_operator_session_file(path, target)
+            except OSError as exc:
+                logger.warning("Could not restore session file %s -> %s: %s", path, target, exc)
+                continue
+            outcomes.setdefault(outcome, []).append(target)
+    for target in outcomes.get("kept-diverged", []):
+        print(
+            f"Warning: Kept your existing {target} instead of the run's copy; "
+            "both have history the other lacks.",
+            file=sys.stderr,
+        )
+    return outcomes
+
+
+def _export_workspace_sessions(
+    backend: ExecutionBackend,
+    worktree_path: Path,
+    relative_path: str,
+    destination: Path,
+    *,
+    trim_partial_lines: bool = False,
+) -> None:
+    """Copy a provider session tree that lives inside the workspace to the host.
+
+    A volume-mode container workspace is only reachable through the backend;
+    bind-mode and host workspaces are read directly from the host checkout.
+    """
+    export = getattr(backend, "export_workspace_path_to_host", None)
+    if callable(export):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=".export-", dir=destination.parent))
+        try:
+            if export(worktree_path, relative_path, staging):
+                _copy_provider_sessions(
+                    staging,
+                    destination,
+                    trim_partial_lines=trim_partial_lines,
+                )
+                return
+        except (OSError, RuntimeError) as exc:
+            logger.warning(
+                "Could not export %s from workspace %s: %s",
+                relative_path,
+                worktree_path,
+                exc,
+            )
+            return
+        finally:
+            remove_tree(staging, ignore_errors=True)
+    _copy_provider_sessions(
+        worktree_path / relative_path,
+        destination,
+        trim_partial_lines=trim_partial_lines,
+    )
+
+
+def _record_live_provider_sessions(
+    repo_root: Path,
+    run: RunState,
+    plan: ImplementLaunchPlan,
+) -> bool:
+    """Note where this launch's provider keeps its sessions while it runs."""
+    if run.agent == "codex" and plan.codex_home is not None:
+        payload = {"agent": "codex", "sessions_dir": str(plan.codex_home / "sessions")}
+    elif run.agent == "claude" and plan.claude_isolated_home is not None:
+        payload = {"agent": "claude", "workspace_path": CLAUDE_ISOLATED_PROJECTS_RELPATH}
+    else:
+        return False
+    atomic_write_text(
+        _live_provider_sessions_path(repo_root, run.run_id),
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return True
+
+
+def _snapshot_live_provider_sessions(
+    repo_root: Path,
+    run: RunState,
+    worktree_path: Path,
+    agent: str,
+    destination: Path,
+) -> bool:
+    """Copy the running launch's current sessions to *destination*.
+
+    Returns False when the live launch keeps no separate session store (host
+    Claude launches write straight into the operator's config directory).
+    """
+    try:
+        payload = json.loads(
+            _live_provider_sessions_path(repo_root, run.run_id).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get("agent") != agent:
+        return False
+    if agent == "codex" and isinstance(payload.get("sessions_dir"), str):
+        _copy_provider_sessions(
+            Path(payload["sessions_dir"]),
+            destination,
+            trim_partial_lines=True,
+        )
+        return True
+    if agent == "claude" and payload.get("workspace_path") == CLAUDE_ISOLATED_PROJECTS_RELPATH:
+        _export_workspace_sessions(
+            _resolve_execution_backend(),
+            worktree_path,
+            CLAUDE_ISOLATED_PROJECTS_RELPATH,
+            destination,
+            trim_partial_lines=True,
+        )
+        return True
     return False
+
+
+def _claude_project_dir_name(cwd: Path) -> str:
+    """Claude Code's per-project transcript directory name for *cwd*."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(cwd))
+
+
+def _operator_claude_config_dir() -> Path:
+    configured = str(os.environ.get("CLAUDE_CONFIG_DIR", "")).strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def _install_claude_session(source: Path, session_id: str, worktree_path: Path) -> Path | None:
+    """Place one archived Claude transcript where ``claude --resume`` finds it.
+
+    Transcripts are filed per working directory; a container worker's copy is
+    filed under the container path, so it is re-filed under the host
+    workspace the attach command runs in. An operator transcript that already
+    has newer interactive turns is kept. Returns the installed transcript.
+    """
+    if not source.is_dir() or source.is_symlink():
+        return None
+    candidates = sorted(
+        path
+        for path in source.glob(f"*/{session_id}.jsonl")
+        if path.is_file() and not path.is_symlink() and not path.parent.is_symlink()
+    )
+    if not candidates:
+        return None
+    transcript = max(candidates, key=lambda path: path.stat().st_mtime)
+    target_dir = (
+        _operator_claude_config_dir()
+        / "projects"
+        / _claude_project_dir_name(worktree_path.resolve())
+    )
+    target = target_dir / transcript.name
+    if _merge_operator_session_file(transcript, target) == "kept-diverged":
+        print(
+            f"Warning: Kept your existing {target} instead of the run's copy; "
+            "both have history the other lacks.",
+            file=sys.stderr,
+        )
+    # Subagent transcripts and tool results live beside the main transcript.
+    _merge_operator_sessions(transcript.parent / session_id, target_dir / session_id)
+    return target
+
+
+def _structured_completion_result(
+    run: RunState,
+    worktree_path: Path,
+    ctx: ImplementContext,
+    tracker: AgentProgressTracker | None,
+) -> ImplementResult | None:
+    """Convert the provider's structured final response into an ImplementResult."""
+    payload = tracker.structured_completion() if tracker is not None else None
+    if payload is None:
+        return None
+    status = STRUCTURED_COMPLETION_STATUS_MAP[payload["status"]]
+    summary = payload["summary"]
+    if status == "needs-input" and payload["question"]:
+        summary = payload["question"]
+    return ImplementResult(
+        status=status,
+        summary=summary,
+        commits=_recent_commit_lines(worktree_path),
+        attempt=run.attempts,
+        launch_number=ctx.launch_number,
+        result_source="structured_output",
+        completed_at=_now_iso(),
+    )
 
 
 def _validate_codex_exec(run: RunState, *, require_output_schema: bool = False) -> bool:
@@ -16565,7 +17498,7 @@ def _validate_codex_exec(run: RunState, *, require_output_schema: bool = False) 
 
 
 def _sync_reused_branch_before_implement(run: RunState, worktree_path: Path) -> str:
-    """Bring a reused branch up to date with origin/master before first implement."""
+    """Bring a reused branch up to date with the configured base before implement."""
     if not run.resumed_from_branch or run.attempts > 0 or run.last_merged_master_sha or run.merge_conflict_error:
         return "passed"
 
@@ -16659,7 +17592,11 @@ def _build_implement_attempt_context(
             repo_root,
             _state_root(repo_root) / "runs" / run.run_id / OPERATOR_REQUEST_FILENAME,
         )
-        if _is_resolved_operator_request(operator_request):
+        # A response answers the blocker it was asked about. Once an attempt has
+        # consumed it, later attempts are retrying a different failure and must
+        # not inherit it (e.g. "do not change code for those failures").
+        consumed_attempt = operator_request.response_consumed_attempt_number
+        if _is_resolved_operator_request(operator_request) and consumed_attempt in {None, ctx.attempt_number}:
             ctx.operator_request_kind = operator_request.kind
             ctx.operator_request_prompt = operator_request.prompt
             ctx.operator_request_context = dict(operator_request.context)
@@ -16899,7 +17836,9 @@ def _prepare_implement_launch_plan(
         tuple[tempfile.TemporaryDirectory[str] | None, Path, bool]
     ] | None = None,
     git_isolations_to_cleanup: list[AgentGitIsolation] | None = None,
+    session: AgentSessionPlan | None = None,
 ) -> ImplementLaunchPlan:
+    session = session or AgentSessionPlan()
     backend = _resolve_execution_backend()
     _require_agent_available_for_backend(run.agent, backend)
     launch_safety = _unattended_launch_safety(run.agent, backend)
@@ -17036,6 +17975,7 @@ def _prepare_implement_launch_plan(
     codex_preserve_home = False
     claude_private_home: Path | None = None
     claude_private_home_context: tempfile.TemporaryDirectory[str] | None = None
+    claude_isolated_home: Path | None = None
     if run.agent == "codex" and adapter.capabilities.supports_mcp:
         # Remove legacy checkout-local provider state before allocating the
         # external home. In volume mode this also deletes any old copied
@@ -17063,6 +18003,14 @@ def _prepare_implement_launch_plan(
             api_key=agent_env.get("OPENAI_API_KEY")
             or agent_env.get("CODEX_API_KEY"),
         )
+        if session.resumes:
+            # Launch homes are emptied after every launch (host homes are
+            # deleted, preserved container homes cleared); bring back the
+            # run's archived rollouts so `codex exec resume` finds the thread.
+            _copy_codex_sessions(
+                _codex_session_archive_dir(repo_root, run.run_id),
+                codex_home / "sessions",
+            )
         _strip_codex_provider_secret_env(agent_env)
         agent_env = _subprocess_env_with_codex_home(agent_env, codex_home)
         # The isolated config.toml is the sole transport for the complete MCP
@@ -17094,6 +18042,15 @@ def _prepare_implement_launch_plan(
                 worktree_path,
                 include_auth=False,
             )
+            claude_isolated_home = claude_home
+            if session.resumes:
+                # The isolated home is removed after every launch; bring back
+                # the run's archived transcripts so `claude --resume` finds
+                # the session. The sync below pushes them into the worker.
+                _copy_provider_sessions(
+                    _claude_session_archive_dir(repo_root, run.run_id),
+                    worktree_path / CLAUDE_ISOLATED_PROJECTS_RELPATH,
+                )
         agent_env = _subprocess_env_with_home(agent_env, claude_home)
         if use_provider_sandbox and canonical_claude_config is not None:
             agent_env["CLAUDE_CONFIG_DIR"] = str(canonical_claude_config)
@@ -17185,6 +18142,17 @@ def _prepare_implement_launch_plan(
         agent_command_kwargs["git_isolation"] = git_isolation
     if use_stream_json:
         agent_command_kwargs["stream_json"] = True
+    if session.session_id:
+        agent_command_kwargs["session_id"] = session.session_id
+    if session.resumes:
+        agent_command_kwargs["resume_session_id"] = session.resume_session_id
+    if session.structured_output:
+        schema_path = completion_outbox_path.parent / COMPLETION_SCHEMA_FILENAME
+        schema_path.write_text(
+            json.dumps(COMPLETION_SCHEMA, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        agent_command_kwargs["completion_schema_path"] = schema_path
     agent_cmd = _build_agent_command(
         run.agent,
         worktree_path,
@@ -17236,6 +18204,10 @@ def _prepare_implement_launch_plan(
         claude_private_home=claude_private_home,
         claude_private_home_context=claude_private_home_context,
         git_isolation=git_isolation,
+        session=session,
+        completion_outbox_path=completion_outbox_path,
+        codex_home=codex_home if codex_auth_root is not None else None,
+        claude_isolated_home=claude_isolated_home,
     )
 
 
@@ -17259,14 +18231,6 @@ def _launch_implement_attempt(
         for key, value in plan.popen_kwargs.items()
         if key not in {"cwd", "env"}
     }
-    request = AgentRequest(
-        argv=plan.agent_cmd,
-        cwd=worktree_path,
-        env=plan.agent_env,
-        popen_kwargs=popen_extras,
-        redactions=plan.agent_env_redactions,
-        declared_env_keys=plan.declared_agent_env_keys,
-    )
 
     def _supervise(proc: subprocess.Popen) -> int:
         _set_active_agent_process(proc)
@@ -17296,12 +18260,27 @@ def _launch_implement_attempt(
                 progress_thread=progress_thread,
                 progress_tracker=plan.progress_tracker,
                 spec_id=run.spec_id,
+                structured_completion=plan.session.structured_output,
             )
         finally:
             _set_active_agent_process(None)
             _prune_registered_worktree_processes(repo_root, worktree_path)
 
+    launch: dict | None = None
+    live_sessions_recorded = _record_live_provider_sessions(repo_root, run, plan)
     try:
+        plan.agent_cmd = _model_command(plan.agent_cmd, "implement", run.agent,
+                                        run.implement_failures + run.verify_failures + run.review_changes)
+        plan.agent_cmd = _budget_command(plan.agent_cmd, run)
+        launch = _begin_usage(run, repo_root, "implement", run.agent, plan.agent_cmd)
+        request = AgentRequest(
+            argv=plan.agent_cmd,
+            cwd=worktree_path,
+            env=plan.agent_env,
+            popen_kwargs=popen_extras,
+            redactions=plan.agent_env_redactions,
+            declared_env_keys=plan.declared_agent_env_keys,
+        )
         result = backend.launch_agent(request, monitor=_supervise)
         # backend.launch_agent returns only after its monitor has confirmed the
         # provider-owned process tree is gone. Import private commits before
@@ -17314,6 +18293,14 @@ def _launch_implement_attempt(
             # Provider credentials must be retired even if disposable Git
             # metadata was poisoned into a form that cannot be removed.
             if run.agent == "codex":
+                if plan.codex_home is not None:
+                    # Keep the thread resumable (and attachable from the host)
+                    # after the launch home is deleted or cleared, including
+                    # a container worker's preserved provider home.
+                    _copy_codex_sessions(
+                        plan.codex_home / "sessions",
+                        _codex_session_archive_dir(repo_root, run.run_id),
+                    )
                 if plan.codex_auth_root is not None:
                     _remove_codex_launch_home(
                         plan.codex_home_context,
@@ -17329,6 +18316,15 @@ def _launch_implement_attempt(
                         required=True,
                     )
             elif run.agent == "claude":
+                if plan.claude_isolated_home is not None:
+                    # Keep the session resumable by the next container launch
+                    # and attachable from the host after the home is removed.
+                    _export_workspace_sessions(
+                        backend,
+                        worktree_path,
+                        CLAUDE_ISOLATED_PROJECTS_RELPATH,
+                        _claude_session_archive_dir(repo_root, run.run_id),
+                    )
                 if (
                     plan.claude_private_home_context is not None
                     and plan.claude_private_home is not None
@@ -17345,6 +18341,9 @@ def _launch_implement_attempt(
                     required=True,
                 )
         finally:
+            if live_sessions_recorded:
+                # Sessions are archived by now; attach reads the archive.
+                _live_provider_sessions_path(repo_root, run.run_id).unlink(missing_ok=True)
             if plan.git_isolation is not None:
                 try:
                     # Idempotent after successful reconciliation; also removes
@@ -17352,6 +18351,13 @@ def _launch_implement_attempt(
                     cleanup_agent_git_isolation(plan.git_isolation)
                 except BaseException as exc:
                     git_cleanup_error = exc
+            if launch is not None:
+                from .usage import update_launch
+
+                if plan.progress_tracker is not None:
+                    for event in plan.progress_tracker.usage_events:
+                        update_launch(launch, event)
+                run.save(repo_root)
             if git_cleanup_error is not None:
                 raise git_cleanup_error
 
@@ -17581,10 +18587,14 @@ def _interpret_implement_attempt_result(
             return "passed"
         if impl_result.status == "blocked":
             summary = impl_result.summary or "Agent reported blocked"
+            tracker = outcome.progress_tracker
             if (
                 outcome.has_new_commit
                 and not outcome.has_uncommitted_changes
-                and is_non_actionable_gate_environment_block(summary)
+                and is_non_actionable_gate_environment_block(
+                    summary,
+                    sandbox_denial_observed=tracker is not None and tracker.latest_sandbox_denial() is not None,
+                )
             ):
                 if not _review_retry_allows_inferred_success(worktree_path, ctx, outcome.head_after):
                     run.last_error = (
@@ -18056,7 +19066,8 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
             run.last_error = credentials_error
             return "failed"
 
-    # Probe Claude CLI for stream-json support (graceful fallback)
+    # Probe Claude CLI for stream-json support (graceful fallback). Container
+    # workers are probed once the worker is up, below.
     use_stream_json = (
         run.agent == "claude"
         and _backend_launches_agent_on_host(backend)
@@ -18128,28 +19139,81 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
                 worktree_path,
                 setup_manifest,
             )
-            if backend.identity.backend == "container":
-                suspend_workspace_for_host_access(workspace)
-            launch_plan = _prepare_implement_launch_plan(
+            if run.agent == "claude" and not _backend_launches_agent_on_host(backend):
+                # The worker's Claude CLI streams its result event (and the
+                # structured completion on it) through the backend's pipe.
+                use_stream_json = _claude_supports_stream_json(backend, worktree_path)
+            session_plan = _plan_agent_session(
                 run,
-                repo_root,
-                worktree_path,
-                ctx,
-                reason=reason,
                 use_stream_json=use_stream_json,
-                setup_manifest=setup_manifest,
-                private_homes_to_cleanup=claude_private_homes_to_cleanup,
-                codex_homes_to_cleanup=codex_homes_to_cleanup,
-                git_isolations_to_cleanup=git_isolations_to_cleanup,
+                backend=backend,
+                worktree_path=worktree_path,
             )
-            if backend.identity.backend == "container":
-                resume_workspace_after_host_access(workspace)
-            exit_code = _launch_implement_attempt(
-                run,
-                repo_root,
-                worktree_path,
-                launch_plan,
-            )
+            for session_attempt in range(2):
+                if session_attempt:
+                    # The resumed session could not start: retry this launch
+                    # once in a fresh session with the full prompt.
+                    session_plan = _fresh_agent_session_plan(
+                        run,
+                        structured_output=session_plan.structured_output,
+                    )
+                _record_planned_agent_session(run, repo_root, session_plan)
+                if backend.identity.backend == "container":
+                    suspend_workspace_for_host_access(workspace)
+                launch_plan = _prepare_implement_launch_plan(
+                    run,
+                    repo_root,
+                    worktree_path,
+                    ctx,
+                    reason=reason,
+                    use_stream_json=use_stream_json,
+                    setup_manifest=setup_manifest,
+                    private_homes_to_cleanup=claude_private_homes_to_cleanup,
+                    codex_homes_to_cleanup=codex_homes_to_cleanup,
+                    git_isolations_to_cleanup=git_isolations_to_cleanup,
+                    session=session_plan,
+                )
+                # Read while the worker is still suspended: a resume only
+                # counts as failed if the launch left the workspace as it was.
+                workspace_before = (
+                    _worktree_change_fingerprint(worktree_path)
+                    if session_plan.resumes
+                    else ""
+                )
+                if backend.identity.backend == "container":
+                    resume_workspace_after_host_access(workspace)
+                exit_code = _launch_implement_attempt(
+                    run,
+                    repo_root,
+                    worktree_path,
+                    launch_plan,
+                )
+                resume_failure = _resume_failure_reason(
+                    run,
+                    launch_plan,
+                    exit_code,
+                    worktree_path,
+                    workspace_before,
+                )
+                if not resume_failure:
+                    _record_agent_session_after_launch(run, repo_root, launch_plan)
+                    break
+                logger.warning(
+                    "Falling back to a fresh %s session for %s: %s",
+                    run.agent,
+                    run.run_id,
+                    resume_failure,
+                )
+                run.agent_session_fallback_reason = resume_failure
+                _record_nonfatal_warning(
+                    run,
+                    phase="implement",
+                    failure_type="session",
+                    failure_subtype="resume_failed",
+                    summary=f"Resume failed; started a fresh session: {resume_failure}"[:400],
+                    retryable=True,
+                )
+                run.save(repo_root)
             _consume_operator_steering(
                 repo_root,
                 run.run_id,
@@ -18184,7 +19248,18 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
             progress_tracker=launch_plan.progress_tracker,
         )
         prefetched_result: tuple[ImplementResult | None, bool] | None = None
-        if outcome.has_uncommitted_changes:
+        structured_result = _structured_completion_result(
+            run,
+            worktree_path,
+            ctx,
+            launch_plan.progress_tracker,
+        )
+        if structured_result is not None:
+            # The provider's schema-validated final response is the primary
+            # completion signal; `spec report` is only consulted without it.
+            structured_result.save(repo_root, run.run_id)
+            prefetched_result = (structured_result, False)
+        elif outcome.has_uncommitted_changes:
             # Preserve a worktree-local completion handshake before teardown
             # potentially removes it from disk.
             prefetched_result = _load_matching_implement_result(
@@ -19478,10 +20553,18 @@ def _handle_claude_stream_line(
             tracker.heartbeat()
         return
 
+    from .usage import parse_event
+    parsed_usage = parse_event("claude", event)
+    if tracker is not None and parsed_usage is not None:
+        tracker.usage_events.append(parsed_usage)
     event_type = event.get("type")
     if tracker is not None:
         _track_claude_inflight_tools(event, tracker)
         tracker.record_sandbox_denials(claude_event_denials(event))
+        if event_type in ("system", "result") and isinstance(event.get("session_id"), str):
+            tracker.record_provider_session(event["session_id"])
+        if event_type == "result" and "structured_output" in event:
+            tracker.record_structured_output(event.get("structured_output"))
     if event_type == "assistant":
         content = _claude_message_content(event)
         if not content and tracker is not None:
@@ -19682,8 +20765,26 @@ def _handle_codex_stream_line(line: str, tracker: AgentProgressTracker) -> None:
         tracker.record(line)
         return
 
+    from .usage import parse_event
+    parsed_usage = parse_event("codex", event)
+    if parsed_usage is not None:
+        tracker.usage_events.append(parsed_usage)
     _track_codex_inflight_items(event, tracker)
     tracker.record_sandbox_denials(codex_event_denials(event))
+    if isinstance(event, dict):
+        event_type = str(event.get("type", "")).strip()
+        if event_type == "thread.started" and isinstance(event.get("thread_id"), str):
+            tracker.record_provider_session(event["thread_id"])
+        item = event.get("item")
+        if (
+            event_type == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "agent_message"
+            and isinstance(item.get("text"), str)
+        ):
+            # With --output-schema the last agent message is the structured
+            # completion JSON.
+            tracker.record_final_agent_message(item["text"])
     summary = _summarize_codex_event(event)
     if summary is None:
         tracker.heartbeat()
@@ -19841,20 +20942,32 @@ def _wait_for_agent_exit(
     progress_thread: threading.Thread | None = None,
     progress_tracker: AgentProgressTracker | None = None,
     spec_id: str | None = None,
+    structured_completion: bool = False,
 ) -> int:
-    """Wait for agent exit, but stop waiting once completion is recorded."""
+    """Wait for agent exit, but stop waiting once completion is recorded.
+
+    With ``structured_completion`` the provider's final structured response is
+    the completion signal, so a ``spec report`` fallback alone does not start
+    the exit grace period: the final response may still be on its way and
+    would take precedence over the report.
+    """
     completion_seen_at: float | None = None
+    structured_tracker = progress_tracker if structured_completion else None
 
     while True:
-        impl_result, _ = _load_matching_implement_result(
-            repo_root=repo_root,
-            worktree_path=worktree_path,
-            run_id=run_id,
-            attempt=attempt,
-            launch_number=launch_number,
-            spec_id=spec_id,
-        )
-        if impl_result is not None and completion_seen_at is None:
+        if structured_tracker is not None:
+            completed = structured_tracker.structured_completion() is not None
+        else:
+            impl_result, _ = _load_matching_implement_result(
+                repo_root=repo_root,
+                worktree_path=worktree_path,
+                run_id=run_id,
+                attempt=attempt,
+                launch_number=launch_number,
+                spec_id=spec_id,
+            )
+            completed = impl_result is not None
+        if completed and completion_seen_at is None:
             completion_seen_at = time.monotonic()
             logger.info(
                 "Detected completion handshake for %s (%s); allowing %.1fs for clean exit.",
@@ -19956,17 +21069,33 @@ def _format_spec_contract_for_prompt(
     )
 
 
-def _format_exit_checklist(spec_id: str | None = None) -> str:
+def _format_exit_checklist(
+    spec_id: str | None = None,
+    *,
+    structured_completion: bool = False,
+) -> str:
     spec_token = spec_id or "<spec-id>"
+    common = [
+        "Exit Checklist:",
+        "1. Commit any completed code changes in this worktree.",
+        f"2. Run {_format_verify_commands(_non_e2e_verify_commands())} before reporting completion.",
+        "   Run these commands in the FOREGROUND and wait for their output in-band. "
+        "Never launch them as background tasks or monitors and end your turn "
+        "'waiting for the notification' — this session terminates with your final "
+        "message and is NEVER re-invoked, so work left waiting is discarded.",
+    ]
+    if structured_completion:
+        return "\n".join(
+            [
+                *common,
+                "3. Report completion through your final response (the structured "
+                "completion result: status, summary and question). `spec report` is an "
+                "optional fallback only; if you run it, still finish with the final response.",
+            ]
+        )
     return "\n".join(
         [
-            "Exit Checklist:",
-            "1. Commit any completed code changes in this worktree.",
-            f"2. Run {_format_verify_commands(_non_e2e_verify_commands())} before reporting completion.",
-            "   Run these commands in the FOREGROUND and wait for their output in-band. "
-            "Never launch them as background tasks or monitors and end your turn "
-            "'waiting for the notification' — this session terminates with your final "
-            "message and is NEVER re-invoked, so work left waiting is discarded.",
+            *common,
             "3. Report completion with "
             "`spec report --status ok|blocked|error|needs-input "
             f"--summary 'plain text summary'` (explicit fallback: "
@@ -20114,8 +21243,24 @@ def _build_agent_command(
     operator_steering_provided_by: str = "",
     operator_steering_provided_at: str = "",
     safety: LaunchSafety | None = None,
+    session_id: str = "",
+    resume_session_id: str = "",
+    completion_schema_path: Path | None = None,
 ) -> list[str]:
-    """Build the command to launch the agent."""
+    """Build the command to launch the agent.
+
+    With ``resume_session_id`` the launch continues the run's provider
+    session, so the prompt is only the delta: the failure package (on a
+    retry), operator input and steering, without the spec contract the
+    session already holds.
+    """
+    adapter = get_agent_adapter(agent)
+
+    def _accepts(name: str) -> bool:
+        return _adapter_method_accepts_kwarg(adapter.build_implement_command, name)
+
+    resume_session_id = resume_session_id if _accepts("resume_session_id") else ""
+    delta_prompt = bool(resume_session_id)
     acceptance_checklist = list(
         acceptance_checklist
         if acceptance_checklist is not None
@@ -20225,7 +21370,7 @@ def _build_agent_command(
             debugger_section = "\n".join(debugger_lines)
         reason_label = {
             "retry": "the orchestrator's verify phase found test/lint failures",
-            "merge_conflict": "a merge conflict with master needs resolution",
+            "merge_conflict": f"a merge conflict with {PR_BASE_BRANCH} needs resolution",
             "review_feedback": "a code review requested changes",
             "recovery": "the previous implement attempt failed before completion",
         }.get(retry_context.implement_reason, "a prior attempt did not pass")
@@ -20288,6 +21433,11 @@ def _build_agent_command(
                     indent=2,
                     sort_keys=True,
                 )
+            )
+            prompt_lines.append(
+                "The next review sees your completion summary as your response to "
+                "these findings. Address each one by its id in that summary (for example "
+                "`<id>: fixed by ...` or `<id>: disagree because ...`)."
             )
 
         instruction_lines: list[str] = []
@@ -20360,7 +21510,7 @@ def _build_agent_command(
         elif retry_context.mergeability_issue:
             instruction_lines.append(
                 "Keep the recorded PR mergeability note in mind, but do not treat it as "
-                "the primary task unless a fresh local `git merge origin/master` now "
+                f"the primary task unless a fresh local `git merge {BASE_REF}` now "
                 "conflicts."
             )
         if retry_context.rescue_snapshot_path:
@@ -20395,8 +21545,9 @@ def _build_agent_command(
             "Read AGENTS.md for project conventions. Do NOT re-implement from scratch "
             "— only address the active failures summarized above."
         )
-        prompt_sections = [spec_contract]
-        if resolved_intake:
+        # A resumed session already holds the contract and intake.
+        prompt_sections = [] if delta_prompt else [spec_contract]
+        if resolved_intake and not delta_prompt:
             prompt_sections.append(resolved_intake)
         if resolved_input:
             prompt_sections.append(resolved_input)
@@ -20406,6 +21557,19 @@ def _build_agent_command(
         if debugger_section:
             prompt_sections.append(debugger_section)
         prompt_sections.append("\n".join(instruction_lines))
+        prompt = "\n\n".join(prompt_sections)
+    elif delta_prompt:
+        # A resumed launch that is not a failure retry: the session paused for
+        # operator input or its launch was interrupted before completing.
+        prompt_sections = [
+            section for section in (resolved_input, resolved_steering) if section
+        ]
+        prompt_sections.append(
+            f"Continue the IMPLEMENT phase for spec {spec_id or '<spec-id>'} from where "
+            "your previous turn in this session ended. Inspect the current branch and "
+            "worktree state first — do not assume earlier work is still present. If "
+            "there are already local changes, continue from them instead of starting over."
+        )
         prompt = "\n\n".join(prompt_sections)
     else:
         spec_prompt = (
@@ -20430,15 +21594,31 @@ def _build_agent_command(
         prompt_sections.append(spec_prompt)
         prompt = "\n\n".join(prompt_sections)
 
-    completion_instruction = COMPLETE_HANDSHAKE_INSTRUCTION.replace("<spec-id>", spec_id or "<spec-id>")
-    exit_checklist = _format_exit_checklist(spec_id)
-    prompt = f"{exit_checklist}\n\n{prompt}\n\n{completion_instruction}"
+    completion_schema_path = (
+        completion_schema_path if _accepts("completion_schema_path") else None
+    )
+    structured_completion = completion_schema_path is not None
+    if structured_completion:
+        # The final response is the completion signal; `spec report` is only
+        # an optional fallback and must not read as the required last step.
+        completion_instruction = STRUCTURED_COMPLETION_INSTRUCTION
+    else:
+        completion_instruction = COMPLETE_HANDSHAKE_INSTRUCTION.replace(
+            "<spec-id>", spec_id or "<spec-id>"
+        )
+    if delta_prompt:
+        prompt = f"{RESUMED_SESSION_PREAMBLE}\n\n{prompt}\n\n{completion_instruction}"
+    else:
+        exit_checklist = _format_exit_checklist(
+            spec_id,
+            structured_completion=structured_completion,
+        )
+        prompt = f"{exit_checklist}\n\n{prompt}\n\n{completion_instruction}"
     # This adapter argument is a launch-scoped capability directory, never the
     # repository-wide control-plane state root. Out-of-tree adapters that use
     # it therefore inherit the same narrow boundary as the built-ins.
     state_dir = agent_state_dir or (worktree_path / ".spec-agent-outbox")
 
-    adapter = get_agent_adapter(agent)
     setup_prompt = str(setup_prompt or "").strip()
     setup_mcp_prompt = str(setup_mcp_prompt or "").strip()
     if setup_prompt:
@@ -20474,7 +21654,13 @@ def _build_agent_command(
         "safety",
     ):
         implement_kwargs["safety"] = safety
-    return adapter.build_implement_command(**implement_kwargs)
+    if resume_session_id:
+        implement_kwargs["resume_session_id"] = resume_session_id
+    elif session_id and _accepts("session_id"):
+        implement_kwargs["session_id"] = session_id
+    if completion_schema_path is not None:
+        implement_kwargs["completion_schema_path"] = completion_schema_path
+    return _model_command(adapter.build_implement_command(**implement_kwargs), "implement", agent)
 
 
 def _is_git_merge_conflict_output(text: str) -> bool:
@@ -20519,8 +21705,12 @@ def _fetch_origin_master(
     if (
         backend is not None
         and backend.identity.backend == "clone"
+        and not remote_url
         and _resolve_git_ref_sha(worktree_path, ref)
     ):
+        # A clone workspace may keep its bootstrap base. A host-side fetch
+        # with an explicit remote (the merge-phase base sync) must refresh
+        # it, or the sync merges a stale base and the forge refuses again.
         return ""
     remote_name, branch_name = ref.split("/", 1) if "/" in ref else ("origin", ref)
     fetch_args = [remote_name, branch_name]
@@ -21069,10 +22259,17 @@ def _run_verify_gate(
     if not _is_test_gate(gate):
         gate_env: dict[str, str] = {}
         _inject_worktree_venv_into_env(gate_env, worktree_path)
+        completed = _run_via_backend(gate_env)
         return _attach_gate_review_evidence(
             gate,
             worktree_path,
-            VerifyGateResult(completed_process=_run_via_backend(gate_env)),
+            VerifyGateResult(
+                completed_process=completed,
+                diagnostic=(
+                    _run_failed_test_diagnostic(worktree_path, env=gate_env, backend=backend, gate=gate)
+                    if completed.returncode != 0 and not getattr(completed, "_timed_out", False) else ""
+                ),
+            ),
         )
 
     diagnostic = ""
@@ -21089,6 +22286,7 @@ def _run_verify_gate(
             ):
                 diagnostic = _run_failed_test_diagnostic(
                     worktree_path,
+                    gate=gate,
                     env=gate_env,
                     backend=backend,
                 )
@@ -21104,7 +22302,7 @@ def _run_verify_gate(
                     targeted_output,
                     env=gate_env,
                     backend=backend,
-                )
+                ) if _gate_is_pytest_like(gate) else []
                 if _every_failed_test_passed_in_isolation(targeted_output, targeted_diagnostics):
                     failed_nodes = ", ".join(_extract_failed_test_node_ids(targeted_output))
                     logger.warning(
@@ -22006,7 +23204,7 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
     body = (
         f"## Spec\nSpec-ID: {run.spec_id}\n{spec_block}\n\n"
         f"## Summary\n{summary}\n\n"
-        f"## Review\n{format_pr_review_owner()}\n\n"
+        f"## Review\n{format_pr_review_owner(SPEC_RUNTIME_CONFIG.review.source)}\n\n"
         f"## Acceptance Criteria\n{checklist}\n\n"
         f"## Known Issues\n{known_issues}\n"
     )
@@ -22031,13 +23229,26 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
                 body = (
                     f"## Spec\nSpec-ID: {run.spec_id}\n{spec_block}\n\n"
                     f"## Summary\n{summary}\n\n"
-                    f"## Review\n{format_pr_review_owner()}\n\n"
+                    f"## Review\n{format_pr_review_owner(SPEC_RUNTIME_CONFIG.review.source)}\n\n"
                     f"## Acceptance Criteria\n{checklist}\n\n"
                     f"## Known Issues\n{known_issues}\n"
                 )
             if outbox_metadata.body:
                 body = outbox_metadata.body
             labels = outbox_metadata.labels
+
+    if SPEC_RUNTIME_CONFIG.review.source == "ci":
+        rounds = review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+        if rounds:
+            result = ImplementResult.load(repo_root, run.run_id)
+            context = review_convergence.render_prior_findings_section(
+                rounds[-1].outstanding_findings,
+                round_number=len(rounds) + 1,
+                implementer_summary=result.summary if result is not None else "",
+            )
+            body = _ci_review_pr_body(
+                body, context=context, previous_head=rounds[-1].reviewed_head_sha,
+            )
 
     # Refresh an existing PR body before push so synchronize sees the local-review marker.
     if not publication_transition_is_safe():
@@ -22601,7 +23812,7 @@ def _retry_reason_label(reason_key: str) -> str:
     return {
         "implement_failures": "Implement phase failed before handoff",
         "review_changes": "Review requested changes",
-        "merge_conflicts": "Merge conflict with `master`",
+        "merge_conflicts": f"Merge conflict with `{PR_BASE_BRANCH}`",
         "verify_failures": "Required checks failed after publish",
         "unknown": "Retry budget consumed without preserved failure detail",
     }.get(reason_key, RETRY_REASON_LABELS.get(reason_key, reason_key.replace("_", " ")).strip())
@@ -23313,18 +24524,31 @@ def _codex_review_sandbox_prompt_note(
     base_sha: str,
     head_sha: str,
 ) -> str:
-    """Inline host-materialized evidence for a Codex session with no tools."""
-    del scratch_dir
+    """Inline host-materialized evidence, plus the checkout layout when a shell is allowed."""
     diff_text = _local_review_diff_text(
         review_worktree,
         base_sha=base_sha,
         head_sha=head_sha,
     )
+    if CODEX_REVIEW_CHECKOUT_SHELL:
+        boundary = (
+            "\n\nCodex review boundary: you may run read-only shell commands (for "
+            "example `cat`, `rg`, `git log`, `git show`) against the PR checkout pinned "
+            f"to the reviewed head at `{review_worktree}`. The filesystem is read-only "
+            f"except the scratch dir `{scratch_dir}`; the network, credentials, MCP, "
+            "subagents and hooks are unavailable, so do not try to install packages or "
+            "rerun the test suite. "
+        )
+    else:
+        boundary = (
+            "\n\nCodex review boundary: you have no shell or file tools in this "
+            "review. Review from the host-materialized diff below, the canonical spec "
+            "and the gate results in this prompt; do not ask to run commands. "
+        )
     return (
-        "\n\nCodex restricted-review boundary: all model-controlled shell, code, "
-        "subagent, hook, user-config, and MCP capabilities are disabled. The "
-        "orchestrator materialized the authoritative diff on the host. Review only "
-        "the evidence below and the gate results already in this prompt.\n\n"
+        boundary
+        + "The orchestrator materialized the authoritative diff on the host below; "
+        "the gate results already in this prompt are authoritative.\n\n"
         "<BEGIN_HOST_MATERIALIZED_DIFF>\n"
         f"{diff_text}"
         "\n<END_HOST_MATERIALIZED_DIFF>"
@@ -23334,6 +24558,8 @@ def _codex_review_sandbox_prompt_note(
 def _host_materialized_review_spec_note(
     run: RunState,
     review_worktree: Path,
+    *,
+    review_agent: str = "",
 ) -> str:
     """Inline the canonical spec required by the review contract."""
     relative_spec_path = Path(_spec_path_for_run(run))
@@ -23349,8 +24575,13 @@ def _host_materialized_review_spec_note(
             f"Could not host-materialize canonical review spec {relative_spec_path}: {exc}"
         ) from exc
 
+    availability = (
+        "it is also readable in the review checkout"
+        if review_agent == "codex"
+        else "model tools are unavailable"
+    )
     return (
-        "\n\nCanonical spec (host materialized; model tools are unavailable): "
+        f"\n\nCanonical spec (host materialized; {availability}): "
         f"`{relative_spec_path.as_posix()}`.\n\n"
         "<BEGIN_HOST_MATERIALIZED_SPEC>\n"
         f"{content}"
@@ -23383,6 +24614,104 @@ def _local_review_diff_text(
             f"`git diff --unified=80 {base_sha}...{head_sha}`: {detail}"
         )
     return diff_result.stdout
+
+
+def _ci_review_pr_body(body: str, *, context: str, previous_head: str) -> str:
+    """Keep PR metadata bounded; CI reconstructs diffs from the recorded head."""
+    if len(context) > 24000:
+        context = context[:24000] + (
+            "\nHistory truncated; consult the prior sticky review for full findings."
+        )
+    return (
+        body[:30000] + "\n\n<!-- spec-ci-rereview-context -->\n"
+        f"Previous-reviewed-head: {previous_head}\n" + context
+    )
+
+
+def _local_review_incremental_diff(
+    review_worktree: Path,
+    *,
+    last_reviewed_head_sha: str,
+    head_sha: str,
+) -> tuple[str, dict[str, list[tuple[int, int]]] | None]:
+    """Return the diff since the last reviewed head and its changed line ranges.
+
+    ``None`` ranges mean the previous head is unknown or unreachable (for
+    example after a force push), so the incremental change cannot be bounded.
+    """
+    if not last_reviewed_head_sha:
+        return "(the previous reviewed head was not recorded)\n", None
+    if last_reviewed_head_sha == head_sha:
+        return "", {}
+    revision_range = f"{last_reviewed_head_sha}..{head_sha}"
+    full = run_subprocess(
+        [
+            "git",
+            "diff",
+            "--unified=20",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            revision_range,
+        ],
+        cwd=review_worktree,
+    )
+    zero = run_subprocess(
+        [
+            "git",
+            "diff",
+            "--unified=0",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            revision_range,
+        ],
+        cwd=review_worktree,
+    )
+    if full.returncode != 0 or zero.returncode != 0:
+        detail = (full.stderr or zero.stderr or "").strip() or "unknown error"
+        return (
+            f"(could not diff {revision_range}: {detail}; the previous head may have "
+            "been rewritten, so treat the full diff as the change under review)\n",
+            None,
+        )
+    return full.stdout, review_convergence.changed_line_ranges(zero.stdout)
+
+
+def _local_review_rereview_context(
+    repo_root: Path,
+    run: RunState,
+    review_worktree: Path,
+    *,
+    last_round: review_convergence.ReviewRound,
+    round_number: int,
+    head_sha: str,
+) -> tuple[str, dict[str, list[tuple[int, int]]] | None]:
+    implement_result = ImplementResult.load(repo_root, run.run_id)
+    implementer_summary = implement_result.summary if implement_result is not None else ""
+    incremental_diff, changed_ranges = _local_review_incremental_diff(
+        review_worktree,
+        last_reviewed_head_sha=last_round.reviewed_head_sha,
+        head_sha=head_sha,
+    )
+    context = "\n\n".join(
+        [
+            review_convergence.render_prior_findings_section(
+                last_round.outstanding_findings,
+                round_number=round_number,
+                implementer_summary=implementer_summary,
+            ),
+            review_convergence.render_rereview_rules_section(
+                last_reviewed_head_sha=last_round.reviewed_head_sha,
+                incremental_diff=incremental_diff,
+            ),
+        ]
+    )
+    return context, changed_ranges
 
 
 def _claude_review_evidence_prompt_note(
@@ -23432,8 +24761,18 @@ def _run_local_review(
     _clear_local_review_artifacts(artifact_paths)
     review_agent = review_agent_override or _effective_review_agent(run)
     require_host_agent_available(review_agent)
+    review_run_dir = _state_root(repo_root) / "runs" / run.run_id
+    prior_rounds = review_convergence.load_review_rounds(
+        review_run_dir
+    ) or _seed_review_rounds_from_legacy_result(repo_root, run, review_run_dir)
+    last_round = prior_rounds[-1] if prior_rounds else None
+    round_number = len(prior_rounds) + 1
+    changed_ranges: dict[str, list[tuple[int, int]]] | None = None
+    is_rereview = last_round is not None or run.review_changes > 0
     reasoning_effort = (
-        LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT if run.review_changes == 0 else LOCAL_REVIEW_REASONING_EFFORT
+        (SPEC_RUNTIME_CONFIG.review.rereview_reasoning_effort or LOCAL_REVIEW_REASONING_EFFORT)
+        if is_rereview
+        else LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT
     )
     logger.info(
         "Running local review for %s with reasoning effort=%s (review_changes=%d)",
@@ -23455,17 +24794,15 @@ def _run_local_review(
             repo_root,
             run,
             expected_head_sha=expected_head_sha,
+            review_agent=review_agent,
         ),
     )
     artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
 
-    # Resolve schema: repo-level override, then bundled
-    schema_path = repo_root / ".github" / "schemas" / "codex-review.schema.json"
-    if not schema_path.is_file():
-        import importlib.resources
-
-        bundled = importlib.resources.files("spec_runtime") / "templates" / "review-schema.json"
-        schema_path = Path(str(bundled))
+    # Resolve schema: repo-level override (upgraded if legacy), then bundled
+    schema_path = _resolve_local_review_schema_path(
+        repo_root, artifact_paths["prompt"].parent
+    )
 
     # Determine review agent
     from .agent_adapter import get_agent_adapter
@@ -23524,7 +24861,7 @@ def _run_local_review(
             else _review_env_prompt_note(review_worktree)
         )
         spec_note = (
-            _host_materialized_review_spec_note(run, review_worktree)
+            _host_materialized_review_spec_note(run, review_worktree, review_agent=agent.name)
             if agent.name in {"claude", "codex"}
             else ""
         )
@@ -23550,8 +24887,19 @@ def _run_local_review(
                 head_sha=expected_head_sha,
             )
         )
-        if env_note or sandbox_note:
-            prompt = f"{prompt}{env_note}{sandbox_note}"
+        rereview_note = ""
+        if last_round is not None:
+            rereview_context, changed_ranges = _local_review_rereview_context(
+                repo_root,
+                run,
+                review_worktree,
+                last_round=last_round,
+                round_number=round_number,
+                head_sha=expected_head_sha,
+            )
+            rereview_note = f"\n\n{rereview_context}"
+        if env_note or sandbox_note or rereview_note:
+            prompt = f"{prompt}{env_note}{sandbox_note}{rereview_note}"
             artifact_paths["prompt"].write_text(prompt, encoding="utf-8")
         if agent.capabilities.supports_mcp:
             # Built-in reviews are MCP-free. Codex still needs an isolated
@@ -23576,6 +24924,8 @@ def _run_local_review(
             reasoning_effort=reasoning_effort,
             mcp_config_path=review_mcp_config_path,
             writable_temp_dir=review_scratch_dir,
+            review_checkout=review_worktree if agent.name == "codex" else None,
+            provider_home=review_codex_home,
         )
         review_env = _build_local_review_env(
             temp_dir=review_scratch_dir,
@@ -23598,8 +24948,8 @@ def _run_local_review(
         try:
             for attempt_index, attempt_timeout in enumerate(review_timeouts):
                 try:
-                    review_exec = _run_local_review_subprocess(
-                        repo_root,
+                    review_exec = _run_usage_subprocess(
+                        run, "review", review_agent, repo_root,
                         review_cmd,
                         cwd=review_process_cwd,
                         env=review_env,
@@ -23697,6 +25047,16 @@ def _run_local_review(
         expected_base_sha=expected_base_sha,
         check_name=REVIEW_GATE_CHECK_NAME,
     )
+    evaluation = _apply_computed_local_review_decision(
+        run,
+        evaluation,
+        review_run_dir=review_run_dir,
+        last_round=last_round,
+        round_number=round_number,
+        changed_ranges=changed_ranges,
+        expected_head_sha=expected_head_sha,
+        expected_base_sha=expected_base_sha,
+    )
     artifact_paths["review_result"].parent.mkdir(parents=True, exist_ok=True)
     artifact_paths["review_result"].write_text(
         json.dumps(evaluation.result_payload, indent=2, sort_keys=True) + "\n",
@@ -23721,6 +25081,228 @@ def _run_local_review(
         review_result,
         artifact_paths["review_result"],
     )
+
+
+def _publish_review_followups(
+    run: RunState,
+    repo_root: Path,
+    findings: list[dict],
+    *,
+    pr_number: int,
+    pr_body: str,
+    repo_slug: str,
+    accepted_at_cap: bool = False,
+) -> None:
+    """Write ``review-followups.md`` and the PR body's Follow-ups section."""
+    run_dir = _state_root(repo_root) / "runs" / run.run_id
+    followups_path = run_dir / review_convergence.REVIEW_FOLLOWUPS_FILENAME
+    if findings:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        followups_path.write_text(
+            review_convergence.render_followups_markdown(
+                findings,
+                spec_id=run.spec_id,
+                accepted_at_cap=accepted_at_cap,
+            ),
+            encoding="utf-8",
+        )
+    else:
+        followups_path.unlink(missing_ok=True)
+    new_body = review_convergence.pr_body_with_followups(
+        pr_body,
+        review_convergence.render_pr_followups_section(findings),
+    )
+    if new_body.strip() == str(pr_body or "").strip():
+        return
+    body_path = run_dir / "review-followups-pr-body.md"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    body_path.write_text(new_body, encoding="utf-8")
+    result = run_subprocess(
+        ["gh", "pr", "edit", str(pr_number), "--body-file", str(body_path)],
+        cwd=repo_root,
+        env=_gh_repo_environment(repo_slug),
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "Could not update the Follow-ups section of PR #%s (non-blocking): %s",
+            pr_number,
+            (result.stderr or result.stdout or "unknown error").strip(),
+        )
+
+
+def _review_round_cap_operator_request(
+    run: RunState,
+    outstanding: list[dict],
+    *,
+    rounds_used: int,
+    max_rounds: int,
+) -> OperatorRequest:
+    return OperatorRequest(
+        kind=review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND,
+        prompt=review_convergence.render_round_cap_summary(
+            outstanding,
+            rounds_used=rounds_used,
+            max_rounds=max_rounds,
+        ),
+        context={
+            "spec_id": run.spec_id,
+            "run_id": run.run_id,
+            "rounds_used": rounds_used,
+            "max_rounds": max_rounds,
+            "outstanding_findings": outstanding,
+        },
+        suggested_action=(
+            f"Run `spec input --spec {run.spec_id} --accept` to accept as-is, or "
+            f"`spec input --spec {run.spec_id} --message '<guidance>'` for one more round."
+        ),
+        options=[
+            {
+                "value": review_convergence.REVIEW_ROUND_CAP_ACCEPT,
+                "label": "Accept as-is",
+                "description": "Approve the change; outstanding findings become follow-ups.",
+            },
+            {
+                "value": review_convergence.REVIEW_ROUND_CAP_ANOTHER_ROUND,
+                "label": "One more round",
+                "description": "Send the guidance to one more implement attempt and re-review.",
+            },
+        ],
+        status="pending",
+        requested_by_phase="review",
+        requested_at=_now_iso(),
+        request_attempt_number=_current_attempt_number(run),
+    )
+
+
+def _accepted_review_round_cap_request(repo_root: Path, run: RunState) -> OperatorRequest | None:
+    request = OperatorRequest.load(repo_root, run.run_id)
+    if (
+        request is None
+        or request.kind != review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND
+        or request.status != "resolved"
+        or review_convergence.parse_round_cap_response(request.response)
+        != review_convergence.REVIEW_ROUND_CAP_ACCEPT
+    ):
+        return None
+    return request
+
+
+def _round_cap_accept_matches_head(
+    accepted_result: ReviewResult | None,
+    rounds: list[review_convergence.ReviewRound],
+    expected_head_sha: str,
+) -> bool:
+    if accepted_result is None or not rounds or not expected_head_sha:
+        return False
+    return accepted_result.reviewed_head_sha == expected_head_sha == rounds[-1].reviewed_head_sha
+
+
+def _apply_computed_local_review_decision(
+    run: RunState,
+    evaluation,
+    *,
+    review_run_dir: Path,
+    last_round: review_convergence.ReviewRound | None,
+    round_number: int,
+    changed_ranges: dict[str, list[tuple[int, int]]] | None,
+    expected_head_sha: str,
+    expected_base_sha: str,
+):
+    """Replace the reviewer's own decision with the computed one.
+
+    The round itself is recorded by ``_record_local_review_round`` only once
+    the review phase reaches ``_apply_review_result``, so a phase that fails
+    afterwards (closed PR, moved head, unsafe transition) does not count
+    toward ``[review] max_rounds``.
+    """
+    from .review_gate import apply_computed_decision, compute_review_decision
+
+    payload = evaluation.result_payload
+    model_decision = str(payload.get("status", "") or "").strip()
+    if model_decision not in {"approved", "request_changes"}:
+        # Blocked/failed reviews did not complete; there is no round to record.
+        return evaluation
+    computed = compute_review_decision(
+        model_decision=model_decision,
+        findings=[f for f in payload.get("findings", []) or [] if isinstance(f, dict)],
+        prior_findings=last_round.outstanding_findings if last_round is not None else None,
+        prior_classifications=[
+            item for item in payload.get("prior_findings", []) or [] if isinstance(item, dict)
+        ],
+        changed_ranges=changed_ranges,
+    )
+    if computed.overrides_model:
+        logger.warning(
+            "Ignoring reviewer decision %s for %s round %d: computed %s (blocking findings: %s)",
+            computed.model_decision,
+            run.run_id,
+            round_number,
+            computed.decision,
+            ", ".join(i or "(no id)" for i in computed.blocking_ids) or "none",
+        )
+    evaluation = apply_computed_decision(evaluation, computed)
+    evaluation.result_payload["review_round"] = round_number
+    return evaluation
+
+
+def _record_local_review_round(review_run_dir: Path, review_result: ReviewResult) -> None:
+    """Append a completed review to the round ledger used by the round cap."""
+    if review_result.status not in {"approved", "request_changes"} or review_result.review_round < 1:
+        return
+    review_convergence.append_review_round(
+        review_run_dir,
+        review_convergence.ReviewRound(
+            round_number=review_result.review_round,
+            reviewed_head_sha=review_result.reviewed_head_sha,
+            reviewed_base_sha=review_result.reviewed_base_sha,
+            decision=review_result.status,
+            model_decision=review_result.model_decision,
+            recorded_at=_now_iso(),
+            outstanding_findings=review_result.outstanding_findings,
+        ),
+    )
+
+
+def _seed_review_rounds_from_legacy_result(
+    repo_root: Path,
+    run: RunState,
+    review_run_dir: Path,
+) -> list[review_convergence.ReviewRound]:
+    """Recover the round ledger for a run that requested changes before it existed.
+
+    Runs started before review convergence have no ``review-rounds.json`` but
+    may already have a ``request_changes`` review-result.json (written without
+    ``review_round``). Seeding round 1 from it lets the resumed re-review see
+    and classify those findings and counts that round toward the cap.
+    """
+    if run.review_changes <= 0 or review_convergence.review_rounds_path(review_run_dir).exists():
+        return []
+    legacy = ReviewResult.load(repo_root, run.run_id)
+    if (
+        legacy is None
+        or legacy.review_round > 0
+        or legacy.status != "request_changes"
+        or not legacy.reviewed_head_sha
+    ):
+        return []
+    logger.info(
+        "Seeding review round ledger for %s from its pre-convergence review result at %s",
+        run.run_id,
+        _short_sha(legacy.reviewed_head_sha),
+    )
+    review_convergence.append_review_round(
+        review_run_dir,
+        review_convergence.ReviewRound(
+            round_number=1,
+            reviewed_head_sha=legacy.reviewed_head_sha,
+            reviewed_base_sha=legacy.reviewed_base_sha,
+            decision="request_changes",
+            model_decision="request_changes",
+            recorded_at=legacy.reviewed_at or _now_iso(),
+            outstanding_findings=[asdict(finding) for finding in legacy.findings],
+        ),
+    )
+    return review_convergence.load_review_rounds(review_run_dir)
 
 
 def _phase_review_local(
@@ -23772,6 +25354,72 @@ def _phase_review_local(
     if not review_transition_is_safe("review preparation"):
         return "failed"
     repo_slug = _trusted_publication_repo_slug(run)
+
+    accepted_request = _accepted_review_round_cap_request(repo_root, run)
+    accepted_result = ReviewResult.load(repo_root, run.run_id) if accepted_request is not None else None
+    rounds = (
+        review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+        if accepted_request is not None
+        else []
+    )
+    if accepted_request is not None and not _round_cap_accept_matches_head(
+        accepted_result, rounds, expected_head_sha
+    ):
+        # "Accept as-is" covers only the head the operator saw at the cap.
+        # A moved head (or a missing review) gets a normal review round.
+        logger.warning(
+            "Operator accepted %s at the review round cap, but the reviewed head "
+            "does not match current head %s; running a normal review round",
+            run.run_id,
+            _short_sha(expected_head_sha),
+        )
+        accepted_request.status = "consumed"
+        accepted_request.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+        accepted_request.consumed_at = _now_iso()
+        accepted_request.response_consumed_attempt_number = _current_attempt_number(run)
+        accepted_request.save(repo_root, run.run_id)
+        accepted_request = None
+    if accepted_request is not None and accepted_result is not None:
+        outstanding = rounds[-1].outstanding_findings if rounds else []
+        _publish_review_followups(
+            run,
+            repo_root,
+            outstanding,
+            pr_number=pr_number,
+            pr_body=str(pr_data.get("body", "") or ""),
+            repo_slug=repo_slug,
+            accepted_at_cap=True,
+        )
+        accepted_result.status = "approved"
+        accepted_result.summary = (
+            f"{accepted_result.summary} [Accepted by the operator at the review round cap.]"
+        ).strip()
+        accepted_result.save(repo_root, run.run_id)
+        try:
+            if review_transition_is_safe("review status publication"):
+                _publish_local_review_status(
+                    repo_root,
+                    repo_name=_repo_name_with_owner(
+                        repo_root,
+                        trusted_remote_url=run.publish_remote_url,
+                    ),
+                    expected_head_sha=expected_head_sha,
+                    review_result=accepted_result,
+                    target_url=accepted_result.source_check_url,
+                )
+        except ValueError as exc:
+            logger.warning("Could not publish operator-accepted review status: %s", exc)
+        now = _now_iso()
+        accepted_request.status = "consumed"
+        accepted_request.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+        accepted_request.consumed_at = now
+        accepted_request.response_consumed_attempt_number = _current_attempt_number(run)
+        accepted_request.save(repo_root, run.run_id)
+        run.review_decision_status = "approved"
+        run.review_decision_summary = "Accepted by the operator at the review round cap."
+        run.last_error = ""
+        return "passed"
+
     disable_error = _disable_pr_auto_merge(
         repo_root,
         pr_number,
@@ -23940,12 +25588,162 @@ def _phase_review_local(
         )
 
     conclusion = "success" if review_result.status == "approved" else "failure"
-    return _apply_review_result(
+    outcome = _apply_review_result(
         run,
         repo_root,
         review_result,
         conclusion=conclusion,
     )
+    review_run_dir = _state_root(repo_root) / "runs" / run.run_id
+    _record_local_review_round(review_run_dir, review_result)
+    if review_result.status == "approved":
+        if review_transition_is_safe("review follow-up publication"):
+            _publish_review_followups(
+                run,
+                repo_root,
+                review_convergence.non_blocking_followups(review_result.outstanding_findings),
+                pr_number=pr_number,
+                pr_body=str(latest_pr.get("body", pr_data.get("body", "")) or ""),
+                repo_slug=repo_slug,
+            )
+    elif review_result.status == "request_changes":
+        max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
+        if review_convergence.round_cap_reached(review_run_dir, max_rounds=max_rounds):
+            rounds_used = review_convergence.request_changes_round_count(
+                review_convergence.load_review_rounds(review_run_dir)
+            )
+            request = _review_round_cap_operator_request(
+                run,
+                review_result.outstanding_findings,
+                rounds_used=rounds_used,
+                max_rounds=max_rounds,
+            )
+            request.save(repo_root, run.run_id)
+            _emit_user_progress(
+                f"[spec] {run.spec_id}: review round cap reached ({rounds_used}/{max_rounds}); "
+                f"waiting for input. Run: spec input --spec {run.spec_id} --accept | --message ..."
+            )
+            run.last_error = request.prompt
+            run.status = "waiting-for-input"
+            run.save(repo_root)
+            return "waiting-for-input"
+    return outcome
+
+
+def _publish_ci_decision_status(repo_root: Path, repo_slug: str, result: ReviewResult, name: str) -> None:
+    response = run_subprocess(
+        ["gh", "api", f"repos/{repo_slug}/statuses/{result.reviewed_head_sha}", "-X", "POST",
+         "--input", "-"], cwd=repo_root, env=_gh_repo_environment(repo_slug),
+        input_text=json.dumps({"context": name, "state": "success",
+                               "description": "Spec Butler effective review: approved"}),
+    )
+    if response.returncode:
+        raise ValueError(f"Cannot publish effective review status for {name}: {response.stderr}")
+
+
+def _publish_effective_ci_approval(run: RunState, repo_root: Path, result: ReviewResult) -> None:
+    """Update only configured review checks; fail closed without checks:write."""
+    repo_slug = _trusted_publication_repo_slug(run)
+    for name in SPEC_RUNTIME_CONFIG.review.checks:
+        check = _find_check_run_for_sha(repo_root, result.reviewed_head_sha, name, repo_slug=repo_slug)
+        if not check or check.get("head_sha", result.reviewed_head_sha) != result.reviewed_head_sha:
+            raise ValueError(f"Cannot publish effective review approval: missing current-head check {name}")
+        if check.get("conclusion") == "success":
+            _publish_ci_decision_status(repo_root, repo_slug, result, name)
+            continue
+        if check.get("status") != "completed" or not check.get("id"):
+            raise ValueError(f"Cannot publish effective review approval: incomplete check {name}")
+        response = run_subprocess(
+            ["gh", "api", f"repos/{repo_slug}/check-runs/{check['id']}", "-X", "PATCH", "--input", "-"],
+            cwd=repo_root, env=_gh_repo_environment(repo_slug),
+            input_text=json.dumps({"conclusion": "success", "output": {
+                "title": "Effective Spec Butler review decision", "summary": result.summary}}),
+        )
+        if response.returncode:
+            raise ValueError(f"Cannot publish effective review approval for {name}: {response.stderr}")
+        _publish_ci_decision_status(repo_root, repo_slug, result, name)
+
+
+def _apply_ci_review_results(run: RunState, repo_root: Path, results: list) -> str:
+    """Use the same computed decision, round ledger and cap as local review."""
+    from .review_gate import compute_review_decision
+
+    review_run_dir = _state_root(repo_root) / "runs" / run.run_id
+    rounds = review_convergence.load_review_rounds(review_run_dir)
+    last = rounds[-1] if rounds else None
+    changed_ranges = None
+    if last:
+        _, changed_ranges = _local_review_incremental_diff(
+            resolve_worktree_path(run, repo_root),
+            last_reviewed_head_sha=last.reviewed_head_sha,
+            head_sha=results[0].reviewed_head_sha,
+        )
+    findings = []
+    classifications = []
+    for review in results:
+        prefix = review.source_check_name + "::"
+        for finding in review.findings:
+            item = asdict(finding)
+            if not item["id"].startswith(prefix):
+                item["id"] = prefix + item["id"]
+            findings.append(item)
+        for classification in review.prior_findings:
+            item = dict(classification)
+            if not str(item.get("id", "")).startswith(prefix):
+                item["id"] = prefix + str(item.get("id", ""))
+            classifications.append(item)
+    model_decision = next(
+        (status for status in ("failed", "blocked", "request_changes")
+         if any(r.status == status for r in results)), "approved")
+    computed = compute_review_decision(
+        model_decision=model_decision, findings=findings,
+        prior_findings=last.outstanding_findings if last else None,
+        prior_classifications=classifications,
+        changed_ranges=changed_ranges,
+    )
+    result = ReviewResult(
+        status=computed.decision, model_decision=model_decision,
+        summary="; ".join(r.summary for r in results),
+        findings=[ReviewFinding(**f) for f in findings],
+        reviewed_head_sha=results[0].reviewed_head_sha,
+        reviewed_base_sha=results[0].reviewed_base_sha,
+        source_check_name=", ".join(r.source_check_name for r in results),
+        source_check_url=results[0].source_check_url,
+        review_round=len(rounds) + 1,
+        outstanding_findings=computed.outstanding_findings,
+        blocking_finding_ids=computed.blocking_ids,
+    )
+    if result.status == "approved":
+        try:
+            _publish_effective_ci_approval(run, repo_root, result)
+        except ValueError as exc:
+            run.last_error = str(exc)
+            return "failed"
+    outcome = _apply_review_result(
+        run, repo_root, result,
+        conclusion="success" if result.status == "approved" else "failure",
+    )
+    if result.status in {"failed", "blocked"}:
+        # An incomplete reviewer must not replace the last completed round or
+        # erase its outstanding blockers when the review is retried.
+        return outcome
+    _record_local_review_round(review_run_dir, result)
+    max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
+    if result.status == "request_changes" and review_convergence.round_cap_reached(
+        review_run_dir, max_rounds=max_rounds,
+    ):
+        request = _review_round_cap_operator_request(
+            run, result.outstanding_findings,
+            rounds_used=review_convergence.request_changes_round_count(
+                review_convergence.load_review_rounds(review_run_dir)),
+            max_rounds=max_rounds,
+        )
+        request.save(repo_root, run.run_id)
+        run.last_error = request.prompt
+        run.status = "waiting-for-input"
+        run.save(repo_root)
+        return "waiting-for-input"
+    return outcome
 
 
 def _phase_review_action(
@@ -23955,10 +25753,47 @@ def _phase_review_action(
     expected_head_sha: str,
     expected_base_sha: str,
 ) -> str:
+    accepted = _accepted_review_round_cap_request(repo_root, run)
+    if accepted is not None:
+        result = ReviewResult.load(repo_root, run.run_id)
+        rounds = review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+        matches = _round_cap_accept_matches_head(result, rounds, expected_head_sha)
+        def consume_acceptance():
+            accepted.status = "consumed"
+            accepted.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+            accepted.consumed_at = _now_iso()
+            accepted.response_consumed_attempt_number = _current_attempt_number(run)
+            accepted.save(repo_root, run.run_id)
+
+        if matches and result is not None:
+            result.status = "approved"
+            result.summary += " [Accepted by the operator at the review round cap.]"
+            try:
+                _publish_effective_ci_approval(run, repo_root, result)
+            except ValueError as exc:
+                run.last_error = str(exc)
+                return "failed"
+            repo_slug = _trusted_publication_repo_slug(run)
+            pr, _ = _find_open_pr_for_branch(repo_root, run.branch, repo_slug=repo_slug)
+            if pr is None or pr.get("headRefOid") != expected_head_sha:
+                run.last_error = "PR head changed before accepted follow-up publication"
+                return "failed"
+            _publish_review_followups(
+                run, repo_root, rounds[-1].outstanding_findings,
+                pr_number=int(pr["number"]), pr_body=str(pr.get("body", "") or ""),
+                repo_slug=repo_slug, accepted_at_cap=True,
+            )
+            consume_acceptance()
+            return _apply_review_result(run, repo_root, result, conclusion="success")
+        consume_acceptance()
+
     deadline = time.time() + REVIEW_TIMEOUT_SECONDS
     poll_interval = max(1, REVIEW_POLL_INTERVAL_SECONDS)
     last_state = "not_started"
     last_url = ""
+    completed_results = {}
+    check_names = SPEC_RUNTIME_CONFIG.review.checks
+    check_name = check_names[0]
 
     while time.time() <= deadline:
         repo_slug = _trusted_publication_repo_slug(run)
@@ -24009,14 +25844,14 @@ def _phase_review_action(
         check_run = _find_check_run_for_sha(
             repo_root,
             expected_head_sha,
-            REVIEW_GATE_CHECK_NAME,
+            check_name,
             repo_slug=repo_slug,
         )
         if check_run is None:
             last_state = "not_found"
         elif "__error__" in check_run:
             run.last_error = (
-                f"Could not query {REVIEW_GATE_CHECK_NAME} check run: {check_run.get('__error__', 'unknown error')}"
+                f"Could not query {check_name} check run: {check_run.get('__error__', 'unknown error')}"
             )
             return "failed"
         else:
@@ -24026,7 +25861,7 @@ def _phase_review_action(
             last_url = str(check_run.get("details_url", "")).strip()
 
             if status == "completed":
-                require_payload = conclusion != "success"
+                require_payload = True
                 try:
                     review_result = _extract_review_result_from_check_run(
                         check_run,
@@ -24037,20 +25872,44 @@ def _phase_review_action(
                         repo_slug=repo_slug,
                     )
                 except ValueError as exc:
-                    run.last_error = f"Review decision payload invalid for {REVIEW_GATE_CHECK_NAME}: {exc}"
+                    try:
+                        payload = review_feedback._load_sticky_review_comment_payload(
+                            repo_root, int(latest_pr["number"]),
+                            run_subprocess=_repo_pinned_run_subprocess(repo_slug),
+                            expected_check=check_run,
+                        )
+                        if payload is None:
+                            raise ValueError(str(exc))
+                        review_result = review_feedback.normalize_review_payload(
+                            payload, expected_head_sha=expected_head_sha,
+                            expected_base_sha=expected_base_sha, check_run=check_run,
+                        )
+                    except (ValueError, KeyError) as sticky_exc:
+                        run.last_error = f"Review decision payload invalid for {check_name}: {sticky_exc}"
+                        return "failed"
+                if conclusion != "success" and review_result.status == "approved":
+                    run.last_error = f"Review check {check_name} failed with an approved payload"
                     return "failed"
 
-                return _apply_review_result(
-                    run,
-                    repo_root,
-                    review_result,
-                    conclusion=conclusion,
-                    fallback_check_url=last_url,
-                )
+                completed_results[check_name] = review_result
+                remaining_checks = [n for n in check_names if n not in completed_results]
+                if remaining_checks:
+                    check_name = remaining_checks[0]
+                    continue
+                outcome = _apply_ci_review_results(run, repo_root, list(completed_results.values()))
+                saved = ReviewResult.load(repo_root, run.run_id)
+                if outcome == "passed" and saved is not None:
+                    _publish_review_followups(
+                        run, repo_root,
+                        review_convergence.non_blocking_followups(saved.outstanding_findings),
+                        pr_number=int(latest_pr["number"]),
+                        pr_body=str(latest_pr.get("body", "") or ""), repo_slug=repo_slug,
+                    )
+                return outcome
 
         logger.info(
             "Waiting for %s on %s (state=%s)...",
-            REVIEW_GATE_CHECK_NAME,
+            check_name,
             _short_sha(expected_head_sha),
             last_state,
         )
@@ -24063,7 +25922,7 @@ def _phase_review_action(
     if last_url:
         timeout_detail = f"{timeout_detail} ({last_url})"
     run.last_error = (
-        f"Timed out waiting for {REVIEW_GATE_CHECK_NAME} on {_short_sha(expected_head_sha)}: {timeout_detail}"
+        f"Timed out waiting for {check_name} on {_short_sha(expected_head_sha)}: {timeout_detail}"
     )
     return "failed"
 
@@ -24149,7 +26008,13 @@ def phase_review(run: RunState, repo_root: Path) -> str:
     run.review_decision_check_url = ""
     run.save(repo_root)
 
-    # Always use local review — no CI review-decision-gate dependency.
+    if SPEC_RUNTIME_CONFIG.review.source == "ci":
+        return _phase_review_action(
+            run, repo_root, expected_head_sha=expected_head_sha,
+            expected_base_sha=expected_base_sha,
+        )
+
+    # Local review is the default.
     return _phase_review_local(
         run,
         repo_root,
@@ -24175,6 +26040,8 @@ def _try_auto_merge(
             flow with --auto enabled.
         "unavailable_after_auto_no_auto" – auto-merge command was attempted and
             reported unsupported; retry manual flow without --auto.
+        "stale_base"  – the forge refused the merge because the base moved;
+            retry the manual flow with a forced base sync.
         "failed"      – auto-merge was enabled but the merge failed (run.last_error set).
     """
     worktree_path = resolve_worktree_path(run, repo_root)
@@ -24219,6 +26086,15 @@ def _try_auto_merge(
             )
             _poll_sleep(MERGE_CHECKS_POLL_INTERVAL_SECONDS)
             return "unavailable_after_auto"
+        # The base moved past the head (GitHub may still say BLOCKED rather
+        # than BEHIND); the manual path merges the base before merging.
+        if _is_stale_base_merge_error(err):
+            logger.info(
+                "Auto-merge refused PR #%s for a stale base; syncing with %s first.",
+                pr_number,
+                BASE_REF,
+            )
+            return "stale_base"
         # Any other error is a real failure.
         run.last_error = f"gh pr merge --auto failed: {err}"
         return "failed"
@@ -24227,12 +26103,28 @@ def _try_auto_merge(
     deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
     poll_interval = max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS)
     while True:
-        pr_data = _find_pr_for_branch(
-            repo_root,
-            run.branch,
-            state="all",
-            repo_slug=repo_slug,
-        )
+        try:
+            pr_data = _find_pr_for_branch(
+                repo_root,
+                run.branch,
+                state="all",
+                repo_slug=repo_slug,
+                raise_on_error=True,
+            )
+        except PrLookupUnavailable as exc:
+            # A forge outage says nothing about the PR; auto-merge stays armed
+            # on GitHub, so keep polling until the normal deadline.
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return _fail_after_auto_merge_armed(
+                    run,
+                    repo_root,
+                    pr_number,
+                    f"Could not reach the forge while waiting for auto-merge on PR #{pr_number}: {exc}",
+                )
+            logger.warning("PR #%s lookup failed while waiting for auto-merge; retrying: %s", pr_number, exc)
+            _poll_sleep(min(poll_interval, remaining))
+            continue
         if pr_data is None:
             return _fail_after_auto_merge_armed(
                 run,
@@ -24348,6 +26240,19 @@ def _try_auto_merge(
         _poll_sleep(min(poll_interval, remaining))
 
 
+def _is_stale_base_merge_error(text: str) -> bool:
+    """True when the forge refused a merge because the head is behind its base."""
+    lowered = (text or "").lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "not up to date with the base branch",
+            "head branch is out of date",
+            "branch is out-of-date",
+        )
+    )
+
+
 def _manual_merge(
     run: RunState,
     repo_root: Path,
@@ -24359,6 +26264,7 @@ def _manual_merge(
     *,
     use_auto_merge: bool = True,
     prior_merge_attempts: int = 0,
+    force_base_sync: bool = False,
 ) -> str:
     """Poll required checks then squash-merge the PR.
 
@@ -24424,9 +26330,9 @@ def _manual_merge(
         return "failed"
     # If branch is behind base, merge origin/master locally and push.
     merge_state = str((latest_pr or pr_data).get("mergeStateStatus", "")).strip().upper()
-    if merge_state == "BEHIND":
+    if merge_state == "BEHIND" or force_base_sync:
         logger.info(
-            "PR #%s branch is behind base — merging origin/master locally...",
+            f"PR #%s branch is behind base — merging {BASE_REF} locally...",
             pr_number,
         )
         try:
@@ -24441,8 +26347,8 @@ def _manual_merge(
             remote_url=run.publish_remote_url,
         )
         if merge_result.status == "conflict":
-            detail = merge_result.stderr or "git merge origin/master reported conflicts"
-            run.last_error = f"Merge conflict while merging origin/master before merge: {detail}"
+            detail = merge_result.stderr or f"git merge {BASE_REF} reported conflicts"
+            run.last_error = f"Merge conflict while merging {BASE_REF} before merge: {detail}"
             run.merge_conflict_error = run.last_error
             run.mergeability_issue = run.last_error
             return "failed"
@@ -24467,12 +26373,16 @@ def _manual_merge(
         )
         if push_result.returncode != 0:
             run.last_error = (
-                "Failed to push branch after merging origin/master: "
+                f"Failed to push branch after merging {BASE_REF}: "
                 f"{push_result.stderr.strip() or push_result.stdout.strip()}"
             )
             return "failed"
 
         current_head_sha = _head_sha(worktree_path) or _remote_branch_head_sha(repo_root, branch)
+        if current_head_sha:
+            # The sync push moved the branch; the final merge must pin the new
+            # head or GitHub rejects --match-head-commit.
+            pr_head_sha = current_head_sha
         pr_body = str((latest_pr or pr_data).get("body", "") or "")
         if _mark_local_review_for_rerun_after_sync(
             run,
@@ -24495,16 +26405,16 @@ def _manual_merge(
             if _required_checks_still_pending(checks_error):
                 remaining = checks_deadline - time.time()
                 if remaining <= 0:
-                    run.last_error = f"Timed out waiting for checks after syncing with origin/master: {checks_error}"
+                    run.last_error = f"Timed out waiting for checks after syncing with {BASE_REF}: {checks_error}"
                     return "failed"
                 logger.info(
-                    "Waiting for checks after syncing with origin/master on PR #%s: %s",
+                    f"Waiting for checks after syncing with {BASE_REF} on PR #%s: %s",
                     pr_number,
                     checks_error,
                 )
                 _poll_sleep(min(checks_poll_interval, remaining))
                 continue
-            run.last_error = f"Checks failed after syncing with origin/master: {checks_error}"
+            run.last_error = f"Checks failed after syncing with {BASE_REF}: {checks_error}"
             return "failed"
     # Retry gh pr merge a few times to handle race between checks
     # passing and GitHub branch protection allowing the merge.
@@ -24599,6 +26509,27 @@ def _manual_merge(
                     )
                 _poll_sleep(MERGE_CHECKS_POLL_INTERVAL_SECONDS)
                 continue
+        if _is_stale_base_merge_error(merge_err) and not force_base_sync:
+            # GitHub can report BLOCKED (checks pending) rather than BEHIND for
+            # a branch the base has moved past, so the sync above was skipped.
+            # The forge refusal is authoritative: sync once and go again.
+            logger.info(
+                "PR #%s is not up to date with %s; merging the base and retrying.",
+                pr_number,
+                BASE_REF,
+            )
+            return _manual_merge(
+                run,
+                repo_root,
+                worktree_path,
+                branch,
+                pr_number,
+                pr_head_sha,
+                pr_data,
+                use_auto_merge=use_auto_merge,
+                prior_merge_attempts=prior_merge_attempts + merge_try + 1,
+                force_base_sync=True,
+            )
         run.last_error = f"gh pr merge failed: {merge_err}"
         return "failed"
     if not merged_successfully:
@@ -24843,7 +26774,12 @@ def _evaluate_readiness_for_promotion(
 
     if require_integration_checkpoint:
         merge_state = str(pr_data.get("mergeStateStatus", "") or "").strip().upper()
-        if merge_state in {"BEHIND", "DIRTY"}:
+        # BEHIND is not a blocker: the merge phase itself merges the base into
+        # the branch, pushes, re-runs review when needed and waits for checks
+        # (see _manual_merge). Refusing here instead sent the run back to an
+        # implement attempt that cannot change BEHIND, looping until an
+        # operator updated the branch. DIRTY (conflicts) still blocks.
+        if merge_state == "DIRTY":
             return ReadinessDecision(
                 False,
                 current_head_sha,
@@ -24915,7 +26851,7 @@ def _best_effort_post_merge_local_sync(
             failure_type="merge",
             failure_subtype="local_post_merge_sync_timed_out",
             summary=(
-                "Remote merge succeeded, but post-merge local master refresh timed out. "
+                f"Remote merge succeeded, but post-merge local {PR_BASE_BRANCH} refresh timed out. "
                 "Cleanup can continue; refresh local refs manually if needed."
             ),
             action=f"git fetch {remote_name} {remote_branch}",
@@ -24930,7 +26866,7 @@ def _best_effort_post_merge_local_sync(
             failure_type="merge",
             failure_subtype="local_post_merge_sync_failed",
             summary=(
-                "Remote merge succeeded, but post-merge local master refresh failed. "
+                f"Remote merge succeeded, but post-merge local {PR_BASE_BRANCH} refresh failed. "
                 "Cleanup can continue; refresh local refs manually if needed."
             ),
             action=f"git fetch {remote_name} {remote_branch}",
@@ -24980,7 +26916,7 @@ def _best_effort_post_merge_local_sync(
             phase="merge",
             failure_type="merge",
             failure_subtype="local_post_merge_sync_failed",
-            summary=("Remote merge succeeded, but the local `master` ref could not be updated after the merge."),
+            summary=(f"Remote merge succeeded, but the local `{PR_BASE_BRANCH}` ref could not be updated after the merge."),
             action=f"git update-ref refs/heads/{PR_BASE_BRANCH} {remote_tracking_ref}",
             detail=detail,
         )
@@ -25163,7 +27099,7 @@ def phase_merge(run: RunState, repo_root: Path) -> str:
             # Auto-merge unavailable — fall back to manual poll-then-merge.
             manual_use_auto_merge = True
             prior_merge_attempts = 0
-            if auto == "unavailable_after_auto":
+            if auto in {"unavailable_after_auto", "stale_base"}:
                 prior_merge_attempts = 1
             elif auto == "unavailable_after_auto_no_auto":
                 manual_use_auto_merge = False
@@ -25178,6 +27114,7 @@ def phase_merge(run: RunState, repo_root: Path) -> str:
                 pr_data,
                 use_auto_merge=manual_use_auto_merge,
                 prior_merge_attempts=prior_merge_attempts,
+                force_base_sync=auto == "stale_base",
             )
             if manual != "passed":
                 return manual
@@ -25540,8 +27477,8 @@ def _confirm_merge_conflict_retry(
         branch=run.branch,
     )
     if mergeability_check.status == "conflict":
-        detail = mergeability_check.stderr or "git merge origin/master reported conflicts"
-        issue = f"Confirmed local merge conflict with origin/master during {context}: {detail}"
+        detail = mergeability_check.stderr or f"git merge {BASE_REF} reported conflicts"
+        issue = f"Confirmed local merge conflict with {BASE_REF} during {context}: {detail}"
         run.merge_conflict_error = issue
         run.mergeability_issue = issue
         run.last_error = issue
@@ -25551,7 +27488,7 @@ def _confirm_merge_conflict_retry(
         run.merge_conflict_error = ""
         run.mergeability_issue = (
             f"PR mergeability issue during {context} appears stale or remote-only: "
-            f"{run.last_error}. A local merge against origin/master is clean."
+            f"{run.last_error}. A local merge against {BASE_REF} is clean."
         )
         run.last_error = run.mergeability_issue
         return False
@@ -25585,6 +27522,9 @@ def _classify_phase_result(
         "gate_name": "",
         "warnings": warnings,
     }
+    if "budget_exceeded" in run.last_error:
+        metadata.update(failure_type="budget", failure_subtype="budget_exceeded", retryable=False)
+        return metadata
     if warnings:
         first_warning = warnings[0]
         metadata.update(
@@ -25731,7 +27671,7 @@ def _classify_phase_result(
                     "gate_name": _gate_name_from_error(message),
                 }
             )
-        elif "merge conflict while merging origin/master before verify" in normalized:
+        elif f"merge conflict while merging {BASE_REF} before verify".lower() in normalized:
             metadata.update(
                 {
                     "failure_type": "verify",
@@ -25950,7 +27890,12 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
     _emit_phase_progress(run, phase, "started")
 
     try:
+        _check_budget(run)
         result_status = handler(run, repo_root)
+        _check_budget(run)
+    except BudgetExceeded:
+        result_status = "blocked"
+        run.last_error = "budget_exceeded: estimated run cost reached the configured limit"
     except Exception as exc:
         result_status = "failed"
         run.last_error = f"Exception in {phase}: {exc}"
@@ -26408,6 +28353,9 @@ def _transition_to_blocked_with_debugger(
     # failure reason, not a generic retry-cap message (F3).
     original_last_error = run.last_error
     run.status = "blocked"
+    if "budget_exceeded" in original_last_error:
+        run.save(repo_root)
+        return "blocked"
     _maybe_run_block_debugger(
         run,
         repo_root,
@@ -26875,14 +28823,22 @@ def cmd_spec(args: argparse.Namespace) -> int:
             cleanup_agent_git_isolation(git_isolation)
         raise
 
+    authoring_run = RunState(
+        run_id=_run_id(spec_id or "authoring"), spec_id=spec_id or "authoring",
+        branch=branch, worktree_path=str(worktree_path), phase="authoring",
+        run_mode="spec", agent=agent, status="passed",
+    )
+
     print(f"{'Resuming' if resumed else 'Launching'} spec authoring in {worktree_path}")
 
     try:
-        completed = _run_interactive_agent_owned(
-            author_cmd,
+        completed = _run_interactive_usage(
+            authoring_run, repo_root, agent, author_cmd,
             cwd=worktree_path,
             env=authoring_env,
         )
+        authoring_run.status = "passed" if completed.returncode == 0 else "failed"
+        authoring_run.save(repo_root)
         _reconcile_and_cleanup_agent_git(git_isolation)
     except FileNotFoundError as exc:
         if git_isolation is not None:
@@ -27018,14 +28974,222 @@ def cmd_steer(args: argparse.Namespace) -> int:
     print(f"  Guidance: {steering.message}")
     print(f"  Provided By: {steering.provided_by or 'unknown'}")
     print(f"  Provided At: {steering.provided_at}")
-    print("  Effect: advisory context for the next implement attempt")
+    print(
+        "  Effect: advisory context for the next implement attempt, delivered "
+        "through the resumed agent session at that attempt boundary"
+    )
     return 0
+
+
+def _run_agent_process_alive(repo_root: Path, worktree_path: Path) -> bool:
+    """Return True while an implement agent registered for *worktree_path* runs."""
+    entries = worktree_process_registry.load_registered_processes(
+        _worktree_registry_state_root(repo_root, worktree_path),
+        worktree_path,
+    )
+    return any(
+        entry.kind == "agent"
+        and worktree_process_registry.is_process_alive(entry.pid, entry.started_at)
+        for entry in entries
+    )
+
+
+def _operator_codex_home() -> Path:
+    configured = str(os.environ.get("CODEX_HOME", "")).strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".codex"
+
+
+def _expose_run_sessions_to_operator(
+    repo_root: Path,
+    run: RunState,
+    worktree_path: Path,
+    agent: str,
+    *,
+    live: bool,
+) -> None:
+    """Make the run's session visible to the operator's own provider CLI.
+
+    Launch provider homes (a host Codex home, a container worker's Codex or
+    Claude home) do not outlive the launch, so the run's archived sessions are
+    restored into the operator's home first; the printed command then works on
+    its own as well. While the launch still runs (``--fork``) its live
+    sessions are newer than the archive, so a snapshot of them is laid on top.
+    Files already in the operator's home are only replaced by copies that
+    extend them, so turns added in an earlier attach are never lost.
+    """
+    archive = (
+        _codex_session_archive_dir(repo_root, run.run_id)
+        if agent == "codex"
+        else _claude_session_archive_dir(repo_root, run.run_id)
+    )
+    with tempfile.TemporaryDirectory(prefix="spec-attach-") as scratch:
+        sources = [archive] if archive.is_dir() else []
+        live_snapshot = Path(scratch) / "live"
+        if live and _snapshot_live_provider_sessions(
+            repo_root, run, worktree_path, agent, live_snapshot
+        ):
+            sources.append(live_snapshot)
+        if agent == "codex":
+            operator_sessions = _operator_codex_home() / "sessions"
+            for source in sources:
+                # Never the plain copy: the operator's home may hold turns
+                # added interactively since an earlier attach.
+                _merge_operator_sessions(source, operator_sessions)
+            if any(
+                any(source.rglob(f"*{run.agent_session_id}*.jsonl")) for source in sources
+            ):
+                origin = "live" if live_snapshot in sources else "archived"
+                print(f"Restored {origin} Codex rollouts for {run.run_id} into {operator_sessions}")
+            else:
+                print(
+                    f"Warning: No archived Codex rollouts for run {run.run_id}; "
+                    f"`codex resume` may not find thread {run.agent_session_id}.",
+                    file=sys.stderr,
+                )
+            return
+        installed: Path | None = None
+        for source in sources:
+            installed = (
+                _install_claude_session(source, run.agent_session_id, worktree_path)
+                or installed
+            )
+        if installed is not None:
+            print(f"Restored Claude session {run.agent_session_id} into {installed}")
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    """Print (or run) the command that resumes the latest run's agent session."""
+    repo_root = resolve_repo_root()
+    spec_id = args.spec
+    fork = bool(getattr(args, "fork", False))
+    run = _latest_non_superseded_run(repo_root, spec_id)
+    if run is None:
+        print(f"Error: No run found for spec {spec_id}", file=sys.stderr)
+        return 1
+    if not run.agent_session_id:
+        print(
+            f"Error: Run {run.run_id} has no recorded {run.agent} session to attach to.",
+            file=sys.stderr,
+        )
+        return 1
+    agent = run.agent_session_agent or run.agent
+    try:
+        attach_cmd = provider_attach_command(agent, run.agent_session_id, fork=fork)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    worktree_path = resolve_worktree_path(run, repo_root)
+    if not worktree_path.is_dir():
+        print(f"Error: Workspace missing: {worktree_path}", file=sys.stderr)
+        return 1
+    alive = _run_agent_process_alive(repo_root, worktree_path)
+    if alive and not fork:
+        # One session must not be driven headless and interactively at once.
+        print(
+            f"Error: The {agent} agent for run {run.run_id} is still running. "
+            "Stop it with `spec stop`, wait for the attempt to finish, or pass "
+            "--fork to branch the session.",
+            file=sys.stderr,
+        )
+        return 1
+    if fork and agent == "codex":
+        print("Note: --fork uses `codex fork` for Codex sessions.")
+    if agent in {"codex", "claude"}:
+        _expose_run_sessions_to_operator(
+            repo_root,
+            run,
+            worktree_path,
+            agent,
+            live=alive,
+        )
+
+    print(f"Run: {run.run_id}")
+    print(f"  Agent Session: {run.agent_session_id} ({agent})")
+    print(f"  Workspace: {worktree_path}")
+    print(f"  Command: cd {shlex.quote(str(worktree_path))} && {shlex.join(attach_cmd)}")
+    if not getattr(args, "exec", False):
+        return 0
+    try:
+        return subprocess.run(attach_cmd, cwd=worktree_path, check=False).returncode
+    except FileNotFoundError as exc:
+        print(f"Error: Agent binary not found: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_input_review_round_cap(
+    repo_root: Path,
+    args: argparse.Namespace,
+    *,
+    accept: bool,
+    message: str,
+) -> int:
+    """Resolve a review round-cap request without an agent session."""
+    spec_id = args.spec
+    if accept and message:
+        print("Error: pass either --accept or --message, not both.", file=sys.stderr)
+        return 1
+    run = RunState.find_latest(repo_root, spec_id)
+    if run is None:
+        print(f"Error: No run found for spec {spec_id}", file=sys.stderr)
+        return 1
+    request = OperatorRequest.load(repo_root, run.run_id)
+    if (
+        request is None
+        or request.kind != review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND
+        or request.status != "pending"
+    ):
+        print(
+            f"Error: Latest run for {spec_id} has no pending review round-cap request; "
+            "--accept and --message only resolve that request.",
+            file=sys.stderr,
+        )
+        return 1
+    if accept:
+        now = _now_iso()
+        request.response = review_convergence.REVIEW_ROUND_CAP_ACCEPT
+        request.response_source = "spec input --accept"
+        request.status = "resolved"
+        request.resolved_at = now
+        request.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+        request.continuation_source = "spec input --accept"
+        request.continuation_selected_at = now
+        request.save(repo_root, run.run_id)
+        # The review phase sees the accepted request and approves the
+        # current head without another reviewer round.
+        run.status = "pending"
+        run.phase = "review"
+        run.save(repo_root)
+        print(f"Accepted {spec_id} at the review round cap. Resuming workflow...")
+    else:
+        review_convergence.grant_extra_review_round(_state_root(repo_root) / "runs" / run.run_id)
+        try:
+            resolve_operator_request(repo_root, run, message, source="spec input --message")
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Granted {spec_id} one more review round. Resuming implement with guidance...")
+    resume_args = argparse.Namespace(
+        spec=spec_id,
+        agent=run.agent or SPEC_RUNTIME_CONFIG.agents.default,
+        review_agent=run.review_agent or _configured_review_agent_default() or run.agent,
+        base=run.base_ref or BASE_REF,
+        run=run.run_id,
+        new=False,
+        retry_cap=run.retry_cap,
+        reset_intake=False,
+    )
+    return cmd_run(resume_args)
 
 
 def cmd_input(args: argparse.Namespace) -> int:
     """Launch an interactive session to resolve an operator intervention."""
     repo_root = resolve_repo_root()
     spec_id = args.spec
+
+    accept = bool(getattr(args, "accept", False))
+    message = str(getattr(args, "message", "") or "").strip()
+    if accept or message:
+        return _cmd_input_review_round_cap(repo_root, args, accept=accept, message=message)
 
     if not sys.stdin.isatty():
         print(
@@ -27048,6 +29212,13 @@ def cmd_input(args: argparse.Namespace) -> int:
     if request is None:
         print(
             f"Error: Latest run for {spec_id} has status '{run.status}' and no active operator intervention.",
+            file=sys.stderr,
+        )
+        return 1
+    if request.kind == review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND:
+        print(
+            f"{request.prompt}\n\nResolve with `spec input --spec {spec_id} --accept` or "
+            f"`spec input --spec {spec_id} --message '<guidance>'`.",
             file=sys.stderr,
         )
         return 1
@@ -27208,7 +29379,7 @@ def cmd_input(args: argparse.Namespace) -> int:
             "git_isolation",
         ):
             authoring_kwargs["git_isolation"] = git_isolation
-        agent_cmd = adapter.build_authoring_command(**authoring_kwargs)
+        agent_cmd = _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
     except RuntimeError as exc:
         if git_isolation is not None:
             cleanup_agent_git_isolation(git_isolation)
@@ -27242,8 +29413,8 @@ def cmd_input(args: argparse.Namespace) -> int:
 
     try:
         try:
-            completed = _run_interactive_agent_owned(
-                agent_cmd,
+            completed = _run_interactive_usage(
+                run, repo_root, agent, agent_cmd,
                 cwd=worktree_path,
                 env=input_env,
             )
@@ -27445,6 +29616,26 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 1
 
 
+def _validate_new_spec_run(repo_root: Path, spec_id: str, base_ref: str) -> None:
+    """Validate catalog input before pinning a new immutable run contract."""
+    from .config import load_repo_spec_runtime_config
+    from .spec_lint import format_lint, lint_specs
+
+    results = lint_specs(repo_root, spec_id)
+    print(format_lint(results))
+    if any(result.errors for result in results):
+        raise RuntimeError("Spec lint failed")
+    config = load_repo_spec_runtime_config(repo_root)
+    if config.specs.require_merged_spec:
+        relative = f"{config.paths.specs_dir}/{spec_id}.md"
+        check = subprocess.run(
+            ["git", "cat-file", "-e", f"{base_ref}:{relative}"],
+            cwd=repo_root, capture_output=True,
+        )
+        if check.returncode:
+            raise RuntimeError("Spec must exist on the base ref; merge it first or set [specs] require_merged_spec = false.")
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Start or resume a full workflow run."""
     repo_root = resolve_repo_root()
@@ -27532,6 +29723,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 )
 
             if run is None:
+                _validate_new_spec_run(repo_root, spec_id, base_ref)
                 if is_spec_merged(repo_root, spec_id):
                     raise RuntimeError(
                         f"Spec '{spec_id}' is already merged on {BASE_REF}; refusing to start a new implementation run."
@@ -27607,6 +29799,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 spec_path = _command_spec_path(repo_root, spec_id, run)
                 if not spec_path.exists():
                     raise RuntimeError(f"Spec not found: {spec_path}")
+                if run.run_mode != "task":
+                    from .spec_lint import format_lint, lint_specs
+
+                    results = lint_specs(repo_root, spec_id, source_path=spec_path)
+                    print(format_lint(results))
+                    if any(result.errors for result in results):
+                        raise RuntimeError("Spec lint failed")
                 run.agent = agent
                 run.review_agent = review_agent
                 # Preserve the run's saved base_ref (e.g. web handoffs that
@@ -27736,7 +29935,7 @@ def cmd_step(args: argparse.Namespace) -> int:
             if run is None:
                 if is_spec_merged(repo_root, spec_id):
                     raise RuntimeError(
-                        f"Spec '{spec_id}' is already merged on origin/master; "
+                        f"Spec '{spec_id}' is already merged on {BASE_REF}; "
                         "use RUN=<run-id> to inspect or clean up an existing run."
                     )
                 run = _create_spec_run(
@@ -28140,9 +30339,13 @@ def cmd_status(args: argparse.Namespace) -> int:
                 previous_phase = candidate.superseded_from_phase or candidate.phase
                 print(f"  Run {candidate.run_id} — superseded (was: {previous_status}, phase: {previous_phase})")
                 continue
+            session_text = (
+                f", session {candidate.agent_session_id}" if candidate.agent_session_id else ""
+            )
             print(
                 f"  Run {candidate.run_id} — {candidate.status} "
-                f"(phase: {candidate.phase}, attempt {format_attempt_progress(candidate.attempts, candidate.retry_cap)})"
+                f"(phase: {candidate.phase}, attempt {format_attempt_progress(candidate.attempts, candidate.retry_cap)}"
+                f"{session_text})"
             )
 
     # Show latest run state
@@ -28166,6 +30369,10 @@ def cmd_status(args: argparse.Namespace) -> int:
             for warning in canonical.warnings:
                 print(f"  Warning: {warning}")
         print(f"  Agent: {run.agent}")
+        if run.agent_session_id:
+            print(f"  Agent Session: {run.agent_session_id} ({run.agent_session_agent or run.agent})")
+            if run.agent_session_fallback_reason:
+                print(f"  Session Fallback: {run.agent_session_fallback_reason}")
         if run.backend or run.safety_mode:
             backend_text = run.backend or "unknown"
             source_text = f" ({run.backend_source})" if run.backend_source else ""
@@ -28330,6 +30537,11 @@ def cmd_status(args: argparse.Namespace) -> int:
                 print(f"  Expected Head SHA: {run.review_expected_head_sha}")
             if run.review_decision_check_url:
                 print(f"  Source Check: {run.review_decision_check_url}")
+
+    if run:
+        from .usage import grouped, totals
+        print("\nUsage (estimated API list prices):")
+        print(json.dumps({"run": totals(run.usage), "phases": grouped(run.usage, "phase")}, indent=2))
 
     # Show gate status
     gate_file, gate_data = _read_gate_status(repo_root, run) if run else (None, None)
@@ -28536,6 +30748,7 @@ def _compute_orchestrator_analytics(
             "run_id": run_id or "",
             "since": since or "",
         },
+        "usage": _usage_analytics(runs),
         "run_counts_by_terminal_phase_status": dict(sorted(terminal_run_counts.items())),
         "phase_attempt_counts_by_outcome": {
             phase: dict(sorted(counts.items())) for phase, counts in sorted(phase_attempt_counts.items())
@@ -28825,6 +31038,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_input.add_argument("--spec", required=True, help="Spec ID")
     p_input.add_argument("--agent", default=None, help="Agent: claude|codex")
+    p_input.add_argument("--accept", action="store_true", help="Review round cap: accept as-is")
+    p_input.add_argument("--message", default="", help="Review round cap: guidance for one more round")
 
     p_steer = subparsers.add_parser(
         "steer",

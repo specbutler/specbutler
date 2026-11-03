@@ -524,7 +524,10 @@ jobs:
         run: |
           Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force artifacts/ci-evidence | Out-Null
-          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests -v --ignore=tests/test_windows_probe.py --junitxml artifacts/ci-evidence/full-suite.xml 2>&1 | Tee-Object artifacts/full-suite.log
+          # The suite is dominated by per-test process and git spawns, which are
+          # several times slower on Windows than on Linux; spread them across
+          # every runner core and keep pytest's temp tree on the runner's D: drive.
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pytest -o "pythonpath=" tests -v --ignore=tests/test_windows_probe.py -n auto --dist worksteal --basetemp "$env:RUNNER_TEMP/pytest-full-suite" --durations 30 --junitxml artifacts/ci-evidence/full-suite.xml 2>&1 | Tee-Object artifacts/full-suite.log
           exit $LASTEXITCODE
       - name: Record successful Windows probe evidence
         shell: pwsh

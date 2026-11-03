@@ -50,6 +50,20 @@ infra_backoff_base_seconds = 30
 infra_backoff_max_seconds = 600
 
 # ---------------------------------------------------------------------------
+# Local review convergence
+# ---------------------------------------------------------------------------
+[review]
+
+# Review rounds one run may spend. The max_rounds-th "request changes" moves the
+# run to waiting-for-input (resolve with `spec input`: accept as-is, or send one
+# more implement round with guidance) instead of starting another retry.
+max_rounds = 3
+
+# Reasoning effort for re-reviews. Empty keeps the first pass's effort.
+# One of: minimal, low, medium, high, xhigh.
+rereview_reasoning_effort = ""
+
+# ---------------------------------------------------------------------------
 # Autopilot infrastructure backoff and circuit breaker
 # ---------------------------------------------------------------------------
 [autopilot]

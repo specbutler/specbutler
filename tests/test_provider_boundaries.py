@@ -682,6 +682,7 @@ def test_codex_profile_deduplicates_nested_denies_without_losing_restrictions(
     assert (f'{json.dumps(str(launch_root))}="write"' in policy) is writable_between
 
 
+@pytest.mark.requires_ps
 def test_local_review_transports_large_prompt_over_stdin(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     cwd = tmp_path / "scratch"
@@ -876,12 +877,14 @@ def test_claude_launch_failure_scrubs_and_resyncs_isolated_credentials(
         '{"accessToken":"secret"}',
         encoding="utf-8",
     )
-    run = SimpleNamespace(
+    run = orch.RunState(
         agent="claude",
         implement_launches=1,
         attempts=1,
         run_id="run-1",
         spec_id="feature",
+        branch="code/feature--run-1",
+        phase="implement",
     )
     plan = orch.ImplementLaunchPlan(
         use_stream_json=False,

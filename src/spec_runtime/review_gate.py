@@ -24,6 +24,43 @@ class GateEvaluation:
     exit_code: int
 
 
+# The ``prior_findings`` property added for re-review classification. Kept in
+# sync with ``templates/review-schema.json``; legacy repository schemas that
+# predate it are upgraded with this definition.
+PRIOR_FINDINGS_SCHEMA: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "required": ["id", "status", "note"],
+        "properties": {
+            "id": {"type": "string", "minLength": 1},
+            "status": {"type": "string", "enum": ["resolved", "unresolved", "withdrawn"]},
+            "note": {"type": "string"},
+        },
+        "additionalProperties": False,
+    },
+}
+
+
+def upgrade_legacy_review_schema(schema: dict[str, Any]) -> dict[str, Any] | None:
+    """Return ``schema`` with ``prior_findings`` merged in, or None if unchanged.
+
+    Repositories initialised before re-review classification keep a review
+    schema whose ``additionalProperties: false`` forbids ``prior_findings``.
+    The upgrade lists the field as required, as strict structured output needs
+    every property listed; the gate defaults it for outputs that omit it.
+    """
+    properties = schema.get("properties")
+    if not isinstance(properties, dict) or "prior_findings" in properties:
+        return None
+    upgraded = json.loads(json.dumps(schema))
+    upgraded["properties"]["prior_findings"] = json.loads(json.dumps(PRIOR_FINDINGS_SCHEMA))
+    required = upgraded.get("required")
+    if isinstance(required, list) and "prior_findings" not in required:
+        required.append("prior_findings")
+    return upgraded
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -296,6 +333,18 @@ def evaluate_review_gate(
             check_url=check_url,
         )
 
+    schema_payload = upgrade_legacy_review_schema(schema_payload) or schema_payload
+    schema_properties = schema_payload.get("properties")
+    if (
+        isinstance(schema_properties, dict)
+        and "prior_findings" in schema_properties
+        and "prior_findings" not in review_payload
+    ):
+        # Outputs written before re-review classification existed omit the
+        # field. The schema lists it as required for strict structured output,
+        # so default it rather than rejecting older payloads.
+        review_payload["prior_findings"] = []
+
     schema_error = _validate_against_schema(review_payload, schema_payload)
     if schema_error is not None:
         return _build_failed_evaluation(
@@ -372,6 +421,9 @@ def evaluate_review_gate(
         "source_check_url": check_url,
         "reviewed_at": str(review_payload.get("reviewed_at", _utc_now_iso())).strip() or _utc_now_iso(),
     }
+    prior_findings = review_payload.get("prior_findings")
+    if isinstance(prior_findings, list):
+        result_payload["prior_findings"] = [item for item in prior_findings if isinstance(item, dict)]
 
     gate_passed = decision == "approved"
     machine_summary = {
@@ -388,6 +440,294 @@ def evaluate_review_gate(
         result_payload=result_payload,
         machine_summary=machine_summary,
         human_summary=human_summary,
+        exit_code=0 if gate_passed else 1,
+    )
+
+
+BLOCKING_SEVERITIES = frozenset({"P0", "P1"})
+
+
+@dataclass
+class ComputedReviewDecision:
+    decision: str
+    model_decision: str
+    # Findings still open after this review, each annotated with ``origin``
+    # (prior|new) and ``blocking``. Blocking ones drive request_changes;
+    # the rest become follow-ups at approval.
+    outstanding_findings: list[dict[str, Any]]
+    blocking_ids: list[str]
+    prior_statuses: dict[str, str]
+
+    @property
+    def overrides_model(self) -> bool:
+        return self.decision != self.model_decision
+
+
+def _severity(finding: dict[str, Any]) -> str:
+    return str(finding.get("severity", "") or "").strip().upper()
+
+
+_SEVERITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+
+
+def _normalized_file(finding: dict[str, Any]) -> str:
+    path = str(finding.get("file", "") or "").replace("\\", "/").strip()
+    while path.startswith("./"):
+        path = path[2:]
+    return path
+
+
+def _same_file(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
+    path, prior_path = _normalized_file(finding), _normalized_file(prior)
+    if path == prior_path:
+        return True
+    if not path or not prior_path:
+        return False
+    # One side may be an absolute path inside the review checkout.
+    shorter, longer = sorted((path, prior_path), key=len)
+    return longer.startswith("/") and longer.endswith("/" + shorter)
+
+
+def _line_span(finding: dict[str, Any]) -> tuple[int, int] | None:
+    try:
+        start = int(finding.get("start_line") or 0)
+        end = int(finding.get("end_line") or start)
+    except (TypeError, ValueError):
+        return None
+    if start <= 0:
+        return None
+    return (start, max(start, end))
+
+
+def _normalized_title(finding: dict[str, Any]) -> str:
+    return " ".join(str(finding.get("title", "") or "").split()).lower()
+
+
+def _same_location(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
+    """Whether two same-file findings point at the same lines.
+
+    With line spans on both, the spans must overlap. Without them there is no
+    location to compare, so only an identical title counts as the same defect.
+    """
+    span, prior_span = _line_span(finding), _line_span(prior)
+    if span is not None and prior_span is not None:
+        return span[0] <= prior_span[1] and prior_span[0] <= span[1]
+    return _same_title(finding, prior)
+
+
+def _same_title(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
+    title = _normalized_title(finding)
+    return bool(title) and title == _normalized_title(prior)
+
+
+def _same_defect(finding: dict[str, Any], prior: dict[str, Any]) -> bool:
+    """Whether a same-id finding is at the prior finding's location.
+
+    A title match alone is not enough when the lines differ: a distinct defect
+    that reuses an id must never be absorbed into a (possibly non-blocking)
+    prior finding. A restatement whose lines moved is therefore treated as new,
+    which can only add a blocking finding, never hide one.
+    """
+    return _same_file(finding, prior) and _same_location(finding, prior)
+
+
+def _restates_prior(finding: dict[str, Any], prior: dict[str, Any], status: str) -> bool:
+    """A same-id finding restates the prior one only if nothing about it is new.
+
+    It must describe the same defect (see ``_same_defect``), be no more
+    severe, and the prior finding must still be unresolved; otherwise it is a
+    distinct defect that reused an id.
+    """
+    if status != "unresolved" or not _same_defect(finding, prior):
+        return False
+    return _severity_rank(finding) >= _severity_rank(prior)
+
+
+def _supersedes_prior(finding: dict[str, Any], prior: dict[str, Any], status: str) -> bool:
+    """A same-id, same-defect finding re-raised at a higher severity replaces the prior entry."""
+    return (
+        status == "unresolved"
+        and _same_defect(finding, prior)
+        and _severity_rank(finding) < _severity_rank(prior)
+    )
+
+
+def _severity_rank(finding: dict[str, Any]) -> int:
+    return _SEVERITY_RANK.get(_severity(finding), 2)
+
+
+def _prior_blocking(prior: dict[str, Any]) -> bool:
+    """Keep the eligibility a prior finding was given when it was first raised.
+
+    A re-review P1 outside the incremental diff is recorded non-blocking and
+    must stay so in later rounds. Legacy ledger entries without the flag fall
+    back to severity.
+    """
+    stored = prior.get("blocking")
+    if isinstance(stored, bool):
+        return stored
+    return _severity(prior) in BLOCKING_SEVERITIES
+
+
+def _unique_id(finding_id: str, used_ids: set[str]) -> str:
+    candidate = f"{finding_id}-new"
+    suffix = 2
+    while candidate in used_ids:
+        candidate = f"{finding_id}-new{suffix}"
+        suffix += 1
+    return candidate
+
+
+def compute_review_decision(
+    *,
+    model_decision: str,
+    findings: list[dict[str, Any]],
+    prior_findings: list[dict[str, Any]] | None = None,
+    prior_classifications: list[dict[str, Any]] | None = None,
+    changed_ranges: dict[str, list[tuple[int, int]]] | None = None,
+) -> ComputedReviewDecision:
+    """Decide approved vs request_changes from findings, not the model's word.
+
+    ``request_changes`` iff a prior P0/P1 finding is unresolved, or a new
+    finding is eligible to block. On the first review (``prior_findings`` is
+    None) every new P0/P1 is eligible. On a re-review a new P0 is always
+    eligible and a new P1 only when it touches ``changed_ranges`` (the lines
+    changed since the last reviewed head); ``changed_ranges=None`` means the
+    incremental diff is unknown, so P1s stay eligible. A prior finding the
+    model did not classify counts as unresolved.
+
+    ``blocked``/``failed`` model decisions describe a review that did not
+    complete and pass through unchanged.
+    """
+    from .review_convergence import finding_touches_ranges
+
+    model_decision = str(model_decision or "").strip().lower()
+    if model_decision not in {"approved", "request_changes"}:
+        return ComputedReviewDecision(
+            decision=model_decision,
+            model_decision=model_decision,
+            outstanding_findings=[dict(f) for f in findings],
+            blocking_ids=[],
+            prior_statuses={},
+        )
+
+    rereview = prior_findings is not None
+    statuses: dict[str, str] = {}
+    for item in prior_classifications or []:
+        finding_id = str(item.get("id", "") or "").strip()
+        status = str(item.get("status", "") or "").strip().lower()
+        if finding_id and status in {"resolved", "unresolved", "withdrawn"}:
+            statuses[finding_id] = status
+
+    # Unresolved prior findings in order, keyed by id so a restatement can
+    # update one and a higher-severity re-raise can replace it.
+    prior_outstanding: dict[str, dict[str, Any]] = {}
+    prior_by_id: dict[str, dict[str, Any]] = {}
+    for index, prior in enumerate(prior_findings or [], start=1):
+        finding_id = str(prior.get("id", "") or "").strip()
+        first_with_id = bool(finding_id) and finding_id not in prior_by_id
+        if first_with_id:
+            prior_by_id[finding_id] = prior
+        status = statuses.get(finding_id, "unresolved")
+        if finding_id:
+            statuses[finding_id] = status
+        if status != "unresolved":
+            continue
+        # A duplicate (legacy) id keeps its own entry rather than replacing the first.
+        key = finding_id if first_with_id else f"\0prior-{index}"
+        prior_outstanding[key] = {**prior, "origin": "prior", "blocking": _prior_blocking(prior)}
+
+    new_outstanding: list[dict[str, Any]] = []
+    used_ids = set(prior_by_id)
+    for index, finding in enumerate(findings, start=1):
+        finding_id = str(finding.get("id", "") or "").strip()
+        prior = prior_by_id.get(finding_id) if finding_id else None
+        if prior is not None:
+            status = statuses.get(finding_id, "unresolved")
+            if _restates_prior(finding, prior, status):
+                # Already counted. Keep the prior eligibility and its latest
+                # location for the next round. Restating an unresolved prior
+                # blocker at a lower severity must not unblock it: only a
+                # resolved or withdrawn classification does, so a blocking
+                # prior keeps its severity too and the restated one is noted.
+                carried = prior_outstanding[finding_id]
+                updated = {**carried, **{k: finding[k] for k in ("start_line", "end_line") if finding.get(k)}}
+                severity = _severity(finding)
+                if severity in _SEVERITY_RANK and severity != _severity(carried):
+                    if carried["blocking"]:
+                        updated["reported_severity"] = severity
+                    else:
+                        updated["severity"] = severity
+                prior_outstanding[finding_id] = updated
+                continue
+            if _supersedes_prior(finding, prior, status):
+                prior_outstanding.pop(finding_id, None)
+            # Reviewers mint ids per round, so a new finding can reuse a prior
+            # id. Give it a distinct id so it is neither dropped nor confused
+            # with the prior finding in later rounds.
+            finding = {**finding, "id": _unique_id(finding_id, used_ids), "reported_id": finding_id}
+            finding_id = finding["id"]
+        elif not finding_id or finding_id in used_ids:
+            # Every outstanding finding needs its own id so the next round can classify it.
+            candidate = finding_id or f"N{index}"
+            finding_id = candidate if candidate not in used_ids else _unique_id(candidate, used_ids)
+            finding = {**finding, "id": finding_id}
+        used_ids.add(finding_id)
+        severity = _severity(finding)
+        if severity == "P0":
+            blocking = True
+        elif severity == "P1":
+            blocking = (
+                not rereview
+                or changed_ranges is None
+                or finding_touches_ranges(finding, changed_ranges)
+            )
+        else:
+            blocking = False
+        new_outstanding.append({**finding, "origin": "new", "blocking": blocking})
+
+    outstanding = [*prior_outstanding.values(), *new_outstanding]
+    blocking_ids = [str(f.get("id", "") or "") for f in outstanding if f["blocking"]]
+
+    decision = "request_changes" if blocking_ids else "approved"
+    return ComputedReviewDecision(
+        decision=decision,
+        model_decision=model_decision,
+        outstanding_findings=outstanding,
+        blocking_ids=blocking_ids,
+        prior_statuses=statuses,
+    )
+
+
+def apply_computed_decision(
+    evaluation: GateEvaluation,
+    computed: ComputedReviewDecision,
+) -> GateEvaluation:
+    """Rewrite a gate evaluation so it carries the orchestrator's decision."""
+    result_payload = dict(evaluation.result_payload)
+    machine_summary = dict(evaluation.machine_summary)
+    result_payload["model_decision"] = computed.model_decision
+    result_payload["outstanding_findings"] = computed.outstanding_findings
+    result_payload["blocking_finding_ids"] = computed.blocking_ids
+    result_payload["status"] = computed.decision
+    result_payload["decision"] = computed.decision
+    gate_passed = computed.decision == "approved"
+    machine_summary["decision"] = computed.decision
+    machine_summary["model_decision"] = computed.model_decision
+    machine_summary["conclusion"] = "success" if gate_passed else "failure"
+    if computed.overrides_model:
+        note = (
+            f"Orchestrator decision {computed.decision} overrides reviewer decision "
+            f"{computed.model_decision}"
+        )
+        if computed.blocking_ids:
+            note += f" (blocking: {', '.join(i or '(no id)' for i in computed.blocking_ids)})"
+        result_payload["summary"] = f"{result_payload.get('summary', '')} [{note}.]".strip()
+        machine_summary["summary"] = result_payload["summary"]
+    return GateEvaluation(
+        result_payload=result_payload,
+        machine_summary=machine_summary,
+        human_summary=_render_human_summary(result_payload, machine_summary),
         exit_code=0 if gate_passed else 1,
     )
 

@@ -10,7 +10,8 @@
     "findings",
     "reviewer_role",
     "reviewer_agent",
-    "reviewed_at"
+    "reviewed_at",
+    "prior_findings"
   ],
   "properties": {
     "schema_version": {
@@ -106,6 +107,35 @@
     "reviewed_at": {
       "type": "string",
       "minLength": 1
+    },
+    "prior_findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "status",
+          "note"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "resolved",
+              "unresolved",
+              "withdrawn"
+            ]
+          },
+          "note": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
     }
   },
   "additionalProperties": false

@@ -120,6 +120,74 @@ def claude_sandbox_unavailability_reason(
     )
 
 
+CLAUDE_SESSION_FLAGS = ("--session-id", "--resume", "--json-schema", "--fork-session")
+CODEX_RESUME_FLAGS = ("--json", "--output-schema")
+
+# Final-turn completion contract shared by both providers. Codex's
+# ``--output-schema`` uses strict structured outputs, which require every
+# property to be listed as required; ``question`` is therefore nullable rather
+# than absent when the agent has nothing to ask.
+COMPLETION_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "status": {
+            "type": "string",
+            "enum": ["ok", "blocked", "error", "needs-input"],
+        },
+        "summary": {"type": "string"},
+        "question": {"type": ["string", "null"]},
+    },
+    "required": ["status", "summary", "question"],
+}
+
+
+def claude_session_unavailability_reason(help_text: str) -> str:
+    """Return why Claude runs cannot keep and resume one session."""
+    missing = [flag for flag in CLAUDE_SESSION_FLAGS if flag not in help_text]
+    if not missing:
+        return ""
+    return (
+        "The installed Claude CLI lacks session controls "
+        f"({', '.join(missing)}); implement runs fall back to a fresh, "
+        "unpersisted session per attempt and completion relies on `spec report`."
+    )
+
+
+def codex_resume_unavailability_reason(resume_help_text: str) -> str:
+    """Return why Codex runs cannot resume their thread for retries."""
+    if not resume_help_text:
+        return (
+            "The installed Codex CLI lacks `codex exec resume`; implement retries "
+            "start a fresh thread."
+        )
+    missing = [flag for flag in CODEX_RESUME_FLAGS if flag not in resume_help_text]
+    if not missing:
+        return ""
+    return (
+        "The installed Codex CLI's `codex exec resume` lacks "
+        f"{', '.join(missing)}; implement retries start a fresh thread."
+    )
+
+
+def provider_attach_command(
+    agent_name: str,
+    session_id: str,
+    *,
+    fork: bool = False,
+) -> list[str]:
+    """Return the interactive command that takes over *session_id*."""
+    agent = agent_name.strip().lower()
+    if agent == "claude":
+        cmd = ["claude", "--resume", session_id]
+        if fork:
+            cmd.append("--fork-session")
+        return cmd
+    if agent == "codex":
+        return ["codex", "fork" if fork else "resume", session_id]
+    raise ValueError(f"Agent {agent_name!r} does not support interactive session takeover")
+
+
 def codex_isolation_unavailability_reason(
     exec_help_text: str,
     sandbox_help_text: str,
@@ -548,6 +616,85 @@ def _codex_implement_permission_overrides(
     ]
 
 
+_CODEX_REVIEW_PERMISSION_PROFILE = "specbutler-review"
+
+# What the reviewer's commands may do beyond the sandbox: nothing. The
+# filesystem profile (read-only except the scratch dir, provider home and
+# operator credentials denied) and the disabled network are the boundary;
+# ``never`` makes any command that would need more fail instead of asking, and
+# exec mode could not answer an approval anyway. The approval reviewer is
+# pinned to ``user`` so an ``auto_review`` model can never approve an
+# escalation, and the launch passes ``--ignore-rules`` so no execpolicy
+# ``.rules`` file can pre-approve one. codex-cli 0.164.0 rejects the older
+# ``untrusted`` policy ("no longer supported") under --strict-config, which
+# made every local Codex review fail to start.
+# codex-cli 0.164 has no approval policy that limits the shell to inspection
+# commands (``untrusted`` was removed), and the review contract forbids
+# executing pull-request code. Until Codex offers such an allowlist, a review
+# keeps the no-tool boundary even when a pinned checkout exists; the
+# orchestrator inlines the full diff and the canonical spec instead.
+CODEX_REVIEW_CHECKOUT_SHELL = False
+
+CODEX_REVIEW_COMMAND_POLICY_OVERRIDES = (
+    'approval_policy="never"',
+    'approvals_reviewer="user"',
+)
+
+
+def codex_review_permission_overrides(
+    review_checkout: Path,
+    *,
+    scratch_dir: Path | None = None,
+    provider_home: Path | None = None,
+) -> list[str]:
+    """Build the read-only inspection profile for a local Codex review.
+
+    The pinned review checkout is readable (so the reviewer can run ``cat``,
+    ``grep`` and ``git log``/``git show``); only the scratch dir is writable.
+    The provider home and every operator credential path are denied, and the
+    network is off.
+    """
+    protected = {path.resolve(strict=False) for path in protected_operator_paths()}
+    if provider_home is not None:
+        protected.add(provider_home.resolve(strict=False))
+    checkout = review_checkout.resolve(strict=False)
+    # A deny on an ancestor would hide the checkout; never emit one.
+    protected = {
+        path
+        for path in protected
+        if not checkout.is_relative_to(path)
+        and not any(parent != path and path.is_relative_to(parent) for parent in protected)
+    }
+    filesystem_entries = [
+        '":root"="read"',
+        f'{_toml_quote(str(checkout))}="read"',
+    ]
+    if scratch_dir is not None:
+        filesystem_entries.append(f'{_toml_quote(str(scratch_dir.resolve(strict=False)))}="write"')
+    filesystem_entries.extend(
+        f'{_toml_quote(str(path))}="deny"' for path in sorted(protected, key=str)
+    )
+    excluded = ", ".join(
+        _toml_quote(key) for key in sorted({*_CODEX_PROVIDER_AUTH_ENV_KEYS, *PROXY_ENV_KEYS})
+    )
+    return [
+        "-c",
+        f'default_permissions="{_CODEX_REVIEW_PERMISSION_PROFILE}"',
+        "-c",
+        (
+            f"permissions.{_CODEX_REVIEW_PERMISSION_PROFILE}.filesystem="
+            "{" + ",".join(filesystem_entries) + "}"
+        ),
+        "-c",
+        f"permissions.{_CODEX_REVIEW_PERMISSION_PROFILE}.network="
+        + codex_profile_network(None, enabled=False),
+        "-c",
+        f"shell_environment_policy.exclude=[{excluded}]",
+        "-c",
+        "allow_login_shell=false",
+    ]
+
+
 def _codex_mcp_secret_env_keys(
     mcp_servers: dict[str, dict[str, object]] | None,
 ) -> set[str]:
@@ -631,11 +778,18 @@ class AgentAdapter(Protocol):
         provider_home: Path | None = None,
         git_isolation: AgentGitIsolation | None = None,
         safety: LaunchSafety | None = None,
+        session_id: str | None = None,
+        resume_session_id: str | None = None,
+        completion_schema_path: Path | None = None,
     ) -> list[str]:
         """Build the shell command to launch the agent for an implement phase.
 
         The launch is unattended: the command must never wait for an
         approval. ``safety`` carries the resolved ``[execution]`` policy.
+        ``session_id`` names a new persisted provider session,
+        ``resume_session_id`` continues an earlier one, and
+        ``completion_schema_path`` constrains the final response to the
+        structured completion contract. Adapters may ignore all three.
         """
         ...
 
@@ -697,6 +851,7 @@ def _claude_unattended_args(
     mcp_config_path: Path | None,
     mcp_servers: dict[str, dict[str, object]] | None,
     safety: LaunchSafety | None,
+    session_args: list[str] | None = None,
 ) -> list[str]:
     """Return print-mode Claude flags for a launch nobody can answer.
 
@@ -705,6 +860,9 @@ def _claude_unattended_args(
     the file tools in the workspace. Otherwise (isolated mode, or a CLI
     without the native controls) restricted mode confines the file tools and
     acceptEdits denies anything that would prompt.
+
+    ``session_args`` replaces ``--no-session-persistence`` when the launch
+    keeps a provider session (``--session-id`` or ``--resume``).
     """
     tools = "Read,Write,Edit,Bash,Glob,Grep"
     mcp_tools = [
@@ -723,7 +881,7 @@ def _claude_unattended_args(
         allowed_tools,
         "--setting-sources",
         "",
-        "--no-session-persistence",
+        *(session_args or ["--no-session-persistence"]),
     ]
     # Even when the container supplies the OS sandbox, Claude still owns the
     # provider-aware credential filtering in this orchestrator-written file.
@@ -770,6 +928,9 @@ class ClaudeAgent:
         provider_home: Path | None = None,
         git_isolation: AgentGitIsolation | None = None,
         safety: LaunchSafety | None = None,
+        session_id: str | None = None,
+        resume_session_id: str | None = None,
+        completion_schema_path: Path | None = None,
     ) -> list[str]:
         # Claude consumes MCP via the pre-written mcp_config_path file. The
         # explicit settings guard applies with either host or outer-container
@@ -778,13 +939,26 @@ class ClaudeAgent:
         cmd = ["claude", "-p"]
         if stream_json:
             cmd += ["--output-format", "stream-json", "--verbose"]
+        session_args: list[str] = []
+        if resume_session_id:
+            session_args = ["--resume", resume_session_id]
+        elif session_id:
+            session_args = ["--session-id", session_id]
         cmd += _claude_unattended_args(
             worktree_path,
             state_dir=state_dir,
             mcp_config_path=mcp_config_path,
             mcp_servers=mcp_servers,
             safety=safety,
+            session_args=session_args,
         )
+        if completion_schema_path is not None:
+            # Claude takes the schema inline and reports the validated value
+            # as ``structured_output`` on the final result event.
+            cmd += [
+                "--json-schema",
+                completion_schema_path.read_text(encoding="utf-8").strip(),
+            ]
         cmd += ["--", prompt]
         return cmd
 
@@ -871,6 +1045,7 @@ class ClaudeAgent:
             "--allowedTools",
             "Read,Glob,Grep",
             "--strict-mcp-config",
+            "--output-format", "json",
             "--no-session-persistence",
         ]
         if writable_temp_dir is not None:
@@ -893,9 +1068,10 @@ CODEX_AMBIENT_CAPABILITY_OVERRIDES = (
     "features.code_mode=false",
     # Do not add features.code_mode_host=false here: Codex 0.164 routes the
     # shell tool itself through the code-mode host, so disabling it makes every
-    # tool call fail ("code-mode host is disabled"). Reviews may disable it
-    # because they have no shell. features.code_mode=true reproducibly hangs
-    # exec; code_mode=false works (probe on codex-cli 0.164.0).
+    # tool call fail ("code-mode host is disabled"). Only the no-checkout
+    # review, which has no shell, disables it. features.code_mode=true
+    # reproducibly hangs exec; code_mode=false works (probe on codex-cli
+    # 0.164.0).
     "features.computer_use=false",
     "features.enable_mcp_apps=false",
     "features.hooks=false",
@@ -1105,8 +1281,13 @@ class CodexAgent:
         provider_home: Path | None = None,
         git_isolation: AgentGitIsolation | None = None,
         safety: LaunchSafety | None = None,
+        session_id: str | None = None,
+        resume_session_id: str | None = None,
+        completion_schema_path: Path | None = None,
     ) -> list[str]:
-        del mcp_config_path, externally_sandboxed
+        # Codex assigns the thread id itself and reports it in the
+        # ``thread.started`` event, so a new session needs no flag.
+        del mcp_config_path, externally_sandboxed, session_id
         policy = safety or LaunchSafety()
         writable_roots = [
             state_dir,
@@ -1121,6 +1302,8 @@ class CodexAgent:
             *codex_unattended_approval_args(policy.codex_auto_review),
             *_codex_add_dir_args(writable_roots),
             "exec",
+            # `exec resume` accepts the same JSON, schema and config flags.
+            *(["resume"] if resume_session_id else []),
             "--json",
             *_codex_implement_permission_overrides(
                 worktree_path,
@@ -1141,6 +1324,10 @@ class CodexAgent:
         # argv: setup manifests may contain literal MCP environment secrets,
         # and command lines are observable through process listings and
         # container inspection/logging.
+        if completion_schema_path is not None:
+            cmd += ["--output-schema", str(completion_schema_path)]
+        if resume_session_id:
+            cmd.append(resume_session_id)
         cmd.append(prompt)
         return cmd
 
@@ -1209,33 +1396,66 @@ class CodexAgent:
         schema_path: Path | None = None,
         mcp_config_path: Path | None = None,
         writable_temp_dir: Path | None = None,
+        review_checkout: Path | None = None,
+        provider_home: Path | None = None,
+        reasoning_effort: str = "",
     ) -> list[str]:
         del prompt, mcp_config_path  # Prompt arrives on stdin; review is MCP-free.
+        if not CODEX_REVIEW_CHECKOUT_SHELL:
+            review_checkout = None
         cmd = [
             "codex",
             "exec",
             "--ephemeral",
+            "--json",
             "--ignore-user-config",
             "--ignore-rules",
             "--strict-config",
-            "-s",
-            "read-only",
         ]
+        if review_checkout is None:
+            # No checkout to inspect: keep the legacy no-tool boundary.
+            cmd += ["-s", "read-only"]
         if writable_temp_dir is not None:
+            # The scratch dir, not the PR checkout, is the working root so
+            # PR-controlled AGENTS.md/.codex config never load as instructions.
             cmd += ["-C", str(writable_temp_dir), "--skip-git-repo-check"]
-        # Provider credentials are required by the Codex parent process, but
-        # must be unreachable from model-controlled tools. Disable every
-        # local-execution path and make a future accidental shell re-enable
-        # inherit no environment. Strict config turns an older CLI that does
-        # not recognize a boundary control into a fail-closed launch error.
-        for override in (
-            "features.shell_tool=false",
-            "features.unified_exec=false",
-            "features.code_mode_host=false",
-            *CODEX_AMBIENT_CAPABILITY_OVERRIDES,
-            "shell_environment_policy.inherit=none",
-        ):
+        if review_checkout is None:
+            # Provider credentials are required by the Codex parent process,
+            # but must be unreachable from model-controlled tools. Disable
+            # every local-execution path and make a future accidental shell
+            # re-enable inherit no environment. Strict config turns an older
+            # CLI that does not recognize a boundary control into a
+            # fail-closed launch error.
+            overrides: tuple[str, ...] = (
+                "features.shell_tool=false",
+                "features.unified_exec=false",
+                "features.code_mode_host=false",
+                *CODEX_AMBIENT_CAPABILITY_OVERRIDES,
+                "shell_environment_policy.inherit=none",
+            )
+        else:
+            # Read-only inspection (cat, grep, git log/show) of the pinned
+            # checkout. The permission profile bounds what a command can
+            # touch: the filesystem is read-only except the scratch dir,
+            # credential stores and the provider home are denied, and the
+            # network is off. Shell children get only core variables.
+            # The code-mode host stays enabled: Codex 0.164 routes the shell
+            # tool through it (see CODEX_AMBIENT_CAPABILITY_OVERRIDES).
+            overrides = (
+                *CODEX_AMBIENT_CAPABILITY_OVERRIDES,
+                *CODEX_REVIEW_COMMAND_POLICY_OVERRIDES,
+                "shell_environment_policy.inherit=core",
+            )
+        for override in overrides:
             cmd += ["-c", override]
+        if review_checkout is not None:
+            cmd += codex_review_permission_overrides(
+                review_checkout,
+                scratch_dir=writable_temp_dir,
+                provider_home=provider_home,
+            )
+        if reasoning_effort:
+            cmd += ["-c", f"model_reasoning_effort={_toml_quote(reasoning_effort)}"]
         cmd += _codex_linux_sandbox_overrides()
         if schema_path:
             cmd += ["--output-schema", str(schema_path)]

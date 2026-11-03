@@ -10,7 +10,6 @@ import sys
 import time
 from hashlib import sha256
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -810,12 +809,14 @@ def test_orchestrator_launch_reconciles_container_oauth_on_every_terminal_path(
         source_home=source_home,
         copy_auth=True,
     )
-    run = SimpleNamespace(
+    run = orch.RunState(
         agent="codex",
         implement_launches=1,
         attempts=1,
         run_id="run-1",
         spec_id="feature",
+        branch="code/feature--run-1",
+        phase="implement",
     )
     plan = orch.ImplementLaunchPlan(
         use_stream_json=False,
@@ -854,3 +855,10 @@ def test_orchestrator_launch_reconciles_container_oauth_on_every_terminal_path(
     )
     assert home.is_dir()
     assert list(home.iterdir()) == []
+    saved_run = orch.RunState.load(tmp_path, run.run_id)
+    assert saved_run.usage == run.usage
+    assert len(saved_run.usage) == 1
+    assert saved_run.usage[0]["role"] == "implement"
+    assert saved_run.usage[0]["provider"] == "codex"
+    assert saved_run.usage[0]["phase"] == "implement"
+    assert saved_run.usage[0]["usage_available"] is False
