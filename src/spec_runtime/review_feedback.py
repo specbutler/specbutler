@@ -412,6 +412,7 @@ def _load_sticky_review_comment_payload(
     pr_number: int,
     *,
     run_subprocess: RunSubprocess = default_run_subprocess,
+    expected_check: dict | None = None,
 ) -> dict | None:
     comments_result = run_subprocess(
         [
@@ -439,6 +440,16 @@ def _load_sticky_review_comment_payload(
             continue
         payload = extract_embedded_review_result(body)
         if payload is not None:
+            if expected_check is not None:
+                user = comment.get("user") or {}
+                expected_run = extract_run_id_from_check_url(str(expected_check.get("details_url", "")))
+                payload_run = extract_run_id_from_check_url(str(payload.get("source_check_url", "")))
+                if (user.get("login") != "github-actions[bot]" or user.get("type") != "Bot"
+                        or not expected_run or payload_run != expected_run
+                        or payload.get("source_check_name") != expected_check.get("name")
+                        or not expected_check.get("started_at")
+                        or str(comment.get("updated_at", "")) < str(expected_check["started_at"])):
+                    continue
             return payload
     return None
 
@@ -541,7 +552,7 @@ def extract_review_result_from_check_run(
                 last_payload_error = str(exc)
 
     artifact_error = ""
-    if require_payload and repo_root is not None:
+    if repo_root is not None:
         artifact_loader = load_artifact_payload or (
             lambda current_repo_root, current_check_run: load_review_payload_from_gate_artifact(
                 current_repo_root,

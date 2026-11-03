@@ -34,5 +34,19 @@ max_rounds = 3
 All configured checks must finish on the current PR head. Structured check output
 uses the normal review JSON payload with reviewed_head_sha, status, summary and
 findings. Findings use the same computed decisions and review round cap as local
-reviews. A failed check without structured findings fails closed. A successful check
-may omit findings. Keep CI publication credentials in CI, outside spec content.
+reviews. Every completed check must supply structured results, even when its
+findings array is empty. Results come from check output, the run artifact, or a
+GitHub Actions sticky comment bound to that check execution.
+
+The bundled workflow publishes a separate decision status for CI-owned PRs.
+A completed review job stays successful when it requests changes; its decision
+status blocks merging until the host computes approval or the operator accepts
+at the round cap. The host updates only configured review gates. Custom checks
+that fail their check run must permit the host to update that run with a
+checks:write credential from the publishing GitHub App; otherwise acceptance
+fails closed. Keep publication credentials outside spec content.
+
+Before pushing a retry, the host includes prior findings, the implementer
+response, and the incremental diff in the PR body. CI reviewers must classify
+prior IDs exactly, including their check prefixes. The bundled workflow also
+inlines the canonical spec, full diff, and current check evidence into its prompt.

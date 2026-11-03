@@ -10,6 +10,7 @@ from pathlib import Path
 
 from . import autopilot as auto
 from . import orchestrator as orch
+from .coordination import CoordinatorError
 from .platform_fs import FileLock
 from .spec_identity import SPEC_ID_RE
 from .spec_metadata import iter_spec_metadata
@@ -134,7 +135,7 @@ def handle_request(root: Path, request: dict):
             params = request.get("params", {})
             result = call_tool(root, params["name"], params.get("arguments", {}))
             response["result"] = {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}
-        except (ValueError, RuntimeError, OSError, KeyError) as exc:
+        except (CoordinatorError, ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
             response["result"] = {"isError": True, "content": [{"type": "text", "text": str(exc)}]}
     else:
         response["error"] = {"code": -32601, "message": "Method not found"}

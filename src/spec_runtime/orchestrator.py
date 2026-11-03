@@ -23072,6 +23072,15 @@ def phase_publish(run: RunState, repo_root: Path) -> str:
                 body = outbox_metadata.body
             labels = outbox_metadata.labels
 
+    if SPEC_RUNTIME_CONFIG.review.source == "ci":
+        rounds = review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
+        if rounds:
+            context, _ = _local_review_rereview_context(
+                repo_root, run, worktree_path, last_round=rounds[-1],
+                round_number=len(rounds) + 1, head_sha=_head_sha(worktree_path),
+            )
+            body += "\n\n<!-- spec-ci-rereview-context -->\n" + context
+
     # Refresh an existing PR body before push so synchronize sees the local-review marker.
     if not publication_transition_is_safe():
         return "failed"
@@ -25440,6 +25449,40 @@ def _phase_review_local(
     return outcome
 
 
+def _publish_ci_decision_status(repo_root: Path, repo_slug: str, result: ReviewResult, name: str) -> None:
+    response = run_subprocess(
+        ["gh", "api", f"repos/{repo_slug}/statuses/{result.reviewed_head_sha}", "-X", "POST",
+         "--input", "-"], cwd=repo_root, env=_gh_repo_environment(repo_slug),
+        input_text=json.dumps({"context": name, "state": "success",
+                               "description": "Spec Butler effective review: approved"}),
+    )
+    if response.returncode:
+        raise ValueError(f"Cannot publish effective review status for {name}: {response.stderr}")
+
+
+def _publish_effective_ci_approval(run: RunState, repo_root: Path, result: ReviewResult) -> None:
+    """Update only configured review checks; fail closed without checks:write."""
+    repo_slug = _trusted_publication_repo_slug(run)
+    for name in SPEC_RUNTIME_CONFIG.review.checks:
+        check = _find_check_run_for_sha(repo_root, result.reviewed_head_sha, name, repo_slug=repo_slug)
+        if not check or check.get("head_sha", result.reviewed_head_sha) != result.reviewed_head_sha:
+            raise ValueError(f"Cannot publish effective review approval: missing current-head check {name}")
+        if check.get("conclusion") == "success":
+            _publish_ci_decision_status(repo_root, repo_slug, result, name)
+            continue
+        if check.get("status") != "completed" or not check.get("id"):
+            raise ValueError(f"Cannot publish effective review approval: incomplete check {name}")
+        response = run_subprocess(
+            ["gh", "api", f"repos/{repo_slug}/check-runs/{check['id']}", "-X", "PATCH", "--input", "-"],
+            cwd=repo_root, env=_gh_repo_environment(repo_slug),
+            input_text=json.dumps({"conclusion": "success", "output": {
+                "title": "Effective Spec Butler review decision", "summary": result.summary}}),
+        )
+        if response.returncode:
+            raise ValueError(f"Cannot publish effective review approval for {name}: {response.stderr}")
+        _publish_ci_decision_status(repo_root, repo_slug, result, name)
+
+
 def _apply_ci_review_results(run: RunState, repo_root: Path, results: list) -> str:
     """Use the same computed decision, round ledger and cap as local review."""
     from .review_gate import compute_review_decision
@@ -25454,12 +25497,27 @@ def _apply_ci_review_results(run: RunState, repo_root: Path, results: list) -> s
             last_reviewed_head_sha=last.reviewed_head_sha,
             head_sha=results[0].reviewed_head_sha,
         )
-    findings = [asdict(f) for result in results for f in result.findings]
-    model_decision = next((r.status for r in results if r.status != "approved"), "approved")
+    findings = []
+    classifications = []
+    for review in results:
+        prefix = review.source_check_name + "::"
+        for finding in review.findings:
+            item = asdict(finding)
+            if not item["id"].startswith(prefix):
+                item["id"] = prefix + item["id"]
+            findings.append(item)
+        for classification in review.prior_findings:
+            item = dict(classification)
+            if not str(item.get("id", "")).startswith(prefix):
+                item["id"] = prefix + str(item.get("id", ""))
+            classifications.append(item)
+    model_decision = next(
+        (status for status in ("failed", "blocked", "request_changes")
+         if any(r.status == status for r in results)), "approved")
     computed = compute_review_decision(
         model_decision=model_decision, findings=findings,
         prior_findings=last.outstanding_findings if last else None,
-        prior_classifications=[f for r in results for f in getattr(r, "prior_findings", [])],
+        prior_classifications=classifications,
         changed_ranges=changed_ranges,
     )
     result = ReviewResult(
@@ -25474,10 +25532,20 @@ def _apply_ci_review_results(run: RunState, repo_root: Path, results: list) -> s
         outstanding_findings=computed.outstanding_findings,
         blocking_finding_ids=computed.blocking_ids,
     )
+    if result.status == "approved":
+        try:
+            _publish_effective_ci_approval(run, repo_root, result)
+        except ValueError as exc:
+            run.last_error = str(exc)
+            return "failed"
     outcome = _apply_review_result(
         run, repo_root, result,
         conclusion="success" if result.status == "approved" else "failure",
     )
+    if result.status in {"failed", "blocked"}:
+        # An incomplete reviewer must not replace the last completed round or
+        # erase its outstanding blockers when the review is retried.
+        return outcome
     _record_local_review_round(review_run_dir, result)
     max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
     if result.status == "request_changes" and review_convergence.round_cap_reached(
@@ -25509,15 +25577,34 @@ def _phase_review_action(
         result = ReviewResult.load(repo_root, run.run_id)
         rounds = review_convergence.load_review_rounds(_state_root(repo_root) / "runs" / run.run_id)
         matches = _round_cap_accept_matches_head(result, rounds, expected_head_sha)
-        accepted.status = "consumed"
-        accepted.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
-        accepted.consumed_at = _now_iso()
-        accepted.response_consumed_attempt_number = _current_attempt_number(run)
-        accepted.save(repo_root, run.run_id)
+        def consume_acceptance():
+            accepted.status = "consumed"
+            accepted.continuation = OPERATOR_CONTINUATION_CONTINUE_WORKFLOW
+            accepted.consumed_at = _now_iso()
+            accepted.response_consumed_attempt_number = _current_attempt_number(run)
+            accepted.save(repo_root, run.run_id)
+
         if matches and result is not None:
             result.status = "approved"
             result.summary += " [Accepted by the operator at the review round cap.]"
+            try:
+                _publish_effective_ci_approval(run, repo_root, result)
+            except ValueError as exc:
+                run.last_error = str(exc)
+                return "failed"
+            repo_slug = _trusted_publication_repo_slug(run)
+            pr, _ = _find_open_pr_for_branch(repo_root, run.branch, repo_slug=repo_slug)
+            if pr is None or pr.get("headRefOid") != expected_head_sha:
+                run.last_error = "PR head changed before accepted follow-up publication"
+                return "failed"
+            _publish_review_followups(
+                run, repo_root, rounds[-1].outstanding_findings,
+                pr_number=int(pr["number"]), pr_body=str(pr.get("body", "") or ""),
+                repo_slug=repo_slug, accepted_at_cap=True,
+            )
+            consume_acceptance()
             return _apply_review_result(run, repo_root, result, conclusion="success")
+        consume_acceptance()
 
     deadline = time.time() + REVIEW_TIMEOUT_SECONDS
     poll_interval = max(1, REVIEW_POLL_INTERVAL_SECONDS)
@@ -25593,7 +25680,7 @@ def _phase_review_action(
             last_url = str(check_run.get("details_url", "")).strip()
 
             if status == "completed":
-                require_payload = conclusion != "success"
+                require_payload = True
                 try:
                     review_result = _extract_review_result_from_check_run(
                         check_run,
@@ -25608,6 +25695,7 @@ def _phase_review_action(
                         payload = review_feedback._load_sticky_review_comment_payload(
                             repo_root, int(latest_pr["number"]),
                             run_subprocess=_repo_pinned_run_subprocess(repo_slug),
+                            expected_check=check_run,
                         )
                         if payload is None:
                             raise ValueError(str(exc))

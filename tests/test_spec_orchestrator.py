@@ -19561,7 +19561,8 @@ class TestLocalReviewHelpers:
 
         assert prompt == bundled_prompt
         assert "Review evidence access is provider-specific" in prompt
-        assert "reviewer has no shell and works from the inlined diff and spec" in prompt
+        assert "Use only the inspection tools allowed by the environment appendix" in prompt
+        assert "reviewer has no shell" not in prompt
         assert "Do not execute pull-request code" in prompt
         assert "Local shell command execution is available" not in prompt
         assert (
