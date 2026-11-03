@@ -296,7 +296,9 @@ spec-backfill-merge-tags repair        # fix broken tags
 
 ## Configuration
 
-`spec init` creates `.spec.toml` automatically. Edit it to customize:
+`spec init` creates `.spec.toml` automatically. Edit it to customize.
+See [models, usage and budgets](docs/model-and-cost.md) for per-role model
+selection, escalation, usage analytics, and estimated cost limits:
 
 ```toml
 base_ref = "origin/main"

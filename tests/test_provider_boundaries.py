@@ -877,12 +877,14 @@ def test_claude_launch_failure_scrubs_and_resyncs_isolated_credentials(
         '{"accessToken":"secret"}',
         encoding="utf-8",
     )
-    run = SimpleNamespace(
+    run = orch.RunState(
         agent="claude",
         implement_launches=1,
         attempts=1,
         run_id="run-1",
         spec_id="feature",
+        branch="code/feature--run-1",
+        phase="implement",
     )
     plan = orch.ImplementLaunchPlan(
         use_stream_json=False,

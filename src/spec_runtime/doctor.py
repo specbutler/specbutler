@@ -484,6 +484,22 @@ def _provider_auth_check(
         logged_in = True
 
     name = f"agent authentication ({agent})"
+    from .provider_env import minimal_provider_environment
+
+    passed_env = minimal_provider_environment(agent)
+    if agent == "claude" and passed_env.get("ANTHROPIC_API_KEY"):
+        return _warning(
+            name, "ANTHROPIC_API_KEY is passed to Claude; in -p mode it takes priority over subscription login and incurs API billing",
+            "Remove ANTHROPIC_API_KEY from the launch environment to use subscription login.",
+        )
+    output = f"{result.stdout} {result.stderr}".casefold()
+    if agent == "codex" and logged_in and "chatgpt" in output and any(
+        passed_env.get(key) for key in ("OPENAI_API_KEY", "CODEX_API_KEY")
+    ):
+        return _warning(
+            name, "OPENAI_API_KEY or CODEX_API_KEY is present alongside a ChatGPT login; launches may incur API billing",
+            "Remove API keys from the launch environment to use ChatGPT login.",
+        )
     if logged_in is True:
         return _ok(name, "provider CLI reports an authenticated session")
 

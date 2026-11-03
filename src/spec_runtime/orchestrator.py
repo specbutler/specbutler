@@ -4649,6 +4649,8 @@ def classify_failure(
     """
     raw = str(message or "").strip()
     text = raw.lower()
+    if "budget_exceeded" in text:
+        return FailureClassification(FailureCategory.INFRASTRUCTURE, kind="budget_exceeded")
     infra = _infrastructure_failure_kind(text) if text else None
     if infra is not None:
         kind, transient, scope = infra
@@ -7359,7 +7361,7 @@ def _build_spec_authoring_command(
         "git_isolation",
     ):
         authoring_kwargs["git_isolation"] = git_isolation
-    return adapter.build_authoring_command(**authoring_kwargs)
+    return _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
 
 
 def _print_spec_authoring_summary(
@@ -9206,6 +9208,7 @@ class RunState:
     # remains the convergence/retry budget for compatibility; launch_numbered
     # artifacts keep recovery and post-cap operator resumes from overwriting one
     # another when the convergence count is intentionally unchanged.
+    usage: list[dict] = field(default_factory=list)
     implement_launches: int = 0
     implement_failures: int = 0
     verify_failures: int = 0
@@ -9454,12 +9457,12 @@ class RunState:
 
     @property
     def is_resumable(self) -> bool:
-        return self.status in RESUMABLE_RUN_STATUSES
+        return self.phase != "authoring" and self.status in RESUMABLE_RUN_STATUSES
 
     @property
     def is_step_selectable(self) -> bool:
         # Manual phase stepping should continue a run that just passed its prior phase.
-        return self.status in STEP_SELECTABLE_RUN_STATUSES
+        return self.phase != "authoring" and self.status in STEP_SELECTABLE_RUN_STATUSES
 
     @property
     def is_auto_resumable(self) -> bool:
@@ -9493,7 +9496,7 @@ class RunState:
                 data = json.loads(candidate.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError, TypeError):
                 continue
-            if data.get("spec_id") != spec_id:
+            if data.get("spec_id") != spec_id or data.get("phase") == "authoring":
                 continue
             runs.append(cls.from_dict(data))
 
@@ -9853,6 +9856,7 @@ class AgentProgressTracker:
     _provider_session_id: str = field(default="", repr=False)
     _structured_output: object = field(default=None, repr=False)
     _final_agent_message: str = field(default="", repr=False)
+    usage_events: list[dict] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         if not self.last_event_summary:
@@ -12203,8 +12207,8 @@ def _maybe_run_block_debugger(
                             debugger_env, debugger_codex_home
                         )
                     try:
-                        completed = _run_local_review_subprocess(
-                            repo_root,
+                        completed = _run_usage_subprocess(
+                            run, "debugger", debugger_agent, repo_root,
                             cmd,
                             cwd=(
                                 output_dir
@@ -13883,6 +13887,96 @@ def _build_local_review_env(
     return env
 
 
+class BudgetExceeded(RuntimeError):
+    """The configured estimated run budget has been consumed."""
+
+
+def _check_budget(run: RunState) -> None:
+    from .usage import totals
+    limit = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
+    if limit is not None and (
+        (totals(run.usage)["estimated_cost_usd"] or 0) >= limit
+        or any(row.get("budget_exceeded") and limit <= (row.get("budget_limit_usd") or limit)
+               for row in run.usage)
+    ):
+        raise BudgetExceeded("budget_exceeded")
+
+
+def _model_command(cmd: list[str], role: str, provider: str, failures: int = 0) -> list[str]:
+    model = SPEC_RUNTIME_CONFIG.agents.model_for(role, provider, failures)
+    if not model:
+        return cmd
+    cmd = list(cmd)
+    if "--model" in cmd:
+        cmd[cmd.index("--model") + 1] = model
+    else:
+        cmd[1:1] = ["--model", model]
+    return cmd
+
+
+def _budget_command(cmd: list[str], run: RunState) -> list[str]:
+    from .usage import totals
+    _check_budget(run)
+    limit = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
+    if limit is None or not cmd or Path(cmd[0]).stem != "claude":
+        return cmd
+    remaining = limit - (totals(run.usage)["estimated_cost_usd"] or 0)
+    return [cmd[0], "--max-budget-usd", str(remaining), *cmd[1:]]
+
+
+def _begin_usage(run: RunState, repo_root: Path, role: str, provider: str, cmd: list[str]) -> dict:
+    from .usage import new_launch
+    model = cmd[cmd.index("--model") + 1] if "--model" in cmd else ""
+    launch = new_launch(role, provider, model, run.phase)
+    launch["budget_limit_usd"] = SPEC_RUNTIME_CONFIG.budget.max_cost_usd_per_run
+    run.usage.append(launch)
+    run.save(repo_root)
+    return launch
+
+
+def _run_interactive_usage(run, repo_root, provider, cmd, *, cwd, env):
+    from .usage import collect_transcript_usage, transcript_snapshot
+    cmd = _budget_command(cmd, run)
+    launch = _begin_usage(run, repo_root, "authoring", provider, cmd)
+    snapshot = transcript_snapshot(provider, cwd, env)
+    try:
+        return _run_interactive_agent_owned(cmd, cwd=cwd, env=env)
+    finally:
+        collect_transcript_usage(launch, cwd, snapshot)
+        run.save(repo_root)
+
+
+def _run_usage_subprocess(run: RunState, role: str, provider: str, repo_root: Path,
+                          cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    from .usage import parse_event, update_launch
+    cmd = _budget_command(cmd, run)
+    launch = _begin_usage(run, repo_root, role, provider, cmd)
+    try:
+        result = _run_local_review_subprocess(repo_root, cmd, **kwargs)
+        for line in (result.stdout or "").splitlines():
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            parsed = parse_event(provider, event)
+            if parsed is not None:
+                update_launch(launch, parsed)
+                # Keep the provider envelope in the receipt, while existing
+                # review/debugger consumers receive their requested JSON body.
+                if provider == "claude" and isinstance(event.get("result"), str):
+                    result.stdout = event["result"]
+        return result
+    finally:
+        run.save(repo_root)
+
+
+def _usage_analytics(runs: list[RunState]) -> dict:
+    from .usage import grouped, totals
+    rows = [row for run in runs for row in run.usage]
+    return {"total": totals(rows), "months": grouped(rows, "recorded_at"),
+            "roles": grouped(rows, "role"), "providers": grouped(rows, "provider")}
+
+
 def _build_local_review_command(
     *,
     prompt: str,
@@ -13915,7 +14009,10 @@ def _build_local_review_command(
     for key, value in optional_kwargs.items():
         if value and _adapter_method_accepts_kwarg(agent.build_review_command, key):
             review_kwargs[key] = value
-    return agent.build_review_command(**review_kwargs)
+    return _model_command(
+        agent.build_review_command(**review_kwargs), "review",
+        agent_name or _configured_review_agent_default() or SPEC_RUNTIME_CONFIG.agents.default,
+    )
 
 
 def _block_debugger_artifact_paths(repo_root: Path, run_id: str) -> dict[str, Path]:
@@ -13957,7 +14054,7 @@ def _build_block_debugger_command(
     agent = get_agent_adapter(agent_name or _configured_review_agent_default() or SPEC_RUNTIME_CONFIG.agents.default)
     if agent.name == "claude":
         del prompt, writable_output_dir, mcp_config_path
-        return [
+        return _model_command([
             "claude",
             "-p",
             "--restricted",
@@ -13968,14 +14065,15 @@ def _build_block_debugger_command(
             "",
             "--strict-mcp-config",
             "--no-session-persistence",
-        ]
+            "--output-format", "json",
+        ], "debugger", agent.name)
     if agent.name == "codex":
-        return agent.build_review_command(
+        return _model_command(agent.build_review_command(
             prompt=prompt,
             output_path=output_path,
             schema_path=schema_path,
             writable_temp_dir=writable_output_dir,
-        )
+        ), "debugger", agent.name)
     review_kwargs: dict[str, object] = {
         "prompt": prompt,
         "output_path": output_path,
@@ -13983,7 +14081,7 @@ def _build_block_debugger_command(
     }
     if _adapter_method_accepts_kwarg(agent.build_review_command, "mcp_config_path"):
         review_kwargs["mcp_config_path"] = mcp_config_path
-    return agent.build_review_command(**review_kwargs)
+    return _model_command(agent.build_review_command(**review_kwargs), "debugger", agent.name)
 
 
 def _render_block_debugger_prompt(
@@ -16018,7 +16116,7 @@ def _build_task_scoping_command(
         "git_isolation",
     ):
         authoring_kwargs["git_isolation"] = git_isolation
-    return adapter.build_authoring_command(**authoring_kwargs)
+    return _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
 
 
 def _agent_exit_suffix(agent: str) -> str:
@@ -16122,8 +16220,8 @@ def phase_scoping(run: RunState, repo_root: Path) -> str:
     print(f"Tip: when scoping is done, {exit_hint} to start implementation.")
 
     try:
-        completed = _run_interactive_agent_owned(
-            cmd,
+        completed = _run_interactive_usage(
+            run, repo_root, run.agent, cmd,
             cwd=worktree_path,
             env=authoring_env,
         )
@@ -18114,14 +18212,6 @@ def _launch_implement_attempt(
         for key, value in plan.popen_kwargs.items()
         if key not in {"cwd", "env"}
     }
-    request = AgentRequest(
-        argv=plan.agent_cmd,
-        cwd=worktree_path,
-        env=plan.agent_env,
-        popen_kwargs=popen_extras,
-        redactions=plan.agent_env_redactions,
-        declared_env_keys=plan.declared_agent_env_keys,
-    )
 
     def _supervise(proc: subprocess.Popen) -> int:
         _set_active_agent_process(proc)
@@ -18157,8 +18247,21 @@ def _launch_implement_attempt(
             _set_active_agent_process(None)
             _prune_registered_worktree_processes(repo_root, worktree_path)
 
+    launch: dict | None = None
     live_sessions_recorded = _record_live_provider_sessions(repo_root, run, plan)
     try:
+        plan.agent_cmd = _model_command(plan.agent_cmd, "implement", run.agent,
+                                        run.implement_failures + run.verify_failures + run.review_changes)
+        plan.agent_cmd = _budget_command(plan.agent_cmd, run)
+        launch = _begin_usage(run, repo_root, "implement", run.agent, plan.agent_cmd)
+        request = AgentRequest(
+            argv=plan.agent_cmd,
+            cwd=worktree_path,
+            env=plan.agent_env,
+            popen_kwargs=popen_extras,
+            redactions=plan.agent_env_redactions,
+            declared_env_keys=plan.declared_agent_env_keys,
+        )
         result = backend.launch_agent(request, monitor=_supervise)
         # backend.launch_agent returns only after its monitor has confirmed the
         # provider-owned process tree is gone. Import private commits before
@@ -18229,6 +18332,13 @@ def _launch_implement_attempt(
                     cleanup_agent_git_isolation(plan.git_isolation)
                 except BaseException as exc:
                     git_cleanup_error = exc
+            if launch is not None:
+                from .usage import update_launch
+
+                if plan.progress_tracker is not None:
+                    for event in plan.progress_tracker.usage_events:
+                        update_launch(launch, event)
+                run.save(repo_root)
             if git_cleanup_error is not None:
                 raise git_cleanup_error
 
@@ -20420,6 +20530,10 @@ def _handle_claude_stream_line(
             tracker.heartbeat()
         return
 
+    from .usage import parse_event
+    parsed_usage = parse_event("claude", event)
+    if tracker is not None and parsed_usage is not None:
+        tracker.usage_events.append(parsed_usage)
     event_type = event.get("type")
     if tracker is not None:
         _track_claude_inflight_tools(event, tracker)
@@ -20628,6 +20742,10 @@ def _handle_codex_stream_line(line: str, tracker: AgentProgressTracker) -> None:
         tracker.record(line)
         return
 
+    from .usage import parse_event
+    parsed_usage = parse_event("codex", event)
+    if parsed_usage is not None:
+        tracker.usage_events.append(parsed_usage)
     _track_codex_inflight_items(event, tracker)
     tracker.record_sandbox_denials(codex_event_denials(event))
     if isinstance(event, dict):
@@ -21519,7 +21637,7 @@ def _build_agent_command(
         implement_kwargs["session_id"] = session_id
     if completion_schema_path is not None:
         implement_kwargs["completion_schema_path"] = completion_schema_path
-    return adapter.build_implement_command(**implement_kwargs)
+    return _model_command(adapter.build_implement_command(**implement_kwargs), "implement", agent)
 
 
 def _is_git_merge_conflict_output(text: str) -> bool:
@@ -24782,8 +24900,8 @@ def _run_local_review(
         try:
             for attempt_index, attempt_timeout in enumerate(review_timeouts):
                 try:
-                    review_exec = _run_local_review_subprocess(
-                        repo_root,
+                    review_exec = _run_usage_subprocess(
+                        run, "review", review_agent, repo_root,
                         review_cmd,
                         cwd=review_process_cwd,
                         env=review_env,
@@ -27173,6 +27291,9 @@ def _classify_phase_result(
         "gate_name": "",
         "warnings": warnings,
     }
+    if "budget_exceeded" in run.last_error:
+        metadata.update(failure_type="budget", failure_subtype="budget_exceeded", retryable=False)
+        return metadata
     if warnings:
         first_warning = warnings[0]
         metadata.update(
@@ -27538,7 +27659,12 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
     _emit_phase_progress(run, phase, "started")
 
     try:
+        _check_budget(run)
         result_status = handler(run, repo_root)
+        _check_budget(run)
+    except BudgetExceeded:
+        result_status = "blocked"
+        run.last_error = "budget_exceeded: estimated run cost reached the configured limit"
     except Exception as exc:
         result_status = "failed"
         run.last_error = f"Exception in {phase}: {exc}"
@@ -27996,6 +28122,9 @@ def _transition_to_blocked_with_debugger(
     # failure reason, not a generic retry-cap message (F3).
     original_last_error = run.last_error
     run.status = "blocked"
+    if "budget_exceeded" in original_last_error:
+        run.save(repo_root)
+        return "blocked"
     _maybe_run_block_debugger(
         run,
         repo_root,
@@ -28463,14 +28592,22 @@ def cmd_spec(args: argparse.Namespace) -> int:
             cleanup_agent_git_isolation(git_isolation)
         raise
 
+    authoring_run = RunState(
+        run_id=_run_id(spec_id or "authoring"), spec_id=spec_id or "authoring",
+        branch=branch, worktree_path=str(worktree_path), phase="authoring",
+        run_mode="spec", agent=agent, status="passed",
+    )
+
     print(f"{'Resuming' if resumed else 'Launching'} spec authoring in {worktree_path}")
 
     try:
-        completed = _run_interactive_agent_owned(
-            author_cmd,
+        completed = _run_interactive_usage(
+            authoring_run, repo_root, agent, author_cmd,
             cwd=worktree_path,
             env=authoring_env,
         )
+        authoring_run.status = "passed" if completed.returncode == 0 else "failed"
+        authoring_run.save(repo_root)
         _reconcile_and_cleanup_agent_git(git_isolation)
     except FileNotFoundError as exc:
         if git_isolation is not None:
@@ -29011,7 +29148,7 @@ def cmd_input(args: argparse.Namespace) -> int:
             "git_isolation",
         ):
             authoring_kwargs["git_isolation"] = git_isolation
-        agent_cmd = adapter.build_authoring_command(**authoring_kwargs)
+        agent_cmd = _model_command(adapter.build_authoring_command(**authoring_kwargs), "authoring", agent)
     except RuntimeError as exc:
         if git_isolation is not None:
             cleanup_agent_git_isolation(git_isolation)
@@ -29045,8 +29182,8 @@ def cmd_input(args: argparse.Namespace) -> int:
 
     try:
         try:
-            completed = _run_interactive_agent_owned(
-                agent_cmd,
+            completed = _run_interactive_usage(
+                run, repo_root, agent, agent_cmd,
                 cwd=worktree_path,
                 env=input_env,
             )
@@ -30170,6 +30307,11 @@ def cmd_status(args: argparse.Namespace) -> int:
             if run.review_decision_check_url:
                 print(f"  Source Check: {run.review_decision_check_url}")
 
+    if run:
+        from .usage import grouped, totals
+        print("\nUsage (estimated API list prices):")
+        print(json.dumps({"run": totals(run.usage), "phases": grouped(run.usage, "phase")}, indent=2))
+
     # Show gate status
     gate_file, gate_data = _read_gate_status(repo_root, run) if run else (None, None)
     if gate_data is not None:
@@ -30375,6 +30517,7 @@ def _compute_orchestrator_analytics(
             "run_id": run_id or "",
             "since": since or "",
         },
+        "usage": _usage_analytics(runs),
         "run_counts_by_terminal_phase_status": dict(sorted(terminal_run_counts.items())),
         "phase_attempt_counts_by_outcome": {
             phase: dict(sorted(counts.items())) for phase, counts in sorted(phase_attempt_counts.items())

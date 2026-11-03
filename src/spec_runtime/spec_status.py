@@ -143,6 +143,8 @@ def _load_active_runs(
         except (ValueError, RecursionError, OSError, TypeError):
             continue
 
+        if data.get("phase") == "authoring":
+            continue
         status = str(data.get("status", "")).strip()
         spec_id = str(data.get("spec_id", "")).strip()
         if not spec_id or status not in ACTIVE_RUN_STATUSES:
@@ -240,6 +242,8 @@ def _load_runs_for_spec(
         except (ValueError, RecursionError, OSError, TypeError):
             continue
 
+        if data.get("phase") == "authoring":
+            continue
         if str(data.get("spec_id", "")).strip() != spec_id:
             continue
 
@@ -872,6 +876,8 @@ def project_canonical_spec_status(
         try:
             data = json.loads(candidate.read_text(encoding="utf-8"))
         except (ValueError, RecursionError, OSError, TypeError):
+            continue
+        if data.get("phase") == "authoring":
             continue
         if str(data.get("spec_id", "")).strip() != spec_id:
             continue

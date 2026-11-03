@@ -1431,6 +1431,12 @@ def test_attach_fork_reads_the_running_codex_rollout(
     _use_fake_binary(monkeypatch, fake)
     run, worktree = _make_run(repo, "codex")
     attached: dict[str, object] = {}
+    registered = threading.Event()
+    register_process = orch._register_worktree_process_from_popen
+
+    def register_and_signal(*args, **kwargs) -> None:
+        register_process(*args, **kwargs)
+        registered.set()
 
     def attach_while_running() -> None:
         try:
@@ -1440,6 +1446,9 @@ def test_attach_fork_reads_the_running_codex_rollout(
                     break
                 threading.Event().wait(0.05)
             thread_id = holding.read_text(encoding="utf-8")
+            # The child can reach its hold point before the parent enters the
+            # launch monitor. Attach only after registration has completed.
+            assert registered.wait(timeout=30), "agent process was not registered"
             assert not orch._codex_session_archive_dir(repo, run.run_id).exists()
             live = orch.RunState.load(repo, run.run_id)
             live.agent_session_id = thread_id
@@ -1462,7 +1471,10 @@ def test_attach_fork_reads_the_running_codex_rollout(
     worker = threading.Thread(target=attach_while_running)
     worker.start()
     try:
-        assert _implement(run, repo, worktree) == "passed"
+        with patch.object(
+            orch, "_register_worktree_process_from_popen", side_effect=register_and_signal
+        ):
+            assert _implement(run, repo, worktree) == "passed"
     finally:
         (fake.state / "release").write_text("go", encoding="utf-8")
         worker.join(timeout=60)
