@@ -9041,22 +9041,25 @@ def _schedule_operator_guided_implement_attempt(
     implement phase must loop back through implement instead of advancing to
     verification. Resolved operator requests use the same continuation path.
     Advancing ``run.attempts`` here gives the follow-up its own attempt-scoped
-    artifacts and keeps operator guidance inside the shared retry limit.
+    artifacts. Steering may be assessed at the cap, but only an unchanged,
+    explicitly successful assessment is excluded from the shared retry limit.
     """
     if not _passed_implement_run_requires_fresh_attempt(repo_root, run):
         return False
 
-    if _convergence_attempts(run) >= retry_cap:
+    steering_recheck = bool(_active_operator_steering(repo_root, run.run_id))
+    used = _convergence_attempts(run)
+    if used > retry_cap or (used == retry_cap and not steering_recheck):
         run.status = "blocked"
         run.last_error = (
-            f"Retry cap reached ({_convergence_attempts(run)}/{retry_cap}) before active "
+            f"Retry cap reached ({used}/{retry_cap}) before active "
             "operator guidance could be applied. Resume with "
             f"`spec implement --spec {run.spec_id} --retry-cap {retry_cap + 10}`."
         )
         run.save(repo_root)
         return False
 
-    run.steering_recheck = bool(_active_operator_steering(repo_root, run.run_id))
+    run.steering_recheck = steering_recheck
     run.attempts += 1
     run.status = "pending"
     run.last_error = ""
@@ -10840,6 +10843,11 @@ def resolve_operator_request(
         request,
         session_completed_implement=session_completed_implement,
     )
+    # Every answer surface (CLI, TUI, and direct callers) uses the same
+    # request-specific continuation. Re-answering a resolved request must not
+    # grant another round without a new pending request from review.
+    if request.kind == review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND and request.status == "pending":
+        review_convergence.grant_extra_review_round(_state_root(repo_root) / "runs" / run.run_id)
     now = _now_iso()
     request.response = resolved_response
     request.response_source = str(source or "").strip()
@@ -17838,6 +17846,11 @@ def _build_implement_attempt_context(
                     + "\nIf all guidance is already satisfied, report ok and explain that in the summary "
                     "without changing files. A successful unchanged recheck costs no additional attempt."
                 )
+                if _convergence_attempts(run) > run.retry_cap:
+                    ctx.operator_steering_message += (
+                        "\nThe retry budget is exhausted. If the guidance requires changes, report blocked "
+                        "and describe the required work so the operator can raise the cap."
+                    )
             ctx.operator_steering_context = dict(operator_steering.context)
             ctx.operator_steering_provided_by = operator_steering.provided_by
             ctx.operator_steering_provided_at = operator_steering.provided_at
@@ -19538,6 +19551,13 @@ def _phase_implement_with_runtime(run: RunState, repo_root: Path) -> str:
             ):
                 run.steering_noop_attempts += 1
             run.steering_recheck = False
+            if result == "passed" and _convergence_attempts(run) > run.retry_cap:
+                run.last_error = (
+                    f"Retry cap reached ({run.retry_cap}/{run.retry_cap}): "
+                    "the steering assessment required changes and consumed an additional attempt. "
+                    f"Resume with `spec implement --spec {run.spec_id} --retry-cap {run.retry_cap + 10}`."
+                )
+                result = "blocked"
             run.save(repo_root)
         return result
     finally:
@@ -29454,13 +29474,13 @@ def _cmd_input_review_round_cap(
         run.save(repo_root)
         print(f"Accepted {spec_id} at the review round cap. Resuming workflow...")
     else:
-        review_convergence.grant_extra_review_round(_state_root(repo_root) / "runs" / run.run_id)
         try:
             resolve_operator_request(repo_root, run, message, source="spec input --message")
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        print(f"Granted {spec_id} one more review round. Resuming implement with guidance...")
+        print(f"Granted {spec_id} one more review round. Implementation is ready to resume with guidance.")
+        return 0
     resume_args = argparse.Namespace(
         spec=spec_id,
         agent=run.agent or SPEC_RUNTIME_CONFIG.agents.default,
@@ -29483,17 +29503,15 @@ def cmd_input(args: argparse.Namespace) -> int:
     message = str(getattr(args, "message", "") or "").strip()
     if message and not accept:
         run = _latest_non_superseded_run(repo_root, spec_id)
-        request = _load_operator_request(repo_root, run) if run is not None else None
-        if request is None or request.kind != review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND:
-            try:
-                if run is None:
-                    raise RuntimeError(f"No run found for spec {spec_id}")
-                resolve_operator_request(repo_root, run, message, source="spec input --message")
-            except RuntimeError as exc:
-                print(f"Error: {exc}", file=sys.stderr)
-                return 1
-            print(f"Resolved operator request for {spec_id}.")
-            return 0
+        try:
+            if run is None:
+                raise RuntimeError(f"No run found for spec {spec_id}")
+            resolve_operator_request(repo_root, run, message, source="spec input --message")
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Resolved operator request for {spec_id}.")
+        return 0
     if accept or message:
         return _cmd_input_review_round_cap(repo_root, args, accept=accept, message=message)
 
