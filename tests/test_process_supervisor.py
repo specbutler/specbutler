@@ -3377,8 +3377,16 @@ def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: 
     )
     supervisor = ProcessSupervisor(LifetimeMode.RUN_OWNED)
     managed = supervisor.spawn([sys.executable, str(script), "0", str(pid_file)])
-    while not all(_pid_file_written(Path(f"{pid_file}-{level}")) for level in range(3)):
+    # Windows recycles PIDs quickly, so compare kernel identities, not bare PIDs.
+    # Record each one as soon as it is published: the leader exits after 2s.
+    identities: dict[int, ProcessIdentity | None] = {}
+    while len(identities) < 3:
+        for level in range(3):
+            path = Path(f"{pid_file}-{level}")
+            if level not in identities and _pid_file_written(path):
+                identities[level] = inspect_process(int(path.read_text(encoding="utf-8")))
         time.sleep(0.05)
+    assert all(identity is not None for identity in identities.values())
     if action == "normal":
         managed.wait(timeout=10)
     else:
@@ -3387,9 +3395,8 @@ def test_windows_run_owned_parent_child_grandchild_tree(tmp_path: Path, action: 
         else:
             managed.terminate(grace_seconds=0.1)
         managed.wait(timeout=10)
-    for level in range(3):
-        pid = int(Path(f"{pid_file}-{level}").read_text(encoding="utf-8"))
-        assert inspect_process(pid) is None
+    for identity in identities.values():
+        assert not identity_matches(identity)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows current-process Job integration")
@@ -3659,18 +3666,25 @@ def test_windows_async_run_owned_owner_close_kills_complete_tree(tmp_path: Path)
         encoding="utf-8",
     )
 
+    identities: list[ProcessIdentity | None] = []
+
     async def exercise() -> None:
         supervisor = ProcessSupervisor(LifetimeMode.RUN_OWNED)
         managed = await supervisor.spawn_async([sys.executable, str(script), "0", str(pid_file)])
         while not all(_pid_file_written(Path(f"{pid_file}-{level}")) for level in range(3)):
             await asyncio.sleep(0.05)
+        # Windows recycles PIDs quickly, so compare kernel identities, not bare PIDs.
+        identities.extend(
+            inspect_process(int(Path(f"{pid_file}-{level}").read_text(encoding="utf-8")))
+            for level in range(3)
+        )
+        assert all(identity is not None for identity in identities)
         supervisor.close()
         await asyncio.wait_for(managed.wait(), timeout=10)
 
     asyncio.run(exercise())
-    for level in range(3):
-        pid = int(Path(f"{pid_file}-{level}").read_text(encoding="utf-8"))
-        assert inspect_process(pid) is None
+    for identity in identities:
+        assert not identity_matches(identity)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows async cancellation integration")

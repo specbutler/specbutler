@@ -234,6 +234,17 @@ def test_spec_pr_policy_embedded_validator_runs_for_implementation_pr(tmp_path: 
     assert "Spec PR policy validation passed." in result.stdout
 
 
+def test_ci_cancels_only_superseded_pull_request_runs():
+    concurrency = _load_workflow("ci.yml")["concurrency"]
+    # Main pushes and merge-queue groups key on their commit, so neither a
+    # running nor a pending run for an earlier merge is replaced.
+    assert concurrency["group"] == (
+        "ci-${{ github.workflow }}-${{ github.event_name }}-"
+        "${{ github.event.pull_request.number || github.sha }}"
+    )
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'pull_request' }}"
+
+
 def test_ci_workflow_has_blocking_aggregate_job():
     jobs = _workflow_jobs()
     ci_job = jobs["ci"]

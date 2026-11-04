@@ -1468,7 +1468,9 @@ def test_windows_lab_unsafe_job_forces_and_verifies_guest_shutdown(
         check=False,
         capture_output=True,
         text=True,
-        timeout=12,
+        # About 9s unloaded across a dozen interpreter startups. A missing inner
+        # bound adds a fake's 30s hang on top, which still trips this guard.
+        timeout=30,
     )
     assert result.returncode == 1
     assert "could not prove descendant cleanup" in result.stderr
@@ -1792,7 +1794,10 @@ def test_windows_lab_portable_timeout_escalates_for_a_lingering_descendant(
     )
     module = _load_host_timeout_module()
     monkeypatch.setattr(module, "KILL_GRACE_SECONDS", 0.2)
-    assert module.run(1, [sys.executable, str(parent), str(tmp_path)]) == 124
+    # The budget covers two interpreter startups and the child's SIGTERM
+    # handler; a loaded macOS runner can need several seconds for that.
+    assert module.run(5, [sys.executable, str(parent), str(tmp_path)]) == 124
+    assert (tmp_path / "child-ready").is_file()
     assert (tmp_path / "child-saw-term").read_text(encoding="ascii") == "yes"
 
 
