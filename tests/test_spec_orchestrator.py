@@ -42971,3 +42971,75 @@ def test_resolved_phase_does_not_rewrite_pending_or_agent_question(repo: Path, k
         status="passed", finished_at="2026-01-02T00:00:00+00:00",
     ))
     assert orch._operator_request_for_implement_prompt(run, repo, request) is request
+
+
+@pytest.mark.parametrize(
+    "diagnosed_head,category,new_commit,human,signature,resolved",
+    [
+        ("verified", "environment_verification_handoff", False, False, "pending", True),
+        ("other", "environment_verification_handoff", False, False, "pending", False),
+        ("verified", "environment_verification_handoff", True, False, "pending", False),
+        ("verified", "environment_verification_handoff", False, True, "pending", False),
+        ("verified", "gate-failure", False, False, "pending", False),
+        ("verified", "environment_verification_handoff", False, False, "other", False),
+    ],
+)
+def test_host_verify_resolves_only_matching_handoff(
+    repo, diagnosed_head, category, new_commit, human, signature, resolved,
+):
+    run = orch.RunState(
+        run_id="host-verify", spec_id="my-feature", branch="spec/my-feature",
+        phase="verify", status="blocked", last_error="Previous verify blocked",
+        pending_block_debugger_signature="pending", review_decision_status="approved",
+    )
+    orch.BlockDiagnosis(
+        summary="Host verification needed", root_cause="Sandbox limit",
+        category=category, evidence=["implement result"],
+        next_best_action="Run host verify", blocker_signature=signature,
+        needs_new_commit=new_commit, requires_human_attention=human,
+        head_sha=diagnosed_head,
+    ).save(repo, run.run_id)
+    with (
+        patch.dict(orch.PHASE_HANDLERS, {"verify": lambda *_: "passed"}),
+        patch.object(orch, "resolve_worktree_path", return_value=repo),
+        patch.object(orch, "_head_sha", return_value="verified"),
+        patch.object(orch, "_backend_resume_mismatch", return_value=""),
+        patch.object(orch, "_refresh_active_run_lease"),
+        patch.object(orch, "_run_lease_heartbeat_loop"),
+    ):
+        assert orch.run_single_phase(run, "verify", repo) == "passed"
+    saved = orch.BlockDiagnosis.load(repo, run.run_id)
+    assert bool(saved.resolved_at) is resolved
+    assert bool(saved.resolution_evidence) is resolved
+    assert run.pending_block_debugger_signature == ("" if resolved else "pending")
+    if resolved:
+        assert "verified" in saved.resolution_evidence[0]
+    else:
+        decision = orch._evaluate_readiness_for_promotion(
+            run, repo, pr_number=1, pr_data={}, current_head_sha="verified",
+            require_forge_checks=False, require_integration_checkpoint=False,
+        )
+        assert not decision.ready
+        if signature == "pending":
+            assert category in decision.blocker
+            assert "Run host verify" in decision.blocker
+
+
+@pytest.mark.parametrize("context_signature,expected", [("pending", True), ("stale", False)])
+def test_host_verify_legacy_diagnosis_uses_matching_context(repo, context_signature, expected):
+    run = orch.RunState(
+        run_id="legacy-handoff", spec_id="my-feature", branch="spec/my-feature",
+        pending_block_debugger_signature="pending", verify_head_sha="verified",
+    )
+    orch.BlockDiagnosis(
+        summary="Host verification needed", root_cause="Sandbox limit",
+        category="environment_verification_handoff", evidence=["implement result"],
+        next_best_action="Run host verify", blocker_signature="pending",
+    ).save(repo, run.run_id)
+    context_path = orch._block_debugger_artifact_paths(repo, run.run_id)["context"]
+    context_path.write_text(json.dumps({
+        "blocker_signature": context_signature, "current_head_sha": "verified",
+    }), encoding="utf-8")
+    orch._resolve_verified_handoff_diagnosis(run, repo)
+    assert bool(orch.BlockDiagnosis.load(repo, run.run_id).resolved_at) is expected
+    assert run.pending_block_debugger_signature == ("" if expected else "pending")
