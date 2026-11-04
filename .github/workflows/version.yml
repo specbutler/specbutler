@@ -193,10 +193,39 @@ jobs:
 
           # GitHub's GraphQL and REST frontends fail independently. Keep the
           # release path REST-only and let branch protection refuse the merge
-          # until the generated PR's required checks are green.
+          # until the generated PR's required checks are green. The one
+          # exception is a base branch that requires a merge queue: it refuses
+          # direct merges and queue admission exists only in GraphQL, so the PR
+          # gets auto-merge once (the queue admits it when checks pass) and the
+          # loop below only waits for the queue to land it.
           release_head_sha="$(git rev-parse HEAD)"
-          for attempt in $(seq 1 90); do
-            if gh api -X PUT "repos/${repo}/pulls/${pr_number}/merge" \
+          queued="$(
+            gh_api_retry "repos/${repo}/rules/branches/main" \
+              --jq 'any(.[]; .type == "merge_queue")'
+          )"
+          wait_attempts=90
+          if [ "$queued" = "true" ]; then
+            wait_attempts=270
+            pr_node_id="$(gh_api_retry "repos/${repo}/pulls/${pr_number}" --jq '.node_id')"
+            enqueued=""
+            for attempt in $(seq 1 6); do
+              if gh api graphql \
+                -f query='mutation($id: ID!, $sha: GitObjectID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, expectedHeadOid: $sha}) { clientMutationId } }' \
+                -f id="$pr_node_id" \
+                -f sha="$release_head_sha" \
+                --silent; then
+                enqueued=1
+                break
+              fi
+              sleep "$((attempt * 5))"
+            done
+            if [ -z "$enqueued" ]; then
+              echo "::error::Unable to add release PR #$pr_number to the merge queue"
+              exit 1
+            fi
+          fi
+          for attempt in $(seq 1 "$wait_attempts"); do
+            if [ "$queued" != "true" ] && gh api -X PUT "repos/${repo}/pulls/${pr_number}/merge" \
               -f merge_method=rebase \
               -f sha="$release_head_sha" \
               --silent; then
@@ -217,7 +246,7 @@ jobs:
               exit 1
             fi
 
-            echo "Release PR #$pr_number is waiting for required checks (attempt $attempt/90)"
+            echo "Release PR #$pr_number is waiting for required checks or the merge queue (attempt $attempt/$wait_attempts)"
             sleep 10
           done
 
