@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -15,11 +16,13 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from spec_runtime.process_supervisor import (
     LifetimeMode,
+    ManagedProcess,
     ProcessSupervisor,
     SupervisionToken,
     durable_metadata_path,
@@ -109,14 +112,69 @@ def _wait_for_authenticated_http(
     raise AssertionError(f"web service did not become ready: {last_error}")
 
 
+def _assert_unauthorized(
+    request: urllib.request.Request | str, *, deadline_seconds: float = 15.0,
+) -> None:
+    deadline = time.monotonic() + deadline_seconds
+    last_error: Exception | None = None
+    while (remaining := deadline - time.monotonic()) > 0:
+        try:
+            with urllib.request.urlopen(request, timeout=min(1.0, remaining)) as response:
+                raise AssertionError(f"Expected HTTP 401, received {response.status}")
+        except urllib.error.HTTPError as exc:
+            with exc:
+                assert exc.code == 401
+            return
+        except (OSError, urllib.error.URLError) as exc:
+            last_error = exc
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    raise AssertionError(f"HTTP 401 was not observed before the deadline: {last_error}")
+
+
 def _assert_wrong_token_rejected(port: int) -> None:
     request = urllib.request.Request(
         f"http://127.0.0.1:{port}/",
         headers={"Authorization": "Bearer wrong-token"},
     )
-    with pytest.raises(urllib.error.HTTPError) as error:
-        urllib.request.urlopen(request, timeout=2)
-    assert error.value.code == 401
+    _assert_unauthorized(request)
+
+
+def _close_chrome_target(
+    browser: ManagedProcess, debug_port: int, target_id: str, *, deadline_seconds: float = 10.0,
+) -> None:
+    # Allow five seconds for the close request and five for confirmation.
+    deadline = time.monotonic() + deadline_seconds
+    close_request = urllib.request.Request(
+        f"http://127.0.0.1:{debug_port}/json/close/{target_id}", method="PUT",
+    )
+    acknowledged = False
+    last_error: Exception | None = None
+    while (remaining := deadline - time.monotonic()) > 0:
+        if browser.poll() is not None:
+            return
+        if not acknowledged:
+            try:
+                with urllib.request.urlopen(close_request, timeout=min(5.0, remaining)) as response:
+                    assert response.read().decode() == "Target is closing"
+                acknowledged = True
+            except (OSError, urllib.error.URLError) as exc:
+                last_error = exc
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{debug_port}/json/list", timeout=min(5.0, remaining),
+            ) as response:
+                targets = json.load(response)
+            # A timed-out close may already have succeeded in Chrome. Verify
+            # the target disappeared rather than depending on its HTTP reply.
+            if all(target.get("id") != target_id for target in targets):
+                return
+        except (OSError, urllib.error.URLError) as exc:
+            last_error = exc
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+    raise AssertionError(f"Chrome did not close the audited page before the deadline: {last_error}")
 
 
 def _assert_port_closed(port: int) -> None:
@@ -315,34 +373,9 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                     assert "bootstrap=" not in current_url
                     assert "spec-csrf" not in current_url
                     target_id = str(page_target["id"])
-                    close_request = urllib.request.Request(
-                        (
-                            f"http://127.0.0.1:{debug_port}"
-                            f"/json/close/{target_id}"
-                        ),
-                        method="PUT",
-                    )
-                    with urllib.request.urlopen(close_request, timeout=5) as response:
-                        assert response.read().decode() == "Target is closing"
-
-                    # Closing the page through the browser protocol gives
-                    # Chrome a deterministic history-commit boundary without
-                    # depending on --dump-dom to exit while the app has live
-                    # timers and streams.
-                    close_deadline = time.monotonic() + 5
-                    while time.monotonic() < close_deadline:
-                        if browser.poll() is not None:
-                            break
-                        with urllib.request.urlopen(
-                            f"http://127.0.0.1:{debug_port}/json/list",
-                            timeout=5,
-                        ) as response:
-                            targets = json.load(response)
-                        if all(target.get("id") != target_id for target in targets):
-                            break
-                        time.sleep(0.05)
-                    else:
-                        raise AssertionError("Chrome did not close the audited page")
+                    # Closing the target commits the navigation to history;
+                    # transient DevTools I/O must not abort that observation.
+                    _close_chrome_target(browser, debug_port, target_id)
                 finally:
                     if browser.owned_tree_active():
                         browser.send_signal(signal.SIGINT)
@@ -363,9 +396,7 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
             assert all(token not in url for url in urls)
             assert all("spec-csrf" not in url for url in urls)
 
-            with pytest.raises(urllib.error.HTTPError) as replay:
-                urllib.request.urlopen(opening_url, timeout=2)
-            assert replay.value.code == 401
+            _assert_unauthorized(opening_url)
         except Exception as exc:
             raise AssertionError(f"{exc}\n{_logs(stdout_path, stderr_path)}") from exc
         finally:
@@ -517,3 +548,130 @@ def test_linux_background_durable_start_auth_status_stop_and_cleanup(
                 timeout=15,
                 check=False,
             )
+
+
+class _HttpResponse(io.BytesIO):
+    status = 200
+
+    def __init__(self, data: bytes, *, timeout_read: bool = False):
+        super().__init__(data)
+        self.timeout_read = timeout_read
+
+    def read(self, size: int = -1) -> bytes:
+        if self.timeout_read:
+            raise TimeoutError("response body timed out")
+        return super().read(size)
+
+
+@pytest.fixture
+def http_poll_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    now = [0.0]
+
+    def sleep(seconds: float) -> None:
+        now[0] += seconds
+
+    # Patch only this module, leaving the supervisor and subprocess clocks real.
+    monkeypatch.setitem(globals(), "time", SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    return now
+
+
+@pytest.mark.parametrize("stage", ["close_open", "close_read", "poll_open", "poll_read"])
+def test_chrome_close_recovers_from_transient_io(
+    monkeypatch: pytest.MonkeyPatch, http_poll_clock: list[float], stage: str,
+) -> None:
+    calls = {"close": 0, "poll": 0}
+
+    def open_response(request, *, timeout):
+        action = "close" if isinstance(request, urllib.request.Request) else "poll"
+        calls[action] += 1
+        if stage == f"{action}_open" and calls[action] == 1:
+            raise TimeoutError("DevTools request timed out")
+        return _HttpResponse(
+            b"Target is closing" if action == "close" else b"[]",
+            timeout_read=stage == f"{action}_read" and calls[action] == 1,
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_response)
+    _close_chrome_target(SimpleNamespace(poll=lambda: None), 1234, "audited")
+    assert calls["close"] == 1
+    assert calls["poll"] == (2 if stage.startswith("poll") else 1)
+
+
+def test_chrome_close_retries_when_timed_out_request_did_not_close_target(
+    monkeypatch: pytest.MonkeyPatch, http_poll_clock: list[float],
+) -> None:
+    closes = []
+
+    def open_response(request, *, timeout):
+        if isinstance(request, urllib.request.Request):
+            closes.append(request)
+            if len(closes) == 1:
+                raise TimeoutError("close was not accepted")
+            return _HttpResponse(b"Target is closing")
+        return _HttpResponse(b'[{"id":"audited"}]' if len(closes) == 1 else b"[]")
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_response)
+    _close_chrome_target(SimpleNamespace(poll=lambda: None), 1234, "audited")
+    assert len(closes) == 2
+
+
+@pytest.mark.parametrize("unreachable", [False, True])
+def test_chrome_close_requires_target_disappearance_before_deadline(
+    monkeypatch: pytest.MonkeyPatch, http_poll_clock: list[float], unreachable: bool,
+) -> None:
+    timeouts = []
+
+    def open_response(request, *, timeout):
+        timeouts.append(timeout)
+        if unreachable:
+            raise TimeoutError("DevTools unavailable")
+        return _HttpResponse(b"Target is closing" if isinstance(request, urllib.request.Request) else b'[{"id":"audited"}]')
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_response)
+    with pytest.raises(AssertionError, match="Chrome did not close the audited page before the deadline"):
+        _close_chrome_target(SimpleNamespace(poll=lambda: None), 1234, "audited", deadline_seconds=0.15)
+    assert http_poll_clock[0] == pytest.approx(0.15)
+    assert timeouts and all(0 < timeout <= 0.15 for timeout in timeouts)
+
+
+def test_unauthorized_check_retries_timeout_but_requires_401(
+    monkeypatch: pytest.MonkeyPatch, http_poll_clock: list[float],
+) -> None:
+    calls = []
+
+    def open_response(request, *, timeout):
+        calls.append(request)
+        if len(calls) == 1:
+            raise TimeoutError("replay request timed out")
+        raise urllib.error.HTTPError(request, 401, "Unauthorized", None, io.BytesIO())
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_response)
+    _assert_unauthorized("http://127.0.0.1:1234/?bootstrap=used")
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("status", [200, 403])
+def test_unauthorized_check_rejects_unexpected_status_immediately(
+    monkeypatch: pytest.MonkeyPatch, http_poll_clock: list[float], status: int,
+) -> None:
+    def open_response(request, *, timeout):
+        if status == 200:
+            return _HttpResponse(b"unexpected authentication success")
+        raise urllib.error.HTTPError(request, status, "Forbidden", None, io.BytesIO())
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_response)
+    with pytest.raises(AssertionError):
+        _assert_unauthorized("http://127.0.0.1:1234/?bootstrap=used")
+    assert http_poll_clock[0] == 0
+
+
+def test_unauthorized_check_does_not_accept_a_server_that_stays_unreachable(
+    monkeypatch: pytest.MonkeyPatch, http_poll_clock: list[float],
+) -> None:
+    def open_response(request, *, timeout):
+        raise TimeoutError("server unavailable")
+
+    monkeypatch.setattr(urllib.request, "urlopen", open_response)
+    with pytest.raises(AssertionError, match="HTTP 401 was not observed before the deadline: server unavailable"):
+        _assert_unauthorized("http://127.0.0.1:1234/?bootstrap=used", deadline_seconds=0.15)
+    assert http_poll_clock[0] == pytest.approx(0.15)
