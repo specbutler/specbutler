@@ -4151,6 +4151,7 @@ def test_windows_detached_workflows_survive_launcher_and_stop_by_identity(tmp_pa
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows background web integration")
+@pytest.mark.requires_network
 def test_windows_background_web_server_survives_launcher_and_stops_by_token(tmp_path: Path) -> None:
     """Exercise the real web start/status/stop lifecycle, including its persisted token."""
     pytest.importorskip("uvicorn")
