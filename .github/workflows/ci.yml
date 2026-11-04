@@ -8,9 +8,13 @@ on:
   pull_request:
     branches: [main]
 
+# Only superseded PR pushes are cancelled. Every main push and merge-queue
+# group gets its own commit-keyed group: a shared group would still replace a
+# pending main run even without cancel-in-progress. The event name keeps the
+# push of a queued merge apart from the merge_group run for the same commit.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions: read-all
 

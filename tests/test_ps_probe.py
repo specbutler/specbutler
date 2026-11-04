@@ -179,8 +179,10 @@ def test_provider_home_probe_reports_denial(monkeypatch: pytest.MonkeyPatch, tmp
 
 @pytest.mark.parametrize("available", [False, True])
 def test_capabilities_preserve_coverage_and_summarize_skips(
-    pytester: pytest.Pytester, available: bool,
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, available: bool,
 ) -> None:
+    # CI with Chrome installed fails browser tests instead; see the test below.
+    monkeypatch.delenv("CI", raising=False)
     source = Path(__file__).with_name("conftest.py").read_text(encoding="utf-8")
     reason = "None" if available else repr("denied by test sandbox")
     pytester.makeconftest(source + f"""
@@ -222,6 +224,41 @@ def test_plain(): pass
             result.stdout.fnmatch_lines([
                 f"1 tests skipped: {capability} unavailable (denied by test sandbox)"
             ])
+
+
+@pytest.mark.parametrize("ci,installed", [(True, True), (True, False), (False, True)])
+def test_browser_probe_failure_fails_under_ci_when_chrome_is_installed(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, ci: bool, installed: bool,
+) -> None:
+    if ci:
+        monkeypatch.setenv("CI", "true")
+    else:
+        monkeypatch.delenv("CI", raising=False)
+    source = Path(__file__).with_name("conftest.py").read_text(encoding="utf-8")
+    pytester.makeconftest(source + f"""
+def _browser_executable():
+    return {"'/fake-chrome'" if installed else "None"}
+def probe_browser():
+    return "probe timed out"
+""")
+    pytester.makeini("[pytest]\nmarkers =\n    requires_browser: headless browser\n")
+    pytester.makepyfile("""
+import pytest
+@pytest.mark.requires_browser
+def test_browser(): pass
+@pytest.mark.requires_browser
+@pytest.mark.skipif(True, reason="platform gated")
+def test_gated_browser(): pass
+""")
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider", "-rs")
+    if ci and installed:
+        # The platform-gated test still skips; only the runnable one fails.
+        result.assert_outcomes(errors=1, skipped=1)
+        result.stdout.fnmatch_lines(["*browser installed but unusable under CI (probe timed out)*"])
+        assert not any("tests skipped: browser" in line for line in result.outlines)
+    else:
+        result.assert_outcomes(skipped=2)
+        result.stdout.fnmatch_lines(["1 tests skipped: browser unavailable (probe timed out)"])
 
 
 @pytest.mark.parametrize("provider,key", [

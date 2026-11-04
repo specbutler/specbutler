@@ -35,6 +35,7 @@ _CONTROL_ROOT_SEQUENCE = itertools.count()
 _PS_SKIP_PREFIX = "ps unavailable"
 _ps_unavailability_key = pytest.StashKey[str | None]()
 _ps_skip_count_key = pytest.StashKey[int]()
+_capability_failure_key = pytest.StashKey[str]()
 _session_config: pytest.Config
 
 # Windows reads and writes text without an explicit ``encoding=`` as cp1252;
@@ -132,8 +133,25 @@ def _browser_probe_home():
                 time.sleep(0.05)
 
 
+_BROWSER_PROBE_TIMEOUT_SECONDS = 45
+
+
+def _browser_executable() -> str | None:
+    return shutil.which("google-chrome") or shutil.which("chromium")
+
+
+def browser_probe_failure_is_fatal() -> bool:
+    """CI installs Chrome on purpose, so a failed probe there is a failure.
+
+    A cold Chrome start on a loaded runner can outlast the probe.  Skipping
+    then hides the browser test behind a green run; locally, a missing or
+    broken browser still skips.
+    """
+    return bool(os.environ.get("CI")) and _browser_executable() is not None
+
+
 def probe_browser() -> str | None:
-    browser = shutil.which("google-chrome") or shutil.which("chromium")
+    browser = _browser_executable()
     if browser is None:
         return "Chrome/Chromium is not installed"
     with _browser_probe_home() as home:
@@ -148,7 +166,7 @@ def probe_browser() -> str | None:
                 start_new_session=os.name == "posix",
             ) as process:
                 try:
-                    stdout, stderr = process.communicate(timeout=15)
+                    stdout, stderr = process.communicate(timeout=_BROWSER_PROBE_TIMEOUT_SECONDS)
                 finally:
                     # Even a successful launcher may leave profile-writing
                     # children behind. Own and stop the whole POSIX group.
@@ -217,6 +235,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     }.items():
         marked = [item for item in items if item.get_closest_marker(f"requires_{capability}")]
         if marked and (reason := probe()) is not None:
+            if capability == "browser" and browser_probe_failure_is_fatal():
+                for item in marked:
+                    item.stash[_capability_failure_key] = (
+                        f"browser installed but unusable under CI ({reason})"
+                    )
+                continue
             _capability_reasons[capability] = reason
             for item in marked:
                 item.add_marker(pytest.mark.skip(reason=f"{capability} unavailable ({reason})"))
@@ -230,6 +254,12 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     skip = pytest.mark.skip(reason=f"{_PS_SKIP_PREFIX} ({reason})")
     for item in needs_ps:
         item.add_marker(skip)
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    # Runs after skip/skipif evaluation, so platform-gated tests still skip.
+    if (failure := item.stash.get(_capability_failure_key, None)) is not None:
+        pytest.fail(failure, pytrace=False)
 
 
 def pytest_configure(config: pytest.Config) -> None:
