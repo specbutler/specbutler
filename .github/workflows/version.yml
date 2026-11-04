@@ -194,45 +194,43 @@ jobs:
           # GitHub's GraphQL and REST frontends fail independently. Keep the
           # release path REST-only and let branch protection refuse the merge
           # until the generated PR's required checks are green. The one
-          # exception is a base branch that requires a merge queue: it refuses
-          # direct merges and queue admission exists only in GraphQL, so the PR
-          # gets auto-merge once (the queue admits it when checks pass) and the
-          # loop below only waits for the queue to land it.
+          # exception is a base branch that requires a merge queue: GitHub
+          # refuses the REST merge with a merge-queue error, and queue
+          # admission exists only in GraphQL. Only that refusal switches the
+          # PR to auto-merge, once; the loop then waits for the queue to land
+          # it. Rule listings aren't consulted, so a queue rule that isn't
+          # enforced never diverts a merge that REST would complete.
           release_head_sha="$(git rev-parse HEAD)"
-          queued="$(
-            gh_api_retry "repos/${repo}/rules/branches/main" \
-              --jq 'any(.[]; .type == "merge_queue")'
-          )"
-          wait_attempts=90
-          if [ "$queued" = "true" ]; then
-            wait_attempts=270
-            pr_node_id="$(gh_api_retry "repos/${repo}/pulls/${pr_number}" --jq '.node_id')"
-            enqueued=""
-            for attempt in $(seq 1 6); do
-              # $id and $sha are GraphQL variables, not shell expansions.
-              # shellcheck disable=SC2016
-              if gh api graphql \
-                -f query='mutation($id: ID!, $sha: GitObjectID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, expectedHeadOid: $sha}) { clientMutationId } }' \
-                -f id="$pr_node_id" \
-                -f sha="$release_head_sha" \
-                --silent; then
-                enqueued=1
-                break
-              fi
-              sleep "$((attempt * 5))"
-            done
+          enqueued=""
+          for attempt in $(seq 1 270); do
             if [ -z "$enqueued" ]; then
-              echo "::error::Unable to add release PR #$pr_number to the merge queue"
-              exit 1
-            fi
-          fi
-          for attempt in $(seq 1 "$wait_attempts"); do
-            if [ "$queued" != "true" ] && gh api -X PUT "repos/${repo}/pulls/${pr_number}/merge" \
-              -f merge_method=rebase \
-              -f sha="$release_head_sha" \
-              --silent; then
-              echo "Release PR #$pr_number merged"
-              exit 0
+              if merge_output="$(gh api -X PUT "repos/${repo}/pulls/${pr_number}/merge" \
+                -f merge_method=rebase \
+                -f sha="$release_head_sha" 2>&1)"; then
+                echo "Release PR #$pr_number merged"
+                exit 0
+              fi
+              if printf '%s' "$merge_output" | grep -qi "merge queue"; then
+                pr_node_id="$(gh_api_retry "repos/${repo}/pulls/${pr_number}" --jq '.node_id')"
+                for enqueue_attempt in $(seq 1 6); do
+                  # $id and $sha are GraphQL variables, not shell expansions.
+                  # shellcheck disable=SC2016
+                  if gh api graphql \
+                    -f query='mutation($id: ID!, $sha: GitObjectID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, expectedHeadOid: $sha}) { clientMutationId } }' \
+                    -f id="$pr_node_id" \
+                    -f sha="$release_head_sha" \
+                    --silent; then
+                    enqueued=1
+                    echo "Release PR #$pr_number requires the merge queue; auto-merge enabled"
+                    break
+                  fi
+                  sleep "$((enqueue_attempt * 5))"
+                done
+                if [ -z "$enqueued" ]; then
+                  echo "::error::Unable to add release PR #$pr_number to the merge queue"
+                  exit 1
+                fi
+              fi
             fi
 
             pr_state="$(
@@ -248,7 +246,7 @@ jobs:
               exit 1
             fi
 
-            echo "Release PR #$pr_number is waiting for required checks or the merge queue (attempt $attempt/$wait_attempts)"
+            echo "Release PR #$pr_number is waiting for required checks or the merge queue (attempt $attempt/270)"
             sleep 10
           done
 

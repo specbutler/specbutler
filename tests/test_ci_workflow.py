@@ -98,15 +98,15 @@ def test_version_workflow_enqueues_release_pr_when_main_requires_a_merge_queue()
     )
 
     # Queue admission is GraphQL-only, so it is the release path's single
-    # GraphQL call; direct REST merges are skipped because a queued base
-    # refuses them.
-    assert '"repos/${repo}/rules/branches/main"' in script
-    assert 'any(.[]; .type == "merge_queue")' in script
+    # GraphQL call, and only GitHub's merge-queue refusal of the REST merge
+    # triggers it; rule listings can include rules that aren't enforced.
+    assert "rules/branches" not in script
+    assert 'grep -qi "merge queue"' in script
     assert script.count("gh api graphql") == 1
     assert "enablePullRequestAutoMerge" in script
     assert "expectedHeadOid: $sha" in script
-    assert '[ "$queued" != "true" ] && gh api -X PUT' in script
-    assert "the merge queue (attempt $attempt/$wait_attempts)" in script
+    assert 'if [ -z "$enqueued" ]; then' in script
+    assert "the merge queue (attempt $attempt/270)" in script
 
 
 def test_version_workflow_reconciles_release_creation_before_retry():
