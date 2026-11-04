@@ -861,6 +861,7 @@ def test_real_codex_sandbox_blocks_hardlinks_from_read_only_git_metadata(
     assert not alias.exists()
 
 
+@pytest.mark.requires_provider_home("claude")
 def test_real_claude_sandbox_blocks_hardlinks_from_read_only_git_metadata(
     tmp_path: Path,
 ) -> None:

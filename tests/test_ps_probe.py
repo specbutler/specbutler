@@ -169,6 +169,8 @@ def test_nested_sandbox_probe_reports_missing_cli(monkeypatch: pytest.MonkeyPatc
 def test_provider_home_probe_reports_denial(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     import conftest
 
+    for key in conftest._PROVIDER_AUTH_ENV_KEYS["codex"]:
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setitem(conftest._REAL_PROVIDER_HOMES, "codex", tmp_path / "missing")
     assert conftest.probe_provider_home("codex") is not None
     monkeypatch.setitem(conftest._REAL_PROVIDER_HOMES, "codex", tmp_path)
@@ -220,3 +222,153 @@ def test_plain(): pass
             result.stdout.fnmatch_lines([
                 f"1 tests skipped: {capability} unavailable (denied by test sandbox)"
             ])
+
+
+@pytest.mark.parametrize("provider,key", [
+    ("codex", "OPENAI_API_KEY"),
+    ("codex", "CODEX_API_KEY"),
+    ("claude", "ANTHROPIC_API_KEY"),
+    ("claude", "ANTHROPIC_AUTH_TOKEN"),
+    ("claude", "CLAUDE_CODE_OAUTH_TOKEN"),
+])
+def test_environment_credentials_run_without_provider_home(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, provider: str, key: str,
+) -> None:
+    import conftest
+
+    for keys in conftest._PROVIDER_AUTH_ENV_KEYS.values():
+        for name in keys:
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(key, "synthetic-test-credential")
+    missing = pytester.path / "missing-provider-home"
+    source = Path(__file__).with_name("conftest.py").read_text(encoding="utf-8")
+    pytester.makeconftest(source + f"""
+_REAL_PROVIDER_HOMES = {{"codex": Path({str(missing)!r}), "claude": Path({str(missing)!r})}}
+""")
+    pytester.makeini("[pytest]\nmarkers =\n    requires_provider_home: provider authentication\n    requires_nested_sandbox: nested sandbox\n")
+    variable = "CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR"
+    pytester.makepyfile(f"""
+import os
+from pathlib import Path
+import pytest
+from conftest import probe_provider_home
+
+@pytest.mark.requires_provider_home({provider!r})
+def test_environment_auth():
+    assert os.environ[{key!r}] == "synthetic-test-credential"
+    assert probe_provider_home({provider!r}) is None
+    home = Path(os.environ[{variable!r}])
+    assert home.is_dir()
+    assert home.is_relative_to(Path(os.environ["XDG_STATE_HOME"]).parent)
+    assert home != Path({str(missing)!r})
+    assert not (home / "auth.json").exists()
+""")
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider")
+    result.assert_outcomes(passed=1)
+    assert not any("provider_home unavailable" in line for line in result.outlines)
+    assert not missing.exists()
+
+
+def test_opt_in_claude_canaries_keep_directory_authentication(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import conftest
+
+    for keys in conftest._PROVIDER_AUTH_ENV_KEYS.values():
+        for name in keys:
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("SPEC_LINUX_CLAUDE_REAL_PROVIDER", "1")
+    monkeypatch.setenv("SPEC_LINUX_CLAUDE_REVIEW_CANARY", "1")
+    home = pytester.path / "operator-claude"
+    home.mkdir()
+    (home / ".credentials.json").write_text("synthetic-directory-login", encoding="utf-8")
+    source = Path(__file__).with_name("conftest.py").read_text(encoding="utf-8")
+    pytester.makeconftest(source + f"""
+_REAL_PROVIDER_HOMES["claude"] = Path({str(home)!r})
+
+@pytest.fixture(autouse=True)
+def fake_claude(monkeypatch):
+    import json
+    import sys
+    monkeypatch.setattr(sys, "platform", "linux")
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw:
+        "/fake/claude" if name == "claude" else real_which(name, *a, **kw))
+    real_run = subprocess.run
+    def run(argv, **kwargs):
+        if Path(argv[0]).name != "claude":
+            return real_run(argv, **kwargs)
+        env = kwargs["env"]
+        config = Path(env["CLAUDE_CONFIG_DIR"])
+        assert config == Path({str(home)!r})
+        assert (config / ".credentials.json").read_text(encoding="utf-8") == "synthetic-directory-login"
+        assert Path(env["HOME"]) != config.parent
+        if "cwd" in kwargs and "--tools" in argv and argv[argv.index("--tools") + 1] == "Bash":
+            (Path(kwargs["cwd"]) / "hardlink-result").write_text("BLOCKED", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0,
+            json.dumps({{"type": "result", "result": "CANARIES_INACCESSIBLE"}}), "")
+    monkeypatch.setattr(subprocess, "run", run)
+""")
+    pytester.makeini("[pytest]\nmarkers =\n    requires_provider_home: provider authentication\n    requires_nested_sandbox: nested sandbox\n")
+    tests = Path(__file__).parent
+    pytester.makepyfile(
+        test_hardlink=(tests / "test_agent_git_isolation.py").read_text(encoding="utf-8"),
+        test_reviewer=(tests / "test_linux_claude_review_isolation.py").read_text(encoding="utf-8"),
+    )
+    result = pytester.runpytest_subprocess(
+        "test_hardlink.py::test_real_claude_sandbox_blocks_hardlinks_from_read_only_git_metadata",
+        "test_reviewer.py::test_real_claude_reviewer_cannot_read_outside_or_environment_canaries",
+        "-p", "no:cacheprovider",
+    )
+    result.assert_outcomes(passed=2)
+
+
+def test_all_linux_credentialed_canaries_declare_provider_home() -> None:
+    """Derive the live-canary inventory from their opt-in environment guards."""
+    import ast
+    import re
+
+    found = []
+    for path in Path(__file__).parent.glob("test_*.py"):
+        module = ast.parse(path.read_text(encoding="utf-8"))
+        constants = {
+            node.targets[0].id: node.value.value
+            for node in module.body
+            if isinstance(node, ast.Assign) and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+        }
+        for function in (node for node in ast.walk(module) if isinstance(node, ast.FunctionDef)):
+            if not function.name.startswith("test_"):
+                continue
+            for call in (node for node in ast.walk(function) if isinstance(node, ast.Call)):
+                if ast.unparse(call.func) != "os.environ.get" or not call.args:
+                    continue
+                arg = call.args[0]
+                name = arg.value if isinstance(arg, ast.Constant) else constants.get(getattr(arg, "id", ""))
+                if not isinstance(name, str) or not re.fullmatch(
+                    r"SPEC_LINUX_(CLAUDE|CODEX)_(REAL_PROVIDER|REVIEW_CANARY)", name,
+                ):
+                    continue
+                provider = "claude" if "CLAUDE" in name else "codex"
+                assert any(
+                    isinstance(decorator, ast.Call)
+                    and ast.unparse(decorator.func) == "pytest.mark.requires_provider_home"
+                    and decorator.args and isinstance(decorator.args[0], ast.Constant)
+                    and decorator.args[0].value == provider
+                    for decorator in function.decorator_list
+                ), f"{path.name}::{function.name} must preserve {provider} authentication"
+                found.append(f"{path.name}::{function.name}")
+    assert found
+    print("Credentialed Linux canaries: " + ", ".join(sorted(found)))
+
+
+def test_environment_auth_keys_cover_doctor_credential_hints() -> None:
+    import conftest
+    from spec_runtime.doctor import _PROVIDER_AUTH_ENV_HINTS
+
+    expected = {
+        provider: {key for key in keys if key.endswith(("_KEY", "_TOKEN"))}
+        for provider, keys in _PROVIDER_AUTH_ENV_HINTS.items()
+    }
+    assert {provider: set(keys) for provider, keys in conftest._PROVIDER_AUTH_ENV_KEYS.items()} == expected

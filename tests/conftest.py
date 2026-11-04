@@ -19,6 +19,13 @@ _REAL_PROVIDER_HOMES = {
     "claude": Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")),
 }
 
+# Credential values from doctor's provider-auth hints; backend-selection flags
+# alone do not authenticate a provider.
+_PROVIDER_AUTH_ENV_KEYS = {
+    "codex": ("CODEX_API_KEY", "OPENAI_API_KEY"),
+    "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+}
+
 _CONTROL_ROOT_SEQUENCE = itertools.count()
 
 _PS_SKIP_PREFIX = "ps unavailable"
@@ -124,7 +131,14 @@ def probe_browser() -> str | None:
     return None
 
 
+def provider_environment_auth_available(provider: str) -> bool:
+    return any(os.environ.get(key) for key in _PROVIDER_AUTH_ENV_KEYS[provider])
+
+
 def probe_provider_home(provider: str) -> str | None:
+    # API keys and explicit OAuth tokens do not need a readable provider home.
+    if provider_environment_auth_available(provider):
+        return None
     try:
         list(_REAL_PROVIDER_HOMES[provider].iterdir())
     except OSError as exc:
@@ -244,7 +258,14 @@ def _isolate_user_state(
     if marker:
         provider = marker.args[0]
         name = "CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR"
-        monkeypatch.setenv(name, str(_REAL_PROVIDER_HOMES[provider]))
+        if provider_environment_auth_available(provider):
+            # Do not reintroduce an inaccessible operator home for key-based
+            # launches. The provider can keep its runtime files in test state.
+            home = root / "home" / f".{provider}"
+            home.mkdir(mode=0o700)
+        else:
+            home = _REAL_PROVIDER_HOMES[provider]
+        monkeypatch.setenv(name, str(home))
 
 
 @pytest.fixture(autouse=True)

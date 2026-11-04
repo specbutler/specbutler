@@ -107,7 +107,10 @@ state. Capability tests use `requires_ps`, `requires_network` (local sockets),
 `requires_nested_sandbox` (Codex), `requires_browser` (headless Chrome), or `requires_provider_home("codex"|"claude")`.
 Probes skip only marked tests when the capability is unavailable; the terminal
 summary counts skips for each missing capability. Real provider tests remain
-opt-in through their existing environment flags.
+opt-in through their existing environment flags. The provider-home marker restores
+directory authentication only when no provider API key or explicit OAuth token
+is supplied; environment-authenticated canaries keep temporary provider homes.
+Live subprocesses must forward CLAUDE_CONFIG_DIR when using directory login.
 
 Tests are hermetic: they do not require network access, model providers, a real
 forge remote, or Docker. Some fixtures create temporary Git repositories and

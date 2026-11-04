@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import provider_environment_auth_available
 from spec_runtime import orchestrator as orch
 from spec_runtime.agent_adapter import CodexAgent
 from spec_runtime.provider_env import minimal_provider_environment
@@ -67,9 +68,7 @@ def test_real_codex_reviewer_cannot_read_auth_or_environment_canaries(
     if shutil.which("codex") is None:
         pytest.skip("Codex CLI is not installed")
     source_home = orch._user_codex_home()
-    if not (source_home / "auth.json").is_file() and not os.environ.get(
-        "OPENAI_API_KEY"
-    ):
+    if not provider_environment_auth_available("codex") and not (source_home / "auth.json").is_file():
         pytest.skip("Codex is not authenticated")
 
     malicious_checkout = tmp_path / "malicious-checkout"
@@ -187,9 +186,7 @@ def test_real_codex_reviewer_reads_checkout_but_cannot_execute_it(
     if shutil.which("codex") is None:
         pytest.skip("Codex CLI is not installed")
     source_home = orch._user_codex_home()
-    if not (source_home / "auth.json").is_file() and not os.environ.get(
-        "OPENAI_API_KEY"
-    ):
+    if not provider_environment_auth_available("codex") and not (source_home / "auth.json").is_file():
         pytest.skip("Codex is not authenticated")
 
     scratch = tmp_path / "review-scratch"
