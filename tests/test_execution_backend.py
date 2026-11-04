@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -6561,7 +6562,7 @@ class TestContainerBackend:
             )
         marker = tmp_path / "fsmonitor-ran"
         monitor = tmp_path / "fsmonitor.sh"
-        monitor.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        monitor.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n")
         monitor.chmod(0o755)
         _git_ok("config", "core.fsmonitor", str(monitor), cwd=handle.path)
 

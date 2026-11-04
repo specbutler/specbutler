@@ -29,6 +29,7 @@ from .config import (
     load_repo_spec_runtime_config,
     resolve_spec_path,
 )
+from .control_plane import DEFAULT_GIT_FETCH_TIMEOUT_SECONDS
 from .git_common import subprocess_text_kwargs
 from .platform import is_unc_path, is_windows
 from .spec_metadata import format_spec_graph_problems, iter_spec_metadata, task_spec_ids, validate_spec_graph
@@ -427,6 +428,34 @@ def _git_checks(
                 "Or set `base_ref` in `.spec.toml` to an existing ref such as `origin/main`.",
             )
         )
+    remote = base_ref.removeprefix("refs/remotes/").split("/", 1)[0] if "/" in base_ref else "origin"
+    if remote == "origin" and origin.returncode != 0:
+        return checks
+    local = run(["git", "tag", "--list", "spec/merged/*"], repo_root, 10.0)
+    upstream = run(
+        ["git", "ls-remote", "--tags", "--refs", remote, "refs/tags/spec/merged/*"],
+        repo_root,
+        DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
+    )
+    if local.returncode != 0 or upstream.returncode != 0:
+        # An unavailable comparison does not establish that any tags are missing.
+        return checks
+    else:
+        local_tags = set(local.stdout.splitlines())
+        remote_tags = {
+            line.split()[-1].removeprefix("refs/tags/") for line in upstream.stdout.splitlines() if line.strip()
+        }
+        missing = remote_tags - local_tags
+        if missing:
+            checks.append(
+                _warning(
+                    "merge tags",
+                    f"{len(missing)} remote merge tags missing locally ({len(local_tags)} local, {len(remote_tags)} remote)",
+                    f"Fetch merge tags: `git fetch {remote} 'refs/tags/spec/merged/*:refs/tags/spec/merged/*'`.",
+                )
+            )
+        else:
+            checks.append(_ok("merge tags", f"All {len(remote_tags)} remote merge tags are present locally"))
     return checks
 
 

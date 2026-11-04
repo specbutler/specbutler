@@ -774,6 +774,7 @@ def _request(port: int, method: str, path: str, token: str = "", body: dict | No
     return response.status, payload
 
 
+@pytest.mark.requires_network
 def test_http_api_health_auth_failures_and_inspection(tmp_path: Path):
     store = CoordinatorStore(tmp_path / "coord.sqlite")
     store.create_token(name="worker", scope="worker", token="worker-token")
@@ -876,6 +877,7 @@ def test_http_api_health_auth_failures_and_inspection(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.requires_network
 def test_http_worker_cannot_spoof_another_tokens_lease_owner(tmp_path: Path):
     store = CoordinatorStore(tmp_path / "coord.sqlite")
     store.create_token(name="worker-a", scope="worker", token="worker-a-token")
@@ -981,6 +983,7 @@ def test_http_worker_cannot_spoof_another_tokens_lease_owner(tmp_path: Path):
         store.close()
 
 
+@pytest.mark.requires_network
 def test_http_concurrent_acquire_requests_are_serialized(tmp_path: Path):
     store = CoordinatorStore(tmp_path / "coord.sqlite")
     store.create_token(name="worker", scope="worker", token="worker-token")

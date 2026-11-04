@@ -100,9 +100,32 @@ pytest tests/ -x -q     # stop on first failure
 pytest tests/ -n auto   # parallel across cores (pytest-xdist, in the dev extra)
 ```
 
+The autouse test fixtures isolate user state and provider homes in per-test
+temporary directories (including child processes). Tests that construct sparse
+subprocess environments must preserve the isolated HOME when resolving provider
+state. Capability tests use `requires_ps`, `requires_network` (local sockets),
+`requires_nested_sandbox` (Codex), `requires_browser` (headless Chrome), or `requires_provider_home("codex"|"claude")`.
+Probes skip only marked tests when the capability is unavailable; the terminal
+summary counts skips for each missing capability. Real provider tests remain
+opt-in through their existing environment flags. The provider-home marker restores
+directory authentication only when no provider API key or explicit OAuth token
+is supplied; environment-authenticated canaries keep temporary provider homes.
+Live subprocesses must forward CLAUDE_CONFIG_DIR when using directory login.
+
 Tests are hermetic: they do not require network access, model providers, a real
 forge remote, or Docker. Some fixtures create temporary Git repositories and
 run bounded local command-parser/preflight checks.
+
+On macOS and Linux the suite emulates two Windows behaviours, so Windows-only
+failures show up before the `windows-probe` CI job: `Path.read_text()`,
+`write_text()` and `Path.open()` without `encoding=` use cp1252, and every
+`tmp_path` contains a backslash. A `'charmap' codec` error means a missing
+`encoding="utf-8"`. A path mismatch means the test rendered a path itself
+instead of using the code's quoting helper (for example `_toml_quote`, or
+`shlex.quote` for a path inside a shell command).
+`tests/test_windows_fixture_parity.py` lints the fixture specs in Windows-only
+tests and runs `test_windows_probe.py`'s fake `gh` and `codex` through
+`spec doctor`. When doctor gains a provider probe, extend those fakes.
 
 To observe or neutralize orchestrator waiting, patch `orch._poll_sleep`, never
 `orch.time.sleep`. The latter is the process-global `time.sleep`, which

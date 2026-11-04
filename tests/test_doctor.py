@@ -149,6 +149,8 @@ class _Runner:
         timeout: float,
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(argv)
+        if argv[:3] == ["git", "ls-remote", "--tags"]:
+            return subprocess.CompletedProcess(argv, 0, "", "")
         if Path(argv[0]).name in {"claude", "codex"} and argv[1:] == ["--version"]:
             return subprocess.CompletedProcess(argv, 0, "vendor-cli 1.2.3\n", "")
         if Path(argv[0]).name == "gh":

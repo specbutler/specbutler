@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from conftest import provider_environment_auth_available
 from spec_runtime import orchestrator as orch
 from spec_runtime.agent_adapter import CodexAgent
 from spec_runtime.provider_env import minimal_provider_environment
@@ -56,6 +58,8 @@ def test_codex_review_isolation_command_is_hermetic(tmp_path: Path) -> None:
     assert all("review host-materialized evidence" not in arg for arg in cmd)
 
 
+@pytest.mark.requires_provider_home("codex")
+@pytest.mark.requires_network
 def test_real_codex_reviewer_cannot_read_auth_or_environment_canaries(
     tmp_path: Path,
 ) -> None:
@@ -64,9 +68,7 @@ def test_real_codex_reviewer_cannot_read_auth_or_environment_canaries(
     if shutil.which("codex") is None:
         pytest.skip("Codex CLI is not installed")
     source_home = orch._user_codex_home()
-    if not (source_home / "auth.json").is_file() and not os.environ.get(
-        "OPENAI_API_KEY"
-    ):
+    if not provider_environment_auth_available("codex") and not (source_home / "auth.json").is_file():
         pytest.skip("Codex is not authenticated")
 
     malicious_checkout = tmp_path / "malicious-checkout"
@@ -174,6 +176,8 @@ def test_real_codex_reviewer_cannot_read_auth_or_environment_canaries(
     assert all(event["item"].get("type") == "error" for event in capability_events)
 
 
+@pytest.mark.requires_provider_home("codex")
+@pytest.mark.requires_network
 def test_real_codex_reviewer_reads_checkout_but_cannot_execute_it(
     tmp_path: Path,
 ) -> None:
@@ -182,9 +186,7 @@ def test_real_codex_reviewer_reads_checkout_but_cannot_execute_it(
     if shutil.which("codex") is None:
         pytest.skip("Codex CLI is not installed")
     source_home = orch._user_codex_home()
-    if not (source_home / "auth.json").is_file() and not os.environ.get(
-        "OPENAI_API_KEY"
-    ):
+    if not provider_environment_auth_available("codex") and not (source_home / "auth.json").is_file():
         pytest.skip("Codex is not authenticated")
 
     scratch = tmp_path / "review-scratch"
@@ -200,7 +202,7 @@ def test_real_codex_reviewer_reads_checkout_but_cannot_execute_it(
         f"def test_canary():\n    {payload}", encoding="utf-8"
     )
     (checkout / "run_me.sh").write_text(
-        f"#!/bin/sh\necho ran > {marker}\n", encoding="utf-8"
+        f"#!/bin/sh\necho ran > {shlex.quote(str(marker))}\n", encoding="utf-8"
     )
     (checkout / "run_me.sh").chmod(0o755)
 

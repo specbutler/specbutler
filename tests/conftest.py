@@ -1,14 +1,30 @@
-"""Suite-wide isolation for process-supervision control state."""
+"""Suite-wide state isolation and capability gates for restricted environments."""
 
 from __future__ import annotations
 
+import io
 import itertools
 import os
+import shutil
+import socket
 import subprocess
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+
+_REAL_PROVIDER_HOMES = {
+    "codex": Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")),
+    "claude": Path(os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")),
+}
+
+# Credential values from doctor's provider-auth hints; backend-selection flags
+# alone do not authenticate a provider.
+_PROVIDER_AUTH_ENV_KEYS = {
+    "codex": ("CODEX_API_KEY", "OPENAI_API_KEY"),
+    "claude": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+}
 
 _CONTROL_ROOT_SEQUENCE = itertools.count()
 
@@ -16,6 +32,21 @@ _PS_SKIP_PREFIX = "ps unavailable"
 _ps_unavailability_key = pytest.StashKey[str | None]()
 _ps_skip_count_key = pytest.StashKey[int]()
 _session_config: pytest.Config
+
+# Windows reads and writes text without an explicit ``encoding=`` as cp1252;
+# macOS and Linux use UTF-8.  A test that does that with non-ASCII text passes
+# on the machines where agents and host verify run, then fails only on the
+# windows-probe CI job.  pathlib and tempfile resolve a missing encoding through
+# ``io.text_encoding()``, so answering cp1252 there makes POSIX runs fail the
+# same way.  Builtin ``open()`` resolves it in C and is not covered.
+WINDOWS_DEFAULT_TEXT_ENCODING = "cp1252"
+_native_text_encoding = io.text_encoding
+
+
+def _windows_text_encoding(encoding: str | None, stacklevel: int = 2) -> str:
+    if encoding is None:
+        return WINDOWS_DEFAULT_TEXT_ENCODING
+    return _native_text_encoding(encoding, stacklevel + 1)
 
 
 def probe_ps(env: Mapping[str, str] | None = None) -> str | None:
@@ -62,12 +93,97 @@ def ps_unavailability_reason(os_name: str, env: Mapping[str, str] | None = None)
     return probe_ps(env)
 
 
+def probe_nested_sandbox() -> str | None:
+    if shutil.which("codex") is None:
+        return "Codex CLI is not installed"
+    with tempfile.TemporaryDirectory() as home:
+        try:
+            result = subprocess.run(
+                ["codex", "sandbox", "--", "true"],
+                env={**os.environ, "CODEX_HOME": home},
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return str(exc)
+    if result.returncode:
+        return result.stderr.strip().splitlines()[-1] if result.stderr.strip() else "sandbox launch failed"
+    return None
+
+
+def probe_browser() -> str | None:
+    browser = shutil.which("google-chrome") or shutil.which("chromium")
+    if browser is None:
+        return "Chrome/Chromium is not installed"
+    with tempfile.TemporaryDirectory() as home:
+        try:
+            result = subprocess.run(
+                [browser, "--headless=new", "--no-sandbox", "--disable-gpu",
+                 "--disable-dev-shm-usage", "--disable-background-networking",
+                 f"--user-data-dir={home}/profile", "--dump-dom", "about:blank"],
+                env={**os.environ, "HOME": home, "XDG_CONFIG_HOME": home,
+                     "XDG_CACHE_HOME": home},
+                capture_output=True, text=True, timeout=15, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return str(exc)
+    if result.returncode or "<html" not in result.stdout.lower():
+        return f"headless browser probe failed (exit {result.returncode}): {result.stderr.strip()[-300:]}"
+    return None
+
+
+def provider_environment_auth_available(provider: str) -> bool:
+    return any(os.environ.get(key) for key in _PROVIDER_AUTH_ENV_KEYS[provider])
+
+
+def probe_provider_home(provider: str) -> str | None:
+    # API keys and explicit OAuth tokens do not need a readable provider home.
+    if provider_environment_auth_available(provider):
+        return None
+    try:
+        list(_REAL_PROVIDER_HOMES[provider].iterdir())
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def probe_network() -> str | None:
+    """Probe local networking without depending on an external service."""
+    try:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+_capability_reasons: dict[str, str] = {}
+_capability_counts: dict[str, int] = {}
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Skip ``requires_ps`` tests, with the probe's error, when ``ps`` cannot run.
 
     The probe runs at most once per session, only on POSIX, and only when a
     collected test actually needs ``ps``.
     """
+    for item in items:
+        marker = item.get_closest_marker("requires_provider_home")
+        if marker:
+            provider = marker.args[0]
+            if reason := probe_provider_home(provider):
+                _capability_reasons["provider_home"] = reason
+                item.add_marker(pytest.mark.skip(reason=f"provider_home unavailable ({reason})"))
+    for capability, probe in {
+        "nested_sandbox": probe_nested_sandbox,
+        "browser": probe_browser,
+        "network": probe_network,
+    }.items():
+        marked = [item for item in items if item.get_closest_marker(f"requires_{capability}")]
+        if marked and (reason := probe()) is not None:
+            _capability_reasons[capability] = reason
+            for item in marked:
+                item.add_marker(pytest.mark.skip(reason=f"{capability} unavailable ({reason})"))
     needs_ps = [item for item in items if item.get_closest_marker("requires_ps")]
     if not needs_ps:
         return
@@ -84,22 +200,72 @@ def pytest_configure(config: pytest.Config) -> None:
     global _session_config
     _session_config = config
     config.stash[_ps_skip_count_key] = 0
+    _capability_reasons.clear()
+    _capability_counts.clear()
+    if os.name != "nt":
+        io.text_encoding = _windows_text_encoding
+
+
+def pytest_unconfigure(config: pytest.Config) -> None:
+    io.text_encoding = _native_text_encoding
 
 
 def pytest_runtest_logreport(report: pytest.TestReport) -> None:
     if not (report.skipped and isinstance(report.longrepr, tuple)):
         return
+    for capability in ("network", "nested_sandbox", "provider_home", "browser"):
+        prefix = f"Skipped: {capability} unavailable ("
+        if report.longrepr[2].startswith(prefix):
+            _capability_reasons[capability] = report.longrepr[2][len(prefix):-1]
+            _capability_counts[capability] = _capability_counts.get(capability, 0) + 1
     if report.longrepr[2].startswith(f"Skipped: {_PS_SKIP_PREFIX} ("):
         _session_config.stash[_ps_skip_count_key] += 1
+        prefix = f"Skipped: {_PS_SKIP_PREFIX} ("
+        _session_config.stash[_ps_unavailability_key] = report.longrepr[2][len(prefix):-1]
 
 
 def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter, config: pytest.Config) -> None:
-    """Make ps-driven skips visible as one line instead of silent ``s`` marks."""
+    """Show one count per unavailable capability, including xdist worker reports."""
+    for capability, count in sorted(_capability_counts.items()):
+        terminalreporter.write_line(
+            f"{count} tests skipped: {capability} unavailable ({_capability_reasons[capability]})",
+            yellow=True,
+        )
     count = config.stash.get(_ps_skip_count_key, 0)
     reason = config.stash.get(_ps_unavailability_key, None)
     if count and reason:
         noun = "test" if count == 1 else "tests"
         terminalreporter.write_line(f"{count} {noun} skipped: {_PS_SKIP_PREFIX} ({reason})", yellow=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_state(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Isolate state and provider homes, including resolvers that ignore XDG."""
+    root = tmp_path_factory.getbasetemp() / f"user{next(_CONTROL_ROOT_SEQUENCE)}"
+    for name, relative in {
+        "HOME": "home", "USERPROFILE": "home", "LOCALAPPDATA": "local",
+        "XDG_STATE_HOME": "state", "XDG_CONFIG_HOME": "config",
+        "XDG_CACHE_HOME": "cache",
+    }.items():
+        (root / relative).mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv(name, str(root / relative))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    marker = request.node.get_closest_marker("requires_provider_home")
+    if marker:
+        provider = marker.args[0]
+        name = "CODEX_HOME" if provider == "codex" else "CLAUDE_CONFIG_DIR"
+        if provider_environment_auth_available(provider):
+            # Do not reintroduce an inaccessible operator home for key-based
+            # launches. The provider can keep its runtime files in test state.
+            home = root / "home" / f".{provider}"
+            home.mkdir(mode=0o700)
+        else:
+            home = _REAL_PROVIDER_HOMES[provider]
+        monkeypatch.setenv(name, str(home))
 
 
 @pytest.fixture(autouse=True)
@@ -202,3 +368,21 @@ def _stub_provider_session_probe(monkeypatch: pytest.MonkeyPatch) -> None:
         "_provider_session_support",
         lambda _agent, *_probe_target: orchestrator.ProviderSessionSupport(),
     )
+
+
+@pytest.fixture
+def tmp_path(tmp_path: Path) -> Path:
+    """Put a backslash in every POSIX test's temporary path.
+
+    Windows paths are full of backslashes, which TOML, JSON and ``file://``
+    renderings must escape.  A test that builds its expectation from the raw
+    path (``f'"{path}"'``) instead of the code's own quoting helper passes on
+    macOS and Linux and fails only on windows-probe.  With a backslash in the
+    path, it fails here too.
+    """
+    if os.name == "nt":
+        return tmp_path
+    path = tmp_path / "back\\slash"
+    # Preserve pytest temporary-directory privacy under permissive umasks.
+    path.mkdir(mode=0o700)
+    return path

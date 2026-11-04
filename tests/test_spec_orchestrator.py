@@ -2014,6 +2014,53 @@ class TestPhaseImplementHandshake:
 
         assert status == "passed"
 
+    @pytest.mark.requires_ps
+    @pytest.mark.parametrize("changed", [False, True])
+    @pytest.mark.parametrize("retry_cap", [1, 10])
+    def test_midflight_steering_satisfied_noop_does_not_consume_retry_budget(
+        self, repo: Path, changed: bool, retry_cap: int,
+    ):
+        run = self._make_run()
+        run.phase = "implement"
+        run.status = "passed"
+        run.attempts = 1
+        run.retry_cap = retry_cap
+        worktree = repo / ".worktrees" / run.spec_id
+        _run_git("clone", str(repo), str(worktree), cwd=repo)
+        run.worktree_path = str(worktree)
+        orch.ImplementResult(status="passed", summary="Already implemented v2", attempt=1).save(repo, run.run_id)
+        orch._record_operator_steering(repo, run, "Use v2", source="test")
+        assert orch._schedule_operator_guided_implement_attempt(repo, run, retry_cap=retry_cap)
+        bundle = orch._build_implement_attempt_context(run, repo)
+        assert "Already implemented v2" in bundle.context.operator_steering_message
+        assert ("retry budget is exhausted" in bundle.context.operator_steering_message) == (retry_cap == 1)
+        orch.ImplementResult(status="passed", summary="Steering already satisfied", attempt=2).save(repo, run.run_id)
+        command = _portable_success_command()
+        if changed:
+            command = [sys.executable, "-c", "from pathlib import Path; Path('new.txt').write_text('change')"]
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch, "specbutler_user_state_root", return_value=repo / "user-state"),
+            patch.object(Path, "home", return_value=repo / "user-home"),
+            patch.object(orch, "_build_agent_command", return_value=command),
+        ):
+            status = orch.phase_implement(run, repo)
+        assert run.steering_noop_attempts == (0 if changed else 1)
+        assert orch._convergence_attempts(run) == (2 if changed else 1)
+        assert not orch._active_operator_steering(repo, run.run_id)
+        if changed and retry_cap == 1:
+            assert status == "blocked"
+            assert "steering assessment required changes" in run.last_error
+        else:
+            assert status == "passed", run.last_error
+            run.status = status
+            run.save(repo)
+            handlers = {phase: MagicMock(return_value="passed") for phase in orch.PHASES}
+            with patch.dict(orch.PHASE_HANDLERS, handlers):
+                assert orch.run_full_workflow(run, repo, retry_cap=retry_cap) == "passed"
+            handlers["implement"].assert_not_called()
+            handlers["verify"].assert_called_once()
+
     def test_review_retry_blocks_when_pinned_review_artifact_does_not_match_head(self, repo: Path):
         run = self._make_run()
         run.attempts = 1
@@ -2438,6 +2485,7 @@ class TestPhaseImplementHandshake:
                 "Actually, fix the schema retry first.",
                 source="spec steer",
                 provided_by="alice",
+                replace=True,
             )
             return 0
 
@@ -2484,6 +2532,27 @@ class TestPhaseImplementHandshake:
         assert run.implement_staged_changes is False
         assert run.implement_unstaged_changes is False
         assert run.implement_tree_status == "new_commit"
+
+    @pytest.mark.parametrize("launches", [0, 2])
+    def test_legacy_launch_does_not_recapture_latest_head_as_original_base(self, repo: Path, launches: int):
+        run = self._make_run()
+        run.attempts = 2
+        run.implement_launches = launches
+        run.implement_head_sha_before = "c" * 40
+        run.implement_head_sha_after = "c" * 40
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True)
+        with (
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch, "_head_sha", return_value="c" * 40),
+            patch.object(orch, "_claude_supports_stream_json", return_value=False),
+            patch.object(orch, "_build_agent_command") as build_command,
+        ):
+            status = orch.phase_implement(run, repo)
+        assert status == "failed"
+        assert "Cannot establish the immutable pre-agent publication base" in run.last_error
+        assert not run.publication_base_sha
+        build_command.assert_not_called()
 
     @pytest.mark.requires_ps
     def test_reused_branch_syncs_origin_master_before_first_implement(self, repo: Path):
@@ -3198,9 +3267,14 @@ class TestPhaseImplementHandshake:
         assert run.last_block_debugger_guided_retry_signature == "sig-123"
 
     def test_phase_implement_attaches_diagnosis_on_first_attempt_block(self, repo: Path):
-        """F1: when the very first attempt blocks (attempts==0), the diagnosis must still be attached."""
+        """A first attempt that produced code keeps its diagnosis even at attempts==0."""
         run = self._make_run()
         run.attempts = 0
+        # The counter has not advanced yet, but the blocked launch produced
+        # work. A first launch without code now receives initial framing.
+        run.publication_base_sha = "base123"
+        run.implement_head_sha_before = "base123"
+        run.implement_head_sha_after = "abc123"
         run.pending_block_debugger_signature = "sig-first"
         run.last_error = "Gate 'lint' failed (exit 1). output: see gate-status.json"
         run.save(repo)
@@ -6402,7 +6476,7 @@ class TestReviewWorktreeBootstrap:
                 orch,
                 "SPEC_RUNTIME_CONFIG",
                 self._config_with_install(
-                    f"env > {marker}",
+                    f"env > {shlex.quote(str(marker))}",
                     windows_argv=(sys.executable, "-c", dump_env, str(marker)),
                 ),
             ),
@@ -6508,8 +6582,8 @@ class TestReviewWorktreeBootstrap:
         found_marker = worktree / "found-secret.txt"
         observed_home = worktree / "observed-home.txt"
         install_cmd = (
-            f'echo "$HOME" > {observed_home}; '
-            f'[ -f "$HOME/.codex/auth.json" ] && cp "$HOME/.codex/auth.json" {found_marker} || true'
+            f'echo "$HOME" > {shlex.quote(str(observed_home))}; '
+            f'[ -f "$HOME/.codex/auth.json" ] && cp "$HOME/.codex/auth.json" {shlex.quote(str(found_marker))} || true'
         )
         windows_probe = (
             "import shutil, sys; "
@@ -6667,7 +6741,7 @@ class TestReviewWorktreeBootstrap:
         marker = worktree / "child-alive"
         # The backgrounded child inherits stdout/stderr (kept open) and, absent
         # a group kill, would keep running/writing long past the timeout.
-        install_cmd = f"(sleep 5; touch {marker}) & sleep 30"
+        install_cmd = f"(sleep 5; touch {shlex.quote(str(marker))}) & sleep 30"
         windows_child = (
             "import sys, time; "
             "from pathlib import Path; "
@@ -17062,16 +17136,18 @@ class TestPhaseTransitions:
         assert run.attempts == 1
 
     @pytest.mark.requires_ps
-    def test_operator_steering_does_not_bypass_retry_cap(self, repo: Path):
+    def test_resolved_operator_request_does_not_bypass_retry_cap(self, repo: Path):
         run = self._make_run(repo)
         run.phase = "implement"
         run.status = "passed"
         run.attempts = 1
         run.save(repo)
-        orch.OperatorSteering(
-            message="Apply one more correction.",
-            provided_by="thiago",
-            source="spec steer",
+        orch.OperatorRequest(
+            kind="agent_question",
+            prompt="Which correction?",
+            status="resolved",
+            response="Apply one more correction.",
+            continuation=orch.OPERATOR_CONTINUATION_RESUME_IMPLEMENT,
         ).save(repo, run.run_id)
 
         handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
@@ -25093,7 +25169,8 @@ class TestRunFullWorkflowRetryHandling:
         assert run.implement_failures == 0
         wait_for_capacity.assert_called_once()
 
-    def test_local_review_stale_after_merge_sync_retries_review_not_implement(self, repo: Path):
+    @pytest.mark.parametrize("syncs", [1, 3])
+    def test_local_review_stale_after_merge_sync_retries_review_not_implement(self, repo: Path, syncs: int):
         run = self._make_run(repo)
         run.save(repo)
 
@@ -25112,7 +25189,7 @@ class TestRunFullWorkflowRetryHandling:
         def mock_merge(r, root):
             del root
             call_counts["merge"] += 1
-            if call_counts["merge"] == 1:
+            if call_counts["merge"] <= syncs:
                 r.last_error = (
                     "Local review must rerun after syncing with origin/main: "
                     "review status approved covered abc1234, but the branch now points to def5678."
@@ -25129,15 +25206,18 @@ class TestRunFullWorkflowRetryHandling:
             result = orch.run_full_workflow(run, repo)
 
         assert result == "passed"
-        assert run.attempts == 1
+        assert run.attempts == 0
+        assert orch._convergence_attempts(run) == 0
+        assert run.base_syncs == syncs
         assert call_counts["implement"] == 1
-        assert call_counts["review"] == 2
-        assert call_counts["merge"] == 2
+        assert call_counts["review"] == syncs + 1
+        assert call_counts["merge"] == syncs + 1
 
-    def test_local_review_stale_after_merge_sync_blocks_at_retry_cap(self, repo: Path):
+    def test_local_review_stale_after_merge_sync_stops_at_sync_cap(self, repo: Path):
         """When local review keeps going stale after merge sync, the workflow
         should escalate to blocked once the retry budget is exhausted."""
         run = self._make_run(repo)
+        run.base_sync_cap = 3
         run.attempts = 2  # Already at retry cap
         run.save(repo)
 
@@ -25165,8 +25245,60 @@ class TestRunFullWorkflowRetryHandling:
         ):
             result = orch.run_full_workflow(run, repo, retry_cap=2)
 
-        assert result == "blocked"
+        assert result == "failed"
+        assert run.base_syncs == 3
+        assert "Base sync cap reached (3/3)" in run.last_error
         assert run.attempts == 2  # Budget was not consumed further
+
+    def test_sync_then_verify_failure_consumes_attempt(self, repo: Path):
+        run = self._make_run(repo)
+        run.phase = "merge"
+        calls = {"merge": 0, "verify": 0}
+
+        def merge(r, root):
+            calls["merge"] += 1
+            if calls["merge"] == 1:
+                r.last_error = orch.LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX
+                return "failed"
+            return "passed"
+
+        def verify(r, root):
+            calls["verify"] += 1
+            if calls["verify"] == 1:
+                r.last_error = "test gate failed: assertion failed"
+                return "failed"
+            return "passed"
+
+        handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
+        handlers.update(merge=merge, verify=verify)
+        with (
+            patch.dict(orch.PHASE_HANDLERS, handlers),
+            patch.object(orch, "_maybe_prepare_debugger_guided_retry", return_value=False),
+            patch.object(orch, "_maybe_trip_no_progress_circuit_breaker", return_value=None),
+        ):
+            assert orch.run_full_workflow(run, repo) == "passed"
+        assert run.attempts == 1
+        assert run.verify_failures == 1
+        assert run.base_syncs == 1
+
+    @pytest.mark.parametrize("phase", ["merge", "verify", "review"])
+    def test_resume_post_sync_enters_gate_directly(self, repo: Path, phase: str):
+        run = self._make_run(repo)
+        run.phase = phase
+        run.status = "failed"
+        run.last_error = orch.LOCAL_REVIEW_RERUN_AFTER_SYNC_PREFIX
+        run.save(repo)
+        run = orch.RunState.load(repo, run.run_id)
+        visited = []
+
+        def handler(r, root):
+            visited.append(r.phase)
+            return "passed"
+
+        with patch.dict(orch.PHASE_HANDLERS, {p: handler for p in orch.PHASES}):
+            assert orch.run_full_workflow(run, repo) == "passed"
+        assert visited[0] == ("verify" if phase == "merge" else phase)
+        assert run.attempts == 0
 
     def test_base_branch_policy_race_retries_merge_not_implement(self, repo: Path):
         """When gh pr merge fails with 'base branch policy' (race after checks
@@ -36298,16 +36430,30 @@ class TestWaitingForInputWorkflow:
     # (3) proactive steering and resume behavior
     # -------------------------------------------------------------------
 
-    def test_cmd_steer_records_and_supersedes_guidance(self, repo: Path, capsys):
+    @pytest.mark.parametrize("second_timestamp", [
+        "2026-11-03T21:00:00+00:00",
+        "2026-11-03T20:59:59+00:00",
+    ])
+    def test_cmd_steer_records_and_supersedes_guidance(self, repo: Path, capsys, second_timestamp: str):
         run = self._make_run()
         run.status = "blocked"
         run.phase = "verify"
         run.save(repo)
 
         args = argparse.Namespace(spec="my-feature", message="Start with the smallest retry.")
-        with patch.object(orch, "resolve_repo_root", return_value=repo):
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch, "_now_iso", return_value="2026-11-03T21:00:00+00:00") as now,
+            # Reverse lexical order so equal clock readings cannot pass by luck.
+            patch.object(orch, "datetime", wraps=orch.datetime) as clock,
+        ):
+            clock.now.return_value = orch.datetime.fromisoformat("2026-11-03T21:00:02+00:00")
             first_code = orch.cmd_steer(args)
-            second_code = orch.cmd_steer(argparse.Namespace(spec="my-feature", message="Actually, fix lint first."))
+            now.return_value = second_timestamp
+            clock.now.return_value = orch.datetime.fromisoformat("2026-11-03T21:00:01+00:00")
+            second_code = orch.cmd_steer(argparse.Namespace(
+                spec="my-feature", message="Actually, fix lint first.", replace=True,
+            ))
 
         assert first_code == 0
         assert second_code == 0
@@ -36323,7 +36469,7 @@ class TestWaitingForInputWorkflow:
         assert "Recorded proactive steering for my-feature." in out
         assert "Replaced proactive steering for my-feature." in out
 
-    def test_cmd_steer_rejects_run_waiting_for_operator_intervention(self, repo: Path, capsys):
+    def test_cmd_steer_attaches_while_waiting_for_operator_intervention(self, repo: Path, capsys):
         run = self._make_run()
         run.status = "waiting-for-input"
         run.phase = "implement"
@@ -36334,9 +36480,65 @@ class TestWaitingForInputWorkflow:
         with patch.object(orch, "resolve_repo_root", return_value=repo):
             code = orch.cmd_steer(args)
 
-        assert code == 1
-        err = capsys.readouterr().err
-        assert "Resolve it with `spec input --spec my-feature` before adding proactive steering." in err
+        assert code == 0
+        assert orch.OperatorSteering.load(repo, run.run_id).message == "Try the minimal diff first."
+        assert orch.RunState.load(repo, run.run_id).status == "waiting-for-input"
+
+    def test_two_steers_are_delivered_in_order(self, repo: Path):
+        run = self._make_run()
+        run.save(repo)
+        orch._record_operator_steering(repo, run, "First note", source="test")
+        second = orch._record_operator_steering(repo, run, "Second note", source="test")
+        bundle = orch._build_implement_attempt_context(run, repo)
+        message = bundle.context.operator_steering_message
+        assert message.index("First note") < message.index("Second note")
+        orch._consume_operator_steering(
+            repo, run.run_id, attempt_number=1, expected_event_id=second.event_id,
+        )
+        assert not orch._active_operator_steering(repo, run.run_id)
+
+    def test_new_midflight_note_remains_active_after_snapshot_consumption(self, repo: Path):
+        run = self._make_run()
+        first = orch._record_operator_steering(repo, run, "First note", source="test")
+        second = orch._record_operator_steering(repo, run, "Midflight note", source="test")
+        orch._consume_operator_steering(
+            repo, run.run_id, attempt_number=1, expected_event_id=first.event_id,
+        )
+        assert [note.event_id for note in orch._active_operator_steering(repo, run.run_id)] == [second.event_id]
+
+    @pytest.mark.parametrize("command", ["input", "steer"])
+    @pytest.mark.parametrize("kind", ["agent_question", "debugger_guidance", "review_round_cap"])
+    def test_answer_pending_request_without_tty(self, repo: Path, command: str, kind: str):
+        run = self._make_run()
+        run.status = "waiting-for-input"
+        run.phase = "implement"
+        run.input_question = "Which API?"
+        run.save(repo)
+        orch.OperatorRequest(
+            kind=kind,
+            prompt="Which API?",
+            requested_by_phase="review" if kind == "review_round_cap" else "implement",
+        ).save(repo, run.run_id)
+        orch._record_operator_steering(repo, run, "Keep compatibility", source="test")
+        args = argparse.Namespace(spec=run.spec_id, message="Use v2", answer=True)
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch.sys.stdin, "isatty", return_value=False),
+            patch.object(orch, "cmd_run") as launch,
+        ):
+            handler = orch.cmd_input if command == "input" else orch.cmd_steer
+            assert handler(args) == 0
+        launch.assert_not_called()
+        saved = orch.RunState.load(repo, run.run_id)
+        request = orch.OperatorRequest.load(repo, run.run_id)
+        assert saved.status == "pending"
+        assert request.response == "Use v2"
+        assert orch.review_convergence.load_extra_rounds_granted(
+            orch._state_root(repo) / "runs" / run.run_id,
+        ) == (1 if kind == "review_round_cap" else 0)
+        assert request.continuation == orch.OPERATOR_CONTINUATION_RESUME_IMPLEMENT
+        bundle = orch._build_implement_attempt_context(saved, repo)
+        assert "Keep compatibility" in bundle.context.operator_steering_message
 
     def test_select_default_run_returns_waiting_for_input_run(self, repo: Path):
         """_select_default_run selects a run in waiting-for-input status."""
@@ -41948,6 +42150,37 @@ class TestInfrastructureFailureBackoff:
         ):
             yield waits, poll_sleep
 
+    def test_auth_preflight_after_outage_retries_without_spending_attempt(self, repo: Path):
+        run = self._make_run()
+        run.save(repo)
+        calls = 0
+
+        def publish(r, root):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                r.last_error = "error connecting to api.github.com"
+                return "failed"
+            error = orch._check_run_forge_auth(r, "publish")
+            if error:
+                r.last_error = error
+                return "failed"
+            return "passed"
+
+        handlers = {p: MagicMock(return_value="passed") for p in orch.PHASES}
+        handlers["publish"] = publish
+        failed_auth = subprocess.CompletedProcess([], 1, "", "not logged in")
+        ok_auth = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            self._harness(handlers) as (waits, _),
+            patch.object(orch, "run_subprocess", side_effect=[failed_auth] * 3 + [ok_auth]),
+        ):
+            assert orch.run_full_workflow(run, repo, retry_cap=10) == "passed"
+        assert calls == 3
+        assert len(waits) == 2
+        assert run.attempts == 0
+        assert run.last_failure_signature == run.last_failure_phase == ""
+
     @pytest.mark.requires_ps
     def test_repeating_infrastructure_failure_backs_off_then_stops(self, repo: Path):
         run = self._make_run()
@@ -42239,3 +42472,502 @@ class TestFailureClassification:
             "requests.exceptions.ConnectionError: error connecting to localhost"
         )
         assert orch.classify_failure(message).category is orch.FailureCategory.CODE
+
+
+@pytest.mark.parametrize("scenario", ["bootstrap", "killed", "committed", "review", "archived_review"])
+def test_implement_prompt_framing_uses_prior_work(repo: Path, scenario: str):
+    base = orch._head_sha(repo)
+    run = orch.RunState(
+        run_id="framing-20261103", spec_id="my-feature", branch="spec/my-feature",
+        attempts=1, implement_launches=0 if scenario == "bootstrap" else 1,
+        publication_base_sha=base,
+    )
+    run.last_error = (
+        "Bootstrap dependency was unavailable" if scenario == "bootstrap"
+        else "Required checks failing: ci (https://example.com/checks/7)"
+    )
+    if scenario == "committed":
+        (repo / "implementation.txt").write_text("prior implementation\n")
+        _run_git("add", "implementation.txt", cwd=repo)
+        _run_git("commit", "-m", "Prior implementation", cwd=repo)
+    if scenario in {"review", "archived_review"}:
+        latest = orch.ReviewResult(
+            status="request_changes", attempt_number=1, summary="Fix the implementation",
+        ).save(repo, run.run_id)
+        if scenario == "review":
+            run.review_decision_status = "request_changes"
+        else:
+            latest.unlink()
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        bundle = orch._build_implement_attempt_context(run, repo)
+    ctx = bundle.context
+    initial = scenario in {"bootstrap", "killed"}
+    assert (ctx.implement_reason == "initial") is initial
+    assert ctx.framing_reason
+    assert run.attempts == 1
+    prompt = orch._build_agent_command(
+        "claude", repo, retry_context=ctx, spec_id=run.spec_id,
+        resume_session_id="interrupted-session",
+    )[-1]
+    if initial:
+        assert "Do NOT re-implement from scratch" not in prompt
+        assert "Continue the IMPLEMENT phase" not in prompt
+        assert "You are running the IMPLEMENT phase" in prompt
+        assert ctx.failure_summary == ""
+        assert ctx.previous_implement_result_path == ""
+        assert ctx.previous_implement_attempt_number == 0
+        assert ctx.gate_output == ""
+    else:
+        assert ctx.previous_implement_attempt_number == 1
+        assert ctx.failure_summary
+        assert "Do NOT re-implement from scratch" in prompt
+
+
+def test_implement_framing_does_not_use_enclosing_repository(repo: Path):
+    missing_checkout = repo / "missing-checkout"
+    missing_checkout.mkdir()
+    run = orch.RunState(
+        run_id="framing-missing-checkout", spec_id="my-feature", branch="spec/my-feature",
+        attempts=1, implement_launches=1, publication_base_sha=orch._head_sha(repo),
+    )
+    with patch.object(orch, "resolve_worktree_path", return_value=missing_checkout):
+        initial, reason = orch._implement_framing_evidence(run, repo)
+    assert not initial
+    assert "evidence unavailable" in reason
+
+
+@pytest.mark.parametrize("history", [
+    "immutable_base", "legacy_single_launch", "legacy_multiple_launches",
+    "legacy_missing_launch_counter", "legacy_noop", "immutable_noop", "legacy_single_noop",
+])
+def test_implement_framing_uses_original_base_after_noop(repo: Path, history: str):
+    original_base = orch._head_sha(repo)
+    if history not in {"legacy_noop", "immutable_noop", "legacy_single_noop"}:
+        (repo / "implemented.txt").write_text("earlier implementation\n")
+        _run_git("add", "implemented.txt", cwd=repo)
+        _run_git("commit", "-m", "Earlier implementation", cwd=repo)
+    head = orch._head_sha(repo)
+    run = orch.RunState(
+        run_id="framing-legacy", spec_id="my-feature", branch="spec/my-feature",
+        attempts=2, implement_launches=2, base_ref="HEAD",
+        implement_head_sha_before=head, implement_head_sha_after=head,
+        last_error="Required checks failing: ci (https://example.com/checks/7)",
+    )
+    if history.startswith("immutable"):
+        run.publication_base_sha = original_base
+    elif history in {"legacy_single_launch", "legacy_single_noop"}:
+        run.implement_launches = 1
+        run.implement_head_sha_before = original_base
+    elif history == "legacy_missing_launch_counter":
+        run.implement_launches = 0
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        ctx = orch._build_implement_attempt_context(run, repo).context
+    if history in {"immutable_noop", "legacy_single_noop"}:
+        assert ctx.implement_reason == "initial"
+        assert not ctx.failure_summary
+    else:
+        assert ctx.implement_reason == "retry"
+        assert "Required checks failing" in ctx.failure_summary
+    if history in {"legacy_multiple_launches", "legacy_missing_launch_counter", "legacy_noop"}:
+        assert "immutable original base unavailable" in ctx.framing_reason
+        assert not run.publication_base_sha
+    if history in {"legacy_single_launch", "legacy_single_noop"}:
+        assert run.publication_base_sha == original_base
+
+
+@pytest.mark.parametrize("evidence", ["latest", "archived", "decision", "snapshot", "cleaned_snapshot", "approval"])
+@pytest.mark.parametrize("same_branch", [True, False])
+def test_implement_framing_finds_reviews_across_runs(repo: Path, evidence: str, same_branch: bool):
+    branch = "spec/reused-feature"
+    prior = orch.RunState(
+        run_id="framing-predecessor", spec_id="my-feature",
+        branch=branch if same_branch else "spec/abandoned-feature", status="failed",
+    )
+    finding = orch.ReviewFinding(id="old-finding", body="Fix the inherited bug.", severity="P1")
+    run = orch.RunState(
+        run_id="framing-successor", spec_id="my-feature", branch=branch,
+        resumed_from_branch=branch,
+        publication_base_sha=orch._head_sha(repo),
+        last_error="Required checks failing: ci (https://example.com/checks/7)",
+        prior_review_run_id=prior.run_id,
+        prior_review_summary="Earlier review requested changes.",
+        prior_review_findings=[vars(finding)],
+    )
+    if evidence == "decision":
+        prior.review_decision_status = "request_changes"
+        prior.review_decision_summary = "Earlier review requested changes."
+        prior.review_expected_head_sha = run.publication_base_sha
+    # A retained other-branch state prevents a copied advisory snapshot from
+    # being mistaken for review evidence on the branch being continued.
+    if evidence != "cleaned_snapshot" or not same_branch:
+        prior.save(repo)
+    if evidence in {"latest", "archived", "approval"}:
+        path = orch.ReviewResult(
+            status="approved" if evidence == "approval" else "request_changes",
+            summary="Earlier review requested changes.", findings=[finding],
+            attempt_number=1, reviewed_head_sha=run.publication_base_sha,
+        ).save(repo, prior.run_id)
+        if evidence == "archived":
+            path.unlink()
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        ctx = orch._build_implement_attempt_context(run, repo).context
+    prompt = orch._build_agent_command("claude", repo, retry_context=ctx)[-1]
+    if same_branch:
+        assert ctx.implement_reason == "retry"
+        assert "reused branch" in ctx.framing_reason
+        assert "Required checks failing" in ctx.failure_summary
+        if evidence != "approval":
+            assert ctx.review_feedback_active
+            assert ctx.triggering_phase == "review"
+            assert prior.run_id in ctx.triggering_review_result_path
+            assert "Earlier review requested changes" in prompt
+            if evidence != "decision":
+                assert ctx.unresolved_review_findings[0]["id"] == "old-finding"
+                assert "Fix the inherited bug." in prompt
+        else:
+            assert ctx.triggering_phase != "review"
+    else:
+        assert ctx.implement_reason == "initial"
+        assert not ctx.failure_summary
+        assert not ctx.review_feedback_active
+
+
+@pytest.mark.parametrize("source", [
+    "last_error", "diagnosis", "operator_request", "audit", "audit_error", "code_failure", "code_audit",
+])
+@pytest.mark.parametrize("resume", [False, True])
+def test_initial_prompt_retains_only_cleared_non_code_blocker(repo: Path, source: str, resume: bool):
+    message = "Bootstrap dependency was unavailable"
+    run = orch.RunState(
+        run_id="framing-blocker", spec_id="my-feature", branch="spec/my-feature",
+        attempts=1, phase="implement", publication_base_sha=orch._head_sha(repo),
+    )
+    if source == "last_error":
+        run.last_error = message + "\nVerbose old setup output that should not be copied."
+    elif source in {"code_failure", "code_audit"}:
+        failure = "Gate 'test' failed (exit 1). Feature assertion failed."
+        if source == "code_failure":
+            run.last_error = failure
+        else:
+            orch._persist_audit(repo, run, "verify", orch.OrchestratorResult(status="failed", error_code=failure))
+    elif source == "diagnosis":
+        orch.BlockDiagnosis(
+            block_reason=message, source_phase="bootstrap", summary=message,
+            root_cause="A dependency was unavailable.", category="environment",
+            next_best_action="Resume when it is available.",
+            blocker_signature="bootstrap-blocker", evidence=["Bootstrap dependency probe failed."],
+        ).save(repo, run.run_id)
+    elif source == "operator_request":
+        orch.OperatorRequest(
+            kind="debugger_guidance", prompt=message, requested_by_phase="bootstrap",
+            status="resolved", response="Dependency is ready.",
+        ).save(repo, run.run_id)
+    else:
+        orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+            status="error" if source == "audit_error" else "blocked", error_code=message,
+        ))
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        ctx = orch._build_implement_attempt_context(run, repo).context
+    ctx.save(repo, run.run_id)
+    assert orch.ImplementContext.load(repo, run.run_id).cleared_blocker_note == ctx.cleared_blocker_note
+    prompt = orch._build_agent_command(
+        "claude", repo, retry_context=ctx, resume_session_id="session" if resume else "",
+    )[-1]
+    assert ctx.implement_reason == "initial"
+    assert not ctx.failure_summary
+    assert not ctx.gate_output
+    assert not ctx.previous_implement_result_path
+    assert "You are running the IMPLEMENT phase" in prompt
+    assert "Do NOT re-implement from scratch" not in prompt
+    assert "Verbose old setup output" not in prompt
+    if source in {"code_failure", "code_audit"}:
+        assert not ctx.cleared_blocker_note
+        assert "Cleared non-code blocker" not in prompt
+    else:
+        assert ctx.cleared_blocker_note == message
+        assert "Cleared non-code blocker: " + message in prompt
+    # The launch path can pass initial context independently of retry_context.
+    if not resume:
+        standalone = orch._build_agent_command(
+            "claude", repo, cleared_blocker_note=ctx.cleared_blocker_note,
+        )[-1]
+        assert ("Cleared non-code blocker" in standalone) is (source not in {"code_failure", "code_audit"})
+
+
+@pytest.mark.parametrize("approval_owner", ["current", "predecessor"])
+def test_implement_framing_does_not_resurrect_superseded_inherited_review(repo: Path, approval_owner: str):
+    prior = orch.RunState(run_id="old-reviewed-run", spec_id="my-feature", branch="spec/shared")
+    run = orch.RunState(
+        run_id="continued-run", spec_id="my-feature", branch=prior.branch, resumed_from_branch=prior.branch,
+        attempts=3, publication_base_sha=orch._head_sha(repo), prior_review_run_id=prior.run_id,
+        prior_review_summary="Old request for changes.",
+        prior_review_findings=[{"id": "superseded-finding", "body": "Old request for changes."}],
+    )
+    if approval_owner == "current":
+        orch.ReviewResult(status="request_changes", attempt_number=1).save(repo, prior.run_id)
+        orch.ReviewResult(status="approved", attempt_number=2).save(repo, run.run_id)
+    else:
+        prior.review_decision_status = "approved"
+    prior.save(repo)
+    with patch.object(orch, "resolve_worktree_path", return_value=repo):
+        ctx = orch._build_implement_attempt_context(run, repo).context
+    assert ctx.implement_reason == "retry"
+    assert not ctx.review_feedback_active
+    assert not ctx.unresolved_review_findings
+    assert "Old request for changes" not in ctx.failure_summary
+    assert ctx.triggering_phase != "review"
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_resume_rechecks_bootstrap_and_archives_dependency_block(repo: Path, legacy: bool):
+    error = "Unmet dependencies: prerequisite"
+    run = orch.RunState(
+        run_id="my-feature-20260101T000000", spec_id="my-feature",
+        branch="spec/my-feature", phase="bootstrap", status="blocked",
+        last_error=error, last_failure_phase="" if legacy else "bootstrap",
+        publication_base_sha=orch._head_sha(repo),
+    )
+    run.save(repo)
+    seen = []
+
+    def bootstrap(r, root):
+        seen.append("bootstrap")
+        assert not orch.check_dependencies_merged(root, r.spec_id)
+        return "passed"
+
+    def implement(r, root):
+        seen.append("implement")
+        package = orch._build_retry_failure_package(r, root)
+        assert error not in "\n".join(package.summary_parts)
+        assert not orch._cleared_initial_blocker_note(r, root)
+        assert r.superseded_failures[0]["error"] == error
+        return "passed"
+
+    handlers = {phase: MagicMock(return_value="passed") for phase in orch.PHASES}
+    handlers.update(bootstrap=bootstrap, implement=implement)
+    with (
+        patch.object(orch, "resolve_repo_root", return_value=repo),
+        patch.object(orch, "resolve_worktree_path", return_value=repo),
+        patch.object(orch, "check_dependencies_merged", return_value=[]) as dependencies,
+        patch.dict(orch.PHASE_HANDLERS, handlers),
+    ):
+        assert orch.cmd_run(argparse.Namespace(spec="my-feature", agent="codex", base="origin/master")) == 0
+    assert seen == ["bootstrap", "implement"]
+    dependencies.assert_called_once()
+    assert orch.RunState.load(repo, run.run_id).superseded_failures[0]["error"] == error
+
+
+@pytest.mark.parametrize("error", [
+    "error connecting to api.github.com",
+    "Agent exited with code 1: provider_network, ECONNRESET",
+    "You have reached your usage limit. Try again later.",
+    "sandbox denied: /tmp/restricted",
+])
+@pytest.mark.parametrize("phase", ["bootstrap", "implement", "publish"])
+@pytest.mark.parametrize("backoff_cleared_error", [False, True])
+def test_passing_phase_archives_infrastructure_failure(
+    repo: Path, error: str, phase: str, backoff_cleared_error: bool,
+):
+    assert orch.classify_failure(error, phase=phase).is_infrastructure
+    run = orch.RunState(
+        run_id="resolved-infra", spec_id="my-feature", branch="spec/my-feature", phase=phase,
+        status="failed", last_error=error, last_failure_phase=phase,
+    )
+    if backoff_cleared_error:
+        with patch.dict(orch.PHASE_HANDLERS, {phase: MagicMock(return_value="failed")}):
+            assert orch.run_single_phase(run, phase, repo) == "failed"
+        # In-process backoff clears prompt evidence before relaunching the phase.
+        run.last_error = ""
+    with patch.dict(orch.PHASE_HANDLERS, {phase: MagicMock(return_value="passed")}):
+        assert orch.run_single_phase(run, phase, repo) == "passed"
+    package = orch._build_retry_failure_package(run, repo)
+    assert error not in "\n".join(package.summary_parts)
+    assert not orch._cleared_initial_blocker_note(run, repo)
+    assert run.superseded_failures[0]["error"] == error
+
+
+def test_resumed_code_verify_failure_remains_retry_evidence(repo: Path):
+    run = orch.RunState(
+        run_id="code-verify-resume", spec_id="my-feature", branch="spec/my-feature", phase="implement",
+        status="failed", attempts=2, last_error="Gate 'test' failed (exit 1).",
+        last_failure_phase="verify",
+    )
+    gate_path = repo / ".spec-state" / "runs" / run.run_id / "gate-status.json"
+    gate_path.parent.mkdir(parents=True)
+    gate_path.write_text(json.dumps({"gates": {"test": {
+        "last_status": "failed", "last_stdout": "AssertionError: feature is broken",
+        "last_exit_code": 1,
+    }}}))
+    run.save(repo)
+    resumed = orch.RunState.load(repo, run.run_id)
+    package = orch._build_retry_failure_package(resumed, repo)
+    assert "make test" in package.active_gates_or_checks
+    assert "feature is broken" in "\n".join(package.gate_output_parts)
+    assert not resumed.superseded_failures
+
+
+@pytest.mark.parametrize("phase,kind", [("bootstrap", "dependency")] + [
+    (phase, "infrastructure") for phase in orch.PHASES
+])
+@pytest.mark.parametrize("source", ["audit", "diagnosis", "operator_request"])
+def test_phase_success_supersedes_all_earlier_failures(repo: Path, phase: str, kind: str, source: str):
+    errors = (
+        ["Unmet dependencies: A", "Unmet dependencies: B"]
+        if kind == "dependency" else ["provider_network: old outage A", "provider_network: old outage B"]
+    )
+    run = orch.RunState(
+        run_id="repeated-phase-failure", spec_id="my-feature", branch="spec/my-feature",
+        publication_base_sha=orch._head_sha(repo),
+    )
+
+    def fail(r, root):
+        r.last_error = errors.pop(0)
+        return "blocked" if kind == "dependency" else "failed"
+
+    first, second = errors
+    with patch.dict(orch.PHASE_HANDLERS, {phase: fail}):
+        orch.run_single_phase(run, phase, repo)
+        if source == "diagnosis":
+            orch.BlockDiagnosis(
+                summary=first, root_cause="Unavailable infrastructure", category="environment",
+                next_best_action="Retry", blocker_signature="old-failure", evidence=[first],
+                block_reason=first, source_phase=phase,
+            ).save(repo, run.run_id)
+            assert orch.BlockDiagnosis.load(repo, run.run_id) is not None
+        elif source == "operator_request":
+            orch.OperatorRequest(
+                kind="debugger_guidance", prompt=first, requested_by_phase=phase,
+                status="resolved", response="Try again.",
+            ).save(repo, run.run_id)
+        orch.run_single_phase(run, phase, repo)
+    with (
+        patch.object(orch, "resolve_worktree_path", return_value=repo),
+        patch.dict(orch.PHASE_HANDLERS, {phase: MagicMock(return_value="passed")}),
+    ):
+        assert orch.run_single_phase(run, phase, repo) == "passed"
+        run = orch.RunState.load(repo, run.run_id)
+        run.phase = "implement"
+        ctx = orch._build_implement_attempt_context(run, repo).context
+        prompt = orch._build_agent_command("claude", repo, retry_context=ctx)[-1]
+    assert ctx.implement_reason == "initial"
+    assert not ctx.cleared_blocker_note
+    assert first not in prompt
+    assert second not in prompt
+    # Even rapid failures of the same phase remain available for inspection.
+    audits = [json.loads((repo / path).read_text()) for path in orch._orchestrator_phase_result_paths(repo, run.run_id)]
+    assert len(audits) == 3
+    assert {item["result"]["error_code"] for item in audits} == {first, second, ""}
+    assert run.superseded_failures[0]["error"] == second
+    if source == "operator_request":
+        stored = orch.OperatorRequest.load(repo, run.run_id)
+        assert stored.prompt == first
+        assert ctx.operator_request_response == stored.response == "Try again."
+        # Normal and recovery launches pass the request independently of the
+        # context snapshot and must apply the same filter.
+        prompt_request = orch._operator_request_for_implement_prompt(run, repo, stored)
+        direct_prompt = orch._build_agent_command("claude", repo, operator_request=prompt_request)[-1]
+        assert first not in direct_prompt
+        assert "Try again." in direct_prompt
+
+
+@pytest.mark.parametrize("source", ["last_error", "diagnosis", "operator_request", "audit"])
+@pytest.mark.parametrize("same_phase", [True, False])
+def test_phase_success_keeps_new_or_other_phase_failure(repo: Path, source: str, same_phase: bool):
+    message = "provider_network: repeated outage"
+    run = orch.RunState(run_id="later-failure", spec_id="my-feature", branch="spec/my-feature")
+    owner = "bootstrap" if same_phase else "publish"
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status="passed", started_at="2026-01-02T00:00:00+00:00", finished_at="2026-01-02T00:00:01+00:00",
+    ))
+    # Reuse the exact message of a previously superseded failure to ensure
+    # filtering depends on time and owning phase, rather than matching text.
+    run.superseded_failures = [{
+        "phase": "bootstrap", "error": message, "resolved_at": "2026-01-02T00:00:01+00:00",
+    }]
+    observed_at = "2026-01-03T00:00:00+00:00" if same_phase else "2026-01-01T00:00:00+00:00"
+    if source == "last_error":
+        run.last_error = message
+        run.last_failure_phase = owner
+    elif source == "diagnosis":
+        orch.BlockDiagnosis(
+            summary=message, root_cause="Unavailable infrastructure", category="environment",
+            next_best_action="Retry", blocker_signature="new-failure", evidence=[message],
+            block_reason=message, source_phase=owner, debugged_at=observed_at,
+        ).save(repo, run.run_id)
+    elif source == "operator_request":
+        orch.OperatorRequest(
+            kind="debugger_guidance", prompt=message, requested_by_phase=owner, requested_at=observed_at,
+            status="resolved", response="Try again.",
+        ).save(repo, run.run_id)
+    else:
+        orch._persist_audit(repo, run, owner, orch.OrchestratorResult(
+            status="failed", error_code=message, started_at=observed_at, finished_at=observed_at,
+        ))
+    assert orch._cleared_initial_blocker_note(run, repo) == message
+    if source == "operator_request":
+        stored = orch.OperatorRequest.load(repo, run.run_id)
+        assert orch._operator_request_for_implement_prompt(run, repo, stored).prompt == message
+
+
+@pytest.mark.parametrize("status", ["blocked", "failed", "error"])
+@pytest.mark.parametrize("dated", [True, False])
+def test_legacy_audit_failure_is_superseded_by_phase_success(repo: Path, status: str, dated: bool):
+    run = orch.RunState(run_id="legacy-phase-failure", spec_id="my-feature", branch="spec/my-feature")
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status=status, error_code="Unmet dependencies: A",
+        started_at="2026-01-01T00:00:00+00:00" if dated else "",
+    ))
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status="passed", finished_at="2026-01-02T00:00:00+00:00",
+    ))
+    assert not run.superseded_failures
+    assert not orch._cleared_initial_blocker_note(run, repo)
+
+
+@pytest.mark.parametrize("source", ["diagnosis", "operator_request"])
+@pytest.mark.parametrize("timestamp", [None, "", "invalid legacy time"])
+def test_phase_success_suppresses_undated_legacy_failure_artifact(repo: Path, source: str, timestamp: str | None):
+    run = orch.RunState(run_id="legacy-failure-artifact", spec_id="my-feature", branch="spec/my-feature")
+    message = "Unmet dependencies: A"
+    if source == "diagnosis":
+        artifact = orch.BlockDiagnosis(
+            summary=message, root_cause="Missing dependency", category="environment",
+            next_best_action="Retry", blocker_signature="old-block", evidence=[message],
+            block_reason=message, source_phase="bootstrap",
+        ).save(repo, run.run_id)
+        key = "debugged_at"
+    else:
+        artifact = orch.OperatorRequest(
+            kind="debugger_guidance", prompt=message, requested_by_phase="bootstrap",
+            status="resolved", response="Try again.",
+        ).save(repo, run.run_id)
+        key = "requested_at"
+    payload = json.loads(artifact.read_text())
+    if timestamp is None:
+        payload.pop(key)
+    else:
+        payload[key] = timestamp
+    artifact.write_text(json.dumps(payload))
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status="passed", finished_at="2026-01-02T00:00:00+00:00",
+    ))
+    assert not orch._cleared_initial_blocker_note(run, repo)
+    if source == "operator_request":
+        stored = orch.OperatorRequest.load(repo, run.run_id)
+        assert orch._operator_request_for_implement_prompt(run, repo, stored).prompt != message
+        assert json.loads(artifact.read_text())["prompt"] == message
+
+
+@pytest.mark.parametrize("kind,status", [
+    ("debugger_guidance", "pending"), ("agent_question", "pending"), ("agent_question", "resolved"),
+])
+def test_resolved_phase_does_not_rewrite_pending_or_agent_question(repo: Path, kind: str, status: str):
+    run = orch.RunState(run_id="unrelated-operator-input", spec_id="my-feature", branch="spec/my-feature")
+    request = orch.OperatorRequest(
+        kind=kind, status=status, prompt="Choose the feature behavior.", response="Option A",
+        requested_by_phase="bootstrap", requested_at="2026-01-01T00:00:00+00:00",
+    )
+    orch._persist_audit(repo, run, "bootstrap", orch.OrchestratorResult(
+        status="passed", finished_at="2026-01-02T00:00:00+00:00",
+    ))
+    assert orch._operator_request_for_implement_prompt(run, repo, request) is request

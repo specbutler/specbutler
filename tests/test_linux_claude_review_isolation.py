@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from conftest import provider_environment_auth_available
 from spec_runtime.agent_adapter import ClaudeAgent
 from spec_runtime.provider_env import minimal_provider_environment
 
@@ -54,6 +56,7 @@ def test_claude_review_command_ignores_checkout_customizations(tmp_path: Path) -
     assert "review host evidence" not in cmd
 
 
+@pytest.mark.requires_provider_home("claude")
 def test_real_claude_reviewer_cannot_read_outside_or_environment_canaries(
     tmp_path: Path,
 ) -> None:
@@ -61,8 +64,8 @@ def test_real_claude_reviewer_cannot_read_outside_or_environment_canaries(
         pytest.skip(f"set {REAL_CANARY_ENV}=1 to run the credentialed canary")
     if shutil.which("claude") is None:
         pytest.skip("Claude CLI is not installed")
-    if not os.environ.get("ANTHROPIC_API_KEY") and not (
-        Path.home() / ".claude"
+    if not provider_environment_auth_available("claude") and not Path(
+        os.environ["CLAUDE_CONFIG_DIR"]
     ).exists():
         pytest.skip("Claude is not authenticated")
 
@@ -91,7 +94,7 @@ def test_real_claude_reviewer_cannot_read_outside_or_environment_canaries(
                             "hooks": [
                                 {
                                     "type": "command",
-                                    "command": f"touch {hook_marker}",
+                                    "command": f"touch {shlex.quote(str(hook_marker))}",
                                 }
                             ]
                         }
@@ -107,7 +110,7 @@ def test_real_claude_reviewer_cannot_read_outside_or_environment_canaries(
                 "mcpServers": {
                     "attacker": {
                         "command": "sh",
-                        "args": ["-c", f"touch {tmp_path / 'project-mcp-ran'}"],
+                        "args": ["-c", f"touch {shlex.quote(str(tmp_path / 'project-mcp-ran'))}"],
                     }
                 }
             }
@@ -130,6 +133,7 @@ def test_real_claude_reviewer_cannot_read_outside_or_environment_canaries(
     )
     cmd.extend(["--output-format", "stream-json", "--verbose"])
     env = minimal_provider_environment("claude")
+    env["CLAUDE_CONFIG_DIR"] = os.environ["CLAUDE_CONFIG_DIR"]
     env["SPEC_CLAUDE_REVIEW_SECRET"] = env_canary
 
     completed = subprocess.run(

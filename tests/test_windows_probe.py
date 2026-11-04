@@ -123,13 +123,11 @@ def _free_port() -> int:
         return probe.getsockname()[1]
 
 
-def _write_fake_cli_tools(fake_bin: Path, python: Path) -> None:
-    """Install deterministic model/forge doubles at the external CLI boundary."""
-    from pip._vendor.distlib.scripts import ScriptMaker
-
-    fake_bin.mkdir()
-    (fake_bin / "fake-gh.py").write_text(
-        """import json, sys
+# The fake forge and model CLIs are plain Python so that
+# tests/test_windows_fixture_parity.py can run them on POSIX too: a Windows-only
+# fixture that falls behind a new doctor check then fails everywhere, not only on
+# the windows-probe job. ``__FIXTURE_PYTHON__`` is replaced with the interpreter.
+FAKE_GH_SOURCE = """import json, sys
 args = sys.argv[1:]
 if args[:2] == ["auth", "status"]:
     raise SystemExit(0)
@@ -142,16 +140,9 @@ elif args[:2] == ["repo", "view"]:
 elif args and args[0] == "api":
     print("[]")
 raise SystemExit(0)
-""",
-        encoding="utf-8",
-    )
-    (fake_bin / "gh.cmd").write_text(
-        f'@echo off\r\n"{python}" -I "%~dp0fake-gh.py" %*\r\n',
-        encoding="utf-8",
-    )
-    codex_source_dir = fake_bin / "fixture-codex-source"
-    codex_source_dir.mkdir()
-    codex_script = """#!/usr/bin/env python
+"""
+
+FAKE_CODEX_SOURCE = """#!/usr/bin/env python
 import pathlib
 import subprocess
 import sys
@@ -221,8 +212,22 @@ def main():
 if __name__ == "__main__":
     raise SystemExit(main())
 """
+
+
+def _write_fake_cli_tools(fake_bin: Path, python: Path) -> None:
+    """Install deterministic model/forge doubles at the external CLI boundary."""
+    from pip._vendor.distlib.scripts import ScriptMaker
+
+    fake_bin.mkdir()
+    (fake_bin / "fake-gh.py").write_text(FAKE_GH_SOURCE, encoding="utf-8")
+    (fake_bin / "gh.cmd").write_text(
+        f'@echo off\r\n"{python}" -I "%~dp0fake-gh.py" %*\r\n',
+        encoding="utf-8",
+    )
+    codex_source_dir = fake_bin / "fixture-codex-source"
+    codex_source_dir.mkdir()
     (codex_source_dir / "codex").write_text(
-        codex_script.replace("__FIXTURE_PYTHON__", repr(str(python))),
+        FAKE_CODEX_SOURCE.replace("__FIXTURE_PYTHON__", repr(str(python))),
         encoding="utf-8",
     )
     maker = ScriptMaker(str(codex_source_dir), str(fake_bin))
@@ -304,7 +309,13 @@ description: Snow 雪 and probe 🧪
 
 # Unicode content
 
+## Goal
+
 Preserve snow 雪 and probe 🧪 exactly.
+
+## Acceptance Criteria
+
+- [ ] Preserve snow 雪 and probe 🧪 exactly.
 """
     spec_path = specs / "unicode-content.md"
     spec_path.write_text(spec_text, encoding="utf-8")
@@ -1081,8 +1092,16 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
         check=True,
         capture_output=True,
     )
+    # Doctor compares merge tags with origin; keep that query hermetic.
+    remote = tmp_path / "fixture-remote.git"
     subprocess.run(
-        ["git", "remote", "add", "origin", "https://github.com/example/spec-windows-probe.git"],
+        ["git", "init", "--bare", str(remote)],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote)],
         cwd=tmp_path,
         check=True,
     )
@@ -1113,6 +1132,7 @@ def test_spec_init_output_is_accepted_by_doctor(tmp_path: Path) -> None:
     )
     assert doctor.returncode == 0, doctor.stdout + doctor.stderr
     assert "0 warning(s)" in doctor.stdout
+    assert "[ok] merge tags: All 0 remote merge tags are present locally" in doctor.stdout
     assert "agent version (codex)" in doctor.stdout
     assert "codex-cli 0.156.1" in doctor.stdout
 

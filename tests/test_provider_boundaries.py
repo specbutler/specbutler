@@ -271,6 +271,7 @@ def test_claude_provider_credential_classification_covers_auth_transports() -> N
     not sys.platform.startswith("linux") or shutil.which("codex") is None,
     reason="requires the installed Codex Linux sandbox",
 )
+@pytest.mark.requires_nested_sandbox
 def test_codex_implement_profile_enforces_write_and_secret_boundaries(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -356,6 +357,7 @@ def test_codex_implement_profile_enforces_write_and_secret_boundaries(
     not sys.platform.startswith("linux") or shutil.which("codex") is None,
     reason="requires the installed Codex Linux sandbox",
 )
+@pytest.mark.requires_nested_sandbox
 def test_codex_authoring_profile_allows_edits_but_blocks_network_and_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1038,6 +1040,7 @@ def test_web_codex_spawn_replaces_ambient_environment(
             os.environ,
             {
                 "PATH": "/bin",
+                "HOME": os.environ["HOME"],
                 "CODEX_HOME": str(tmp_path / "missing-codex-home"),
                 "OPENAI_API_KEY": "provider-secret",
                 "GH_TOKEN": "github-secret",

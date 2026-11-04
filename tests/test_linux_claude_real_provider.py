@@ -507,6 +507,8 @@ def _write_proof_receipt(payload: dict[str, Any]) -> None:
     os.environ.get(REAL_PROVIDER_ENV) != "1",
     reason=f"set {REAL_PROVIDER_ENV}=1 to opt into the credentialed real-Claude web proof",
 )
+@pytest.mark.requires_provider_home("claude")
+@pytest.mark.requires_network
 def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
     tmp_path: Path,
 ) -> None:
@@ -726,6 +728,8 @@ def test_linux_real_claude_web_chat_preserves_context_and_reaps_provider(
     os.environ.get(CODEX_REAL_PROVIDER_ENV) != "1",
     reason=f"set {CODEX_REAL_PROVIDER_ENV}=1 to opt into the credentialed real-Codex web proof",
 )
+@pytest.mark.requires_provider_home("codex")
+@pytest.mark.requires_network
 def test_linux_real_codex_web_chat_edits_and_preserves_context(
     tmp_path: Path,
 ) -> None:

@@ -1588,7 +1588,7 @@ def main(argv: list[str] | None = None) -> int:
     p_input.add_argument(
         "--message",
         default="",
-        help="Review round cap: guidance for one more implement and review round",
+        help="Answer a pending operator request without an interactive session",
     )
 
     p_steer = subparsers.add_parser(
@@ -1596,6 +1596,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Attach proactive steering guidance to the latest run for a spec",
     )
     p_steer.add_argument("--spec", required=True, help="Spec ID")
+    p_steer.add_argument("--replace", action="store_true", help="Replace active steering notes")
+    p_steer.add_argument("--answer", action="store_true", help="Resolve the pending operator request")
     p_steer.add_argument("--message", required=True, help="Advisory guidance for the next implement attempt")
 
     p_attach = subparsers.add_parser(
