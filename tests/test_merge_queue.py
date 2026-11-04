@@ -1,6 +1,7 @@
 """Hermetic merge-queue adapter, lifecycle and diagnostic contracts."""
 
 import json
+import re
 import subprocess
 from dataclasses import replace
 from types import SimpleNamespace
@@ -96,13 +97,19 @@ def test_removal_routes_to_existing_retry_policy(queued, tmp_path, reason, expec
     forge.merge_group_failure_excerpt.return_value = "group workflow failure excerpt"
     forge.merge_queue_status.side_effect = [
         queue_status(),
-        queue_status(event={"id": "new", "reason": reason, "beforeCommit": {"oid": "group"}}),
+        queue_status(entry={"id": "q", "headCommit": {"oid": "group"}}),
+        queue_status(event={"id": "new", "reason": reason}),
     ]
     assert orch._try_queued_merge(run, tmp_path, 12, expected_head_sha="head") == "failed"
     assert expected in run.last_error
     if "check" in reason:
         assert "group workflow failure excerpt" in run.last_error
-        forge.merge_group_failure_excerpt.assert_called_once_with("group", cwd=tmp_path)
+        args, kwargs = forge.merge_group_failure_excerpt.call_args
+        assert args == ("group",)
+        assert kwargs["pr_number"] == 12
+        assert kwargs["base_branch"] == orch.PR_BASE_BRANCH
+        assert kwargs["queued_at"]
+        assert kwargs["cwd"] == tmp_path
         assert orch._is_required_checks_failure(run.last_error)
     else:
         assert orch._is_merge_conflict(run.last_error)
@@ -250,3 +257,160 @@ def test_failed_dequeue_prevents_implementation_retry(queued, tmp_path):
     assert orch._try_queued_merge(run, tmp_path, 12, expected_head_sha="head") == "failed"
     assert run.last_error.startswith("Could not cancel merge queue request")
     assert orch._workflow_failure_policy(run, "merge") is None
+
+
+@pytest.mark.parametrize("entry,event", [
+    (None, None),
+    ({"id": "q", "headCommit": {"oid": "group"}}, None),
+    (None, {"id": "removed", "reason": "checks failed"}),
+])
+def test_queue_status_graphql_contract(tmp_path, entry, event):
+    # Exercise the real adapter with the portable response contract: removal
+    # events supply identity/reason, never the workflow commit. Reject extra
+    # selections here, even when the response has no timeline events.
+    payload = queue_status(entry=entry, event=event)
+    payload["autoMergeRequest"] = None
+
+    def runner(cmd, **kwargs):
+        query = cmd[4].removeprefix("query=")
+        selection = re.search(r"on RemovedFromMergeQueueEvent\{([^{}]*)\}", query)
+        assert selection is not None
+        assert set(selection[1].split()) == {"id", "reason"}
+        return response({"data": {"repository": {"pullRequest": payload}}})
+
+    status = GitHubForge(run_fn=runner).merge_queue_status(12, cwd=tmp_path)
+    assert status == payload
+
+
+def test_removal_between_polls_uses_workflow_lookup(queued, tmp_path):
+    run, forge = queued
+    forge.merge_queue_status.side_effect = [
+        queue_status(), queue_status(event={"id": "removed", "reason": "checks failed"}),
+    ]
+    forge.merge_group_failure_excerpt.return_value = "synthetic workflow failure"
+    assert orch._try_queued_merge(run, tmp_path, 12, expected_head_sha="head") == "failed"
+    args, kwargs = forge.merge_group_failure_excerpt.call_args
+    assert args == ("",)
+    assert kwargs["pr_number"] == 12
+    assert kwargs["queued_at"]
+    assert "synthetic workflow failure" in run.last_error
+
+
+def test_workflow_lookup_excludes_other_prs_bases_and_admissions(tmp_path):
+    now = "2026-11-04T18:00:00Z"
+
+    def workflow(number, branch, created=now):
+        return dict(databaseId=number, conclusion="failure", url=f"run-{number}",
+                    headBranch=branch, headSha=f"synthetic-{number}", createdAt=created)
+
+    runner = MagicMock(side_effect=[
+        response([
+            workflow(1, "gh-readonly-queue/main/pr-12-abcd", "2026-11-03T18:00:00Z"),
+            workflow(2, "gh-readonly-queue/main/pr-123-abcd"),
+            workflow(3, "gh-readonly-queue/release/pr-12-abcd"),
+            workflow(4, "code/feature"),
+            workflow(5, "gh-readonly-queue/main/pr-12-abcd"),
+        ]),
+        subprocess.CompletedProcess([], 0, "failed synthetic test", ""),
+    ])
+    excerpt = GitHubForge(run_fn=runner).merge_group_failure_excerpt(
+        "", cwd=tmp_path, pr_number=12, base_branch="main", queued_at=now,
+    )
+    assert "failed synthetic test" in excerpt
+    assert "synthetic-5" in excerpt
+    assert runner.call_args_list[1].args[0] == ["gh", "run", "view", "5", "--log-failed"]
+    command = runner.call_args_list[0].args[0]
+    assert command[command.index("--event") + 1] == "merge_group"
+    assert command[command.index("--created") + 1] == ">=" + now
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "invalid-json", "queue-query-unavailable", "confirmation-timeout", "confirmation-oserror", "timeout"])
+@pytest.mark.parametrize("cancel_error", [False, True])
+def test_successful_admission_with_uncertain_confirmation_is_cancelled(
+    queued, tmp_path, monkeypatch, failure, cancel_error,
+):
+    run, _ = queued
+    armed = False
+    calls = []
+
+    def runner(cmd, **kwargs):
+        nonlocal armed
+        calls.append(cmd)
+        if cmd[:3] == ["gh", "pr", "merge"]:
+            if "--disable-auto" in cmd:
+                armed = False
+                return response({})
+            armed = True
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(cmd, 30)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            if failure == "confirmation-timeout":
+                raise subprocess.TimeoutExpired(cmd, 30)
+            if failure == "confirmation-oserror":
+                raise OSError("confirmation connection lost")
+            if failure == "invalid-json":
+                return subprocess.CompletedProcess(cmd, 0, "{", "")
+            if failure == "queue-query-unavailable":
+                return response(dict(state="OPEN", headRefOid="head", autoMergeRequest=None))
+            return response({}, code=1, stderr="confirmation unavailable")
+        query = cmd[4].removeprefix("query=")
+        if "dequeuePullRequest" in query:
+            if cancel_error:
+                return response({"errors": [{"message": "permission denied"}]})
+            armed = False
+            return response({"data": {"dequeuePullRequest": {}}})
+        if failure == "queue-query-unavailable" and armed:
+            # Both confirmation and cleanup must report uncertainty without
+            # permitting an implementation retry while admission may remain.
+            return response({"errors": [{"message": "queue query unavailable"}]})
+        payload = queue_status(entry={"id": "q"} if armed else None)
+        payload["autoMergeRequest"] = {"enabledAt": "now"} if armed else None
+        return response({"data": {"repository": {"pullRequest": payload}}})
+
+    forge = GitHubForge(run_fn=runner)
+    monkeypatch.setattr(orch, "_forge", lambda *_: forge)
+    assert orch._try_queued_merge(run, tmp_path, 12, expected_head_sha="head") == "failed"
+    if cancel_error or failure == "queue-query-unavailable":
+        assert run.last_error.startswith("Could not cancel merge queue request")
+        assert orch._workflow_failure_policy(run, "merge") is None
+    else:
+        assert not armed
+        assert any("dequeuePullRequest" in " ".join(command) for command in calls)
+        assert "admission failed" in run.last_error
+
+
+@pytest.mark.parametrize("path", ["auto", "manual"])
+def test_direct_auto_merge_paths_disarm_uncertain_admission(queued, tmp_path, monkeypatch, path):
+    run, forge = queued
+    forge.merge_pr.return_value = MergeResult(
+        False, "successful CLI mutation with failed confirmation", auto_merge_may_be_armed=True,
+    )
+    disable = MagicMock(return_value="")
+    monkeypatch.setattr(orch, "_disable_pr_auto_merge", disable)
+    monkeypatch.setattr(orch, "_required_checks_green_for_repo", lambda *a, **kw: (True, ""))
+    monkeypatch.setattr(orch, "_find_open_pr_for_branch", lambda *a, **kw: (
+        {"headRefOid": "head", "mergeStateStatus": "CLEAN"}, "",
+    ))
+    if path == "auto":
+        result = orch._try_auto_merge(run, tmp_path, 12, expected_head_sha="head")
+    else:
+        result = orch._manual_merge(run, tmp_path, tmp_path, run.branch, 12, "head", {})
+    assert result == "failed"
+    assert "could not be confirmed" in run.last_error
+    disable.assert_called_once_with(tmp_path, 12, repo_slug="owner/repo")
+    forge.merge_pr.assert_called_once()
+
+
+def test_removal_after_resuming_queue_uses_existing_group(queued, tmp_path):
+    run, forge = queued
+    forge.merge_queue_status.side_effect = [
+        queue_status(entry={"id": "q", "headCommit": {"oid": "existing-group"},
+                            "enqueuedAt": "2026-11-04T17:00:00Z"}),
+        queue_status(event={"id": "removed", "reason": "checks failed"}),
+    ]
+    forge.merge_group_failure_excerpt.return_value = "existing group failed"
+    assert orch._try_queued_merge(run, tmp_path, 12, expected_head_sha="head") == "failed"
+    args, kwargs = forge.merge_group_failure_excerpt.call_args
+    assert args == ("existing-group",)
+    assert kwargs["queued_at"] == "2026-11-04T17:00:00Z"

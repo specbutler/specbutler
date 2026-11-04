@@ -26475,7 +26475,6 @@ def _try_queued_merge(
 ) -> str:
     """Queue admission is head-pinned; BEHIND is owned entirely by the forge."""
     forge = _forge(_trusted_publication_repo_slug(run))
-    group_sha = ""
     reason = "retry limit reached"
     for _attempt in range(max(0, 3 - run.merge_queue_retries)):
         try:
@@ -26492,13 +26491,18 @@ def _try_queued_merge(
                 run.last_error = f"Merge refused for {_short_sha(decision.head_sha)}: {decision.blocker}"
                 return "failed"
             _assert_publication_transition_safe(run, resolve_worktree_path(run, repo_root))
+            existing_entry = before.get("mergeQueueEntry") or {}
+            group_sha = (existing_entry.get("headCommit") or {}).get("oid", "")
+            queued_at = existing_entry.get("enqueuedAt") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             result = forge.merge_pr(
                 pr_number, method="squash", auto=True,
                 expected_head_sha=expected_head_sha, cwd=repo_root,
             )
             if not result.ok:
-                run.last_error = f"Merge queue admission failed for PR #{pr_number}: {result.message}"
-                return "failed"
+                return _fail_queued_merge(
+                    run, repo_root, pr_number,
+                    f"Merge queue admission failed for PR #{pr_number}: {result.message}",
+                )
             deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
             reason = "timed out waiting for queue result"
             while True:
@@ -26524,7 +26528,6 @@ def _try_queued_merge(
                 event = events[-1] if events else {}
                 if not entry and event.get("id") and event["id"] != old_event:
                     reason = str(event.get("reason") or "removed by another actor")
-                    group_sha = (event.get("beforeCommit") or {}).get("oid", "") or group_sha
                     lower = reason.lower()
                     if "conflict" in lower:
                         # Existing conflict policy confirms and applies the local base merge,
@@ -26534,7 +26537,10 @@ def _try_queued_merge(
                     if "timeout" not in lower and "timed out" not in lower and any(
                         word in lower for word in ("check", "fail", "ci ")
                     ):
-                        detail = forge.merge_group_failure_excerpt(group_sha, cwd=repo_root)
+                        detail = forge.merge_group_failure_excerpt(
+                            group_sha, cwd=repo_root, pr_number=pr_number,
+                            base_branch=PR_BASE_BRANCH, queued_at=queued_at,
+                        )
                         return _fail_queued_merge(
                             run, repo_root, pr_number,
                             f"required checks failing: merge queue removed PR #{pr_number}: {reason}\n{detail}",
@@ -26551,7 +26557,7 @@ def _try_queued_merge(
                 return "failed"
             run.merge_queue_retries += 1
             logger.warning("PR #%s merge queue retry %s/3: %s", pr_number, run.merge_queue_retries, reason)
-        except RuntimeError as exc:
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
             return _fail_queued_merge(
                 run, repo_root, pr_number, f"Merge queue query failed for PR #{pr_number}: {exc}",
             )
@@ -26595,6 +26601,10 @@ def _try_auto_merge(
         cwd=repo_root,
     )
     if not auto_merge.ok:
+        if auto_merge.auto_merge_may_be_armed:
+            return _fail_after_auto_merge_armed(
+                run, repo_root, pr_number, f"Auto-merge admission could not be confirmed: {auto_merge.message}",
+            )
         err = auto_merge.message
         err_lower = err.lower()
         # Draft PR error: cannot auto-merge a draft PR.
@@ -26985,6 +26995,10 @@ def _manual_merge(
         if merge_result.ok:
             merged_successfully = True
             break
+        if merge_result.auto_merge_may_be_armed:
+            return _fail_after_auto_merge_armed(
+                run, repo_root, pr_number, f"Auto-merge admission could not be confirmed: {merge_result.message}",
+            )
         merge_err = merge_result.message
         if use_auto_merge and _is_auto_merge_capability_error(merge_err):
             logger.info(

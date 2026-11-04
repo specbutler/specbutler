@@ -60,6 +60,9 @@ class CheckRun:
 class MergeResult:
     ok: bool
     message: str = ""
+    # A successful/unfinished mutation with an unconfirmed postcondition must
+    # be disarmed before callers fall back or return control to implementation.
+    auto_merge_may_be_armed: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,8 +96,11 @@ class ForgeAdapter(Protocol):
         """Disarm auto-merge and dequeue, returning an error or empty string."""
         ...
 
-    def merge_group_failure_excerpt(self, commit_sha: str, *, cwd: Path) -> str:
-        """Read failed workflow logs for the exact merge-group commit."""
+    def merge_group_failure_excerpt(
+        self, commit_sha: str, *, cwd: Path, pr_number: int | None = None,
+        base_branch: str = "", queued_at: str = "",
+    ) -> str:
+        """Read merge-group logs by observed commit or PR queue branch and admission time."""
         ...
 
     def get_auth_token(self) -> str:
@@ -335,9 +341,9 @@ class GitHubForge:
         repository = self._graphql_repository(
             f"pullRequest(number:{int(pr_number)})" + """{
               id state headRefOid autoMergeRequest{enabledAt}
-              mergeQueueEntry{id headCommit{oid}}
+              mergeQueueEntry{id enqueuedAt headCommit{oid}}
               timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){
-                nodes{... on RemovedFromMergeQueueEvent{id reason beforeCommit{oid}}}
+                nodes{... on RemovedFromMergeQueueEvent{id reason}}
               }
             }""", cwd=cwd,
         )
@@ -362,28 +368,46 @@ class GitHubForge:
                 if result.returncode:
                     return result.stderr or result.stdout
             return ""
-        except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+        except (RuntimeError, OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as exc:
             return str(exc)
 
-    def merge_group_failure_excerpt(self, commit_sha: str, *, cwd: Path) -> str:
-        if not commit_sha:
+    def merge_group_failure_excerpt(
+        self, commit_sha: str, *, cwd: Path, pr_number: int | None = None,
+        base_branch: str = "", queued_at: str = "",
+    ) -> str:
+        # Removal events need not expose a commit. A PR may enter and leave
+        # the queue between polls, so find its synthetic workflow commit
+        # independently, restricted to this admission and this PR's queue ref.
+        args = ["run", "list", "--event", "merge_group",
+                "--json", "databaseId,conclusion,url,headBranch,headSha,createdAt", "--limit", "100"]
+        if commit_sha:
+            args.extend(["--commit", commit_sha])
+        elif pr_number is not None and base_branch and queued_at:
+            args.extend(["--created", ">=" + queued_at])
+        else:
             return "Merge-group commit was unavailable; no PR-head logs substituted."
-        result = self._gh(
-            ["run", "list", "--event", "merge_group", "--commit", commit_sha,
-             "--json", "databaseId,conclusion,url", "--limit", "100"], cwd=cwd,
-        )
+        result = self._gh(args, cwd=cwd)
         try:
             if result.returncode:
                 raise ValueError(result.stderr)
             runs = json.loads(result.stdout)
             excerpts = []
+            prefix = f"gh-readonly-queue/{base_branch}/pr-{pr_number}-"
             for run in runs:
+                if not commit_sha:
+                    if not str(run.get("headBranch", "")).startswith(prefix):
+                        continue
+                    if str(run.get("createdAt", "")) < queued_at:
+                        continue
                 if run.get("conclusion") in {"failure", "timed_out", "cancelled", "action_required"}:
                     logs = self._gh(["run", "view", str(run["databaseId"]), "--log-failed"], cwd=cwd)
-                    excerpts.append(str(run.get("url", "")) + "\n" + (logs.stdout or logs.stderr)[-12000:])
-            return "\n".join(excerpts) or f"No failed merge-group workflow logs found for {commit_sha}."
+                    excerpts.append(
+                        str(run.get("url", "")) + " (merge-group " + str(run.get("headSha", commit_sha)) + ")\n"
+                        + (logs.stdout or logs.stderr)[-12000:]
+                    )
+            return "\n".join(excerpts) or f"No failed merge-group workflow logs found for {commit_sha or prefix}."
         except (ValueError, TypeError, KeyError) as exc:
-            return f"Could not read merge-group logs for {commit_sha}: {exc}"
+            return f"Could not read merge-group logs for {commit_sha or pr_number}: {exc}"
 
     def get_auth_token(self) -> str:
         # Prefer explicit env vars over gh CLI to avoid unnecessary subprocess calls.
@@ -674,16 +698,19 @@ class GitHubForge:
         if expected_head_sha:
             args.extend(["--match-head-commit", expected_head_sha])
         def confirm_auto_merge() -> tuple[bool, str]:
-            confirmation = self._gh(
-                [
-                    "pr",
-                    "view",
-                    str(pr_number),
-                    "--json",
-                    "state,autoMergeRequest,headRefOid",
-                ],
-                cwd=cwd,
-            )
+            try:
+                confirmation = self._gh(
+                    [
+                        "pr",
+                        "view",
+                        str(pr_number),
+                        "--json",
+                        "state,autoMergeRequest,headRefOid",
+                    ],
+                    cwd=cwd,
+                )
+            except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+                return False, f"GitHub CLI could not confirm the resulting PR state: {exc}"
             if confirmation.returncode != 0:
                 detail = (confirmation.stderr or confirmation.stdout or "").strip()
                 return False, detail or "GitHub CLI could not query the resulting PR state"
@@ -704,7 +731,7 @@ class GitHubForge:
             if not merge_confirmed and isinstance(payload, dict) and cwd is not None:
                 try:
                     merge_confirmed = bool(self.merge_queue_status(pr_number, cwd=cwd).get("mergeQueueEntry"))
-                except RuntimeError:
+                except (RuntimeError, OSError, subprocess.TimeoutExpired):
                     pass
             if merge_confirmed:
                 return True, ""
@@ -728,6 +755,7 @@ class GitHubForge:
                 return MergeResult(ok=True, message="auto-merge armed; gh wait detached")
             return MergeResult(
                 ok=False,
+                auto_merge_may_be_armed=auto,
                 message=(
                     "GraphQL: enablePullRequestAutoMerge timed out before "
                     "the resulting PR state could be confirmed"
@@ -746,6 +774,7 @@ class GitHubForge:
             if not confirmed:
                 return MergeResult(
                     ok=False,
+                    auto_merge_may_be_armed=True,
                     message=(
                         "auto-merge is not enabled: GitHub CLI exited successfully, but "
                         f"{detail}"
