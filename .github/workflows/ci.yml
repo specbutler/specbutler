@@ -100,7 +100,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev]"
+      - run: python tools/ci_pip_install.py -e ".[dev]"
       - run: ruff check .
       - name: Validate GitHub Actions workflows with actionlint v1.7.12
         env:
@@ -146,7 +146,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev,tui,web]"
+      - run: python tools/ci_pip_install.py -e ".[dev,tui,web]"
       - name: Run Linux portable suite
         run: |
           mkdir -p artifacts/ci-evidence
@@ -180,7 +180,7 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
-      - run: pip install -e ".[dev,tui,web]"
+      - run: python tools/ci_pip_install.py -e ".[dev,tui,web]"
       - name: Run macOS portable suite
         run: |
           mkdir -p artifacts/ci-evidence
@@ -215,15 +215,15 @@ jobs:
           python-version: "3.12"
       - name: Build distributions
         run: |
-          python -m pip install -e ".[dev]"
+          python tools/ci_pip_install.py -e ".[dev]"
           python -m build
       - name: Smoke-test wheel and audit dependencies
         run: |
           wheel_path="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
           test -n "$wheel_path"
           python -m venv "$RUNNER_TEMP/spec-wheel-smoke"
-          "$RUNNER_TEMP/spec-wheel-smoke/bin/python" -m pip install --upgrade pip
-          "$RUNNER_TEMP/spec-wheel-smoke/bin/python" -m pip install "${wheel_path}[tui,web]" pip-audit
+          "$RUNNER_TEMP/spec-wheel-smoke/bin/python" tools/ci_pip_install.py --upgrade pip
+          "$RUNNER_TEMP/spec-wheel-smoke/bin/python" tools/ci_pip_install.py "${wheel_path}[tui,web]" pip-audit
           "$RUNNER_TEMP/spec-wheel-smoke/bin/python" -m pip check
           "$RUNNER_TEMP/spec-wheel-smoke/bin/python" -m pip_audit
           "$RUNNER_TEMP/spec-wheel-smoke/bin/spec" --help >/dev/null
@@ -332,7 +332,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force artifacts | Out-Null
-          python -m pip install build twine 2>&1 | Tee-Object artifacts/build.log
+          python tools/ci_pip_install.py build twine 2>&1 | Tee-Object artifacts/build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m build --wheel --sdist 2>&1 | Tee-Object -Append artifacts/build.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -429,7 +429,7 @@ jobs:
           }
           python -m venv "$env:RUNNER_TEMP/spec-windows-probe"
           $requirement = "$($packages[0].FullName)[dev,web,tui]"
-          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" -m pip install $requirement 2>&1 | Tee-Object artifacts/install.log
+          & "$env:RUNNER_TEMP/spec-windows-probe/Scripts/python.exe" tools/ci_pip_install.py $requirement 2>&1 | Tee-Object artifacts/install.log
           exit $LASTEXITCODE
       - name: Check installed dependencies
         shell: pwsh
