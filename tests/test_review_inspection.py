@@ -1,6 +1,7 @@
 """Hermetic inspection boundary tests and opt-in real Codex MCP smoke."""
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 from spec_runtime.agent_adapter import CODEX_REVIEW_CHECKOUT_SHELL, CodexAgent
-from spec_runtime.review_inspection import LIMIT, Inspection
+from spec_runtime.review_inspection import LIMIT, TOOLS, Inspection
 
 
 @pytest.fixture
@@ -236,3 +237,112 @@ def test_git_disables_checkout_execution(checkout, tmp_path):
     subprocess.run(["git", "config", "core.worktree", str(tmp_path)], cwd=checkout, check=True)
     assert Inspection(checkout, ()).git(operation="diff", paths=["hello.txt"])["text"] == ""
     assert not marker.exists()
+
+
+# Derive operation coverage from the published MCP contract, rather than a
+# separate handwritten list that could miss a future Git operation.
+GIT_OPERATIONS = next(t for t in TOOLS if t["name"] == "git_show")[
+    "inputSchema"]["properties"]["operation"]["enum"]
+SEARCH_TOOLS = [t["name"] for t in TOOLS
+                if "pattern" in t["inputSchema"]["properties"]]
+
+
+def git_fixture(checkout, *args):
+    return subprocess.check_output(
+        ["git", "-c", "user.name=Test", "-c", "user.email=t@example.org", *args],
+        cwd=checkout, text=True).strip()
+
+
+@pytest.mark.parametrize("operation", GIT_OPERATIONS)
+@pytest.mark.parametrize("kind", ["blob", "tree", "blob-tag", "tree-tag"])
+def test_git_rejects_noncommit_objects(checkout, operation, kind):
+    protected = checkout / "credentials"
+    protected.write_text("protected blob contents", encoding="utf-8")
+    git_fixture(checkout, "add", "credentials")
+    git_fixture(checkout, "commit", "-m", "protected fixture")
+    blob = git_fixture(checkout, "rev-parse", "HEAD:credentials")
+    tree = git_fixture(checkout, "rev-parse", "HEAD^{tree}")
+    object_id = blob if kind.startswith("blob") else tree
+    if kind.endswith("-tag"):
+        git_fixture(checkout, "tag", "-a", "unsafe-object", object_id, "-m", "tag")
+        object_id = "unsafe-object"
+    server = Inspection(checkout, (protected,))
+    for revision in (object_id, f"HEAD..{object_id}", f"{object_id}...HEAD"):
+        with pytest.raises(ValueError, match="Git inspection failed"):
+            server.git(operation=operation, revision=revision, paths=["hello.txt"])
+
+
+@pytest.mark.parametrize("operation", GIT_OPERATIONS)
+def test_git_commit_selectors_and_ranges(checkout, operation):
+    git_fixture(checkout, "tag", "-a", "safe-commit", "HEAD", "-m", "commit tag")
+    (checkout / "hello.txt").write_text("updated review\n", encoding="utf-8")
+    git_fixture(checkout, "add", "hello.txt")
+    git_fixture(checkout, "commit", "-m", "second commit")
+    server = Inspection(checkout, ())
+    for revision in ("HEAD", "safe-commit", "HEAD~1", "HEAD^", "safe-commit..HEAD",
+                     "safe-commit...HEAD"):
+        result = server.git(operation=operation, revision=revision, paths=["hello.txt"])
+        assert not result["truncated"]
+        if operation == "diff":
+            if revision == "HEAD":
+                assert result["text"] == ""
+            else:
+                assert "+updated review" in result["text"]
+    for revision in ("HEAD^@", "HEAD^{tree}", "HEAD^{}", "HEAD@{0}", "HEAD....HEAD"):
+        with pytest.raises(ValueError):
+            server.git(operation=operation, revision=revision, paths=["hello.txt"])
+
+
+@pytest.mark.parametrize("operation", GIT_OPERATIONS)
+@pytest.mark.parametrize("driver", ["clean", "process"])
+def test_git_never_runs_conversion_filters(checkout, tmp_path, operation, driver):
+    marker = tmp_path / "filter-executed"
+    hook = tmp_path / "filter.py"
+    hook.write_text("from pathlib import Path\nPath(" + repr(str(marker)) + ").touch()\n",
+                    encoding="utf-8")
+    (checkout / ".gitattributes").write_text("hello.txt filter=untrusted\n", encoding="utf-8")
+    git_fixture(checkout, "add", ".gitattributes")
+    git_fixture(checkout, "commit", "-m", "attributes")
+    git_fixture(checkout, "config", f"filter.untrusted.{driver}",
+                shlex.join([sys.executable, str(hook)]))
+    git_fixture(checkout, "config", "filter.untrusted.required", "true")
+    # A worktree diff would need conversion even though the review only needs
+    # committed history. Neither the single-ref nor range form may touch it.
+    (checkout / "hello.txt").write_text("uncommitted conversion trigger\n", encoding="utf-8")
+    server = Inspection(checkout, ())
+    for revision in ("HEAD", "HEAD~1..HEAD", "HEAD~1...HEAD"):
+        result = server.git(operation=operation, revision=revision, paths=["hello.txt"])
+        assert "uncommitted conversion trigger" not in result["text"]
+        assert not marker.exists()
+
+
+@pytest.mark.parametrize("tool", SEARCH_TOOLS)
+def test_search_file_and_directory_paths(checkout, tool):
+    server = Inspection(checkout, ())
+    pattern = "review" if tool == "grep" else "*.txt"
+    expected = "hello.txt:1:hello review" if tool == "grep" else "hello.txt"
+    assert server.call(tool, {"path": "hello.txt", "pattern": pattern})["entries"] == [expected]
+    assert server.call(tool, {"path": ".", "pattern": pattern})["entries"] == [expected]
+    for path in ("..", str(checkout / "hello.txt")):
+        with pytest.raises(ValueError):
+            server.call(tool, {"path": path, "pattern": pattern})
+
+
+@pytest.mark.parametrize(("pattern", "expected"), [
+    ("**/*.txt", ["hello.txt", "src/nested/deep.txt", "src/one.txt"]),
+    ("*.txt", ["hello.txt"]),
+    ("src/*.py", ["src/one.py"]),
+    ("src/**/*.py", ["src/nested/deep.py", "src/one.py"]),
+    ("**/nested/**/*.py", ["src/nested/deep.py"]),
+    ("src/??e.[pt][xy]", ["src/one.py"]),
+    ("src/missing/**/*.py", []),
+])
+def test_glob_segments(checkout, pattern, expected):
+    (checkout / "src" / "nested").mkdir(parents=True)
+    for name in ("src/one.py", "src/one.txt", "src/nested/deep.py", "src/nested/deep.txt"):
+        (checkout / name).write_text("review\n", encoding="utf-8")
+    server = Inspection(checkout, ())
+    assert sorted(server.call("glob", {"pattern": pattern})["entries"]) == expected
+    assert server.call("glob", {"path": "src", "pattern": "*.py"})["entries"] == ["src/one.py"]
+    assert sorted(server.call("glob", {"path": "src", "pattern": "**/*.py"})["entries"]) == [
+        "src/nested/deep.py", "src/one.py"]

@@ -21,6 +21,38 @@ LIMIT = 64 * 1024
 MAX_ENTRIES = 2000
 
 
+# Restrict each endpoint to a ref/object name plus parent selectors. In
+# particular, do not accept object peeling, reflog expansion, or path selectors.
+_COMMIT_REF = r"[A-Za-z0-9_][A-Za-z0-9_./-]*(?:[~^][0-9]*)*"
+
+
+def commit_revision(revision: str) -> str:
+    """Require commit objects for single revisions and both range endpoints."""
+    if not isinstance(revision, str) or len(revision) > 200:
+        raise ValueError("Invalid commit revision")
+    endpoints = re.split(r"(\.\.\.?)", revision)
+    if len(endpoints) not in {1, 3}:
+        raise ValueError("Invalid commit revision")
+    for endpoint in endpoints[::2]:
+        if not re.fullmatch(_COMMIT_REF, endpoint) or ".." in endpoint:
+            raise ValueError("Invalid commit revision")
+    return "".join(part + "^{commit}" if i % 2 == 0 else part
+                   for i, part in enumerate(endpoints))
+
+
+def glob_matches(relative: str, pattern: str) -> bool:
+    """Match path segments; only ** can consume zero or more directories."""
+    parts = relative.split("/")
+    reachable = {0}
+    for segment in Path(pattern).parts:
+        if segment == "**":
+            reachable = set(range(min(reachable), len(parts) + 1)) if reachable else set()
+        else:
+            reachable = {i + 1 for i in reachable if i < len(parts)
+                         and fnmatch.fnmatchcase(parts[i], segment)}
+    return len(parts) in reachable
+
+
 class Inspection:
     def __init__(self, root: Path, protected: tuple[Path, ...] | None = None):
         self.root = root.resolve(strict=True)
@@ -49,8 +81,14 @@ class Inspection:
                 "truncated": len(data) > LIMIT}
 
     def files(self, path: str):
+        target = self.path(path)
+        if stat.S_ISREG(target.stat().st_mode):
+            yield target.relative_to(self.root).as_posix()
+            return
+        if not target.is_dir():
+            raise ValueError("Only regular files and directories can be searched")
         # Never descend through links, junctions, protected paths, or git metadata.
-        for directory, dirs, files in os.walk(self.path(path), followlinks=False):
+        for directory, dirs, files in os.walk(target, followlinks=False):
             safe = []
             for name in dirs:
                 candidate = Path(directory) / name
@@ -75,8 +113,7 @@ class Inspection:
     def git(self, operation: str = "show", revision: str = "HEAD", paths: list | None = None):
         if operation not in {"show", "log", "diff"}:
             raise ValueError("Only show, log and diff are allowed")
-        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./~^@{}-]{0,199}", revision):
-            raise ValueError("Invalid revision")
+        revision = commit_revision(revision)
         paths = paths or []
         for path in paths:
             self.path(path)
@@ -102,7 +139,12 @@ class Inspection:
         for path in paths:
             if not self.path(path).is_file():
                 raise ValueError("Git paths must identify current regular files")
-        args += [revision, "--", *paths]
+        args.append(revision)
+        if operation == "diff" and ".." not in revision:
+            # Review inspects a pinned checkout, never uncommitted worktree
+            # conversions: clean/process filters can execute checkout code.
+            args.append("HEAD^{commit}")
+        args += ["--", *paths]
         with subprocess.Popen(args, cwd=self.root, env=env, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL) as process:
             timer = threading.Timer(10, process.kill)
@@ -147,9 +189,13 @@ class Inspection:
         if name == "glob" and (Path(pattern).is_absolute() or ".." in Path(pattern).parts):
             raise ValueError("Invalid glob")
         truncated = False
+        base = self.path(path)
+        if not base.is_dir():
+            base = base.parent
         for relative in self.files(path):
             if name == "glob":
-                matches = [relative] if fnmatch.fnmatchcase(relative, pattern) else []
+                local = (self.root / relative).relative_to(base).as_posix()
+                matches = [relative] if glob_matches(local, pattern) else []
             else:
                 result = self.read(relative)
                 truncated |= result["truncated"]
@@ -165,7 +211,8 @@ class Inspection:
 
 def tool_schema(name: str, properties: dict, required: list[str] | None = None) -> dict:
     return {"name": name, "description": "Read-only checkout inspection. grep uses literal text. "
-            "git_show requires explicit current file paths and a revision, never command options.",
+            "git_show requires explicit current file paths and commit revisions, never command options. "
+            "It inspects committed history only; a single-revision diff compares with HEAD.",
             "inputSchema": {"type": "object", "properties": properties,
                             "required": required or [], "additionalProperties": False}}
 

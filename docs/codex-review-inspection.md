@@ -9,16 +9,22 @@ review retains its previous tool-free boundary.
 The MCP server supports `read_file`, `list_dir`, `glob`, literal-text `grep`, and
 `git_show`. Paths are relative to the launch root. Absolute paths, parent
 traversals, resolved escapes, and operator/provider credential paths are refused.
-Directory traversal skips Git metadata and linked directories. Reads consume at
-most 64 KiB of file data; listing/search responses contain at most 2,000 entries
+Search accepts a file or a directory; glob patterns are relative to the search
+directory and match path segments (`**` includes zero directories). Results are
+relative to the checkout root. Directory traversal skips Git metadata and linked
+directories. Reads consume at most 64 KiB of file data; listing/search responses contain at most 2,000 entries
 and 64 KiB of entry data. A `truncated` flag reports omitted content, including
 files whose unread tail could contain grep matches.
 
 `git_show` accepts `operation` (`show`, `log`, or `diff`), `revision` (default
 `HEAD`), and explicit `paths` identifying current regular files. It deliberately
 refuses arbitrary Git options, pathspec magic, directories, and unrestricted
-history queries. Git output is limited to 64 KiB, execution to ten seconds, and
-logs to fifty commits. External diffs, textconv, signature verification,
+history queries. Revisions and both endpoints of ranges must resolve to commits;
+blob/tree objects and tags pointing to them are rejected. A single-revision diff
+compares that commit with HEAD; a range compares its committed endpoints.
+Uncommitted worktree contents are never converted by Git, so repository clean
+and process filters cannot execute. Git output is limited to 64 KiB, execution
+to ten seconds, and logs to fifty commits. External diffs, textconv, signature verification,
 filesystem monitors, hooks, submodule recursion, lazy fetching, and transport
 protocols are disabled. The child receives no inherited Git configuration
 environment; system and global configuration are disabled. The checkout remains
