@@ -22,7 +22,6 @@ def missing_spec_guidance(repo_root: Path, spec_id: str, *, base_ref: str | None
     except ValueError:
         return None
     ref = base_ref or config.base_ref
-    ref = ref.removeprefix("refs/remotes/")
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never",
            "GIT_SSH_COMMAND": "ssh -oBatchMode=yes", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}
 
@@ -32,13 +31,32 @@ def missing_spec_guidance(repo_root: Path, spec_id: str, *, base_ref: str | None
             encoding="utf-8", errors="replace", timeout=FETCH_TIMEOUT,
         )
 
+    stale = False
+    stale_note = "Fetch failed or timed out; using the cached ref, so remote state may be stale."
+    stale_miss = f"spec not found: '{spec_id}'. {stale_note}"
     try:
+        # Git owns the mapping from a local branch to its upstream, including
+        # upstreams whose remote branch name differs or whose cache is absent.
+        local_ref = ref if ref.startswith("refs/heads/") else f"refs/heads/{ref}"
+        if ref == "HEAD":
+            local_ref = git("symbolic-ref", "--quiet", "HEAD").stdout.strip()
+        local_branch = None
+        if local_ref:
+            tracking = git("for-each-ref", "--format=%(refname)\t%(upstream)", "--", local_ref)
+            for line in tracking.stdout.splitlines():
+                name, _, upstream = line.partition("\t")
+                if name == local_ref:
+                    if not upstream.startswith("refs/remotes/"):
+                        return None
+                    local_branch = local_ref.removeprefix("refs/heads/")
+                    ref = upstream
+                    break
+        ref = ref.removeprefix("refs/remotes/")
         remotes = git("remote")
         remote = next((name for name in remotes.stdout.splitlines() if ref.startswith(name + "/")), None)
         if remote is None:
             return None
         branch = ref[len(remote) + 1:]
-        stale = False
         try:
             fetched = git("fetch", "--no-tags", "--no-recurse-submodules", remote,
                           f"+refs/heads/{branch}:refs/remotes/{ref}")
@@ -46,10 +64,11 @@ def missing_spec_guidance(repo_root: Path, spec_id: str, *, base_ref: str | None
         except (OSError, subprocess.SubprocessError):
             stale = True
         if git("cat-file", "-t", f"refs/remotes/{ref}:{relative}").stdout.strip() != "blob":
-            return None
+            return stale_miss if stale else None
         count = git("rev-list", "--count", f"HEAD..refs/remotes/{ref}")
         behind = count.stdout.strip() if count.returncode == 0 else "an unknown number of"
         current = git("symbolic-ref", "--quiet", "--short", "HEAD").stdout.strip()
+        branch = local_branch or branch
         hint = "Run git pull --ff-only." if current == branch else (
             f"Switch to {branch} (git switch {branch}), then run git pull --ff-only."
         )
@@ -58,7 +77,7 @@ def missing_spec_guidance(repo_root: Path, spec_id: str, *, base_ref: str | None
             f"This checkout is behind {ref} by {behind} commits. {hint}"
         )
         if stale:
-            message += " Fetch failed or timed out; using the cached ref, so remote state may be stale."
+            message += f" {stale_note}"
         return message
     except (OSError, subprocess.SubprocessError):
-        return None
+        return stale_miss if stale else None
