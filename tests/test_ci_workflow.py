@@ -87,6 +87,28 @@ def test_version_workflow_uses_rest_for_release_pr_lifecycle():
     assert "gh pr merge" not in script
 
 
+def test_version_workflow_enqueues_release_pr_when_main_requires_a_merge_queue():
+    workflow = _load_workflow("version.yml")
+    script = str(
+        next(
+            step["run"]
+            for step in workflow["jobs"]["bump-pr"]["steps"]
+            if step.get("name") == "Create or update release PR"
+        )
+    )
+
+    # Queue admission is GraphQL-only, so it is the release path's single
+    # GraphQL call, and only GitHub's merge-queue refusal of the REST merge
+    # triggers it; rule listings can include rules that aren't enforced.
+    assert "rules/branches" not in script
+    assert 'grep -qi "merge queue"' in script
+    assert script.count("gh api graphql") == 1
+    assert "enablePullRequestAutoMerge" in script
+    assert "expectedHeadOid: $sha" in script
+    assert 'if [ -z "$enqueued" ]; then' in script
+    assert "the merge queue (attempt $attempt/270)" in script
+
+
 def test_version_workflow_reconciles_release_creation_before_retry():
     workflow = _load_workflow("version.yml")
     jobs = workflow["jobs"]
