@@ -30242,6 +30242,12 @@ def _validate_new_spec_run(repo_root: Path, spec_id: str, base_ref: str) -> None
     from .spec_lint import format_lint, lint_specs
 
     results = lint_specs(repo_root, spec_id)
+    if any("spec not found" in result.errors for result in results):
+        from .spec_lookup import missing_spec_guidance
+
+        guidance = missing_spec_guidance(repo_root, spec_id, base_ref=base_ref)
+        if guidance:
+            results[0].errors = [guidance]
     print(format_lint(results))
     if any(result.errors for result in results):
         raise RuntimeError("Spec lint failed")
@@ -30907,7 +30913,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     git_state = collect_git_spec_state(repo_root)
 
     if not spec_path.exists():
-        print(f"Error: Spec not found: {spec_path}", file=sys.stderr)
+        from .spec_lookup import missing_spec_guidance
+
+        guidance = missing_spec_guidance(repo_root, spec_id)
+        print(f"Error: {guidance or f'Spec not found: {spec_path}'}", file=sys.stderr)
         return 1
 
     # Show spec frontmatter
