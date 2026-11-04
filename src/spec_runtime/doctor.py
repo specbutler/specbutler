@@ -292,7 +292,7 @@ def run_doctor_checks(
     checks.extend(_git_checks(repo_root, config, run))
     checks.extend(_agent_checks(repo_root, config, resolve_executable, run))
     checks.extend(_agent_git_probe_checks(config, agent_git_probe))
-    checks.extend(_github_checks(repo_root, run, resolve_executable))
+    checks.extend(_github_checks(repo_root, run, resolve_executable, config))
     checks.extend(_command_checks(repo_root, config, run, resolve_executable))
     path_checks, runtime_paths = _runtime_path_checks(repo_root, config, run)
     checks.extend(path_checks)
@@ -961,6 +961,7 @@ def _github_checks(
     repo_root: Path,
     run: CommandRunner,
     which: ExecutableResolver,
+    config: SpecRuntimeConfig | None = None,
 ) -> list[DoctorCheck]:
     gh_path = which("gh")
     if not gh_path:
@@ -993,6 +994,16 @@ def _github_checks(
         slug = repository.stdout.strip()
         if repository.returncode == 0 and re.fullmatch(r"[^/\s]+/[^/\s]+", slug):
             checks.append(_ok("GitHub repository", f"resolved as {slug}"))
+            if config is not None:
+                from .forge import GitHubForge
+
+                def forge_run(cmd, cwd=None, **kwargs):
+                    # Keep doctor queries on its injectable, read-only runner.
+                    cmd = [gh_path, *cmd[1:]]
+                    return run(cmd, cwd or repo_root, 15.0)
+
+                forge = GitHubForge(run_fn=forge_run, repo_slug=slug)
+                checks.extend(_merge_queue_checks(repo_root, config, forge))
         else:
             checks.append(
                 _warning(
@@ -1017,6 +1028,75 @@ def _github_checks(
                 "In CI, provide a valid `GH_TOKEN` with repository access.",
             )
         )
+    return checks
+
+
+def _merge_queue_checks(repo_root: Path, config: SpecRuntimeConfig, forge) -> list[DoctorCheck]:
+    """Queue diagnostics are advisory, including inaccessible protection metadata."""
+    from .autopilot import compute_autopilot_concurrency
+
+    try:
+        policy = forge.branch_merge_policy(config.pr_base_branch, cwd=repo_root)
+    except RuntimeError as exc:
+        return [_warning("merge queue", str(exc), "Check repository ruleset and branch protection read permissions.")]
+    queued = policy["queued"]
+    checks = [_ok("merge queue", f"{config.pr_base_branch}: {'enabled' if queued else 'not enabled'}")]
+    if config.merge.queue != "auto":
+        checks.append(_warning("merge queue override", f"merge.queue={config.merge.queue}; forge reports queue={queued}"))
+    if not queued:
+        concurrency = compute_autopilot_concurrency(config, explicit=None).cap
+        if policy["strict"] and concurrency > 1:
+            checks.append(_warning(
+                "merge queue recommendation",
+                f"Up-to-date PRs are required and autopilot concurrency is {concurrency}.",
+                "Consider enabling a merge queue to avoid repeated base sync and CI.",
+            ))
+        return checks
+    gate = "review-decision-gate"
+    if gate not in policy["contexts"]:
+        checks.append(_warning("queue review gate", "review-decision-gate is not required on PR heads.",
+                               "Require independent review of the exact PR head before queue admission."))
+    else:
+        checks.append(_warning(
+            "queue review gate",
+            "review-decision-gate is required by base policy, which also applies inside the merge queue.",
+            "Keep review as an admission requirement; do not require review status on merge-group commits.",
+        ))
+    # Match required contexts to local Actions job/workflow names. Unknown/external
+    # providers are reported explicitly rather than silently considered queue-ready.
+    import yaml
+
+    workflows = []
+    for path in sorted((repo_root / ".github/workflows").glob("*")):
+        if path.suffix not in {".yml", ".yaml"}:
+            continue
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            events = data.get("on", data.get(True, {}))
+            names = {data.get("name", path.stem)}
+            for job_id, job in data.get("jobs", {}).items():
+                names.add(job.get("name", job_id))
+            workflows.append((path.name, names, "merge_group" in events if isinstance(events, (dict, list)) else events == "merge_group"))
+        except (OSError, yaml.YAMLError):
+            checks.append(_warning("queue workflows", f"Could not inspect {path.name}"))
+    for context in policy["contexts"]:
+        if context == gate:
+            continue
+        matches = [(name, ready) for name, names, ready in workflows if context in names]
+        if not matches:
+            checks.append(_warning("queue workflows", f"Required check {context}: no local workflow found.",
+                                   "Verify its CI provider handles merge_group commits."))
+        for name, ready in matches:
+            checks.append((_ok if ready else _warning)(
+                "queue workflows", f"{context} ({name}): merge_group {'enabled' if ready else 'missing'}",
+            ))
+    for workflow in policy["workflows"]:
+        path = workflow.get("path", "")
+        matches = [ready for name, _, ready in workflows if name == Path(path).name]
+        if not matches or not all(matches):
+            checks.append(_warning("queue workflows", f"Required workflow {path}: verify merge_group trigger in its source repository."))
     return checks
 
 

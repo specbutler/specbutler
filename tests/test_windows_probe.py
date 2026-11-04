@@ -137,6 +137,12 @@ elif args[:2] == ["pr", "list"]:
     print("[]")
 elif args[:2] == ["repo", "view"]:
     print("example/windows-ci-fixture")
+elif args[:2] == ["api", "graphql"]:
+    print(json.dumps({"data": {"repository": {"mergeQueue": None}}}))
+elif len(args) > 1 and args[0] == "api" and "rules/branches/" in args[1]:
+    print("[[]]")
+elif len(args) > 1 and args[0] == "api" and args[1].endswith("/protection"):
+    print("{}")
 elif args and args[0] == "api":
     print("[]")
 raise SystemExit(0)

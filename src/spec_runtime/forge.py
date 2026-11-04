@@ -20,6 +20,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from urllib.parse import quote
 
 from .config import load_spec_runtime_config
 from .git_common import subprocess_text_kwargs
@@ -79,6 +80,22 @@ class ForgeAdapter(Protocol):
     Any forge backend (GitHub, GitLab, Bitbucket, etc.) must implement
     this protocol to integrate with the spec workflow.
     """
+
+    def merge_queue_required(self, base_branch: str, *, cwd: Path) -> bool:
+        """Whether the base requires queue admission (raise when unknown)."""
+        ...
+
+    def merge_queue_status(self, pr_number: int, *, cwd: Path) -> dict:
+        """Return state, headRefOid, mergeQueueEntry and latest removal event."""
+        ...
+
+    def cancel_merge_queue(self, pr_number: int, *, cwd: Path) -> str:
+        """Disarm auto-merge and dequeue, returning an error or empty string."""
+        ...
+
+    def merge_group_failure_excerpt(self, commit_sha: str, *, cwd: Path) -> str:
+        """Read failed workflow logs for the exact merge-group commit."""
+        ...
 
     def get_auth_token(self) -> str:
         """Return an authentication token for API calls."""
@@ -249,6 +266,124 @@ class GitHubForge:
     ) -> None:
         self._run = run_fn or _default_run_fn
         self._repo_slug = repo_slug.strip()
+
+    def _graphql_repository(self, fields: str, *, cwd: Path) -> dict:
+        # gh substitutes owner/name from the pinned GH_REPO.
+        query = 'query($owner:String!,$name:String!){repository(owner:$owner,name:$name){' + fields + '}}'
+        result = self._gh(
+            ["api", "graphql", "-f", "query=" + query, "-F", "owner={owner}", "-F", "name={repo}"],
+            cwd=cwd,
+        )
+        try:
+            payload = json.loads(result.stdout)
+            if not isinstance(payload, dict):
+                raise ValueError("invalid GraphQL response")
+            if result.returncode or payload.get("errors"):
+                raise ValueError(result.stderr or str(payload.get("errors")))
+            repository = payload["data"]["repository"]
+            if not isinstance(repository, dict):
+                raise ValueError("missing repository")
+            return repository
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(f"Could not query merge queue: {exc}") from exc
+
+    def merge_queue_required(self, base_branch: str, *, cwd: Path) -> bool:
+        # Repository.mergeQueue includes classic branch protection as well as rulesets.
+        repository = self._graphql_repository(
+            "mergeQueue(branch:" + json.dumps(base_branch) + "){id}", cwd=cwd,
+        )
+        if "mergeQueue" not in repository:
+            raise RuntimeError("Could not determine whether the base requires a merge queue")
+        return repository["mergeQueue"] is not None
+
+    def branch_merge_policy(self, base_branch: str, *, cwd: Path) -> dict:
+        queued = self.merge_queue_required(base_branch, cwd=cwd)
+        endpoint = "repos/{owner}/{repo}/"
+        rules_result = self._gh(
+            ["api", endpoint + "rules/branches/" + quote(base_branch, safe=""), "--paginate", "--slurp"],
+            cwd=cwd,
+        )
+        protection_result = self._gh(
+            ["api", endpoint + "branches/" + quote(base_branch, safe="") + "/protection"],
+            cwd=cwd,
+        )
+        try:
+            if rules_result.returncode:
+                raise ValueError(rules_result.stderr)
+            pages = json.loads(rules_result.stdout)
+            rules = [rule for page in pages for rule in page]
+            protection = json.loads(protection_result.stdout) if not protection_result.returncode else {}
+            if protection_result.returncode and "404" not in protection_result.stderr:
+                raise ValueError(protection_result.stderr)
+            required = protection.get("required_status_checks") or {}
+            contexts = set(required.get("contexts", []))
+            contexts.update(check["context"] for check in required.get("checks", []))
+            strict = bool(required.get("strict"))
+            workflows = []
+            for rule in rules:
+                parameters = rule.get("parameters", {})
+                if rule["type"] == "required_status_checks":
+                    contexts.update(check["context"] for check in parameters.get("required_status_checks", []))
+                    strict |= bool(parameters.get("strict_required_status_checks_policy"))
+                if rule["type"] == "workflows":
+                    workflows.extend(parameters.get("workflows", []))
+            return dict(queued=queued, strict=strict, contexts=sorted(contexts), workflows=workflows)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(f"Could not inspect branch merge policy: {exc}") from exc
+
+    def merge_queue_status(self, pr_number: int, *, cwd: Path) -> dict:
+        repository = self._graphql_repository(
+            f"pullRequest(number:{int(pr_number)})" + """{
+              id state headRefOid autoMergeRequest{enabledAt}
+              mergeQueueEntry{id headCommit{oid}}
+              timelineItems(last:1,itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){
+                nodes{... on RemovedFromMergeQueueEvent{id reason beforeCommit{oid}}}
+              }
+            }""", cwd=cwd,
+        )
+        pr = repository.get("pullRequest")
+        if not isinstance(pr, dict) or "mergeQueueEntry" not in pr:
+            raise RuntimeError("Could not read PR merge queue state")
+        return pr
+
+    def cancel_merge_queue(self, pr_number: int, *, cwd: Path) -> str:
+        try:
+            status = self.merge_queue_status(pr_number, cwd=cwd)
+            if status.get("state") == "MERGED":
+                return ""
+            if status.get("mergeQueueEntry"):
+                query = "mutation{dequeuePullRequest(input:{pullRequestId:" + json.dumps(status["id"]) + "}){clientMutationId}}"
+                result = self._gh(["api", "graphql", "-f", "query=" + query], cwd=cwd)
+                payload = json.loads(result.stdout or "{}")
+                if result.returncode or payload.get("errors"):
+                    return result.stderr or str(payload.get("errors"))
+            if status.get("autoMergeRequest"):
+                result = self._gh(["pr", "merge", str(pr_number), "--disable-auto"], cwd=cwd)
+                if result.returncode:
+                    return result.stderr or result.stdout
+            return ""
+        except (RuntimeError, ValueError, KeyError, TypeError) as exc:
+            return str(exc)
+
+    def merge_group_failure_excerpt(self, commit_sha: str, *, cwd: Path) -> str:
+        if not commit_sha:
+            return "Merge-group commit was unavailable; no PR-head logs substituted."
+        result = self._gh(
+            ["run", "list", "--event", "merge_group", "--commit", commit_sha,
+             "--json", "databaseId,conclusion,url", "--limit", "100"], cwd=cwd,
+        )
+        try:
+            if result.returncode:
+                raise ValueError(result.stderr)
+            runs = json.loads(result.stdout)
+            excerpts = []
+            for run in runs:
+                if run.get("conclusion") in {"failure", "timed_out", "cancelled", "action_required"}:
+                    logs = self._gh(["run", "view", str(run["databaseId"]), "--log-failed"], cwd=cwd)
+                    excerpts.append(str(run.get("url", "")) + "\n" + (logs.stdout or logs.stderr)[-12000:])
+            return "\n".join(excerpts) or f"No failed merge-group workflow logs found for {commit_sha}."
+        except (ValueError, TypeError, KeyError) as exc:
+            return f"Could not read merge-group logs for {commit_sha}: {exc}"
 
     def get_auth_token(self) -> str:
         # Prefer explicit env vars over gh CLI to avoid unnecessary subprocess calls.
@@ -566,6 +701,11 @@ class GitHubForge:
                 str(payload.get("state", "")).upper() == "MERGED"
                 or payload.get("autoMergeRequest") is not None
             )
+            if not merge_confirmed and isinstance(payload, dict) and cwd is not None:
+                try:
+                    merge_confirmed = bool(self.merge_queue_status(pr_number, cwd=cwd).get("mergeQueueEntry"))
+                except RuntimeError:
+                    pass
             if merge_confirmed:
                 return True, ""
             return False, "the PR is still open and has no auto-merge request"

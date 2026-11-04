@@ -86,6 +86,11 @@ class UpdateConfig:
 
 
 @dataclass(frozen=True)
+class MergeConfig:
+    queue: str = "auto"
+
+
+@dataclass(frozen=True)
 class ReadinessConfig:
     require_forge_checks: bool = True
 
@@ -359,6 +364,7 @@ class SpecRuntimeConfig:
     bootstrap_cache: BootstrapCacheConfig = BootstrapCacheConfig()
     implement: ImplementConfig = ImplementConfig()
     update: UpdateConfig = UpdateConfig()
+    merge: MergeConfig = MergeConfig()
     readiness: ReadinessConfig = ReadinessConfig()
     review: ReviewConfig = ReviewConfig()
     autopilot: AutopilotConfig = AutopilotConfig()
@@ -1032,7 +1038,11 @@ def load_spec_runtime_config(
     max_cost = budget_payload.get("max_cost_usd_per_run")
     if max_cost is not None and (number(max_cost) is None or max_cost <= 0):
         raise SpecConfigError("budget.max_cost_usd_per_run must be a positive finite number")
+    merge_payload = raw.get("merge", {})
+    if not isinstance(merge_payload, dict) or merge_payload.get("queue", "auto") not in ("auto", "on", "off"):
+        raise SpecConfigError("merge.queue must be auto, on or off")
     return SpecRuntimeConfig(
+        merge=MergeConfig(queue=merge_payload.get("queue", "auto")),
         budget=BudgetConfig(max_cost_usd_per_run=max_cost),
         specs=SpecsConfig(require_merged_spec=specs_payload.get("require_merged_spec", True)),
         paths=paths,

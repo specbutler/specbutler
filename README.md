@@ -305,6 +305,28 @@ spec-backfill-merge-tags backfill      # create missing tags
 spec-backfill-merge-tags repair        # fix broken tags
 ```
 
+## Merge queues
+
+The merge phase detects whether the base branch uses a GitHub merge queue and
+caches that decision for the run. Queued PRs wait for the forge to merge them;
+they do not sync the base merely because GitHub reports them as behind.
+Conflicts and failing merge-group checks use the existing implementation and
+review retry paths. Timeouts and other removals allow at most three queue
+attempts per run.
+
+Run `spec doctor` to inspect queue policy and required workflow triggers.
+Independent review must cover the exact PR head before admission. The doctor
+warns if the review gate is missing on PRs or required inside the queue; it does
+not change repository rules. GitHub currently couples base-required status checks
+to merge-group checks, so inspect this warning before enabling a queue.
+
+For testing, an optional override in `.spec.toml` selects the merge path:
+
+```toml
+[merge]
+queue = "auto" # default; "on" forces queue handling, "off" forces direct handling
+```
+
 ## Configuration
 
 `spec init` creates `.spec.toml` automatically. Edit it to customize.
