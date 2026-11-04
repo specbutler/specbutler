@@ -189,6 +189,7 @@ def _assert_port_closed(port: int) -> None:
     raise AssertionError(f"web service still accepts connections on port {port}")
 
 
+@pytest.mark.requires_network
 def test_linux_foreground_bind_auth_status_and_legacy_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -244,6 +245,8 @@ def test_linux_foreground_bind_auth_status_and_legacy_stop(
                 managed.terminate(grace_seconds=0.1)
 
 
+@pytest.mark.requires_network
+@pytest.mark.requires_browser
 def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -401,6 +404,7 @@ def test_linux_chrome_bootstrap_keeps_credentials_out_of_url_history(
                 managed.terminate(grace_seconds=0.1)
 
 
+@pytest.mark.requires_network
 def test_linux_raw_foreground_launch_claims_group_and_stops_out_of_process(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -463,6 +467,7 @@ def test_linux_raw_foreground_launch_claims_group_and_stops_out_of_process(
             process.wait(timeout=5)
 
 
+@pytest.mark.requires_network
 def test_linux_background_durable_start_auth_status_stop_and_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

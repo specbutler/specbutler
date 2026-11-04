@@ -83,6 +83,10 @@ markers = [
   "linux_claude_real_provider: opt-in Linux web chat proof using an authenticated real Claude provider",
   "linux_codex_real_provider: opt-in Linux web chat proof using an authenticated real Codex provider",
   "windows_real_provider: opt-in Windows 11 lab proof using real Codex and a disposable GitHub repository",
+  "requires_nested_sandbox: needs a usable nested Codex sandbox",
+  "requires_browser: needs a usable headless Chrome/Chromium",
+  "requires_network: needs local socket networking",
+  "requires_provider_home: needs access to real provider authentication",
   "requires_ps: needs a working ps; skipped with the probe error when ps cannot run (for example in a sandbox)",
 ]
 
