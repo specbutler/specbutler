@@ -24947,7 +24947,7 @@ def _codex_review_sandbox_prompt_note(
     base_sha: str,
     head_sha: str,
 ) -> str:
-    """Inline host-materialized evidence, plus the checkout layout when a shell is allowed."""
+    """Inline host-materialized evidence and the checkout inspection boundary."""
     diff_text = _local_review_diff_text(
         review_worktree,
         base_sha=base_sha,
@@ -24964,9 +24964,10 @@ def _codex_review_sandbox_prompt_note(
         )
     else:
         boundary = (
-            "\n\nCodex review boundary: you have no shell or file tools in this "
-            "review. Review from the host-materialized diff below, the canonical spec "
-            "and the gate results in this prompt; do not ask to run commands. "
+            "\n\nCodex review boundary: inspect the pinned checkout through the "
+            "read-only MCP tools read_file, list_dir, glob, grep and git_show. "
+            "Paths are relative to the checkout; git_show requires explicit file paths. "
+            "Shell execution is unavailable. Do not rerun tests or execute PR code. "
         )
     return (
         boundary
