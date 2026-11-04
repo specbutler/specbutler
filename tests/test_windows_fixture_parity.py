@@ -17,6 +17,7 @@ import ast
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -40,6 +41,12 @@ def test_posix_runs_default_text_encoding_like_windows(tmp_path: Path) -> None:
     assert path.read_text(encoding="utf-8") == "snow 雪\n"
     with pytest.raises(UnicodeEncodeError):
         path.write_text("snow 雪\n")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission modes")
+def test_emulated_tmp_path_preserves_pytest_private_directory(tmp_path: Path) -> None:
+    assert "\\" in str(tmp_path)
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
 
 
 def _is_windows_only_condition(node: ast.expr) -> bool:

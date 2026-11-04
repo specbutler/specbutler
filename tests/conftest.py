@@ -239,5 +239,6 @@ def tmp_path(tmp_path: Path) -> Path:
     if os.name == "nt":
         return tmp_path
     path = tmp_path / "back\\slash"
-    path.mkdir()
+    # Preserve pytest temporary-directory privacy under permissive umasks.
+    path.mkdir(mode=0o700)
     return path
