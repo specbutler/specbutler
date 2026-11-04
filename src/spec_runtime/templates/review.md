@@ -14,6 +14,8 @@ orchestrator adds to this prompt is authoritative. In every environment:
   head.
 - A read-only checkout pinned to the reviewed head may be available for
   context. Use only the inspection tools allowed by the environment appendix.
+  Codex can inspect it with read_file, list_dir, glob, grep and git_show
+  read-only MCP tools; Claude can use Read, Glob and Grep.
   Local adapters and CI may expose different capabilities.
 - Do not execute pull-request code: no tests, builds, installs, or scripts
   from the checkout. Rely on the orchestrator's gate results instead; the

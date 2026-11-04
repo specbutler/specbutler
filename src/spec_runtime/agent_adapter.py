@@ -631,8 +631,8 @@ _CODEX_REVIEW_PERMISSION_PROFILE = "specbutler-review"
 # codex-cli 0.164 has no approval policy that limits the shell to inspection
 # commands (``untrusted`` was removed), and the review contract forbids
 # executing pull-request code. Until Codex offers such an allowlist, a review
-# keeps the no-tool boundary even when a pinned checkout exists; the
-# orchestrator inlines the full diff and the canonical spec instead.
+# keeps shell execution disabled. A pinned checkout is exposed only through
+# the bounded, read-only review inspection MCP server.
 CODEX_REVIEW_CHECKOUT_SHELL = False
 
 CODEX_REVIEW_COMMAND_POLICY_OVERRIDES = (
@@ -1400,7 +1400,8 @@ class CodexAgent:
         provider_home: Path | None = None,
         reasoning_effort: str = "",
     ) -> list[str]:
-        del prompt, mcp_config_path  # Prompt arrives on stdin; review is MCP-free.
+        del prompt, mcp_config_path  # Prompt arrives on stdin.
+        inspection_checkout = review_checkout
         if not CODEX_REVIEW_CHECKOUT_SHELL:
             review_checkout = None
         cmd = [
@@ -1454,6 +1455,19 @@ class CodexAgent:
                 scratch_dir=writable_temp_dir,
                 provider_home=provider_home,
             )
+        if inspection_checkout is not None:
+            cmd += _codex_mcp_server_overrides({
+                "review_inspection": {
+                    "command": sys.executable,
+                    "args": ["-I", "-c",
+                             "import sys; sys.path.insert(0, "
+                             + repr(str(Path(__file__).resolve().parent.parent))
+                             + "); from spec_runtime.review_inspection import main; main()",
+                             str(inspection_checkout.resolve()),
+                             *(str(p) for p in protected_operator_paths()),
+                             *([str(provider_home.resolve())] if provider_home else [])],
+                },
+            })
         if reasoning_effort:
             cmd += ["-c", f"model_reasoning_effort={_toml_quote(reasoning_effort)}"]
         cmd += _codex_linux_sandbox_overrides()
