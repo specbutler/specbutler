@@ -18,7 +18,7 @@ from spec_runtime.review_inspection import LIMIT, TOOLS, Inspection
 def checkout(tmp_path):
     root = tmp_path / "checkout"
     root.mkdir()
-    (root / "hello.txt").write_text("hello review\n", encoding="utf-8")
+    (root / "hello.txt").write_bytes(b"hello review\n")
     for args in (["init"], ["add", "."],
                  ["-c", "user.name=Test", "-c", "user.email=test@example.org",
                   "commit", "-m", "fixture"]):
@@ -37,6 +37,16 @@ def test_each_tool(checkout):
         assert not result["truncated"]
         if operation != "diff":
             assert "fixture" in result["text"]
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_file_newlines(tmp_path, newline):
+    text = "hello review" + newline
+    (tmp_path / "hello.txt").write_bytes(text.encode("utf-8"))
+    server = Inspection(tmp_path, ())
+    assert server.call("read_file", {"path": "hello.txt"})["text"] == text
+    assert server.call("grep", {"path": "hello.txt", "pattern": "review"})["entries"] == [
+        "hello.txt:1:hello review"]
 
 
 def test_escapes_and_protected(checkout, tmp_path):
