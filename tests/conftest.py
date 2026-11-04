@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import errno
 import io
 import itertools
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -110,24 +114,56 @@ def probe_nested_sandbox() -> str | None:
     return None
 
 
+@contextmanager
+def _browser_probe_home():
+    home = tempfile.TemporaryDirectory()
+    try:
+        yield home.name
+    finally:
+        # Chrome children can still be exiting after the launcher is reaped.
+        # Retry only their transient profile writes, not unrelated I/O errors.
+        for attempt in range(10):
+            try:
+                home.cleanup()
+                break
+            except OSError as exc:
+                if exc.errno != errno.ENOTEMPTY or attempt == 9:
+                    raise
+                time.sleep(0.05)
+
+
 def probe_browser() -> str | None:
     browser = shutil.which("google-chrome") or shutil.which("chromium")
     if browser is None:
         return "Chrome/Chromium is not installed"
-    with tempfile.TemporaryDirectory() as home:
+    with _browser_probe_home() as home:
         try:
-            result = subprocess.run(
+            with subprocess.Popen(
                 [browser, "--headless=new", "--no-sandbox", "--disable-gpu",
                  "--disable-dev-shm-usage", "--disable-background-networking",
                  f"--user-data-dir={home}/profile", "--dump-dom", "about:blank"],
                 env={**os.environ, "HOME": home, "XDG_CONFIG_HOME": home,
                      "XDG_CACHE_HOME": home},
-                capture_output=True, text=True, timeout=15, check=False,
-            )
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=os.name == "posix",
+            ) as process:
+                try:
+                    stdout, stderr = process.communicate(timeout=15)
+                finally:
+                    # Even a successful launcher may leave profile-writing
+                    # children behind. Own and stop the whole POSIX group.
+                    if os.name == "posix":
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    else:
+                        process.kill()
+                    process.communicate()
         except (OSError, subprocess.TimeoutExpired) as exc:
             return str(exc)
-    if result.returncode or "<html" not in result.stdout.lower():
-        return f"headless browser probe failed (exit {result.returncode}): {result.stderr.strip()[-300:]}"
+    if process.returncode or "<html" not in stdout.lower():
+        return f"headless browser probe failed (exit {process.returncode}): {stderr.strip()[-300:]}"
     return None
 
 

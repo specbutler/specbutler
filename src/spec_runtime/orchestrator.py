@@ -10245,6 +10245,9 @@ class BlockDiagnosis:
     first_failed_test_nodeid: str = ""
     attempt_number: int | None = None
     debugged_at: str = field(default_factory=_now_iso)
+    head_sha: str = ""
+    resolved_at: str = ""
+    resolution_evidence: list[str] = field(default_factory=list)
 
     def save(self, repo_root: Path, run_id: str) -> Path:
         d = _state_root(repo_root) / "runs" / run_id
@@ -10318,6 +10321,9 @@ def _coerce_block_diagnosis(payload: object) -> BlockDiagnosis | None:
         debugger_agent=str(payload.get("debugger_agent", "")).strip(),
         first_failed_test_nodeid=str(payload.get("first_failed_test_nodeid", "")).strip(),
         attempt_number=_coerce_optional_int(payload.get("attempt_number")),
+        head_sha=str(payload.get("head_sha", "") or "").strip(),
+        resolved_at=str(payload.get("resolved_at", "") or "").strip(),
+        resolution_evidence=_coerce_block_diagnosis_evidence(payload.get("resolution_evidence", [])),
         debugged_at=str(payload.get("debugged_at", _now_iso())).strip() or _now_iso(),
     )
     required_fields = (
@@ -12133,6 +12139,32 @@ def _matching_pending_block_diagnosis(
     )
 
 
+def _resolve_verified_handoff_diagnosis(run: RunState, repo_root: Path) -> None:
+    diagnosis = BlockDiagnosis.load(repo_root, run.run_id)
+    if (
+        not _matching_pending_block_diagnosis(run, diagnosis)
+        or diagnosis.category != "environment_verification_handoff"
+        or diagnosis.needs_new_commit
+        or not run.verify_head_sha
+    ):
+        return
+    diagnosed_head = diagnosis.head_sha
+    if not diagnosed_head:
+        # Older diagnoses recorded the head only in the debugger context.
+        context = _read_optional_json_payload(_block_debugger_artifact_paths(repo_root, run.run_id)["context"])
+        if isinstance(context, dict) and context.get("blocker_signature") == diagnosis.blocker_signature:
+            diagnosed_head = str(context.get("current_head_sha", "") or "")
+    if diagnosed_head != run.verify_head_sha:
+        return
+    diagnosis.resolved_at = _now_iso()
+    diagnosis.resolution_evidence = [
+        f"Host verify passed on head {run.verify_head_sha}",
+        f"Resolved by verify for run {run.run_id} at {diagnosis.resolved_at}",
+    ]
+    diagnosis.save(repo_root, run.run_id)
+    run.pending_block_debugger_signature = ""
+
+
 def _claim_block_debugger_auto_resume(
     run: RunState,
     repo_root: Path,
@@ -12362,6 +12394,7 @@ def _maybe_run_block_debugger(
                     shutil.copyfile(command_output_path, artifact_paths["raw_output"])
             diagnosis.blocker_signature = blocker_signature
             diagnosis.source_phase = source_phase
+            diagnosis.head_sha = head_sha
             diagnosis.block_reason = run.last_error or ""
             diagnosis.debugger_agent = debugger_agent
             diagnosis.attempt_number = _current_attempt_number(run)
@@ -24914,7 +24947,7 @@ def _codex_review_sandbox_prompt_note(
     base_sha: str,
     head_sha: str,
 ) -> str:
-    """Inline host-materialized evidence, plus the checkout layout when a shell is allowed."""
+    """Inline host-materialized evidence and the checkout inspection boundary."""
     diff_text = _local_review_diff_text(
         review_worktree,
         base_sha=base_sha,
@@ -24931,9 +24964,10 @@ def _codex_review_sandbox_prompt_note(
         )
     else:
         boundary = (
-            "\n\nCodex review boundary: you have no shell or file tools in this "
-            "review. Review from the host-materialized diff below, the canonical spec "
-            "and the gate results in this prompt; do not ask to run commands. "
+            "\n\nCodex review boundary: inspect the pinned checkout through the "
+            "read-only MCP tools read_file, list_dir, glob, grep and git_show. "
+            "Paths are relative to the checkout; git_show requires explicit file paths. "
+            "Shell execution is unavailable. Do not rerun tests or execute PR code. "
         )
     return (
         boundary
@@ -27151,11 +27185,15 @@ def _evaluate_readiness_for_promotion(
             )
 
     if run.pending_block_debugger_signature:
+        diagnosis = BlockDiagnosis.load(repo_root, run.run_id)
+        detail = run.pending_block_debugger_signature
+        if diagnosis is not None and diagnosis.blocker_signature == detail:
+            detail += f"; category: {diagnosis.category}; next action: {diagnosis.next_best_action}"
         return ReadinessDecision(
             False,
             current_head_sha,
             "merge-blocked",
-            f"blocked-run diagnosis remains unresolved: {run.pending_block_debugger_signature}",
+            f"blocked-run diagnosis remains unresolved: {detail}",
         )
     if run.merge_conflict_error:
         return ReadinessDecision(False, current_head_sha, "merge-blocked", run.merge_conflict_error)
@@ -28306,6 +28344,7 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         run.verify_passed_once = True
         worktree_path = resolve_worktree_path(run, repo_root)
         run.verify_head_sha = (_head_sha(worktree_path) if worktree_path.is_dir() else None) or ""
+        _resolve_verified_handoff_diagnosis(run, repo_root)
     run.status = result_status
 
     # Classify the phase result and persist the classification onto the run
@@ -28319,7 +28358,8 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
                 "error": prior_error,
                 "resolved_at": _now_iso(),
             })
-            run.pending_block_debugger_signature = ""
+            if phase != "verify":
+                run.pending_block_debugger_signature = ""
             run.last_block_debugger_guided_retry_signature = ""
         # A successful phase clears any prior failure classification so the
         # retryable hint / circuit breaker resets on forward progress. The

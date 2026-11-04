@@ -372,3 +372,71 @@ def test_environment_auth_keys_cover_doctor_credential_hints() -> None:
         for provider, keys in _PROVIDER_AUTH_ENV_HINTS.items()
     }
     assert {provider: set(keys) for provider, keys in conftest._PROVIDER_AUTH_ENV_KEYS.items()} == expected
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "timeout"])
+@posix_only
+def test_browser_probe_stops_children_before_removing_profile(monkeypatch, outcome):
+    import signal
+    import subprocess
+    from contextlib import contextmanager
+    from unittest.mock import MagicMock
+
+    import conftest
+
+    events = []
+
+    @contextmanager
+    def home():
+        yield "/probe-home"
+        events.append("cleanup")
+
+    process = MagicMock(pid=12345, returncode=0 if outcome == "success" else 1)
+    process.__enter__.return_value = process
+
+    def communicate(timeout=None):
+        events.append("communicate")
+        if outcome == "timeout" and timeout is not None:
+            raise subprocess.TimeoutExpired("chrome", timeout)
+        return ("<html></html>" if outcome == "success" else "", "browser failed")
+
+    process.communicate.side_effect = communicate
+    launch = MagicMock(return_value=process)
+    monkeypatch.setattr(conftest.shutil, "which", lambda _: "/fake-chrome")
+    monkeypatch.setattr(conftest, "_browser_probe_home", home)
+    monkeypatch.setattr(conftest.subprocess, "Popen", launch)
+    monkeypatch.setattr(conftest.os, "killpg", lambda pid, sig: events.append((pid, sig)))
+
+    reason = conftest.probe_browser()
+
+    assert (reason is None) == (outcome == "success")
+    assert launch.call_args.kwargs["start_new_session"] is True
+    assert events == ["communicate", (12345, signal.SIGKILL), "communicate", "cleanup"]
+    assert launch.call_args.kwargs["env"]["HOME"] == "/probe-home"
+
+
+@pytest.mark.parametrize("retried", [True, False])
+def test_browser_probe_profile_cleanup_retries_only_directory_not_empty(monkeypatch, retried):
+    import errno
+    from unittest.mock import MagicMock
+
+    import conftest
+
+    error_number = errno.ENOTEMPTY if retried else errno.EACCES
+    home = MagicMock(name="temporary-home")
+    home.cleanup.side_effect = [OSError(error_number, "cleanup failed"), None]
+    monkeypatch.setattr(conftest.tempfile, "TemporaryDirectory", lambda: home)
+    sleep = MagicMock()
+    monkeypatch.setattr(conftest.time, "sleep", sleep)
+
+    if retried:
+        with conftest._browser_probe_home():
+            pass
+        assert home.cleanup.call_count == 2
+        sleep.assert_called_once_with(0.05)
+    else:
+        with pytest.raises(OSError) as exc, conftest._browser_probe_home():
+            pass
+        assert exc.value.errno == errno.EACCES
+        assert home.cleanup.call_count == 1
+        sleep.assert_not_called()
