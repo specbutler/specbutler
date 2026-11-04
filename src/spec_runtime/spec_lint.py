@@ -120,6 +120,12 @@ def format_lint(results: list[LintResult]) -> str:
 def cmd_lint(args, *, repo_root: Path) -> int:
     root = repo_root
     results = lint_specs(root, args.spec)
+    if args.spec and any("spec not found" in result.errors for result in results):
+        from .spec_lookup import missing_spec_guidance
+
+        guidance = missing_spec_guidance(root, args.spec)
+        if guidance:
+            results[0].errors = [guidance]
     suggestions = critique(root, args.spec) if args.critique else None
     if args.json:
         payload = [asdict(r) for r in results]
