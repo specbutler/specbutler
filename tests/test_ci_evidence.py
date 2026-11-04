@@ -514,3 +514,14 @@ def test_ci_workflow_aggregates_and_requires_hosted_evidence() -> None:
     condition = str(evidence_job["if"])
     assert "needs.package.result == 'success'" in condition
     assert "needs.security.result == 'success'" in condition
+
+
+def test_ci_evidence_accepts_merge_group_context() -> None:
+    from tools.ci_evidence import _github_context
+
+    revision = "a" * 40
+    env = _github_env(revision, job="ci-evidence", runner_os="Linux")
+    env["GITHUB_EVENT_NAME"] = "merge_group"
+    context = _github_context(env)
+    assert context["event_name"] == "merge_group"
+    assert context["github_sha"] == revision

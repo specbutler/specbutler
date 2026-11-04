@@ -1,6 +1,8 @@
 name: spec-pr-policy
 
 on:
+  merge_group:
+    types: [checks_requested]
   pull_request:
     branches: [main]
     types: [opened, edited, synchronize, reopened, ready_for_review]
@@ -13,7 +15,11 @@ jobs:
     if: github.head_ref != 'release/version-bump' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Merge group policy
+        if: github.event_name == 'merge_group'
+        run: echo "PR policy was checked before queue admission."
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
@@ -21,12 +27,14 @@ jobs:
           persist-credentials: false
 
       - name: Fetch untrusted PR head as data
+        if: github.event_name == 'pull_request'
         env:
           HEAD_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: git -C trusted fetch --no-tags "$HEAD_REPO_URL" "$HEAD_SHA"
 
       - name: Validate spec PR policy
+        if: github.event_name == 'pull_request'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           GITHUB_HEAD_REF: ${{ github.head_ref }}

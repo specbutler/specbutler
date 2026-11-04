@@ -9292,6 +9292,8 @@ class RunState:
     steering_noop_attempts: int = 0
     implement_failures: int = 0
     verify_failures: int = 0
+    merge_queue_required: bool | None = None
+    merge_queue_retries: int = 0
     merge_conflicts: int = 0
     review_changes: int = 0
     no_progress_retries: int = 0
@@ -26448,6 +26450,121 @@ def phase_review(run: RunState, repo_root: Path) -> str:
     )
 
 
+def _run_uses_merge_queue(run: RunState, repo_root: Path) -> bool:
+    override = SPEC_RUNTIME_CONFIG.merge.queue
+    if override != "auto":
+        return override == "on"
+    if run.merge_queue_required is None:
+        run.merge_queue_required = _forge(_trusted_publication_repo_slug(run)).merge_queue_required(
+            PR_BASE_BRANCH, cwd=repo_root,
+        )
+    return run.merge_queue_required
+
+
+def _fail_queued_merge(run: RunState, repo_root: Path, pr_number: int, message: str) -> str:
+    error = _forge(_trusted_publication_repo_slug(run)).cancel_merge_queue(pr_number, cwd=repo_root)
+    run.last_error = (
+        f"Could not cancel merge queue request for PR #{pr_number}: {error}; original failure: {message}"
+        if error else message
+    )
+    return "failed"
+
+
+def _try_queued_merge(
+    run: RunState, repo_root: Path, pr_number: int, *, expected_head_sha: str,
+) -> str:
+    """Queue admission is head-pinned; BEHIND is owned entirely by the forge."""
+    forge = _forge(_trusted_publication_repo_slug(run))
+    reason = "retry limit reached"
+    for _attempt in range(max(0, 3 - run.merge_queue_retries)):
+        try:
+            before = forge.merge_queue_status(pr_number, cwd=repo_root)
+            old_events = before.get("timelineItems", {}).get("nodes", [])
+            old_event = old_events[-1].get("id") if old_events else None
+            if before.get("state") == "MERGED":
+                return "merged"
+            decision = _revalidate_readiness_pr_head(
+                run, repo_root, current_head_sha=expected_head_sha, context="before queue admission",
+            )
+            if decision is not None:
+                _record_readiness_decision(run, decision)
+                run.last_error = f"Merge refused for {_short_sha(decision.head_sha)}: {decision.blocker}"
+                return "failed"
+            _assert_publication_transition_safe(run, resolve_worktree_path(run, repo_root))
+            existing_entry = before.get("mergeQueueEntry") or {}
+            group_sha = (existing_entry.get("headCommit") or {}).get("oid", "")
+            queued_at = existing_entry.get("enqueuedAt") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            result = forge.merge_pr(
+                pr_number, method="squash", auto=True,
+                expected_head_sha=expected_head_sha, cwd=repo_root,
+            )
+            if not result.ok:
+                return _fail_queued_merge(
+                    run, repo_root, pr_number,
+                    f"Merge queue admission failed for PR #{pr_number}: {result.message}",
+                )
+            deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
+            reason = "timed out waiting for queue result"
+            while True:
+                status = forge.merge_queue_status(pr_number, cwd=repo_root)
+                if status.get("state") == "MERGED":
+                    return "merged"
+                if status.get("state") != "OPEN":
+                    return _fail_queued_merge(
+                        run, repo_root, pr_number, f"PR #{pr_number} closed while queued",
+                    )
+                if status.get("headRefOid") != expected_head_sha:
+                    rerun = _mark_local_review_for_rerun_after_sync(
+                        run, repo_root, pr_body="", current_head_sha=status.get("headRefOid", ""),
+                    )
+                    return _fail_queued_merge(
+                        run, repo_root, pr_number,
+                        run.last_error if rerun else "Merge refused because PR head changed while queued",
+                    )
+                entry = status.get("mergeQueueEntry")
+                if entry:
+                    group_sha = (entry.get("headCommit") or {}).get("oid", "") or group_sha
+                events = status.get("timelineItems", {}).get("nodes", [])
+                event = events[-1] if events else {}
+                if not entry and event.get("id") and event["id"] != old_event:
+                    reason = str(event.get("reason") or "removed by another actor")
+                    lower = reason.lower()
+                    if "conflict" in lower:
+                        # Existing conflict policy confirms and applies the local base merge,
+                        # then republishes and reruns review before queue admission.
+                        run.last_error = f"Merge conflict: PR #{pr_number} removed from merge queue: {reason}"
+                        return _fail_queued_merge(run, repo_root, pr_number, run.last_error)
+                    if "timeout" not in lower and "timed out" not in lower and any(
+                        word in lower for word in ("check", "fail", "ci ")
+                    ):
+                        detail = forge.merge_group_failure_excerpt(
+                            group_sha, cwd=repo_root, pr_number=pr_number,
+                            base_branch=PR_BASE_BRANCH, queued_at=queued_at,
+                        )
+                        return _fail_queued_merge(
+                            run, repo_root, pr_number,
+                            f"required checks failing: merge queue removed PR #{pr_number}: {reason}\n{detail}",
+                        )
+                    break
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                _poll_sleep(min(max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS), remaining))
+            # Cancel before retrying so a delayed admission cannot race new review.
+            error = forge.cancel_merge_queue(pr_number, cwd=repo_root)
+            if error:
+                run.last_error = f"Could not cancel merge queue request for PR #{pr_number}: {error}"
+                return "failed"
+            run.merge_queue_retries += 1
+            logger.warning("PR #%s merge queue retry %s/3: %s", pr_number, run.merge_queue_retries, reason)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            return _fail_queued_merge(
+                run, repo_root, pr_number, f"Merge queue query failed for PR #{pr_number}: {exc}",
+            )
+    run.last_error = f"Merge queue exhausted 3 attempts for PR #{pr_number}: {reason}"
+    return "failed"
+
+
 def _try_auto_merge(
     run: RunState,
     repo_root: Path,
@@ -26484,6 +26601,10 @@ def _try_auto_merge(
         cwd=repo_root,
     )
     if not auto_merge.ok:
+        if auto_merge.auto_merge_may_be_armed:
+            return _fail_after_auto_merge_armed(
+                run, repo_root, pr_number, f"Auto-merge admission could not be confirmed: {auto_merge.message}",
+            )
         err = auto_merge.message
         err_lower = err.lower()
         # Draft PR error: cannot auto-merge a draft PR.
@@ -26874,6 +26995,10 @@ def _manual_merge(
         if merge_result.ok:
             merged_successfully = True
             break
+        if merge_result.auto_merge_may_be_armed:
+            return _fail_after_auto_merge_armed(
+                run, repo_root, pr_number, f"Auto-merge admission could not be confirmed: {merge_result.message}",
+            )
         merge_err = merge_result.message
         if use_auto_merge and _is_auto_merge_capability_error(merge_err):
             logger.info(
@@ -27513,7 +27638,13 @@ def phase_merge(run: RunState, repo_root: Path) -> str:
             _record_readiness_decision(run, head_decision)
             run.last_error = f"Merge refused for {_short_sha(head_decision.head_sha)}: {head_decision.blocker}"
             return "failed"
-        auto = _try_auto_merge(
+        try:
+            queued = _run_uses_merge_queue(run, repo_root)
+        except RuntimeError as exc:
+            run.last_error = str(exc)
+            return "failed"
+        merge_operation = _try_queued_merge if queued else _try_auto_merge
+        auto = merge_operation(
             run,
             repo_root,
             pr_number,
@@ -28529,6 +28660,9 @@ def _workflow_failure_policy(
     run: RunState,
     phase: str,
 ) -> WorkflowFailurePolicy | None:
+    if phase == "merge" and run.last_error.startswith("Could not cancel merge queue request"):
+        # Never mutate/review a branch while queue admission may remain armed.
+        return None
     if _is_forge_auth_failure_message(run.last_error) or (
         _is_agent_auth_failure_message(run.last_error) and phase != "implement"
     ):
