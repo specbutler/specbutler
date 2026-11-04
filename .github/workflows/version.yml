@@ -209,6 +209,8 @@ jobs:
             pr_node_id="$(gh_api_retry "repos/${repo}/pulls/${pr_number}" --jq '.node_id')"
             enqueued=""
             for attempt in $(seq 1 6); do
+              # $id and $sha are GraphQL variables, not shell expansions.
+              # shellcheck disable=SC2016
               if gh api graphql \
                 -f query='mutation($id: ID!, $sha: GitObjectID!) { enablePullRequestAutoMerge(input: {pullRequestId: $id, expectedHeadOid: $sha}) { clientMutationId } }' \
                 -f id="$pr_node_id" \
