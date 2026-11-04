@@ -1,6 +1,8 @@
 name: Codex Review
 
 on:
+  merge_group:
+    types: [checks_requested]
   pull_request:
     branches: [main]
     types: [opened, edited, synchronize, reopened, ready_for_review]
@@ -13,6 +15,7 @@ permissions: read-all
 
 jobs:
   skip-check:
+    if: github.event_name != 'merge_group'
     name: skip-check
     runs-on: ubuntu-latest
     outputs:
@@ -638,7 +641,7 @@ jobs:
   publish-sticky-review-comment:
     name: publish-sticky-review-comment
     if: >-
-      always() && needs.determine-review-routing.outputs.local_review_owned != 'true' &&
+      always() && github.event_name != 'merge_group' && needs.determine-review-routing.outputs.local_review_owned != 'true' &&
       needs.determine-review-routing.outputs.ci_approved != 'true'
     needs: [determine-review-routing, review-decision-gate]
     runs-on: ubuntu-latest

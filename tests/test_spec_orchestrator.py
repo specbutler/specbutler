@@ -25651,6 +25651,7 @@ class TestWorkflowFailurePolicy:
 
 
 def _merge_ready_run(run: orch.RunState, head_sha: str = "deadbeef1234567") -> orch.RunState:
+    run.merge_queue_required = False  # Existing merge fixtures model a base without a queue.
     run.verify_passed_once = True
     run.verify_head_sha = head_sha
     run.review_expected_head_sha = head_sha
@@ -25839,9 +25840,11 @@ class TestMergeCompletionFence:
         assert manual_merge_mock.call_count == 0
 
     @pytest.mark.requires_ps
+    @pytest.mark.parametrize("queued", [False, True])
     def test_normal_merge_flow_calls_forge_merge_when_no_completion_tag(
         self,
         repo: Path,
+        queued: bool,
     ):
         run = self._make_run()
         run.save(repo)
@@ -25880,7 +25883,8 @@ class TestMergeCompletionFence:
             patch.object(orch, "run_subprocess", return_value=auth_ok),
             patch.object(orch, "_find_pr_for_branch", return_value=pr_data),
             patch.object(orch, "_required_checks_green", return_value=(True, "")),
-            patch.object(orch, "_try_auto_merge", auto_merge_mock),
+            patch.object(orch, "_run_uses_merge_queue", return_value=queued),
+            patch.object(orch, "_try_queued_merge" if queued else "_try_auto_merge", auto_merge_mock),
             patch.object(
                 orch,
                 "_merge_tag_provenance_for_pr",

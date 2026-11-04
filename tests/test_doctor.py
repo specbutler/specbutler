@@ -154,6 +154,12 @@ class _Runner:
         if Path(argv[0]).name in {"claude", "codex"} and argv[1:] == ["--version"]:
             return subprocess.CompletedProcess(argv, 0, "vendor-cli 1.2.3\n", "")
         if Path(argv[0]).name == "gh":
+            if argv[1:3] == ["api", "graphql"]:
+                return subprocess.CompletedProcess(argv, 0, '{"data":{"repository":{"mergeQueue":null}}}', "")
+            if len(argv) > 2 and argv[1] == "api" and "rules/branches/" in argv[2]:
+                return subprocess.CompletedProcess(argv, 0, "[[]]", "")
+            if len(argv) > 2 and argv[1] == "api" and argv[2].endswith("/protection"):
+                return subprocess.CompletedProcess(argv, 0, "{}", "")
             if argv[1:] == ["auth", "status"]:
                 if self.gh_auth_ok:
                     return subprocess.CompletedProcess(argv, 0, "Logged in to github.com", "")
