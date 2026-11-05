@@ -15684,6 +15684,45 @@ def _cancelled_workflow_superseded(forge, info: dict, run_id: str, repo_slug: st
     return False
 
 
+def _required_workflow_retry_spent(run: RunState, head: str, run_id: str) -> bool:
+    return any(e["head_sha"] == head and e["workflow_run_id"] == run_id
+               and e["kind"] == "workflow" and e["status"] != "released"
+               for e in run.required_check_reruns)
+
+
+def _reserve_required_workflow_retry(run: RunState, head: str, run_id: str, info: dict, names: list[str]) -> dict:
+    jobs = [job["name"] for job in info.get("jobs", [])
+            if job.get("conclusion") in {"failure", "cancelled", "timed_out", "action_required"}]
+    event = dict(kind="workflow", head_sha=head, workflow_run_id=run_id,
+                 jobs=jobs or names, attempt=info.get("attempt", 1),
+                 status="requested", created_at=_now_iso())
+    run.required_check_reruns.append(event)
+    return event
+
+
+def _required_workflow_reservation_state(forge, pr_number: int, run_id: str, info: dict, repo_root: Path) -> str:
+    """An aggregate pending result says nothing about this workflow's jobs."""
+    checks = forge.get_required_checks(pr_number, cwd=repo_root)
+    if not isinstance(checks, list):
+        return "pending"
+    current = [check for check in checks if _extract_run_id_from_check_url(check.url) == run_id]
+    if current:
+        if all((check.bucket or "").lower() in {"pass", "skipping"} for check in current):
+            return "passed"
+        return "failing" if any((check.bucket or "").lower() == "fail" for check in current) else "pending"
+    # Another workflow's pending/failing jobs cannot prove replacement. Match
+    # the forge workflow identity and head before releasing this reservation.
+    workflow_id = info.get("workflowDatabaseId")
+    if workflow_id:
+        for other_id in dict.fromkeys(_extract_run_id_from_check_url(check.url) for check in checks):
+            if not other_id or other_id == run_id:
+                continue
+            other = forge.workflow_run(other_id, cwd=repo_root)
+            if other.get("workflowDatabaseId") == workflow_id and other.get("headSha") == info.get("headSha"):
+                return "replaced"
+    return "pending"
+
+
 def _merge_required_checks(
     run: RunState, repo_root: Path, pr_number: int, *, repo_slug: str,
     expected_head_sha: str = "",
@@ -15723,19 +15762,14 @@ def _merge_required_checks(
         head = next(iter(heads))
         if expected_head_sha and head != expected_head_sha:
             return False, "Required checks still pending: waiting for checks on the current PR head"
-        if any(e["head_sha"] == head and e["kind"] == "workflow" and e["status"] != "released"
-               for e in run.required_check_reruns):
+        eligible = {rid: info for rid, info in observations.items()
+                    if not _required_workflow_retry_spent(run, head, rid)}
+        if not eligible:
             if not _retry_failure_is_current(error, observations):
                 return False, "Required checks still pending: waiting for current retry results"
             return ok, error
-        for rid, info in observations.items():
-            jobs = [job["name"] for job in info.get("jobs", [])
-                    if job.get("conclusion") in {"failure", "cancelled", "timed_out", "action_required"}]
-            event = dict(kind="workflow", head_sha=head, workflow_run_id=rid,
-                         jobs=jobs or [name for name, _ in labels], attempt=info.get("attempt", 1),
-                         status="requested", created_at=_now_iso())
-            events.append(event)
-            run.required_check_reruns.append(event)
+        for rid, info in eligible.items():
+            events.append(_reserve_required_workflow_retry(run, head, rid, info, [name for name, _ in labels]))
         run.save(repo_root)
     head = events[0]["head_sha"]
     deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
@@ -15767,12 +15801,22 @@ def _merge_required_checks(
                     return False, fresh_error  # Preserve reservations when observation is unknown.
                 failing_ids = {_extract_run_id_from_check_url(_split_check_label(label)[1])
                                for label in _required_checks_from_error(fresh_error)}
-                if fresh_ok or superseded or rid not in failing_ids:
+                if fresh_ok:
                     _release_required_check_reservations(run, repo_root, events)
-                    if fresh_ok:
-                        _finish_required_check_reruns(run, repo_root, head, kind="workflow")
-                        return True, ""
+                    _finish_required_check_reruns(run, repo_root, head, kind="workflow")
+                    return True, ""
+                state = "failing"
+                if not superseded and rid not in failing_ids:
+                    try:
+                        state = _required_workflow_reservation_state(forge, pr_number, rid, info, repo_root)
+                    except _CHECK_QUERY_ERRORS:
+                        state = "pending"
+                if superseded or state in {"passed", "replaced"}:
+                    _release_required_check_reservations(run, repo_root, [event])
                     return False, "Required checks still pending: workflow reservation released; waiting for current checks"
+                if state == "pending":
+                    completed = False
+                    continue  # Preserve this reservation while a sibling rerun is pending.
                 # Persist uncertainty before mutation. On restart, an advanced
                 # attempt proves acceptance; never repeat an ambiguous submission.
                 event["status"] = "submitting"
@@ -15793,8 +15837,8 @@ def _merge_required_checks(
         if completed:
             try:
                 ok, latest_error = _required_checks_green_for_repo(repo_root, pr_number, repo_slug=repo_slug)
-                # Superseding workflows have different run IDs but share the
-                # per-head allowance. Their required results remain authoritative.
+                # Each workflow run on this head owns its own retry allowance.
+                # Required results remain authoritative across replacement runs.
                 for label in _required_checks_from_error(latest_error):
                     rid = _extract_run_id_from_check_url(_split_check_label(label)[1])
                     if rid and rid not in observations:
@@ -15804,7 +15848,18 @@ def _merge_required_checks(
             if ok:
                 _finish_required_check_reruns(run, repo_root, head, kind="workflow")
                 return True, ""
-            if _is_required_checks_failure(latest_error) and _retry_failure_is_current(latest_error, observations):
+            new_events = []
+            for label in _required_checks_from_error(latest_error):
+                name, link = _split_check_label(label)
+                rid = _extract_run_id_from_check_url(link)
+                info = observations.get(rid, {})
+                if rid and info.get("headSha") == head and not _required_workflow_retry_spent(run, head, rid):
+                    new_events.append(_reserve_required_workflow_retry(run, head, rid, info, [name]))
+            events.extend(new_events)
+            if new_events:
+                run.save(repo_root)
+            if (not new_events and _is_required_checks_failure(latest_error)
+                    and _retry_failure_is_current(latest_error, observations)):
                 for event in events:
                     event["status"] = "failed"
                 run.save(repo_root)

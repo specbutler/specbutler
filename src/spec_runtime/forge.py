@@ -655,7 +655,7 @@ class GitHubForge:
 
     def workflow_run(self, run_id: str, *, cwd: Path) -> dict:
         result = self._gh(["run", "view", run_id, "--json",
-                           "headSha,status,conclusion,attempt,jobs"], cwd=cwd)
+                           "headSha,status,conclusion,attempt,jobs,workflowDatabaseId"], cwd=cwd)
         if result.returncode:
             raise RuntimeError(result.stderr or "Could not read workflow run")
         info = json.loads(result.stdout)

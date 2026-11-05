@@ -581,7 +581,9 @@ def test_later_workflow_supersession_does_not_release_submitted_retry(retry_host
     url2 = URL.replace("/123/", "/124/")
     initial = ERROR + f", other ({url2})"
     first = observation()
-    second = observation()
+    second = observation(conclusion="cancelled")
+    second["jobs"][0]["databaseId"] = 789
+    forge.check_cancellation_reason.return_value = "Cancelled by concurrency"
     forge.workflow_run.side_effect = [first, second]
     monkeypatch.setattr(orch, "_required_checks_green_for_repo", MagicMock(side_effect=[
         (False, initial), (False, initial), (False, "Required checks still pending: replacement"),
@@ -616,3 +618,112 @@ def test_pre_submission_green_result_needs_no_cancellation_annotation(retry_host
     forge.check_cancellation_reason.assert_not_called()
     forge.rerun_workflow.assert_not_called()
     assert orch.RunState.load(tmp_path, "run").required_check_reruns[0]["status"] == "released"
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_two_workflows_each_rerun_while_first_is_pending(retry_host, monkeypatch, tmp_path, restart):
+    from spec_runtime.forge import MergeResult
+
+    run, forge = retry_host
+    urls = {"123": URL, "124": URL.replace("/123/", "/124/").replace("/456", "/789")}
+    names = {"123": "browser", "124": "other"}
+    submitted = set()
+    finished = [False]
+    if restart:
+        for rid in urls:
+            event = reserve(run)
+            event.update(workflow_run_id=rid, jobs=[names[rid]])
+        run.save(tmp_path)
+        run = orch.RunState.load(tmp_path, "run")
+    def checks(*a, **kw):
+        return [CheckRun(names[rid], "SUCCESS" if finished[0] else "PENDING" if rid in submitted else "FAILURE",
+                         url, "pass" if finished[0] else "pending" if rid in submitted else "fail")
+                for rid, url in urls.items()]
+    def workflow(rid, **kw):
+        info = observation(attempt=2 if rid in submitted else 1,
+                           conclusion="success" if finished[0] else "failure",
+                           status="completed" if finished[0] or rid not in submitted else "in_progress")
+        info["jobs"][0]["name"] = names[rid]
+        return info
+    def rerun(rid, **kw):
+        assert rid not in submitted
+        if rid == "124":
+            # The real aggregate helper now reports pending, hiding the second
+            # workflow's failure; its individual required check still says fail.
+            assert checks()[0].bucket == "pending"
+            assert checks()[1].bucket == "fail"
+        submitted.add(rid)
+        return ""
+    def poll(_):
+        assert submitted == {"123", "124"}
+        finished[0] = True
+    forge.get_required_checks.side_effect = checks
+    forge.workflow_run.side_effect = workflow
+    forge.rerun_workflow.side_effect = rerun
+    forge.merge_pr.return_value = MergeResult(True)
+    monkeypatch.setattr(orch, "_poll_sleep", poll)
+    pr = dict(headRefOid="head", mergeStateStatus="CLEAN")
+    monkeypatch.setattr(orch, "_find_open_pr_for_branch", lambda *a, **kw: (pr, pr))
+    monkeypatch.setattr(orch, "_revalidate_readiness_pr_head", lambda *a, **kw: None)
+    monkeypatch.setattr(orch, "_wait_for_pr_merged", lambda *a, **kw: (True, ""))
+    monkeypatch.setattr(orch, "_augment_required_checks_error", MagicMock(side_effect=AssertionError("CI failure escaped")))
+    assert orch._manual_merge(run, tmp_path, tmp_path, "branch", 1, "head", pr) == "passed"
+    assert [call.args[0] for call in forge.rerun_workflow.call_args_list] == ["123", "124"]
+    assert run.attempts == 2 and run.review_changes == 1 and not run.last_error
+    assert [(e["workflow_run_id"], e["status"]) for e in run.required_check_reruns] == [("123", "flaky"), ("124", "flaky")]
+    forge.merge_pr.assert_called_once()
+
+
+def test_another_workflow_keeps_its_allowance_after_first_finished(retry_host, monkeypatch, tmp_path):
+    run, forge = retry_host
+    reserve(run, "flaky")
+    error = ERROR.replace("/123/", "/124/")
+    forge.workflow_run.side_effect = [observation(), observation(attempt=2, conclusion="success")]
+    monkeypatch.setattr(orch, "_required_checks_green_for_repo", MagicMock(side_effect=[(False, error), (False, error), (True, "")]))
+    assert orch._merge_required_checks(run, tmp_path, 1, repo_slug="owner/repo", expected_head_sha="head") == (True, "")
+    forge.rerun_workflow.assert_called_once_with("124", cwd=tmp_path)
+    assert [e["status"] for e in run.required_check_reruns] == ["flaky", "flaky"]
+
+
+def test_new_failure_during_another_retry_gets_its_own_reservation(retry_host, monkeypatch, tmp_path):
+    run, forge = retry_host
+    other_error = ERROR.replace("/123/", "/124/")
+    submitted = set()
+    def info(rid, **kw):
+        return observation(attempt=2 if rid in submitted else 1,
+                           conclusion="success" if rid in submitted else "failure")
+    def rerun(rid, **kw):
+        assert rid not in submitted
+        submitted.add(rid)
+        return ""
+    forge.workflow_run.side_effect = info
+    forge.rerun_workflow.side_effect = rerun
+    monkeypatch.setattr(orch, "_required_checks_green_for_repo", MagicMock(side_effect=[
+        (False, ERROR), (False, ERROR), (False, other_error), (False, other_error), (True, ""),
+    ]))
+    assert orch._merge_required_checks(run, tmp_path, 1, repo_slug="owner/repo", expected_head_sha="head") == (True, "")
+    assert submitted == {"123", "124"} and forge.rerun_workflow.call_count == 2
+    assert [e["status"] for e in run.required_check_reruns] == ["flaky", "flaky"]
+
+
+@pytest.mark.parametrize("outcome", ["passed", "replacement", "unrelated_pending", "own_pending"])
+def test_reservation_release_requires_individual_workflow_evidence(retry_host, monkeypatch, tmp_path, outcome):
+    run, forge = retry_host
+    reserve(run)
+    own = observation()
+    own["workflowDatabaseId"] = 10
+    other_url = URL.replace("/123/", "/124/")
+    other = observation(status="in_progress")
+    other["workflowDatabaseId"] = 10 if outcome == "replacement" else 20
+    forge.workflow_run.side_effect = lambda rid, **kw: own if rid == "123" else other
+    own_checks = [CheckRun("browser", "SUCCESS" if outcome == "passed" else "PENDING", URL,
+                           "pass" if outcome == "passed" else "pending")]
+    forge.get_required_checks.return_value = (own_checks if outcome in {"passed", "own_pending"} else []) + [
+        CheckRun("other", "PENDING", other_url, "pending"),
+    ]
+    monkeypatch.setattr(orch, "_required_checks_green_for_repo", lambda *a, **kw: (False, "Required checks still pending: other"))
+    monkeypatch.setattr(orch, "MERGE_CHECKS_TIMEOUT_SECONDS", 0)
+    ok, error = orch._merge_required_checks(run, tmp_path, 1, repo_slug="owner/repo", expected_head_sha="head")
+    assert not ok and orch._required_checks_still_pending(error)
+    assert run.required_check_reruns[0]["status"] == ("released" if outcome in {"passed", "replacement"} else "requested")
+    forge.rerun_workflow.assert_not_called()
