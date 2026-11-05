@@ -146,7 +146,7 @@ from .execution_backend import (
     run_local_command_preserving_descendants,
 )
 from .execution_backend import get_execution_backend as _factory_get_execution_backend
-from .forge import GitHubForge, PushResult, get_forge_adapter
+from .forge import CheckRun, GitHubForge, PushResult, get_forge_adapter
 from .git_common import resolve_common_root, run_git, subprocess_text_kwargs
 from .git_publish_guard import (
     UnsafeRepositoryGitConfigError,
@@ -15601,7 +15601,10 @@ def _finish_required_check_reruns(
     for event in run.required_check_reruns:
         if ((not kind or event["kind"] == kind)
                 and event["status"] in _REQUIRED_CHECK_RETRY_ACTIVE):
-            event["status"] = "flaky" if not head_sha or event["head_sha"] == head_sha else "superseded"
+            if event["kind"] == "workflow" and event["status"] == "requested":
+                event["status"] = "released"  # No command was submitted; no allowance or flake was earned.
+            else:
+                event["status"] = "flaky" if not head_sha or event["head_sha"] == head_sha else "superseded"
             event["completed_at"] = _now_iso()
             changed = True
     if changed:
@@ -15657,6 +15660,30 @@ def _retry_failure_is_current(error: str, observations: dict[str, dict]) -> bool
     return False
 
 
+def _release_required_check_reservations(run: RunState, repo_root: Path, events: list[dict]) -> None:
+    for event in events:
+        if event["status"] == "requested":
+            event["status"] = "released"
+            event["completed_at"] = _now_iso()
+    run.save(repo_root)
+
+
+def _cancelled_workflow_superseded(forge, info: dict, run_id: str, repo_slug: str, repo_root: Path) -> bool:
+    reader = getattr(forge, "check_cancellation_reason", None)
+    if reader is None:
+        return False
+    for job in info.get("jobs", []):
+        if job.get("conclusion") != "cancelled" or not job.get("databaseId"):
+            continue
+        check = CheckRun(job["name"], "CANCELLED",
+                         f"https://github.com/{repo_slug}/actions/runs/{run_id}/job/{job['databaseId']}", "cancel")
+        reason = reader(check, cwd=repo_root)
+        if isinstance(reason, str) and any(marker in reason.lower() for marker in
+                                          ("higher priority waiting request", "concurrency", "superseded")):
+            return True
+    return False
+
+
 def _merge_required_checks(
     run: RunState, repo_root: Path, pr_number: int, *, repo_slug: str,
     expected_head_sha: str = "",
@@ -15696,7 +15723,8 @@ def _merge_required_checks(
         head = next(iter(heads))
         if expected_head_sha and head != expected_head_sha:
             return False, "Required checks still pending: waiting for checks on the current PR head"
-        if any(e["head_sha"] == head and e["kind"] == "workflow" for e in run.required_check_reruns):
+        if any(e["head_sha"] == head and e["kind"] == "workflow" and e["status"] != "released"
+               for e in run.required_check_reruns):
             if not _retry_failure_is_current(error, observations):
                 return False, "Required checks still pending: waiting for current retry results"
             return ok, error
@@ -15725,6 +15753,26 @@ def _merge_required_checks(
             if advanced:
                 event["status"] = "waiting"
             elif event["status"] == "requested" and info.get("status") == "completed":
+                # Completion may have followed supersession while optional jobs
+                # drained. Revalidate every reservation, including restart recovery,
+                # immediately before spending its allowance.
+                try:
+                    fresh_ok, fresh_error = _required_checks_green_for_repo(
+                        repo_root, pr_number, repo_slug=repo_slug,
+                    )
+                    superseded = not fresh_ok and _cancelled_workflow_superseded(forge, info, rid, repo_slug, repo_root)
+                except _CHECK_QUERY_ERRORS:
+                    return False, "Required checks still pending: unable to revalidate workflow rerun"
+                if "unable to query" in fresh_error.lower():
+                    return False, fresh_error  # Preserve reservations when observation is unknown.
+                failing_ids = {_extract_run_id_from_check_url(_split_check_label(label)[1])
+                               for label in _required_checks_from_error(fresh_error)}
+                if fresh_ok or superseded or rid not in failing_ids:
+                    _release_required_check_reservations(run, repo_root, events)
+                    if fresh_ok:
+                        _finish_required_check_reruns(run, repo_root, head, kind="workflow")
+                        return True, ""
+                    return False, "Required checks still pending: workflow reservation released; waiting for current checks"
                 # Persist uncertainty before mutation. On restart, an advanced
                 # attempt proves acceptance; never repeat an ambiguous submission.
                 event["status"] = "submitting"
