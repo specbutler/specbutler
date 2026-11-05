@@ -490,3 +490,14 @@ def test_completion_fence_without_pr_attribution_is_terminal_not_flaky(retry_hos
     event = orch.RunState.load(tmp_path, "run").required_check_reruns[0]
     assert event["status"] == "completed"
     assert "attribution unavailable" in event["completion_note"]
+
+
+def test_workflow_only_link_does_not_match_an_optional_job(retry_host, monkeypatch, tmp_path):
+    run, forge = retry_host
+    error = "Required checks failing: browser (https://github.com/owner/repo/actions/runs/123)"
+    after = observation(attempt=2, conclusion="failure")
+    after["jobs"] = [dict(name="optional", conclusion="failure"), dict(name="browser", conclusion="success")]
+    forge.workflow_run.side_effect = [observation(), after, after]
+    monkeypatch.setattr(orch, "_required_checks_green_for_repo", MagicMock(side_effect=[(False, error), (False, error), (True, "")]))
+    assert orch._merge_required_checks(run, tmp_path, 1, repo_slug="owner/repo") == (True, "")
+    assert run.required_check_reruns[0]["status"] == "flaky"

@@ -15644,7 +15644,7 @@ def _retry_failure_is_current(error: str, observations: dict[str, dict]) -> bool
             continue
         job_id = _extract_job_id_from_check_url(link)
         for job in info.get("jobs", []):
-            if str(job.get("databaseId", "")) == job_id or job.get("name") == name:
+            if (job_id and str(job.get("databaseId", "")) == job_id) or job.get("name") == name:
                 # Real job IDs distinguish a stale failure from this attempt.
                 if job_id and job.get("databaseId") and str(job["databaseId"]) != job_id:
                     continue
