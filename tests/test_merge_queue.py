@@ -94,6 +94,7 @@ def test_queue_waits_through_behind_and_merges(queued, tmp_path, monkeypatch):
 ])
 def test_removal_routes_to_existing_retry_policy(queued, tmp_path, reason, expected):
     run, forge = queued
+    run.required_check_reruns.append(dict(kind="queue", head_sha="head", status="failed"))
     forge.merge_group_failure_excerpt.return_value = "group workflow failure excerpt"
     forge.merge_queue_status.side_effect = [
         queue_status(),
@@ -249,6 +250,7 @@ def test_doctor_accepts_merge_group_workflow(tmp_path):
 
 def test_failed_dequeue_prevents_implementation_retry(queued, tmp_path):
     run, forge = queued
+    run.required_check_reruns.append(dict(kind="queue", head_sha="head", status="failed"))
     forge.cancel_merge_queue.return_value = "permission denied"
     forge.merge_queue_status.side_effect = [
         queue_status(),
@@ -284,6 +286,7 @@ def test_queue_status_graphql_contract(tmp_path, entry, event):
 
 def test_removal_between_polls_uses_workflow_lookup(queued, tmp_path):
     run, forge = queued
+    run.required_check_reruns.append(dict(kind="queue", head_sha="head", status="failed"))
     forge.merge_queue_status.side_effect = [
         queue_status(), queue_status(event={"id": "removed", "reason": "checks failed"}),
     ]
@@ -404,6 +407,7 @@ def test_direct_auto_merge_paths_disarm_uncertain_admission(queued, tmp_path, mo
 
 def test_removal_after_resuming_queue_uses_existing_group(queued, tmp_path):
     run, forge = queued
+    run.required_check_reruns.append(dict(kind="queue", head_sha="head", status="failed"))
     forge.merge_queue_status.side_effect = [
         queue_status(entry={"id": "q", "headCommit": {"oid": "existing-group"},
                             "enqueuedAt": "2026-11-04T17:00:00Z"}),
@@ -414,3 +418,22 @@ def test_removal_after_resuming_queue_uses_existing_group(queued, tmp_path):
     args, kwargs = forge.merge_group_failure_excerpt.call_args
     assert args == ("existing-group",)
     assert kwargs["queued_at"] == "2026-11-04T17:00:00Z"
+
+
+@pytest.mark.parametrize("passes", [True, False])
+def test_queue_check_gets_one_free_reenqueue(queued, tmp_path, passes):
+    run, forge = queued
+    removed = queue_status(event={"id": "removed", "reason": "checks failed"})
+    forge.merge_group_failure_excerpt.return_value = "https://github.com/o/r/actions/runs/123 workflow failure"
+    forge.workflow_run.return_value = dict(jobs=[dict(name="queue browser", conclusion="failure")])
+    forge.merge_queue_status.side_effect = [
+        queue_status(), removed, removed,
+        queue_status(state="MERGED") if passes else queue_status(event={"id": "again", "reason": "checks failed"}),
+    ]
+    assert orch._try_queued_merge(run, tmp_path, 12, expected_head_sha="head") == ("merged" if passes else "failed")
+    assert forge.merge_pr.call_count == 2
+    assert run.merge_queue_retries == 0
+    assert run.attempts == run.review_changes == 0
+    assert run.required_check_reruns[0]["status"] == ("flaky" if passes else "failed")
+    assert run.required_check_reruns[0]["workflow_run_id"] == "123"
+    assert run.required_check_reruns[0]["jobs"] == ["queue browser"]

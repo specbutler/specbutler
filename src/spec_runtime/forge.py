@@ -178,6 +178,12 @@ class ForgeAdapter(Protocol):
         """Return the list of check runs for a PR."""
         ...
 
+    def workflow_run(self, run_id: str, *, cwd: Path) -> dict: ...
+
+    def check_cancellation_reason(self, check: CheckRun, *, cwd: Path) -> str: ...
+
+    def rerun_workflow(self, run_id: str, *, cwd: Path) -> str: ...
+
     def get_required_checks(self, pr_number: int, *, cwd: Path | None = None) -> list[CheckRun] | None:
         """Return required checks, [] when none are configured, None when the
         query failed and the state is unknown."""
@@ -646,6 +652,37 @@ class GitHubForge:
             )
             for c in checks
         ]
+
+    def workflow_run(self, run_id: str, *, cwd: Path) -> dict:
+        result = self._gh(["run", "view", run_id, "--json",
+                           "headSha,status,conclusion,attempt,jobs"], cwd=cwd)
+        if result.returncode:
+            raise RuntimeError(result.stderr or "Could not read workflow run")
+        return json.loads(result.stdout)
+
+    def check_cancellation_reason(self, check: CheckRun, *, cwd: Path) -> str:
+        match = re.search(r"/job/(\d+)", check.url)
+        if not match:
+            return ""
+        job = self._gh(["api", f"repos/{self.get_repo_slug(cwd=cwd)}/actions/jobs/{match[1]}"], cwd=cwd)
+        try:
+            check_url = json.loads(job.stdout).get("check_run_url", "")
+        except (ValueError, TypeError, AttributeError):
+            return ""
+        if job.returncode or not check_url:
+            return ""
+        result = self._gh(["api", check_url + "/annotations"], cwd=cwd)
+        if result.returncode:
+            return ""
+        try:
+            return " ".join(str(item.get("message", "")) for item in json.loads(result.stdout))
+        except (ValueError, TypeError, AttributeError):
+            return ""
+
+    def rerun_workflow(self, run_id: str, *, cwd: Path) -> str:
+        """Rerun all jobs so evidence fragments share one attempt."""
+        result = self._gh(["run", "rerun", run_id], cwd=cwd)
+        return (result.stderr or result.stdout or "Workflow rerun failed") if result.returncode else ""
 
     def get_required_checks(self, pr_number: int, *, cwd: Path | None = None) -> list[CheckRun] | None:
         """Return required checks, [] when none are configured, None when unknown.

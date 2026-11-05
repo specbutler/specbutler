@@ -9294,6 +9294,7 @@ class RunState:
     verify_failures: int = 0
     merge_queue_required: bool | None = None
     merge_queue_retries: int = 0
+    required_check_reruns: list[dict] = field(default_factory=list)
     merge_conflicts: int = 0
     review_changes: int = 0
     no_progress_retries: int = 0
@@ -15554,6 +15555,12 @@ def _required_checks_green(
         decorated = f"{name} ({link})" if link else name
         if bucket in ("pass", "skipping"):
             continue
+        if bucket == "cancel":
+            reader = getattr(_forge(repo_slug), "check_cancellation_reason", None)
+            reason = reader(check, cwd=repo_root) if reader else ""
+            if isinstance(reason, str) and "not acquired by runner" in reason.lower():
+                failing.append(decorated)
+                continue
         if bucket in ("pending", "cancel"):
             pending.append(decorated)
             continue
@@ -15580,6 +15587,103 @@ def _required_checks_green_for_repo(
             repo_slug=repo_slug,
         )
     return _required_checks_green(repo_root, pr_number)
+
+
+def _merge_required_checks(
+    run: RunState, repo_root: Path, pr_number: int, *, repo_slug: str,
+    expected_head_sha: str = "",
+) -> tuple[bool, str]:
+    ok, error = _required_checks_green_for_repo(repo_root, pr_number, repo_slug=repo_slug)
+    if ok:
+        # A host restart can observe green checks before resuming its wait loop.
+        # Close durable events using workflow evidence rather than losing flakes.
+        for event in run.required_check_reruns:
+            if event["kind"] != "workflow" or event["status"] != "waiting":
+                continue
+            try:
+                info = _forge(repo_slug).workflow_run(event["workflow_run_id"], cwd=repo_root)
+            except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired):
+                continue
+            if info.get("attempt", 0) > event["attempt"] and info.get("status") == "completed":
+                event["status"] = "flaky" if info.get("conclusion") == "success" else "failed"
+                run.save(repo_root)
+        return ok, error
+    if not _is_required_checks_failure(error):
+        return ok, error
+    forge = _forge(repo_slug)
+    reader = getattr(forge, "workflow_run", None)
+    if reader is None:
+        return ok, error
+    labels = [_split_check_label(label) for label in _required_checks_from_error(error)]
+    # External providers retain their existing failure path.
+    if any(not _extract_run_id_from_check_url(link) for _, link in labels):
+        return ok, error
+    ids = list(dict.fromkeys(_extract_run_id_from_check_url(link) for _, link in labels))
+    if not ids:
+        return ok, error
+    try:
+        observations = [(rid, reader(rid, cwd=repo_root)) for rid in ids]
+    except (RuntimeError, ValueError, OSError, subprocess.TimeoutExpired):
+        logger.warning("Could not inspect workflow runs for required check rerun", exc_info=True)
+        return ok, error
+    heads = {info.get("headSha") for _, info in observations}
+    if len(heads) != 1 or not all(heads):
+        return ok, error
+    head = next(iter(heads))
+    if expected_head_sha and head != expected_head_sha:
+        return False, "Required checks still pending: waiting for checks on the current PR head"
+    events = [e for e in run.required_check_reruns if e["head_sha"] == head and e["kind"] == "workflow"]
+    if events and not any(e["status"] == "waiting" for e in events):
+        if (all(e["status"] == "flaky" for e in events)
+                and set(ids) <= {e["workflow_run_id"] for e in events}
+                and all(info.get("conclusion") == "success" for _, info in observations)):
+            return False, "Required checks still pending: waiting for rerun check results to propagate"
+        return ok, error
+    if not events:
+        for rid, info in observations:
+            jobs = [job["name"] for job in info.get("jobs", [])
+                    if job.get("conclusion") in {"failure", "cancelled", "timed_out", "action_required"}]
+            event = dict(kind="workflow", head_sha=head, workflow_run_id=rid,
+                         jobs=jobs or [name for name, _ in labels], attempt=info.get("attempt", 1),
+                         status="requested", created_at=_now_iso())
+            events.append(event)
+            run.required_check_reruns.append(event)
+        # Reserve before mutation so restarting cannot buy another rerun.
+        run.save(repo_root)
+        for event in events:
+            failure = forge.rerun_workflow(event["workflow_run_id"], cwd=repo_root)
+            if failure:
+                event["status"] = "failed"
+                run.save(repo_root)
+                return False, error + "; workflow rerun failed: " + failure
+            event["status"] = "waiting"
+        run.save(repo_root)
+    deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
+    while True:
+        waiting = False
+        for event in events:
+            if event["status"] != "waiting":
+                continue
+            info = reader(event["workflow_run_id"], cwd=repo_root)
+            if info.get("attempt", 0) <= event["attempt"] or info.get("status") != "completed":
+                waiting = True
+                continue
+            event["status"] = "flaky" if info.get("conclusion") == "success" else "failed"
+        run.save(repo_root)
+        if any(e["status"] == "failed" for e in events):
+            return False, error
+        if not waiting:
+            ok, latest_error = _required_checks_green_for_repo(repo_root, pr_number, repo_slug=repo_slug)
+            if not ok and _is_required_checks_failure(latest_error):
+                latest_ids = {_extract_run_id_from_check_url(_split_check_label(label)[1])
+                              for label in _required_checks_from_error(latest_error)}
+                if latest_ids and latest_ids <= set(ids):
+                    return False, "Required checks still pending: waiting for rerun check results to propagate"
+            return ok, latest_error
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False, "Required checks still pending: workflow rerun in progress"
+        _poll_sleep(min(max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS), remaining))
 
 
 def _required_checks_still_pending(checks_error: str) -> bool:
@@ -26541,6 +26645,25 @@ def _try_queued_merge(
                             group_sha, cwd=repo_root, pr_number=pr_number,
                             base_branch=PR_BASE_BRANCH, queued_at=queued_at,
                         )
+                        if not any(e["head_sha"] == expected_head_sha and e["kind"] == "queue"
+                                   for e in run.required_check_reruns):
+                            workflow_ids = list(dict.fromkeys(re.findall(r"/actions/runs/(\d+)", detail)))
+                            retry_events = []
+                            for workflow_id in workflow_ids or [""]:
+                                info = forge.workflow_run(workflow_id, cwd=repo_root) if workflow_id else {}
+                                jobs = [job["name"] for job in info.get("jobs", [])
+                                        if job.get("conclusion") in {"failure", "cancelled", "timed_out", "action_required"}]
+                                retry_event = dict(kind="queue", head_sha=expected_head_sha,
+                                                   workflow_run_id=workflow_id,
+                                                   jobs=jobs or [reason], status="waiting", created_at=_now_iso())
+                                retry_events.append(retry_event)
+                                run.required_check_reruns.append(retry_event)
+                            run.save(repo_root)
+                            outcome = _try_queued_merge(run, repo_root, pr_number, expected_head_sha=expected_head_sha)
+                            for retry_event in retry_events:
+                                retry_event["status"] = "flaky" if outcome == "merged" else "failed"
+                            run.save(repo_root)
+                            return outcome
                         return _fail_queued_merge(
                             run, repo_root, pr_number,
                             f"required checks failing: merge queue removed PR #{pr_number}: {reason}\n{detail}",
@@ -26724,10 +26847,12 @@ def _try_auto_merge(
             return "unavailable_after_auto_no_auto"
         # Check if required checks are genuinely failing (not just pending).
         # If so, surface the error so run_full_workflow can loop to implement.
-        checks_ok, checks_error = _required_checks_green_for_repo(
+        checks_ok, checks_error = _merge_required_checks(
+            run,
             repo_root,
             pr_number,
             repo_slug=repo_slug,
+            expected_head_sha=expected_head_sha,
         )
         if not checks_ok and _required_checks_still_pending(checks_error):
             restored, restore_error = _restore_approved_local_review_status_if_pending(
@@ -26744,10 +26869,12 @@ def _try_auto_merge(
                     restore_error,
                 )
             if restored:
-                checks_ok, checks_error = _required_checks_green_for_repo(
+                checks_ok, checks_error = _merge_required_checks(
+                    run,
                     repo_root,
                     pr_number,
                     repo_slug=repo_slug,
+                    expected_head_sha=expected_head_sha,
                 )
         if not checks_ok and not _required_checks_still_pending(checks_error):
             checks_error = _augment_required_checks_error(
@@ -26823,10 +26950,12 @@ def _manual_merge(
     checks_deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
     checks_poll_interval = max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS)
     while True:
-        checks_ok, checks_error = _required_checks_green_for_repo(
+        checks_ok, checks_error = _merge_required_checks(
+            run,
             repo_root,
             pr_number,
             repo_slug=repo_slug,
+            expected_head_sha=pr_head_sha,
         )
         if checks_ok:
             break
@@ -26940,10 +27069,12 @@ def _manual_merge(
         # After syncing with master, wait for required checks to pass again.
         checks_deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
         while True:
-            checks_ok, checks_error = _required_checks_green_for_repo(
+            checks_ok, checks_error = _merge_required_checks(
+                run,
                 repo_root,
                 pr_number,
                 repo_slug=repo_slug,
+                expected_head_sha=pr_head_sha,
             )
             if checks_ok:
                 break
@@ -27030,10 +27161,12 @@ def _manual_merge(
             _poll_sleep(MERGE_CHECKS_POLL_INTERVAL_SECONDS)
             continue
         if _is_retryable_merge_race_error(merge_err):
-            checks_ok, checks_error = _required_checks_green_for_repo(
+            checks_ok, checks_error = _merge_required_checks(
+                run,
                 repo_root,
                 pr_number,
                 repo_slug=repo_slug,
+                expected_head_sha=pr_head_sha,
             )
             if not checks_ok and checks_error.lower().startswith("required checks failing:"):
                 checks_error = _augment_required_checks_error(
@@ -27226,10 +27359,12 @@ def _evaluate_readiness_for_promotion(
         checks_deadline = time.time() + MERGE_CHECKS_TIMEOUT_SECONDS
         checks_poll_interval = max(1, MERGE_CHECKS_POLL_INTERVAL_SECONDS)
         while True:
-            checks_ok, checks_error = _required_checks_green_for_repo(
+            checks_ok, checks_error = _merge_required_checks(
+                run,
                 repo_root,
                 pr_number,
                 repo_slug=repo_slug,
+                expected_head_sha=current_head_sha,
             )
             if checks_ok:
                 break
@@ -31022,6 +31157,9 @@ def cmd_status(args: argparse.Namespace) -> int:
             print(f"  Spec Revision: {run.spec_revision}")
         if run.requested_by:
             print(f"  Actor: {run.requested_by}")
+        for event in run.required_check_reruns:
+            print(f"  Required Check Rerun: {event['status']} head={event['head_sha']} "
+                  f"run={event['workflow_run_id']} jobs={', '.join(event['jobs'])}")
         if run.last_error:
             print(f"  Last Error: {run.last_error}")
         if run.last_failure_category and run.status != "passed":
