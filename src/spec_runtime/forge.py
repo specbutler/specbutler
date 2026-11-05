@@ -658,7 +658,14 @@ class GitHubForge:
                            "headSha,status,conclusion,attempt,jobs"], cwd=cwd)
         if result.returncode:
             raise RuntimeError(result.stderr or "Could not read workflow run")
-        return json.loads(result.stdout)
+        info = json.loads(result.stdout)
+        if (not isinstance(info, dict) or not isinstance(info.get("attempt"), int)
+                or not isinstance(info.get("headSha"), str) or not isinstance(info.get("status"), str)
+                or not isinstance(info.get("jobs"), list)
+                or any(not isinstance(job, dict) or not isinstance(job.get("name"), str)
+                       for job in info["jobs"])):
+            raise ValueError("Invalid workflow run metadata")
+        return info
 
     def check_cancellation_reason(self, check: CheckRun, *, cwd: Path) -> str:
         match = re.search(r"/job/(\d+)", check.url)

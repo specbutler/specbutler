@@ -437,3 +437,16 @@ def test_queue_check_gets_one_free_reenqueue(queued, tmp_path, passes):
     assert run.required_check_reruns[0]["status"] == ("flaky" if passes else "failed")
     assert run.required_check_reruns[0]["workflow_run_id"] == "123"
     assert run.required_check_reruns[0]["jobs"] == ["queue browser"]
+
+
+@pytest.mark.parametrize("merged_on_admission", [True, False])
+def test_queue_terminal_recovery_closes_waiting_retry(queued, tmp_path, merged_on_admission):
+    run, forge = queued
+    run.required_check_reruns.append(dict(kind="queue", head_sha="head", workflow_run_id="123",
+                                         jobs=["browser"], status="waiting"))
+    run.save(tmp_path)
+    run = orch.RunState.load(tmp_path, "run")
+    forge.merge_queue_status.side_effect = ([queue_status()] if not merged_on_admission else []) + [queue_status(state="MERGED")]
+    assert orch._try_queued_merge(run, tmp_path, 12, expected_head_sha="head") == "merged"
+    assert orch.RunState.load(tmp_path, "run").required_check_reruns[0]["status"] == "flaky"
+    assert run.merge_queue_retries == 0

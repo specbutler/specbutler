@@ -26110,7 +26110,7 @@ class TestMergeRequiredChecks:
             patch.object(orch, "_try_auto_merge", return_value="unavailable"),
             patch.object(
                 orch,
-                "_required_checks_green",
+                "_merge_required_checks",
                 return_value=(False, checks_error),
             ),
             patch.object(
