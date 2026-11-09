@@ -1137,3 +1137,41 @@ def test_reconcile_refuses_symlinked_private_branch_directory(tmp_path: Path) ->
     with pytest.raises(UnsafeAgentGitIsolationError, match="symlink"):
         reconcile_agent_git_isolation(isolation)
     assert _git(repository, "rev-parse", "code/test").stdout.strip() == isolation.initial_head
+
+
+def test_packed_refs_size_limit_bounds_each_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_dir = tmp_path / "git"
+    git_dir.mkdir()
+    (git_dir / "packed-refs").write_bytes(b"#" + b"x" * 8192)
+    monkeypatch.setattr(git_isolation, "_MAX_PACKED_REFS_BYTES", 1024)
+    original_open = Path.open
+    longest = 0
+
+    class TrackingHandle:
+        def __init__(self, handle: object) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> TrackingHandle:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self._handle.close()
+
+        def readline(self, size: int = -1) -> bytes:
+            nonlocal longest
+            line = self._handle.readline(size)
+            longest = max(longest, len(line))
+            return line
+
+    monkeypatch.setattr(
+        Path,
+        "open",
+        lambda self, *args, **kwargs: TrackingHandle(original_open(self, *args, **kwargs)),
+    )
+
+    with pytest.raises(UnsafeAgentGitIsolationError, match="too large"):
+        git_isolation._read_packed_ref(git_dir, "refs/heads/code/test")
+    assert longest <= 1025

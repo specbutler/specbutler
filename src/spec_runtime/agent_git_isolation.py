@@ -255,7 +255,12 @@ def _read_packed_ref(
     total = 0
     try:
         with packed_refs.open("rb") as handle:
-            for raw_line in handle:
+            while True:
+                # Bound every read so one newline-free line cannot be
+                # materialized beyond the limit before it is rejected.
+                raw_line = handle.readline(_MAX_PACKED_REFS_BYTES - total + 1)
+                if not raw_line:
+                    break
                 total += len(raw_line)
                 if total > _MAX_PACKED_REFS_BYTES:
                     raise UnsafeAgentGitIsolationError("Packed refs are too large")
