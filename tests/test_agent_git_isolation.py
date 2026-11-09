@@ -1006,15 +1006,16 @@ def _seed_context_refs(repository: Path, count: int) -> None:
         f"create refs/tags/release-tag-with-a-long-name-{index:04d} {head}\n"
         for index in range(count)
     )
+    # Send bytes: text mode on Windows translates "\n" to "\r\n", and
+    # ``update-ref --stdin`` rejects the trailing "\r" as extra input.
     completed = subprocess.run(
         ["git", "update-ref", "--stdin"],
         cwd=repository,
-        input=commands,
-        text=True,
+        input=commands.encode("utf-8"),
         capture_output=True,
         check=False,
     )
-    assert completed.returncode == 0, completed.stderr
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
 
 
 def _private_git(
@@ -1106,13 +1107,12 @@ def test_reconcile_refuses_private_branch_missing_from_loose_and_packed_refs(
     isolation = prepare_agent_git_isolation(worktree)
     _private_git(isolation, "pack-refs", "--all", "--prune")
     packed_refs = isolation.private_git_dir / "packed-refs"
-    packed_refs.write_text(
-        "".join(
-            line + "\n"
-            for line in packed_refs.read_text(encoding="utf-8").splitlines()
-            if not line.endswith(" refs/heads/code/test")
-        ),
-        encoding="utf-8",
+    packed_refs.write_bytes(
+        b"".join(
+            line + b"\n"
+            for line in packed_refs.read_bytes().splitlines()
+            if not line.endswith(b" refs/heads/code/test")
+        )
     )
 
     with pytest.raises(UnsafeAgentGitIsolationError, match="packed refs"):
