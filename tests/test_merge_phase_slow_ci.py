@@ -346,6 +346,11 @@ def test_readiness_keeps_the_saved_conflict_when_the_recheck_cannot_run(tmp_path
         )
 
     assert not decision.ready
-    assert decision.blocker.startswith(saved)
-    assert "recheck on the current head failed" in decision.blocker
+    assert decision.status == "merge-blocked"
+    assert "could not recheck the saved base-branch conflict" in decision.blocker
     assert run.merge_conflict_error == saved
+    # Not a confirmed conflict: the run stops in merge instead of spending an
+    # implement retry on a conflict that may already be resolved.
+    run.last_error = f"Readiness promotion refused for {orch._short_sha(head)}: {decision.blocker}"
+    assert not orch._is_merge_conflict(run.last_error)
+    assert orch._workflow_failure_policy(run, "merge") is None

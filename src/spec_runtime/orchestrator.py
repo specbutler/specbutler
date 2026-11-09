@@ -27549,9 +27549,13 @@ def _recheck_saved_merge_conflict(run: RunState, repo_root: Path, *, context: st
         run.merge_conflict_error = issue
         run.mergeability_issue = issue
         return issue
-    # Unconfirmable either way: keep the saved conflict as the blocker.
+    # Unconfirmable either way: keep the saved conflict on the run, but word the
+    # blocker so it is not routed as a confirmed conflict to an implement retry.
     detail = check.stderr or "unknown error"
-    return f"{run.merge_conflict_error} (recheck on the current head failed: {detail})"
+    return f"{_SAVED_CONFLICT_RECHECK_FAILED}: {detail}"
+
+
+_SAVED_CONFLICT_RECHECK_FAILED = "could not recheck the saved base-branch conflict on the current head"
 
 
 def _evaluate_readiness_for_promotion(
@@ -29186,6 +29190,10 @@ def _workflow_failure_policy(
         and run.last_error.startswith("Readiness promotion refused")
         and "pending operator request:" in run.last_error
     ):
+        return None
+    if phase == "merge" and _SAVED_CONFLICT_RECHECK_FAILED in run.last_error:
+        # The conflict may already be resolved; an agent cannot help until the
+        # recheck itself can run. Stop in merge (resumable).
         return None
     if phase == "merge" and _is_required_checks_pending_timeout(run.last_error):
         # Slow CI, not a code problem: stop in merge (the infrastructure
