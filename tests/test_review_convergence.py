@@ -1338,6 +1338,49 @@ def test_resumed_review_on_unchanged_head_keeps_request_changes(tmp_path: Path):
     assert not classification.is_infrastructure
 
 
+def test_resumed_review_at_round_cap_keeps_waiting_for_operator(tmp_path: Path):
+    """A kept result at the cap must not grant another round without the operator."""
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    _record_rounds(run_dir, orch.SPEC_RUNTIME_CONFIG.review.max_rounds)
+    assert _run_phase(tmp_path, run, _request_changes_result(), []) == "waiting-for-input"
+    assert run.review_unaddressed_head_sha == HEAD
+    rounds_before = len(review_convergence.load_review_rounds(run_dir))
+    run.status = "running"  # `spec implement` resumes the waiting run at review
+
+    outcome, run_review = _review_phase_with_reviewer(tmp_path, run, _approved_result())
+
+    assert outcome == "waiting-for-input"
+    run_review.assert_not_called()
+    assert run.status == "waiting-for-input"
+    request = orch.OperatorRequest.load(tmp_path, run.run_id)
+    assert request is not None and request.status == "pending"
+    assert request.kind == review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND
+    assert len(review_convergence.load_review_rounds(run_dir)) == rounds_before
+
+
+def test_interactive_session_completing_implement_clears_unaddressed_review(tmp_path: Path):
+    run = _run()
+    assert _run_phase(tmp_path, run, _request_changes_result(), []) == "failed"
+    run.phase = "implement"
+    run.status = "waiting-for-input"
+    run.save(tmp_path)
+    orch.OperatorRequest(
+        kind="agent_question",
+        prompt="Is F1 a real defect?",
+        requested_by_phase="implement",
+        status="pending",
+        request_attempt_number=orch._current_attempt_number(run),
+    ).save(tmp_path, run.run_id)
+
+    orch.resolve_operator_request(
+        tmp_path, run, "F1 is a false positive; see the session notes.",
+        source="spec input", session_completed_implement=True,
+    )
+
+    assert run.review_unaddressed_head_sha == ""
+
+
 def test_resumed_review_after_implement_rereviews_unchanged_head(tmp_path: Path):
     """An implement attempt in between may rebut a finding; review convergence decides."""
     run = _run()

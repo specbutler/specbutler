@@ -35644,6 +35644,51 @@ class TestCmdStep:
         assert ctx.operator_request_response == ""
         assert orch.RunState.load(repo, run.run_id).attempts == 2
 
+    def test_step_implement_after_passed_implement_with_steering_rechecks(self, repo: Path):
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="spec/my-feature",
+            phase="implement",
+            status="passed",
+            attempts=1,
+        )
+        orch.ImplementResult(status="passed", summary="done", attempt=1).save(repo, run.run_id)
+        orch.OperatorSteering(message="Rename the flag.", source="spec steer").save(repo, run.run_id)
+
+        assert orch._advance_attempt_for_explicit_implement_step(repo, run) is True
+
+        assert run.attempts == 2
+        assert run.steering_recheck is True
+
+    def test_step_implement_past_implement_advances_without_result_file(self, repo: Path):
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="spec/my-feature",
+            phase="review",
+            status="failed",
+            attempts=1,
+            implement_launches=1,
+        )
+
+        assert orch._advance_attempt_for_explicit_implement_step(repo, run) is True
+
+        assert run.attempts == 2
+        assert run.steering_recheck is False
+
+    def test_step_implement_never_launched_keeps_attempt(self, repo: Path):
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="spec/my-feature",
+            phase="verify",
+            status="failed",
+        )
+
+        assert orch._advance_attempt_for_explicit_implement_step(repo, run) is False
+        assert run.attempts == 0
+
     def test_step_implement_still_reuses_operator_completion_for_unfinished_attempt(
         self,
         repo: Path,

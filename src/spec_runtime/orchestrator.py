@@ -9128,17 +9128,22 @@ def _advance_attempt_for_explicit_implement_step(repo_root: Path, run: RunState)
     current-attempt reuse path reported the old result as passed without
     launching the agent or delivering pending steering.
 
-    Reruns of an implement attempt that has not finished (no result for the
-    current attempt, or the run is still at implement and not passed) keep the
-    attempt number, so an operator-answered request can still reuse a
-    completion the operator reported for that attempt.
+    Reruns of an implement attempt that has not finished (the run is still at
+    implement and not passed) keep the attempt number, so an operator-answered
+    request can still reuse a completion the operator reported for that
+    attempt. This explicit operator command does not apply the retry cap.
     """
     implement_index = PHASES.index("implement")
     past_implement = run.phase in PHASES and PHASES.index(run.phase) > implement_index
     passed_implement = run.phase == "implement" and run.status == "passed"
     if not (past_implement or passed_implement):
         return False
-    if not _current_attempt_has_implement_result(repo_root, run):
+    # Past implement, the attempt finished even if its result file has since
+    # been removed (as an operator working around #98 might do).
+    if not (
+        (past_implement and run.implement_launches > 0)
+        or _current_attempt_has_implement_result(repo_root, run)
+    ):
         return False
     run.steering_recheck = passed_implement and bool(
         _active_operator_steering(repo_root, run.run_id)
@@ -10958,6 +10963,10 @@ def resolve_operator_request(
     request.continuation_session_completed_implement = bool(session_completed_implement)
     request.save(repo_root, run.run_id)
     _sync_legacy_input_fields(run, request)
+    if session_completed_implement:
+        # The interactive session finished an implement attempt outside
+        # run_single_phase, so the next review is a real re-review.
+        run.review_unaddressed_head_sha = ""
 
     if action == OPERATOR_CONTINUATION_RESUME_IMPLEMENT:
         run.status = "pending"
@@ -26247,7 +26256,15 @@ def _phase_review_local(
         run.last_error = (
             f"{run.last_error} [Kept from the previous review: head unchanged since it requested changes.]"
         )
-        return outcome
+        # Keeping the result is not a new round, but a kept result at the cap
+        # still needs the operator's decision before another implement round.
+        cap_outcome = _wait_at_review_round_cap(
+            run,
+            repo_root,
+            _state_root(repo_root) / "runs" / run.run_id,
+            unaddressed_review.outstanding_findings,
+        )
+        return cap_outcome or outcome
 
     try:
         repo_name = _repo_name_with_owner(
@@ -26424,27 +26441,42 @@ def _phase_review_local(
                 repo_slug=repo_slug,
             )
     elif review_result.status == "request_changes":
-        max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
-        if review_convergence.round_cap_reached(review_run_dir, max_rounds=max_rounds):
-            rounds_used = review_convergence.request_changes_round_count(
-                review_convergence.load_review_rounds(review_run_dir)
-            )
-            request = _review_round_cap_operator_request(
-                run,
-                review_result.outstanding_findings,
-                rounds_used=rounds_used,
-                max_rounds=max_rounds,
-            )
-            request.save(repo_root, run.run_id)
-            _emit_user_progress(
-                f"[spec] {run.spec_id}: review round cap reached ({rounds_used}/{max_rounds}); "
-                f"waiting for input. Run: spec input --spec {run.spec_id} --accept | --message ..."
-            )
-            run.last_error = request.prompt
-            run.status = "waiting-for-input"
-            run.save(repo_root)
-            return "waiting-for-input"
+        cap_outcome = _wait_at_review_round_cap(
+            run, repo_root, review_run_dir, review_result.outstanding_findings
+        )
+        if cap_outcome is not None:
+            return cap_outcome
     return outcome
+
+
+def _wait_at_review_round_cap(
+    run: RunState,
+    repo_root: Path,
+    review_run_dir: Path,
+    outstanding_findings: list[dict],
+) -> str | None:
+    """Move the run to waiting-for-input when request_changes hit the round cap."""
+    max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
+    if not review_convergence.round_cap_reached(review_run_dir, max_rounds=max_rounds):
+        return None
+    rounds_used = review_convergence.request_changes_round_count(
+        review_convergence.load_review_rounds(review_run_dir)
+    )
+    request = _review_round_cap_operator_request(
+        run,
+        outstanding_findings,
+        rounds_used=rounds_used,
+        max_rounds=max_rounds,
+    )
+    request.save(repo_root, run.run_id)
+    _emit_user_progress(
+        f"[spec] {run.spec_id}: review round cap reached ({rounds_used}/{max_rounds}); "
+        f"waiting for input. Run: spec input --spec {run.spec_id} --accept | --message ..."
+    )
+    run.last_error = request.prompt
+    run.status = "waiting-for-input"
+    run.save(repo_root)
+    return "waiting-for-input"
 
 
 def _publish_ci_decision_status(repo_root: Path, repo_slug: str, result: ReviewResult, name: str) -> None:
