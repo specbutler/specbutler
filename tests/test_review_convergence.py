@@ -1290,6 +1290,159 @@ def test_request_changes_below_cap_retries_implement(tmp_path: Path):
     assert orch.OperatorRequest.load(tmp_path, run.run_id) is None
 
 
+def _review_phase_with_reviewer(repo: Path, run: orch.RunState, review_result: orch.ReviewResult):
+    """Run the local review phase and return (outcome, reviewer mock)."""
+    patches, pr = _patch_local_review_phase(repo, review_result, repo / "review-result.json")
+    with (
+        patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6],
+        patches[7] as run_review, patches[8], patches[9], patches[10], patches[11], patches[12],
+        patch.object(orch, "run_subprocess", return_value=subprocess.CompletedProcess([], 0, "", "")),
+    ):
+        outcome = orch._phase_review_local(
+            run, repo, pr_data=pr, expected_head_sha=HEAD, expected_base_sha=BASE
+        )
+    return outcome, run_review
+
+
+def _approved_result(head: str = HEAD) -> orch.ReviewResult:
+    return orch.ReviewResult(
+        status="approved", summary="Looks fine.", reviewed_head_sha=head, reviewed_base_sha=BASE
+    )
+
+
+def test_resumed_review_on_unchanged_head_keeps_request_changes(tmp_path: Path):
+    """Regression for #99: a fresh reviewer roll cannot clear a finding on unchanged code."""
+    run = _run()
+    first = _request_changes_result()
+    first.review_round = 1
+    assert _run_phase(tmp_path, run, first, []) == "failed"
+    assert run.review_unaddressed_head_sha == HEAD
+
+    # The run resumes straight into review on the same head; this roll would approve.
+    outcome, run_review = _review_phase_with_reviewer(tmp_path, run, _approved_result())
+
+    assert outcome == "failed"
+    run_review.assert_not_called()
+    assert run.review_decision_status == "request_changes"
+    assert "Independent review requested changes" in run.last_error
+    assert "head unchanged" in run.last_error
+    kept = orch.ReviewResult.load(tmp_path, run.run_id)
+    assert kept is not None and kept.status == "request_changes"
+    assert [f.id for f in kept.findings] == ["F1"]
+    # Keeping the result is not another review round.
+    assert len(review_convergence.load_review_rounds(_run_dir(tmp_path, run))) == 1
+    # The workflow classifies it like any requested change, so implement retries.
+    classification = orch.classify_failure(
+        run.last_error, phase="review", review_decision_status=run.review_decision_status
+    )
+    assert not classification.is_infrastructure
+
+
+def test_resumed_review_at_round_cap_keeps_waiting_for_operator(tmp_path: Path):
+    """A kept result at the cap must not grant another round without the operator."""
+    run = _run()
+    run_dir = _run_dir(tmp_path, run)
+    _record_rounds(run_dir, orch.SPEC_RUNTIME_CONFIG.review.max_rounds)
+    assert _run_phase(tmp_path, run, _request_changes_result(), []) == "waiting-for-input"
+    assert run.review_unaddressed_head_sha == HEAD
+    rounds_before = len(review_convergence.load_review_rounds(run_dir))
+    run.status = "running"  # `spec implement` resumes the waiting run at review
+
+    outcome, run_review = _review_phase_with_reviewer(tmp_path, run, _approved_result())
+
+    assert outcome == "waiting-for-input"
+    run_review.assert_not_called()
+    assert run.status == "waiting-for-input"
+    request = orch.OperatorRequest.load(tmp_path, run.run_id)
+    assert request is not None and request.status == "pending"
+    assert request.kind == review_convergence.REVIEW_ROUND_CAP_REQUEST_KIND
+    assert len(review_convergence.load_review_rounds(run_dir)) == rounds_before
+
+
+def test_interactive_session_completing_implement_clears_unaddressed_review(tmp_path: Path):
+    run = _run()
+    assert _run_phase(tmp_path, run, _request_changes_result(), []) == "failed"
+    run.phase = "implement"
+    run.status = "waiting-for-input"
+    run.save(tmp_path)
+    orch.OperatorRequest(
+        kind="agent_question",
+        prompt="Is F1 a real defect?",
+        requested_by_phase="implement",
+        status="pending",
+        request_attempt_number=orch._current_attempt_number(run),
+    ).save(tmp_path, run.run_id)
+
+    orch.resolve_operator_request(
+        tmp_path, run, "F1 is a false positive; see the session notes.",
+        source="spec input", session_completed_implement=True,
+    )
+
+    assert run.review_unaddressed_head_sha == ""
+
+
+def test_resumed_review_after_implement_rereviews_unchanged_head(tmp_path: Path):
+    """An implement attempt in between may rebut a finding; review convergence decides."""
+    run = _run()
+    assert _run_phase(tmp_path, run, _request_changes_result(), []) == "failed"
+
+    with patch.dict(orch.PHASE_HANDLERS, {"implement": lambda _run, _repo: "passed"}):
+        assert orch.run_single_phase(run, "implement", tmp_path) == "passed"
+    assert run.review_unaddressed_head_sha == ""
+
+    outcome, run_review = _review_phase_with_reviewer(tmp_path, run, _approved_result())
+
+    run_review.assert_called_once()
+    assert outcome == "passed"
+    assert run.review_decision_status == "approved"
+
+
+def test_resumed_review_on_moved_head_rereviews(tmp_path: Path):
+    run = _run()
+    assert _run_phase(tmp_path, run, _request_changes_result(), []) == "failed"
+    run.review_unaddressed_head_sha = "c" * 40  # the blocked head, since replaced by HEAD
+
+    outcome, run_review = _review_phase_with_reviewer(tmp_path, run, _approved_result())
+
+    run_review.assert_called_once()
+    assert outcome == "passed"
+
+
+def test_resumed_workflow_returns_to_implement_when_review_head_unchanged(tmp_path: Path):
+    """End to end through the workflow loop: review keeps its result, implement runs next."""
+    run = _run()
+    run.save(tmp_path)
+    assert _run_phase(tmp_path, run, _request_changes_result(), []) == "failed"
+    run.phase = "review"
+    run.status = "failed"
+    run.save(tmp_path)
+    phases: list[str] = []
+
+    def review_handler(review_run: orch.RunState, repo: Path) -> str:
+        phases.append("review")
+        outcome, run_review = _review_phase_with_reviewer(repo, review_run, _approved_result())
+        assert run_review.call_count == (0 if phases.count("review") == 1 else 1)
+        return outcome
+
+    def recording(name: str):
+        def handler(_run: orch.RunState, _repo: Path) -> str:
+            phases.append(name)
+            return "passed"
+        return handler
+
+    handlers = {phase: recording(phase) for phase in orch.PHASES}
+    handlers["review"] = review_handler
+    with (
+        patch.dict(orch.PHASE_HANDLERS, handlers),
+        patch.object(orch, "_ensure_orchestrator_process_group", return_value=None),
+    ):
+        result = orch.run_full_workflow(run, tmp_path, retry_cap=5)
+
+    assert phases[:5] == ["review", "implement", "verify", "publish", "review"]
+    assert phases[5:] == ["merge", "cleanup"]
+    assert result == "passed"
+
+
 def test_round_cap_moves_run_to_waiting_for_input(tmp_path: Path):
     run = _run()
     run_dir = _run_dir(tmp_path, run)
@@ -1399,6 +1552,8 @@ def test_completed_review_round_is_recorded_once_per_round_number(tmp_path: Path
     result.review_round = 1
 
     assert _run_phase(tmp_path, run, result, []) == "failed"
+    # Simulate an implement attempt in between so the second call re-reviews.
+    run.review_unaddressed_head_sha = ""
     assert _run_phase(tmp_path, run, result, []) == "failed"
 
     rounds = review_convergence.load_review_rounds(run_dir)

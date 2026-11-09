@@ -436,7 +436,12 @@ The orchestrator runs each spec through 9 phases:
 
 On verify failures, review change requests, or merge conflicts, the
 orchestrator loops back to implement with failure context until passing or
-the retry cap is reached.
+the retry cap is reached. A run resumed into review on a head that a review
+has just blocked, with no implement attempt since, keeps that
+`request_changes` result and goes back to implement rather than reviewing the
+same code again. `spec phase --phase implement` on a run whose implement
+attempt has already finished starts a new attempt, with any pending
+`spec steer` guidance, instead of reusing the earlier result.
 
 All implementation happens in an isolated workspace selected by the configured
 backend: a git worktree, a separate clone, or a container-backed workspace. The

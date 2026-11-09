@@ -9104,6 +9104,61 @@ def _schedule_operator_guided_implement_attempt(
     return True
 
 
+def _current_attempt_has_implement_result(repo_root: Path, run: RunState) -> bool:
+    state_roots = [_state_root(repo_root)]
+    worktree_path = resolve_worktree_path(run, repo_root)
+    if worktree_path.is_dir():
+        state_roots.append(_worktree_state_root(worktree_path))
+    for state_root in state_roots:
+        result = ImplementResult.load_from_state_root(state_root, run.run_id)
+        if result is not None and _attempt_matches_current_result(result, run.attempts):
+            return True
+    return False
+
+
+def _advance_attempt_for_explicit_implement_step(repo_root: Path, run: RunState) -> bool:
+    """Give ``spec phase --phase implement`` a fresh attempt once implement finished.
+
+    The full workflow always advances ``run.attempts`` before it loops back to
+    implement: retry budget consumption after a later phase fails, or
+    ``_schedule_operator_guided_implement_attempt`` after a passed implement
+    with active guidance. A single-phase rerun skipped that step, so its launch
+    shared the finished attempt's number. That attempt's completion result,
+    and any operator response it already consumed, still matched, and the
+    current-attempt reuse path reported the old result as passed without
+    launching the agent or delivering pending steering.
+
+    Reruns of an implement attempt that has not finished (the run is still at
+    implement and not passed) keep the attempt number, so an operator-answered
+    request can still reuse a completion the operator reported for that
+    attempt. This explicit operator command does not apply the retry cap.
+    """
+    implement_index = PHASES.index("implement")
+    past_implement = run.phase in PHASES and PHASES.index(run.phase) > implement_index
+    passed_implement = run.phase == "implement" and run.status == "passed"
+    if not (past_implement or passed_implement):
+        return False
+    # Past implement, the attempt finished even if its result file has since
+    # been removed (as an operator working around #98 might do).
+    if not (
+        (past_implement and run.implement_launches > 0)
+        or _current_attempt_has_implement_result(repo_root, run)
+    ):
+        return False
+    run.steering_recheck = passed_implement and bool(
+        _active_operator_steering(repo_root, run.run_id)
+    )
+    run.attempts += 1
+    logger.info(
+        "Starting implement attempt %d for %s: the previous attempt already completed (run was %s at %s).",
+        run.attempts + 1,
+        run.spec_id,
+        run.status,
+        run.phase,
+    )
+    return True
+
+
 def _mark_superseded_runs(
     repo_root: Path,
     spec_id: str,
@@ -9325,6 +9380,10 @@ class RunState:
     review_decision_status: str = ""
     review_decision_summary: str = ""
     review_decision_check_url: str = ""
+    # Head SHA of the latest ``request_changes`` review that no passing
+    # implement attempt has followed yet. A review resumed on this unchanged
+    # head keeps that result instead of letting a fresh reviewer roll clear it.
+    review_unaddressed_head_sha: str = ""
     readiness_status: str = ""
     readiness_head_sha: str = ""
     readiness_blocker: str = ""
@@ -10904,6 +10963,10 @@ def resolve_operator_request(
     request.continuation_session_completed_implement = bool(session_completed_implement)
     request.save(repo_root, run.run_id)
     _sync_legacy_input_fields(run, request)
+    if session_completed_implement:
+        # The interactive session finished an implement attempt outside
+        # run_single_phase, so the next review is a real re-review.
+        run.review_unaddressed_head_sha = ""
 
     if action == OPERATOR_CONTINUATION_RESUME_IMPLEMENT:
         run.status = "pending"
@@ -25010,6 +25073,9 @@ def _apply_review_result(
     review_result.save(repo_root, run.run_id)
     run.review_decision_status = review_result.status
     run.review_decision_summary = review_result.summary
+    run.review_unaddressed_head_sha = (
+        review_result.reviewed_head_sha if review_result.status == "request_changes" else ""
+    )
     check_name = review_result.source_check_name or REVIEW_GATE_CHECK_NAME
     check_url = review_result.source_check_url or fallback_check_url
     finding_count = len(review_result.findings)
@@ -26021,6 +26087,31 @@ def _seed_review_rounds_from_legacy_result(
     return review_convergence.load_review_rounds(review_run_dir)
 
 
+def _unaddressed_request_changes_review(
+    repo_root: Path,
+    run: RunState,
+    head_sha: str,
+) -> ReviewResult | None:
+    """Return the stored ``request_changes`` review that still applies to ``head_sha``.
+
+    A resumed run can re-enter review on the head a review just blocked, with
+    no implement attempt in between. Another reviewer roll on identical code
+    could then approve it and clear a real finding. Once an implement attempt
+    passes, the marker is cleared and an unchanged head is re-reviewed with the
+    implementer's response, as review convergence intends.
+    """
+    if not head_sha or run.review_unaddressed_head_sha != head_sha:
+        return None
+    review_result = ReviewResult.load(repo_root, run.run_id)
+    if (
+        review_result is None
+        or review_result.status != "request_changes"
+        or review_result.reviewed_head_sha != head_sha
+    ):
+        return None
+    return review_result
+
+
 def _phase_review_local(
     run: RunState,
     repo_root: Path,
@@ -26132,6 +26223,7 @@ def _phase_review_local(
         accepted_request.response_consumed_attempt_number = _current_attempt_number(run)
         accepted_request.save(repo_root, run.run_id)
         run.review_decision_status = "approved"
+        run.review_unaddressed_head_sha = ""
         run.review_decision_summary = "Accepted by the operator at the review round cap."
         run.last_error = ""
         return "passed"
@@ -26147,6 +26239,32 @@ def _phase_review_local(
             pr_number,
             disable_error,
         )
+
+    unaddressed_review = _unaddressed_request_changes_review(repo_root, run, expected_head_sha)
+    if unaddressed_review is not None:
+        logger.warning(
+            "Keeping the request_changes review of %s for %s: the head has not moved "
+            "and no implement attempt has run since, so it is not re-reviewed",
+            _short_sha(expected_head_sha),
+            run.run_id,
+        )
+        _emit_user_progress(
+            f"[spec] {run.spec_id}: head {_short_sha(expected_head_sha)} is unchanged since review "
+            "requested changes; keeping that review and returning to implement"
+        )
+        outcome = _apply_review_result(run, repo_root, unaddressed_review, conclusion="failure")
+        run.last_error = (
+            f"{run.last_error} [Kept from the previous review: head unchanged since it requested changes.]"
+        )
+        # Keeping the result is not a new round, but a kept result at the cap
+        # still needs the operator's decision before another implement round.
+        cap_outcome = _wait_at_review_round_cap(
+            run,
+            repo_root,
+            _state_root(repo_root) / "runs" / run.run_id,
+            unaddressed_review.outstanding_findings,
+        )
+        return cap_outcome or outcome
 
     try:
         repo_name = _repo_name_with_owner(
@@ -26323,27 +26441,42 @@ def _phase_review_local(
                 repo_slug=repo_slug,
             )
     elif review_result.status == "request_changes":
-        max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
-        if review_convergence.round_cap_reached(review_run_dir, max_rounds=max_rounds):
-            rounds_used = review_convergence.request_changes_round_count(
-                review_convergence.load_review_rounds(review_run_dir)
-            )
-            request = _review_round_cap_operator_request(
-                run,
-                review_result.outstanding_findings,
-                rounds_used=rounds_used,
-                max_rounds=max_rounds,
-            )
-            request.save(repo_root, run.run_id)
-            _emit_user_progress(
-                f"[spec] {run.spec_id}: review round cap reached ({rounds_used}/{max_rounds}); "
-                f"waiting for input. Run: spec input --spec {run.spec_id} --accept | --message ..."
-            )
-            run.last_error = request.prompt
-            run.status = "waiting-for-input"
-            run.save(repo_root)
-            return "waiting-for-input"
+        cap_outcome = _wait_at_review_round_cap(
+            run, repo_root, review_run_dir, review_result.outstanding_findings
+        )
+        if cap_outcome is not None:
+            return cap_outcome
     return outcome
+
+
+def _wait_at_review_round_cap(
+    run: RunState,
+    repo_root: Path,
+    review_run_dir: Path,
+    outstanding_findings: list[dict],
+) -> str | None:
+    """Move the run to waiting-for-input when request_changes hit the round cap."""
+    max_rounds = SPEC_RUNTIME_CONFIG.review.max_rounds
+    if not review_convergence.round_cap_reached(review_run_dir, max_rounds=max_rounds):
+        return None
+    rounds_used = review_convergence.request_changes_round_count(
+        review_convergence.load_review_rounds(review_run_dir)
+    )
+    request = _review_round_cap_operator_request(
+        run,
+        outstanding_findings,
+        rounds_used=rounds_used,
+        max_rounds=max_rounds,
+    )
+    request.save(repo_root, run.run_id)
+    _emit_user_progress(
+        f"[spec] {run.spec_id}: review round cap reached ({rounds_used}/{max_rounds}); "
+        f"waiting for input. Run: spec input --spec {run.spec_id} --accept | --message ..."
+    )
+    run.last_error = request.prompt
+    run.status = "waiting-for-input"
+    run.save(repo_root)
+    return "waiting-for-input"
 
 
 def _publish_ci_decision_status(repo_root: Path, repo_slug: str, result: ReviewResult, name: str) -> None:
@@ -28833,6 +28966,10 @@ def run_single_phase(run: RunState, phase: str, repo_root: Path) -> str:
         result_status = "failed"
         run.last_error = lease_failure_message
 
+    if phase == "implement" and result_status == "passed":
+        # A completed implement attempt has answered (or rebutted) the last
+        # requested changes, so the next review on any head is a real re-review.
+        run.review_unaddressed_head_sha = ""
     if phase == "verify" and result_status == "passed":
         run.verify_passed_once = True
         worktree_path = resolve_worktree_path(run, repo_root)
@@ -30952,6 +31089,8 @@ def cmd_step(args: argparse.Namespace) -> int:
                 run.review_agent = review_agent
                 run.base_ref = args.base or run.base_ref or BASE_REF
                 run.intake_reset_requested = run.intake_reset_requested or reset_intake
+                if phase == "implement":
+                    _advance_attempt_for_explicit_implement_step(repo_root, run)
 
             if reset_intake and phase != "intake":
                 run.save(repo_root)
