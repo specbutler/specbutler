@@ -125,6 +125,10 @@ infra_retry_attempts = 2        # in-place reruns after a transient infrastructu
 max_rounds = 3                  # request_changes rounds before the run waits for operator input
 rereview_reasoning_effort = ""  # empty keeps the first review's reasoning effort
 
+[readiness]
+require_forge_checks = true     # wait for required checks before marking the PR ready
+checks_timeout_seconds = 900    # per-head required-check wait in readiness and merge; raise for slow CI
+
 [agents]
 default = "claude"
 review_default = "codex"

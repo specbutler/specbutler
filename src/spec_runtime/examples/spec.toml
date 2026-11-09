@@ -64,6 +64,23 @@ max_rounds = 3
 rereview_reasoning_effort = ""
 
 # ---------------------------------------------------------------------------
+# Readiness promotion and merge
+# ---------------------------------------------------------------------------
+[readiness]
+
+# Wait for required forge checks on the exact head before marking the draft PR
+# ready. Branch protection and the merge step's own check wait still apply
+# when this is false.
+require_forge_checks = true
+
+# Seconds readiness promotion and the merge step each wait for required checks
+# on one head. Raise it when required suites run longer than 15 minutes. A wait
+# that runs out with checks still pending stops the merge phase (resume it once
+# CI finishes) instead of relaunching the agent; failing checks still go back
+# to the agent.
+checks_timeout_seconds = 900
+
+# ---------------------------------------------------------------------------
 # Autopilot infrastructure backoff and circuit breaker
 # ---------------------------------------------------------------------------
 [autopilot]

@@ -26949,7 +26949,15 @@ class TestAutoMerge:
         assert "disappeared" not in run.last_error
 
     @pytest.mark.requires_ps
-    def test_auto_merge_unavailable_falls_back_to_manual(self, repo: Path):
+    @pytest.mark.parametrize(
+        "auto_stderr",
+        [
+            "auto-merge is not allowed for this repository",
+            # gh's wording when the repository's "Allow auto-merge" setting is off (#95).
+            "GraphQL: Auto merge is not allowed for this repository (enablePullRequestAutoMerge)",
+        ],
+    )
+    def test_auto_merge_unavailable_falls_back_to_manual(self, repo: Path, auto_stderr: str):
         """When auto-merge is not enabled on the repo, fall back to manual merge."""
         run = self._make_run()
         run.save(repo)
@@ -26969,13 +26977,15 @@ class TestAutoMerge:
             args=["gh", "pr", "merge", "12", "--squash", "--auto"],
             returncode=1,
             stdout="",
-            stderr="auto-merge is not allowed for this repository",
+            stderr=auto_stderr,
         )
+        merge_commands: list[list[str]] = []
 
         def mock_run_subprocess(cmd, **kwargs):  # noqa: ARG001
             if cmd[:3] == ["gh", "auth", "status"]:
                 return subprocess.CompletedProcess(cmd, 0, "ok", "")
             if cmd[:3] == ["gh", "pr", "merge"]:
+                merge_commands.append(list(cmd))
                 if "--auto" in cmd:
                     return auto_fail
                 return subprocess.CompletedProcess(cmd, 0, "merged", "")
@@ -27005,10 +27015,13 @@ class TestAutoMerge:
             patch.object(orch, "_required_checks_green", return_value=(True, "")),
             patch.object(orch, "_wait_for_pr_merged", return_value=(True, "")),
             patch.object(orch, "run_or_fail", return_value=True),
+            patch.object(orch, "_poll_sleep"),
         ):
             result = orch.phase_merge(run, repo)
 
-        assert result == "passed"
+        assert result == "passed", run.last_error
+        # One refused --auto attempt, then a plain merge; never --auto again.
+        assert ["--auto" in cmd for cmd in merge_commands] == [True, False]
 
     @pytest.mark.requires_ps
     def test_auto_merge_detects_dirty_pr(self, repo: Path):

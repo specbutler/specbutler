@@ -400,7 +400,10 @@ BLOCK_DEBUGGER_AUTO_RESUME_LIMIT = 1
 LOCAL_REVIEW_WORKTREE_ROOT = Path(tempfile.gettempdir()).resolve()
 GITHUB_API_VERSION = "2022-11-28"
 MERGE_CHECKS_POLL_INTERVAL_SECONDS = 10
-MERGE_CHECKS_TIMEOUT_SECONDS = 900
+# [readiness] checks_timeout_seconds: the bound on each required-check wait in
+# readiness promotion and the merge step. Repositories whose required suites
+# run longer than the default raise it.
+MERGE_CHECKS_TIMEOUT_SECONDS = SPEC_RUNTIME_CONFIG.readiness.checks_timeout_seconds
 INTAKE_FILE_VERSION = 1
 INTAKE_INPUT_TYPES = ("string", "int", "float", "bool", "choice")
 TASK_SCOPING_PROMPT_FILE = "prompts/task-scoping.md"
@@ -4452,6 +4455,24 @@ def _is_auto_merge_pending_checks_timeout(error: str) -> bool:
     )
 
 
+def _is_required_checks_pending_timeout(error: str) -> bool:
+    """Return True when a required-check wait ran out with checks still pending.
+
+    Readiness promotion and the merge step both stop this way when CI is
+    slower than ``[readiness] checks_timeout_seconds``. Nothing is wrong with
+    the code, so the merge phase stops resumably instead of relaunching the
+    implementing agent. A failing check reports "Required checks failing"
+    instead and keeps its implement retry.
+    """
+    if not error:
+        return False
+    error_lower = error.lower()
+    return (
+        "timed out waiting for required checks" in error_lower
+        and "required checks still pending" in error_lower
+    )
+
+
 def _is_auto_merge_capability_error(error: str) -> bool:
     """Return True when gh cannot enable auto-merge for this repository."""
     if not error:
@@ -4464,6 +4485,11 @@ def _is_auto_merge_capability_error(error: str) -> bool:
         "auto merge is not enabled",
     )
     if any(ind in error_lower for ind in indicators):
+        return True
+    # GitHub's refusal when the repository's "Allow auto-merge" setting is off:
+    # "GraphQL: Auto merge is not allowed for this repository
+    # (enablePullRequestAutoMerge)". Both spellings of auto-merge count.
+    if ("auto-merge" in error_lower or "auto merge" in error_lower) and "not allowed" in error_lower:
         return True
     # GitHub App / integration tokens may lack permission for the
     # enablePullRequestAutoMerge mutation even when direct squash merge works.
@@ -4670,7 +4696,11 @@ def _infrastructure_failure_kind(text: str) -> tuple[str, bool, str] | None:
         return "pr_create", True, "spec"
     if _is_auto_merge_pending_checks_timeout(text) or "timed out waiting for auto-merge" in text:
         return "ci_wait_timeout", True, "spec"
-    if "timed out waiting for checks" in text or "timed out waiting for pr #" in text:
+    if (
+        "timed out waiting for checks" in text
+        or "timed out waiting for pr #" in text
+        or _is_required_checks_pending_timeout(text)
+    ):
         return "ci_wait_timeout", True, "spec"
     if _is_retryable_merge_race_error(text) or _is_readiness_promotion_forge_failure(text):
         return "forge_transient", True, "spec"
@@ -27050,13 +27080,12 @@ def _try_auto_merge(
                 run, repo_root, pr_number, f"Auto-merge admission could not be confirmed: {auto_merge.message}",
             )
         err = auto_merge.message
-        err_lower = err.lower()
         # Draft PR error: cannot auto-merge a draft PR.
         if _is_draft_pr_error(err):
             run.last_error = f"PR #{pr_number} is a draft and cannot be merged"
             return "failed"
         # Repo capability errors: retry manual merge without --auto.
-        if _is_auto_merge_capability_error(err) or ("auto-merge" in err_lower and "not allowed" in err_lower):
+        if _is_auto_merge_capability_error(err):
             logger.info("Auto-merge not available for this repo, falling back to manual merge")
             return "unavailable_after_auto_no_auto"
         # GraphQL mutation errors can be transient; back off and retry manually.
@@ -27627,6 +27656,41 @@ def _revalidate_readiness_pr_head(
     return None
 
 
+def _recheck_saved_merge_conflict(run: RunState, repo_root: Path, *, context: str) -> str:
+    """Return the conflict that still blocks the current head, or "" once it is gone.
+
+    ``run.merge_conflict_error`` describes the head that conflicted. An
+    operator (or a resumed phase) may have merged the base and pushed since,
+    and ``spec phase`` does not clear the saved text when verify passes, so
+    the saved conflict is rechecked against the current head before it may
+    block readiness.
+    """
+    worktree_path = resolve_worktree_path(run, repo_root)
+    check = _check_local_mergeability_against_origin_master(repo_root, worktree_path, branch=run.branch)
+    if check.status in {"success", "noop"}:
+        logger.info(
+            "Saved merge conflict for %s no longer applies: the current head merges cleanly with %s.",
+            run.spec_id,
+            BASE_REF,
+        )
+        run.merge_conflict_error = ""
+        run.mergeability_issue = ""
+        return ""
+    if check.status == "conflict":
+        detail = check.stderr or f"git merge {BASE_REF} reported conflicts"
+        issue = f"Confirmed local merge conflict with {BASE_REF} during {context}: {detail}"
+        run.merge_conflict_error = issue
+        run.mergeability_issue = issue
+        return issue
+    # Unconfirmable either way: keep the saved conflict on the run, but word the
+    # blocker so it is not routed as a confirmed conflict to an implement retry.
+    detail = check.stderr or "unknown error"
+    return f"{_SAVED_CONFLICT_RECHECK_FAILED}: {detail}"
+
+
+_SAVED_CONFLICT_RECHECK_FAILED = "could not recheck the saved base-branch conflict on the current head"
+
+
 def _evaluate_readiness_for_promotion(
     run: RunState,
     repo_root: Path,
@@ -27795,7 +27859,9 @@ def _evaluate_readiness_for_promotion(
             f"blocked-run diagnosis remains unresolved: {detail}",
         )
     if run.merge_conflict_error:
-        return ReadinessDecision(False, current_head_sha, "merge-blocked", run.merge_conflict_error)
+        conflict = _recheck_saved_merge_conflict(run, repo_root, context="readiness promotion")
+        if conflict:
+            return ReadinessDecision(False, current_head_sha, "merge-blocked", conflict)
     if run.review_decision_status == "request_changes":
         return ReadinessDecision(False, current_head_sha, "merge-blocked", run.review_decision_summary)
 
@@ -29261,6 +29327,14 @@ def _workflow_failure_policy(
         and run.last_error.startswith("Readiness promotion refused")
         and "pending operator request:" in run.last_error
     ):
+        return None
+    if phase == "merge" and _SAVED_CONFLICT_RECHECK_FAILED in run.last_error:
+        # The conflict may already be resolved; an agent cannot help until the
+        # recheck itself can run. Stop in merge (resumable).
+        return None
+    if phase == "merge" and _is_required_checks_pending_timeout(run.last_error):
+        # Slow CI, not a code problem: stop in merge (the infrastructure
+        # wait-out reruns it first) rather than relaunching implement.
         return None
     if phase == "merge" and run.last_error.startswith("Readiness promotion refused"):
         return WorkflowFailurePolicy(

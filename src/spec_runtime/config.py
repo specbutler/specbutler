@@ -93,6 +93,9 @@ class MergeConfig:
 @dataclass(frozen=True)
 class ReadinessConfig:
     require_forge_checks: bool = True
+    # How long readiness promotion and the merge step each wait for required
+    # forge checks on one head before stopping the merge phase.
+    checks_timeout_seconds: int = 900
 
 
 REVIEW_REASONING_EFFORTS: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh")
@@ -414,6 +417,20 @@ class SpecConfigError(ValueError):
 
 
 _MAX_REVIEW_EVIDENCE_FILES_PER_GATE = 8
+
+
+def _parse_readiness_section(payload: object) -> ReadinessConfig:
+    if payload is None:
+        return ReadinessConfig()
+    if not isinstance(payload, dict):
+        raise SpecConfigError("[readiness] must be a table")
+    timeout = payload.get("checks_timeout_seconds", ReadinessConfig.checks_timeout_seconds)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
+        raise SpecConfigError("[readiness].checks_timeout_seconds must be an integer >= 1")
+    return ReadinessConfig(
+        require_forge_checks=bool(payload.get("require_forge_checks", True)),
+        checks_timeout_seconds=timeout,
+    )
 
 
 def _parse_review_section(payload: object) -> ReviewConfig:
@@ -1078,9 +1095,7 @@ def load_spec_runtime_config(
         update=UpdateConfig(
             check_enabled=bool(update_payload.get("check_enabled", True)),
         ),
-        readiness=ReadinessConfig(
-            require_forge_checks=bool(readiness_payload.get("require_forge_checks", True)),
-        ),
+        readiness=_parse_readiness_section(readiness_payload),
         review=_parse_review_section(raw.get("review", {})),
         autopilot=autopilot,
         execution=execution,
