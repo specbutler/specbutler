@@ -35542,6 +35542,144 @@ class TestCmdStep:
         assert "Phase 'implement' blocked for interactive-feature" in out
         assert "Required intake answers are missing" in out
 
+    def _stage_finished_implement_attempt(
+        self,
+        repo: Path,
+        *,
+        phase: str,
+        status: str,
+        request_status: str,
+        request_consumed_attempt: int | None,
+    ) -> tuple[orch.RunState, Path]:
+        run = orch.RunState(
+            run_id="my-feature-20260101T000000",
+            spec_id="my-feature",
+            branch="spec/my-feature",
+            agent="claude",
+            phase=phase,
+            status=status,
+            attempts=1,
+        )
+        if phase == "review":
+            run.review_decision_status = "request_changes"
+        run.save(repo)
+        worktree = repo / ".worktrees" / run.spec_id
+        worktree.mkdir(parents=True, exist_ok=True)
+        orch.ImplementResult(
+            status="passed",
+            summary="Implemented the spec.",
+            attempt=1,
+            result_source="agent_report",
+        ).save(repo, run.run_id)
+        # An operator answer from earlier in the run, already consumed by the
+        # implement attempt that produced the result above.
+        orch.OperatorRequest(
+            kind="debugger_guidance",
+            prompt="Commit import failed; retry?",
+            requested_by_phase="implement",
+            status=request_status,
+            response="Retry the import.",
+            response_source="spec input",
+            request_attempt_number=2,
+            response_consumed_attempt_number=request_consumed_attempt,
+        ).save(repo, run.run_id)
+        return run, worktree
+
+    def test_step_implement_after_review_launches_fresh_attempt_with_steering(
+        self,
+        repo: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Regression for #98: a finished attempt's result must not be replayed."""
+        run, worktree = self._stage_finished_implement_attempt(
+            repo,
+            phase="review",
+            status="failed",
+            request_status="consumed",
+            request_consumed_attempt=2,
+        )
+        orch.OperatorSteering(
+            message="Give each concurrent stack its own compiler output directory.",
+            provided_by="alice",
+            source="spec steer",
+        ).save(repo, run.run_id)
+        monkeypatch.setattr(orch, "_prepare_agent_git_boundary", lambda _path: None)
+        monkeypatch.setattr(
+            orch,
+            "_capture_or_validate_run_publication_baseline",
+            lambda *_args, **_kwargs: None,
+        )
+        launches: list[orch.ImplementContext] = []
+
+        def fake_build_agent_command(*_args, **kwargs):
+            launches.append(kwargs["retry_context"])
+            return _portable_success_command()
+
+        args = argparse.Namespace(
+            spec="my-feature",
+            phase="implement",
+            run=run.run_id,
+            agent="claude",
+            base="origin/master",
+            reset_intake=False,
+        )
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(orch, "_build_agent_command", side_effect=fake_build_agent_command),
+            patch.object(orch, "_head_sha", return_value="abc123"),
+            patch.object(orch, "_worktree_dirty_files", return_value=[]),
+            patch.object(orch, "_worktree_dirty_state", return_value=([], False, False)),
+        ):
+            orch.cmd_step(args)
+
+        assert len(launches) == 1, "spec phase --phase implement must launch the agent"
+        ctx = launches[0]
+        assert ctx.attempt_number == 3
+        assert ctx.implement_reason == "review_feedback"
+        assert ctx.operator_steering_message == (
+            "Give each concurrent stack its own compiler output directory."
+        )
+        # The earlier, consumed operator answer belongs to the finished attempt.
+        assert ctx.operator_request_response == ""
+        assert orch.RunState.load(repo, run.run_id).attempts == 2
+
+    def test_step_implement_still_reuses_operator_completion_for_unfinished_attempt(
+        self,
+        repo: Path,
+    ):
+        """The operator-answered reuse path keeps working for the same attempt."""
+        run, worktree = self._stage_finished_implement_attempt(
+            repo,
+            phase="implement",
+            status="waiting-for-input",
+            request_status="resolved",
+            request_consumed_attempt=None,
+        )
+        args = argparse.Namespace(
+            spec="my-feature",
+            phase="implement",
+            run=run.run_id,
+            agent="claude",
+            base="origin/master",
+            reset_intake=False,
+        )
+        with (
+            patch.object(orch, "resolve_repo_root", return_value=repo),
+            patch.object(orch, "resolve_worktree_path", return_value=worktree),
+            patch.object(
+                orch,
+                "_build_agent_command",
+                side_effect=AssertionError("implement should not relaunch"),
+            ),
+            patch.object(orch, "_head_sha", return_value="abc123"),
+            patch.object(orch, "_worktree_dirty_state", return_value=([], False, False)),
+        ):
+            code = orch.cmd_step(args)
+
+        assert code == 0
+        assert orch.RunState.load(repo, run.run_id).attempts == 1
+
 
 class TestWaitingForInputWorkflow:
     @pytest.fixture(autouse=True)
