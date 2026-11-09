@@ -156,7 +156,12 @@ Key things to check:
   `origin/master`).
 - **`verify.gates`** -- add or adjust commands so they match what you actually
   run. Gates with `parallel = true` run concurrently; set `parallel = false`
-  for gates that need exclusive access (e.g., e2e tests).
+  for gates that need exclusive access (e.g., e2e tests). A gate `command`
+  runs without a shell unless the gate sets `shell = "sh"`: it is split into
+  arguments, so `&&`, `|`, `;`, redirections, `$VAR` and `$(...)` reach the
+  program literally. Add `shell = "sh"` to a gate that needs them, or split it
+  into one plain command per gate. `spec doctor` reports gates that use shell
+  syntax without `shell`.
 - **`bootstrap.install_command`** -- keep dependencies isolated inside each
   generated worktree. For Python, make sure the verify commands use that same
   environment rather than an ambient `pytest` or `ruff` executable.

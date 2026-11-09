@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -1106,3 +1107,183 @@ def test_spec_graph_check_ok_for_valid_specs_and_wired_into_doctor(tmp_path: Pat
     check = _checks_by_name(report)["spec dependencies"]
     assert check.status == "ok"
     assert "2 specs" in check.detail
+
+
+# --- verify gates run without a shell (#100) ---------------------------------
+
+_ISSUE_100_COMMAND = "npm run typecheck && npm run check:type"
+
+
+def _gate_repo(tmp_path: Path, gate_body: str, *, bootstrap_command: str = "python -m pip --version") -> Path:
+    text = _config_text(bootstrap_command=bootstrap_command).replace(
+        'command = "python -m pytest --version"\n', gate_body
+    )
+    assert gate_body in text
+    return _make_repo(tmp_path, text)
+
+
+def _gate_command_checks(repo: Path) -> dict[str, doctor.DoctorCheck]:
+    config = load_repo_spec_runtime_config(repo, require=True)
+    paths = {"npm": "/usr/bin/npm", "python": sys.executable}
+    with patch.object(doctor, "is_windows", return_value=False):
+        checks = doctor._command_checks(repo, config, _Runner(), paths.get)
+    return {check.name: check for check in checks}
+
+
+def _command_gate(command: str, *, shell: str = "") -> str:
+    body = f"command = {json.dumps(command)}\n"
+    if shell:
+        body += f"shell = {json.dumps(shell)}\n"
+    return body
+
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX verify gate execution")
+
+
+@posix_only
+def test_issue_100_gate_with_control_operator_is_error_with_fix_hint(tmp_path: Path) -> None:
+    repo = _gate_repo(tmp_path, _command_gate(_ISSUE_100_COMMAND))
+
+    check = _gate_command_checks(repo)["verify command (test)"]
+
+    assert check.status == "error"
+    assert "'test'" in check.detail
+    assert "`&&`" in check.detail
+    assert "without a shell" in check.detail
+    hint = " ".join(check.remediation)
+    assert "shell = \"sh\"" in hint
+    assert "[[verify.gates]] name='test'" in hint
+    assert "one plain command per gate" in hint
+
+
+@posix_only
+def test_issue_100_gate_with_shell_sh_keeps_shell_script_checks(tmp_path: Path) -> None:
+    repo = _gate_repo(tmp_path, _command_gate(_ISSUE_100_COMMAND, shell="sh"))
+
+    check = _gate_command_checks(repo)["verify command (test)"]
+
+    assert check.status == "ok"
+    assert check.detail == "syntax valid; launcher(s): npm"
+
+
+@posix_only
+def test_shell_sh_gate_still_validates_every_launcher_and_syntax(tmp_path: Path) -> None:
+    repo = _gate_repo(tmp_path, _command_gate("npm test && missing-tool", shell="sh"))
+    assert "`missing-tool`" in _gate_command_checks(repo)["verify command (test)"].detail
+
+    other = tmp_path / "other"
+    other.mkdir()
+    repo = _gate_repo(other, _command_gate("npm test &&", shell="sh"))
+    check = _gate_command_checks(repo)["verify command (test)"]
+    assert check.status == "error"
+    assert "invalid shell syntax" in check.detail
+
+
+@posix_only
+@pytest.mark.parametrize(
+    ("command", "syntax"),
+    [
+        ("python -m pytest && python -m ruff", "control operator `&&`"),
+        ("python -m pytest || python -m ruff", "control operator `||`"),
+        ("python -m pytest; python -m ruff", "control operator `;`"),
+        ("python -m pytest | python -m tee", "control operator `|`"),
+        ("python -m pytest &", "control operator `&`"),
+        ("python -m pytest < input.txt", "redirection `<`"),
+        ("python -m pytest > out.txt", "redirection `>`"),
+        ("python -m pytest >> out.txt", "redirection `>>`"),
+        ("python -m pytest 2>&1", "redirection `2>&1`"),
+        ("python -m pytest (tests)", "subshell parentheses"),
+        ("python -m pytest $(git ls-files tests)", "command substitution `$(...)`"),
+        ("python -m pytest `git ls-files tests`", "command substitution (backticks)"),
+        ("python -m pytest $TESTS", "parameter expansion `$TESTS`"),
+        ("python -m pytest ${TESTS}", "parameter expansion `${TESTS}`"),
+        ("CI=1 python -m pytest", "environment assignment `CI=1`"),
+    ],
+    ids=[
+        "and", "or", "semicolon", "pipe", "background",
+        "redirect-in", "redirect-out", "redirect-append", "redirect-fd",
+        "subshell", "dollar-substitution", "backtick-substitution",
+        "parameter", "braced-parameter", "env-assignment",
+    ],
+)
+def test_shell_syntax_in_argv_split_gate_is_error(
+    tmp_path: Path, command: str, syntax: str
+) -> None:
+    repo = _gate_repo(tmp_path, _command_gate(command))
+
+    check = _gate_command_checks(repo)["verify command (test)"]
+
+    assert check.status == "error"
+    assert syntax in check.detail
+    assert "'test'" in check.detail
+    assert "without a shell" in check.detail
+    assert "shell = \"sh\"" in " ".join(check.remediation)
+
+
+@posix_only
+@pytest.mark.parametrize(
+    "command",
+    [
+        'python -c "import a; a.run()"',
+        "python -m pytest -k 'a or b'",
+        "python -c 'print(\"$HOME && $(date)\")'",
+        "python -m pytest tests/*.py",
+        ".venv/bin/python -m pytest",
+        ".venv/bin/python -m ruff check .",
+    ],
+)
+def test_quoted_operators_and_repository_gates_pass(tmp_path: Path, command: str) -> None:
+    repo = _gate_repo(
+        tmp_path,
+        _command_gate(command),
+        bootstrap_command="python -m venv .venv && .venv/bin/python -m pip install -e .",
+    )
+
+    checks = _gate_command_checks(repo)
+
+    assert checks["verify command (test)"].status == "ok", checks["verify command (test)"]
+    assert checks["bootstrap command"].status == "ok"
+
+
+@posix_only
+def test_argv_split_gate_resolves_only_the_program_verify_launches(tmp_path: Path) -> None:
+    repo = _gate_repo(tmp_path, _command_gate("python -m missing-module missing-tool"))
+
+    check = _gate_command_checks(repo)["verify command (test)"]
+
+    assert check.status == "ok"
+    assert check.detail == "argument list; launcher: python"
+
+
+@posix_only
+def test_argv_split_gate_reports_missing_program(tmp_path: Path) -> None:
+    repo = _gate_repo(tmp_path, _command_gate("missing-tool --check"))
+
+    check = _gate_command_checks(repo)["verify command (test)"]
+
+    assert check.status == "error"
+    assert "`missing-tool`" in check.detail
+
+
+@posix_only
+def test_argv_gate_is_never_reported_for_shell_syntax(tmp_path: Path) -> None:
+    repo = _gate_repo(tmp_path, 'argv = ["npm", "run", "typecheck", "&&", "$HOME", ">"]\n')
+
+    check = _gate_command_checks(repo)["verify command (test)"]
+
+    assert check.status == "ok"
+    assert check.detail == "argument list; launcher: npm"
+
+
+@posix_only
+def test_bootstrap_command_with_control_operator_is_still_accepted(tmp_path: Path) -> None:
+    repo = _gate_repo(
+        tmp_path,
+        _command_gate("python -m pytest"),
+        bootstrap_command="python -m venv .venv && .venv/bin/python -m pip install -e .",
+    )
+
+    check = _gate_command_checks(repo)["bootstrap command"]
+
+    assert check.status == "ok"
+    assert check.detail == "syntax valid; launcher(s): python"

@@ -22,9 +22,10 @@ from .agent_git_probe import (
     agent_git_probe_disabled,
     run_agent_git_probe,
 )
-from .command_runtime import CommandSpec, looks_posix_script
+from .command_runtime import CommandSpec, CommandVariants, looks_posix_script
 from .config import (
     SpecRuntimeConfig,
+    VerifyGateConfig,
     container_alpha_warning,
     load_repo_spec_runtime_config,
     resolve_spec_path,
@@ -1209,10 +1210,121 @@ def _resolve_command_executable(
     return None
 
 
+_REDIRECTION_RE = re.compile(r"\d*(?:&>>?|>>|>&|>\||<<-?|<&|<>|[<>])(?:\d+-?|-)?")
+_PARAMETER_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|[0-9?@*#!$])")
+_LEADING_ASSIGNMENT_RE = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*=\S*)")
+
+
+def _argv_split_shell_syntax(command: str) -> tuple[str, ...]:
+    """Describe shell syntax outside quotes that an argv split would not interpret.
+
+    Verify launches a legacy gate ``command`` (no ``shell``) as
+    ``shlex.split(command)``. Operators, redirections, substitutions and
+    expansions in such a command reach the program as literal arguments.
+    Quoted text is literal for both a shell and the argv split, so it is
+    skipped.
+    """
+    found: list[str] = []
+    assignment = _LEADING_ASSIGNMENT_RE.match(command)
+    if assignment:
+        found.append(f"environment assignment `{assignment.group(1)}`")
+    index = 0
+    length = len(command)
+    word_start = True
+    while index < length:
+        char = command[index]
+        if char == "\\":
+            index += 2
+            word_start = False
+            continue
+        if char == "'":
+            closing = command.find("'", index + 1)
+            index = length if closing < 0 else closing + 1
+            word_start = False
+            continue
+        if char == '"':
+            index += 1
+            while index < length and command[index] != '"':
+                index += 2 if command[index] == "\\" else 1
+            index += 1
+            word_start = False
+            continue
+        if char.isspace():
+            index += 1
+            word_start = True
+            continue
+        if char in "<>&" or (word_start and char.isdigit()):
+            redirection = _REDIRECTION_RE.match(command, index)
+            if redirection and any(op in redirection.group(0) for op in "<>"):
+                found.append(f"redirection `{redirection.group(0)}`")
+                index = redirection.end()
+                word_start = True
+                continue
+        if command.startswith(("&&", "||"), index):
+            found.append(f"control operator `{command[index:index + 2]}`")
+            index += 2
+            word_start = True
+            continue
+        if char in ";|&":
+            found.append(f"control operator `{char}`")
+            index += 1
+            word_start = True
+            continue
+        if char in "()":
+            found.append("subshell parentheses `(...)`")
+            index += 1
+            word_start = True
+            continue
+        if command.startswith("$(", index):
+            found.append("command substitution `$(...)`")
+            depth = 0
+            while index < length:
+                depth += {"(": 1, ")": -1}.get(command[index], 0)
+                index += 1
+                if depth == 0 and command[index - 1] == ")":
+                    break
+            word_start = False
+            continue
+        if char == "`":
+            found.append("command substitution (backticks)")
+            closing = command.find("`", index + 1)
+            index = length if closing < 0 else closing + 1
+            word_start = False
+            continue
+        if command.startswith("${", index):
+            closing = command.find("}", index + 2)
+            text = command[index:] if closing < 0 else command[index:closing + 1]
+            found.append(f"parameter expansion `{text}`")
+            index = length if closing < 0 else closing + 1
+            word_start = False
+            continue
+        parameter = _PARAMETER_RE.match(command, index)
+        if parameter:
+            found.append(f"parameter expansion `{parameter.group(0)}`")
+            index = parameter.end()
+            word_start = False
+            continue
+        index += 1
+        word_start = False
+    return tuple(dict.fromkeys(found))
+
+
+_GateMode = Literal["argv", "shell", "split"]
+
+
+def _gate_mode(variants: CommandVariants) -> _GateMode:
+    """How verify launches a gate on POSIX (see ``_verify_gate_command_args``)."""
+    if variants.argv_value:
+        return "argv"
+    if variants.shell:
+        return "shell"
+    return "split"
+
+
 def _configured_commands(
     config: SpecRuntimeConfig,
-) -> list[tuple[str, str, str, bool]]:
-    commands: list[tuple[str, str, str, bool]] = []
+) -> list[tuple[str, str, str, bool, VerifyGateConfig | None]]:
+    commands: list[tuple[str, str, str, bool, VerifyGateConfig | None]] = []
     if config.bootstrap_install_command:
         commands.append(
             (
@@ -1220,6 +1332,7 @@ def _configured_commands(
                 config.bootstrap_install_command,
                 "[bootstrap].install_command",
                 False,
+                None,
             )
         )
     if config.bootstrap_cache.enabled and config.bootstrap_cache.command:
@@ -1229,6 +1342,7 @@ def _configured_commands(
                 config.bootstrap_cache.command,
                 "[bootstrap.cache].command",
                 False,
+                None,
             )
         )
     for gate in config.verify_gates:
@@ -1238,9 +1352,56 @@ def _configured_commands(
                 gate.command,
                 f"[[verify.gates]] name={gate.name!r}",
                 True,
+                gate,
             )
         )
     return commands
+
+
+def _argv_gate_check(
+    name: str,
+    gate: VerifyGateConfig,
+    config_location: str,
+    repo_root: Path,
+    which: ExecutableResolver,
+    bootstrap_deferred_executables: set[str],
+) -> DoctorCheck:
+    """Check a gate verify launches as an argument list, not a shell script."""
+    variants = gate.command_variants
+    command = gate.command
+    if _gate_mode(variants) == "argv":
+        argv = list(variants.argv_value)
+    else:
+        syntax = _argv_split_shell_syntax(command)
+        if syntax:
+            return _error(
+                name,
+                f"gate {gate.name!r} uses shell syntax ({', '.join(syntax)}), but verify "
+                "runs the command without a shell, so it is passed to the program as "
+                "literal arguments",
+                f"Add `shell = \"sh\"` to `{config_location}` in `.spec.toml`, or split "
+                "it into one plain command per gate.",
+            )
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            return _error(
+                name,
+                f"could not parse command: {_one_line(str(exc))}",
+                f"Fix `{config_location}` in `.spec.toml`.",
+            )
+    if not argv:
+        return _error(name, "empty command", f"Fix `{config_location}` in `.spec.toml`.")
+    executable = argv[0]
+    if _resolve_command_executable(executable, repo_root, which) is not None:
+        return _ok(name, f"argument list; launcher: {executable}")
+    if executable in bootstrap_deferred_executables:
+        return _ok(name, f"argument list; pending bootstrap: {executable}")
+    return _error(
+        name,
+        f"missing executable(s): `{executable}`",
+        f"Install the missing executable(s), or update `{config_location}` in `.spec.toml`.",
+    )
 
 
 def _command_checks(
@@ -1267,7 +1428,21 @@ def _command_checks(
         bootstrap_deferred_executables.update(bootstrap_executables[1:])
     if not config.bootstrap_install_command:
         checks.append(_ok("bootstrap command", "not configured (optional)"))
-    for name, command, config_location, validate_all_executables in commands:
+    for name, command, config_location, validate_all_executables, gate in commands:
+        if gate is not None and _gate_mode(gate.command_variants) != "shell":
+            # Verify argv-splits a gate without `shell` (or launches its
+            # `argv` directly), so check it exactly that way.
+            checks.append(
+                _argv_gate_check(
+                    name,
+                    gate,
+                    config_location,
+                    repo_root,
+                    which,
+                    bootstrap_deferred_executables,
+                )
+            )
+            continue
         syntax = run(["/bin/sh", "-n", "-c", command], repo_root, 10.0)
         if syntax.returncode != 0:
             checks.append(
