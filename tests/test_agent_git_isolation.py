@@ -992,3 +992,186 @@ def test_prepare_if_linked_rejects_symlinked_dot_git(tmp_path: Path) -> None:
 
     with pytest.raises(UnsafeAgentGitIsolationError, match="symlink"):
         prepare_agent_git_isolation_if_linked(repository)
+
+
+def _seed_context_refs(repository: Path, count: int) -> None:
+    """Create enough remote-tracking refs and tags to trip ``pack-refs --auto``.
+
+    Long names keep the eventual ``packed-refs`` file well above the 16 KiB
+    pointer-file limit, matching repositories with hundreds of branches.
+    """
+    head = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    commands = "".join(
+        f"create refs/remotes/origin/feature/a-reasonably-long-branch-name-{index:04d} {head}\n"
+        f"create refs/tags/release-tag-with-a-long-name-{index:04d} {head}\n"
+        for index in range(count)
+    )
+    # Send bytes: text mode on Windows translates "\n" to "\r\n", and
+    # ``update-ref --stdin`` rejects the trailing "\r" as extra input.
+    completed = subprocess.run(
+        ["git", "update-ref", "--stdin"],
+        cwd=repository,
+        input=commands.encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", "replace")
+
+
+def _private_git(
+    isolation: object,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    environment = isolation.apply_to_environment({"PATH": os.environ["PATH"]})
+    return _git(isolation.worktree, *arguments, env=environment)
+
+
+def test_reconcile_imports_commit_after_private_refs_are_packed(tmp_path: Path) -> None:
+    """Regression for #36: pack-refs moves the private branch into packed-refs."""
+    repository, worktree = _linked_worktree(tmp_path)
+    _seed_context_refs(repository, 120)
+    isolation = prepare_agent_git_isolation(worktree)
+
+    (worktree / "tracked.txt").write_text("agent commit\n", encoding="utf-8")
+    _private_git(isolation, "add", "tracked.txt")
+    _private_git(isolation, "commit", "-m", "agent")
+    private_head = _private_git(isolation, "rev-parse", "HEAD").stdout.strip()
+
+    # What ``git maintenance run --auto`` does once 16+ loose refs exist.
+    _private_git(isolation, "pack-refs", "--all", "--prune")
+    private_branch = isolation.private_git_dir / "refs" / "heads" / "code" / "test"
+    assert not private_branch.exists()
+    assert not private_branch.parent.exists()
+    packed_refs = isolation.private_git_dir / "packed-refs"
+    assert packed_refs.stat().st_size > 16 * 1024
+
+    assert agent_git_head(isolation) == private_head
+    result = reconcile_agent_git_isolation(isolation)
+
+    assert result.final_head == private_head
+    assert result.imported_commit_count == 1
+    assert _git(repository, "rev-parse", "code/test").stdout.strip() == private_head
+
+
+def test_private_git_commit_does_not_run_auto_maintenance(tmp_path: Path) -> None:
+    """The disposable private GIT_DIR never runs git's auto gc/maintenance."""
+    repository, worktree = _linked_worktree(tmp_path)
+    _seed_context_refs(repository, 20)
+    isolation = prepare_agent_git_isolation(worktree)
+    environment = isolation.apply_to_environment({"PATH": os.environ["PATH"]})
+    # Run any auto maintenance in the foreground so the assertion below is
+    # deterministic; the private config must still disable it entirely.
+    environment.update(
+        {
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "maintenance.autoDetach",
+            "GIT_CONFIG_VALUE_0": "false",
+            "GIT_CONFIG_KEY_1": "gc.autoDetach",
+            "GIT_CONFIG_VALUE_1": "false",
+        }
+    )
+
+    assert _agent_git(worktree, environment, "config", "maintenance.auto") == "false"
+    assert _agent_git(worktree, environment, "config", "gc.auto") == "0"
+    (worktree / "tracked.txt").write_text("agent commit\n", encoding="utf-8")
+    _agent_git(worktree, environment, "add", "tracked.txt")
+    _agent_git(worktree, environment, "commit", "-m", "agent")
+
+    assert not (isolation.private_git_dir / "packed-refs").exists()
+    assert (isolation.private_git_dir / "refs" / "heads" / "code" / "test").is_file()
+    assert reconcile_agent_git_isolation(isolation).imported_commit_count == 1
+
+
+def test_prepare_accepts_real_branch_that_lives_only_in_packed_refs(
+    tmp_path: Path,
+) -> None:
+    repository, worktree = _linked_worktree(tmp_path)
+    _seed_context_refs(repository, 120)
+    _git(repository, "pack-refs", "--all", "--prune")
+    assert not (repository / ".git" / "refs" / "heads" / "code").exists()
+
+    isolation = prepare_agent_git_isolation(worktree)
+    (worktree / "tracked.txt").write_text("agent commit\n", encoding="utf-8")
+    _private_git(isolation, "add", "tracked.txt")
+    _private_git(isolation, "commit", "-m", "agent")
+    private_head = _private_git(isolation, "rev-parse", "HEAD").stdout.strip()
+
+    assert reconcile_agent_git_isolation(isolation).final_head == private_head
+    assert _git(repository, "rev-parse", "code/test").stdout.strip() == private_head
+
+
+def test_reconcile_refuses_private_branch_missing_from_loose_and_packed_refs(
+    tmp_path: Path,
+) -> None:
+    repository, worktree = _linked_worktree(tmp_path)
+    isolation = prepare_agent_git_isolation(worktree)
+    _private_git(isolation, "pack-refs", "--all", "--prune")
+    packed_refs = isolation.private_git_dir / "packed-refs"
+    packed_refs.write_bytes(
+        b"".join(
+            line + b"\n"
+            for line in packed_refs.read_bytes().splitlines()
+            if not line.endswith(b" refs/heads/code/test")
+        )
+    )
+
+    with pytest.raises(UnsafeAgentGitIsolationError, match="packed refs"):
+        reconcile_agent_git_isolation(isolation)
+    assert _git(repository, "rev-parse", "code/test").stdout.strip() == isolation.initial_head
+
+
+def test_reconcile_refuses_symlinked_private_branch_directory(tmp_path: Path) -> None:
+    repository, worktree = _linked_worktree(tmp_path)
+    isolation = prepare_agent_git_isolation(worktree)
+    _private_git(isolation, "pack-refs", "--all", "--prune")
+    decoy = tmp_path / "decoy-refs"
+    decoy.mkdir()
+    (decoy / "test").write_text(f"{isolation.initial_head}\n", encoding="utf-8")
+    try:
+        (isolation.private_git_dir / "refs" / "heads" / "code").symlink_to(
+            decoy, target_is_directory=True
+        )
+    except OSError:
+        pytest.skip("symlink creation is unavailable on this host")
+
+    with pytest.raises(UnsafeAgentGitIsolationError, match="symlink"):
+        reconcile_agent_git_isolation(isolation)
+    assert _git(repository, "rev-parse", "code/test").stdout.strip() == isolation.initial_head
+
+
+def test_packed_refs_size_limit_bounds_each_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_dir = tmp_path / "git"
+    git_dir.mkdir()
+    (git_dir / "packed-refs").write_bytes(b"#" + b"x" * 8192)
+    monkeypatch.setattr(git_isolation, "_MAX_PACKED_REFS_BYTES", 1024)
+    original_open = Path.open
+    longest = 0
+
+    class TrackingHandle:
+        def __init__(self, handle: object) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> TrackingHandle:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self._handle.close()
+
+        def readline(self, size: int = -1) -> bytes:
+            nonlocal longest
+            line = self._handle.readline(size)
+            longest = max(longest, len(line))
+            return line
+
+    monkeypatch.setattr(
+        Path,
+        "open",
+        lambda self, *args, **kwargs: TrackingHandle(original_open(self, *args, **kwargs)),
+    )
+
+    with pytest.raises(UnsafeAgentGitIsolationError, match="too large"):
+        git_isolation._read_packed_ref(git_dir, "refs/heads/code/test")
+    assert longest <= 1025

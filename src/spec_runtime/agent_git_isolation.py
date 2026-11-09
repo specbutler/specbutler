@@ -29,6 +29,7 @@ from urllib.parse import urlsplit
 
 _PRIVATE_GIT_DIR_NAME = "specbutler-private-git"
 _MAX_POINTER_BYTES = 16 * 1024
+_MAX_PACKED_REFS_BYTES = 256 * 1024 * 1024
 _MAX_PRIVATE_GIT_ENTRIES = 200_000
 _OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SCP_REMOTE_RE = re.compile(
@@ -235,22 +236,50 @@ def _validate_oid(value: str, *, object_format: str | None = None) -> str:
     return normalized
 
 
-def _read_packed_ref(common_dir: Path, branch_ref: str) -> str:
-    packed_refs = common_dir / "packed-refs"
-    payload = _read_small_regular(packed_refs, label="packed refs")
-    try:
-        lines = payload.decode("ascii", errors="strict").splitlines()
-    except UnicodeDecodeError as exc:
-        raise UnsafeAgentGitIsolationError("Invalid packed refs") from exc
+def _read_packed_ref(
+    git_dir: Path,
+    branch_ref: str,
+    *,
+    object_format: str | None = None,
+) -> str:
+    """Resolve *branch_ref* from ``packed-refs`` without trusting Git config.
+
+    ``packed-refs`` is not a pointer file: repositories with hundreds of
+    branches and tags routinely exceed the pointer-size limit, so it is
+    streamed line by line under its own, much larger, bound.
+    """
+    packed_refs = git_dir / "packed-refs"
+    _lstat_kind(packed_refs, required=True, directory=False)
+    target = branch_ref.encode("utf-8")
     matches: list[str] = []
-    for line in lines:
-        if not line or line.startswith(("#", "^")):
-            continue
-        oid, separator, ref = line.partition(" ")
-        if not separator or not ref:
-            raise UnsafeAgentGitIsolationError("Invalid packed refs")
-        if ref == branch_ref:
-            matches.append(_validate_oid(oid))
+    total = 0
+    try:
+        with packed_refs.open("rb") as handle:
+            while True:
+                # Bound every read so one newline-free line cannot be
+                # materialized beyond the limit before it is rejected.
+                raw_line = handle.readline(_MAX_PACKED_REFS_BYTES - total + 1)
+                if not raw_line:
+                    break
+                total += len(raw_line)
+                if total > _MAX_PACKED_REFS_BYTES:
+                    raise UnsafeAgentGitIsolationError("Packed refs are too large")
+                if b"\0" in raw_line:
+                    raise UnsafeAgentGitIsolationError("Invalid packed refs")
+                line = raw_line.rstrip(b"\r\n")
+                if not line or line.startswith((b"#", b"^")):
+                    continue
+                oid, separator, ref = line.partition(b" ")
+                if not separator or not ref:
+                    raise UnsafeAgentGitIsolationError("Invalid packed refs")
+                if ref == target:
+                    try:
+                        oid_text = oid.decode("ascii", errors="strict")
+                    except UnicodeDecodeError as exc:
+                        raise UnsafeAgentGitIsolationError("Invalid packed refs") from exc
+                    matches.append(_validate_oid(oid_text, object_format=object_format))
+    except OSError as exc:
+        raise UnsafeAgentGitIsolationError("Unable to read packed refs") from exc
     if len(matches) != 1:
         raise UnsafeAgentGitIsolationError(
             "The worktree branch is missing or ambiguous in packed refs"
@@ -258,21 +287,14 @@ def _read_packed_ref(common_dir: Path, branch_ref: str) -> str:
     return matches[0]
 
 
-def _read_branch_head(common_dir: Path, branch_ref: str) -> str:
-    branch_path = common_dir.joinpath(*PurePosixPath(branch_ref).parts)
-    refs_heads = _absolute(common_dir / "refs" / "heads")
-    try:
-        _absolute(branch_path).relative_to(refs_heads)
-    except ValueError as exc:
-        raise UnsafeAgentGitIsolationError("The worktree branch ref escapes refs/heads") from exc
-    _assert_real_directory_chain(refs_heads, branch_path.parent)
-    if _lstat_kind(branch_path, required=False, directory=False):
-        return _validate_oid(_read_one_line(branch_path, label="branch ref"))
-    return _read_packed_ref(common_dir, branch_ref)
+def _loose_ref_directory_chain_exists(root: Path, descendant: Path) -> bool:
+    """Return whether every directory from *root* to *descendant* exists.
 
-
-def _assert_real_directory_chain(root: Path, descendant: Path) -> None:
-    """Reject symlinked directory components below an already-validated root."""
+    Each existing component must be a real directory (never a symlink or
+    reparse point).  A missing component is not an error: ``git pack-refs
+    --prune`` deletes ref directories it empties, after which the ref can
+    only live in ``packed-refs``.
+    """
     root = _absolute(root)
     descendant = _absolute(descendant)
     try:
@@ -283,7 +305,37 @@ def _assert_real_directory_chain(root: Path, descendant: Path) -> None:
     _lstat_kind(current, required=True, directory=True)
     for component in relative.parts:
         current /= component
-        _lstat_kind(current, required=True, directory=True)
+        if not _lstat_kind(current, required=False, directory=True):
+            return False
+    return True
+
+
+def _read_branch_head(
+    git_dir: Path,
+    branch_ref: str,
+    *,
+    object_format: str | None = None,
+) -> str:
+    """Resolve a local branch the way Git does: loose ref first, then packed.
+
+    Both the real common directory and the private ``GIT_DIR`` use this.  Git
+    maintenance (``pack-refs --all --prune``) can move the branch into
+    ``packed-refs`` and remove its now-empty loose-ref directories (#36).
+    """
+    branch_path = git_dir.joinpath(*PurePosixPath(branch_ref).parts)
+    refs_heads = _absolute(git_dir / "refs" / "heads")
+    try:
+        _absolute(branch_path).relative_to(refs_heads)
+    except ValueError as exc:
+        raise UnsafeAgentGitIsolationError("The worktree branch ref escapes refs/heads") from exc
+    if _loose_ref_directory_chain_exists(refs_heads, branch_path.parent) and _lstat_kind(
+        branch_path, required=False, directory=False
+    ):
+        return _validate_oid(
+            _read_one_line(branch_path, label="branch ref"),
+            object_format=object_format,
+        )
+    return _read_packed_ref(git_dir, branch_ref, object_format=object_format)
 
 
 def _assert_private_tree_is_plain(root: Path) -> None:
@@ -770,6 +822,13 @@ def _private_config(
         "[user]\n"
         "\tname = Spec Butler Agent\n"
         "\temail = specbutler-agent@localhost\n"
+        # The private GIT_DIR is disposable.  Auto gc/maintenance has no value
+        # here, and its pack-refs task rewrites the private branch ref while a
+        # detached process may still be running during reconciliation (#36).
+        "[maintenance]\n"
+        "\tauto = false\n"
+        "[gc]\n"
+        "\tauto = 0\n"
         f"{remote_lines}"
         f"{format_lines}\n"
     )
@@ -1101,17 +1160,25 @@ def _validate_private_layout(isolation: AgentGitIsolation) -> str:
     )
     if private_head_ref != isolation.branch_ref:
         raise UnsafeAgentGitIsolationError("Private Git HEAD changed branches")
-    private_branch = isolation.private_git_dir.joinpath(
-        *PurePosixPath(isolation.branch_ref).parts
-    )
-    _assert_real_directory_chain(
-        isolation.private_git_dir / "refs" / "heads",
-        private_branch.parent,
-    )
-    head = _validate_oid(
-        _read_one_line(private_branch, label="private branch ref"),
+    head = _read_branch_head(
+        isolation.private_git_dir,
+        isolation.branch_ref,
         object_format=isolation._baseline.object_format,
     )
+    # Cross-check the file-level parse against Git's own resolution so the
+    # commit later bundled as HEAD is exactly the one validated here.
+    resolved = _run_trusted_git(
+        isolation,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        isolation.branch_ref,
+        private=True,
+    ).stdout.strip()
+    if resolved != head:
+        raise UnsafeAgentGitIsolationError(
+            "Private branch ref does not match Git's resolution"
+        )
     _file_snapshot(isolation.private_git_dir / "index", required=True)
     return head
 
