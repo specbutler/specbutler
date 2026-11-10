@@ -995,6 +995,10 @@ class CoordinatorRequestHandler(BaseHTTPRequestHandler):
 
 
 class CoordinatorHTTPServer(ThreadingHTTPServer):
+    # The socketserver default backlog of 5 makes macOS reset connections when
+    # several workers connect at once.
+    request_queue_size = 128
+
     def __init__(
         self,
         server_address: tuple[str, int],

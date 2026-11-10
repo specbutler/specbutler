@@ -43,6 +43,13 @@ def git(root: Path, *args: str) -> str:
     ).stdout
 
 
+def clone(origin: Path, dest: Path) -> None:
+    """Clone ``origin`` with a committer identity, so annotated tags work without a global git config."""
+    git(dest.parent, "clone", str(origin), str(dest))
+    git(dest, "config", "user.email", "test@example.com")
+    git(dest, "config", "user.name", "Test")
+
+
 def write_spec(root: Path, spec_id: str, *, depends_on: tuple[str, ...] = (), extra: str = "", subdir: str = "specs"):
     deps = ", ".join(depends_on)
     path = root / subdir / f"{spec_id}.md"
@@ -262,7 +269,7 @@ class TestRefresh:
         git(use_repo, "tag", "spec/merged/local-only")
 
         other = tmp_path / "other"
-        git(tmp_path, "clone", str(origin), str(other))
+        clone(origin, other)
         git(other, "config", "user.email", "o@example.com")
         git(other, "config", "user.name", "Other")
         assert read_hold_tag(other, "alpha") is not None
@@ -287,7 +294,7 @@ class TestRefresh:
 
     def test_list_refresh_picks_up_remote_hold(self, use_repo: Path, origin: Path, tmp_path, monkeypatch, capsys):
         other = tmp_path / "other"
-        git(tmp_path, "clone", str(origin), str(other))
+        clone(origin, other)
         git(other, "tag", "-a", "spec/hold/gamma", "-m", json.dumps({"reason": "elsewhere"}))
         git(other, "push", "origin", "refs/tags/spec/hold/gamma")
         assert cli._cmd_list(argparse.Namespace(all=False)) == 0
@@ -522,7 +529,7 @@ class TestImplement:
 
     def test_implement_refreshes_hold_tags_first(self, use_repo: Path, origin: Path, tmp_path, stub_workflow, capsys):
         other = tmp_path / "other"
-        git(tmp_path, "clone", str(origin), str(other))
+        clone(origin, other)
         git(other, "tag", "-a", "spec/hold/alpha", "-m", json.dumps({"reason": "set elsewhere"}))
         git(other, "push", "origin", "refs/tags/spec/hold/alpha")
         assert orch.cmd_run(implement_args("alpha")) == 1
