@@ -10,6 +10,11 @@ worktrees_dir = ".worktrees"
 cap = 20
 no_progress_retry_threshold = 2
 
+[readiness]
+# This repository's merge-queue CI (Linux, macOS and Windows suites) takes
+# 15-18 minutes, longer than the 900s default.
+checks_timeout_seconds = 2700
+
 [agents]
 default = "claude"
 review_default = "codex"
