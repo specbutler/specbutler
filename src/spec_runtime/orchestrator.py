@@ -2654,6 +2654,7 @@ def _build_implement_agent_env(
     worktree_path: Path,
     *,
     git_isolation: AgentGitIsolation | None = None,
+    persist_session: bool = False,
 ) -> dict[str, str]:
     # Repository code runs inside the provider process and can read every
     # inherited variable. Start from a provider-specific allowlist; project
@@ -2669,7 +2670,13 @@ def _build_implement_agent_env(
         # while the scrub is set; with the explicit --allowedTools list that
         # still runs unattended (anything else is denied, never prompted).
         env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
-        env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
+        # Claude Code also disables session persistence while this is set
+        # (reason "skip_prompt_history"), which silently defeats
+        # `--session-id`: no transcript is written, so every retry's
+        # `--resume` finds no conversation (#116). Only launches that keep no
+        # session may set it.
+        if not persist_session:
+            env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
     _inject_worktree_venv_into_env(env, worktree_path)
     _apply_implement_run_identity(env, run)
     _apply_agent_git_environment(env, worktree_path, git_isolation)
@@ -18705,6 +18712,7 @@ def _prepare_implement_launch_plan(
         run,
         worktree_path,
         git_isolation=git_isolation,
+        persist_session=bool(session.session_id or session.resume_session_id),
     )
     referenced_mcp_environment = (
         claude_mcp_materialization.referenced_environment_keys

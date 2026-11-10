@@ -212,7 +212,13 @@ if AGENT == "claude":
             raise SystemExit(1)
     else:
         sid = args[args.index("--session-id") + 1] if "--session-id" in args else ""
-    if sid and scenario.get("transcripts"):
+    # Like the real CLI (2.1.x), CLAUDE_CODE_SKIP_PROMPT_HISTORY disables
+    # session persistence as completely as --no-session-persistence does.
+    persists = (
+        "--no-session-persistence" not in args
+        and not os.environ.get("CLAUDE_CODE_SKIP_PROMPT_HISTORY")
+    )
+    if sid and scenario.get("transcripts") and persists:
         project_dir.mkdir(parents=True, exist_ok=True)
         with (project_dir / f"{sid}.jsonl").open("a", encoding="utf-8") as transcript:
             transcript.write(json.dumps({"sessionId": sid}) + "\\n")
@@ -236,7 +242,8 @@ else:
         while not (STATE / "release").exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         rollout.write_text("{}\\n{}\\n", encoding="utf-8")
-if sid and sid not in known:
+    persists = True
+if sid and persists and sid not in known:
     known.append(sid)
     known_path.write_text(json.dumps(known), encoding="utf-8")
 
