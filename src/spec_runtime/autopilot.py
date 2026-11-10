@@ -96,7 +96,7 @@ from spec_runtime.process_supervisor import (
     process_cwd,
     request_legacy_process_shutdown,
 )
-from spec_runtime.spec_hold_tags import HoldTag, refresh_hold_tags
+from spec_runtime.spec_hold_tags import HoldTag
 from spec_runtime.spec_identity import SPEC_ID_RE
 from spec_runtime.spec_merge_tags import (
     MergeTagProvenance,
@@ -1693,30 +1693,14 @@ def refresh_runtime_git_refs(repo_root: Path) -> tuple[bool, str]:
     """Refresh remote refs used by spec_status before queue evaluation.
 
     Also mirrors ``spec/hold/*`` tags with pruning, because ``--tags --prune``
-    never removes a local tag whose remote counterpart was deleted.
+    never removes a local tag whose remote counterpart was deleted. The hold
+    fetch runs first and independently: ``spec hold`` force-replaces a tag,
+    and a plain ``--tags`` fetch refuses to clobber the stale local copy, so
+    gating the hold refresh on that fetch would leave holds stale forever.
     """
-    from .control_plane import (
-        DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
-        GitFetchTimeoutError,
-        run_git_fetch_with_timeout,
-    )
+    from .spec_table import refresh_git_spec_refs
 
-    try:
-        outcome = run_git_fetch_with_timeout(
-            ["--quiet", "--tags", "--prune", "origin"],
-            cwd=repo_root,
-            timeout_seconds=DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
-        )
-    except GitFetchTimeoutError as exc:
-        return False, f"git fetch timed out after {exc.timeout_seconds:.0f}s"
-
-    if outcome.is_success:
-        return refresh_hold_tags(repo_root)
-
-    output = (outcome.stderr or outcome.stdout).strip()
-    if not output:
-        output = "git fetch failed"
-    return False, output
+    return refresh_git_spec_refs(repo_root)
 
 
 def held_spec_reasons(repo_root: Path, git_state) -> dict[str, HoldTag]:

@@ -286,6 +286,47 @@ class TestRefresh:
         tags = git(use_repo, "tag", "--list").split()
         assert "local-only-tag" in tags and "spec/merged/local-only" in tags
 
+    @pytest.mark.parametrize("site", ["autopilot", "spec_table", "spec_list"])
+    def test_refresh_follows_replaced_hold_and_later_deletion_across_clones(
+        self, use_repo: Path, origin: Path, tmp_path, monkeypatch, capsys, site
+    ):
+        from spec_runtime import spec_table
+
+        def refresh() -> None:
+            if site == "autopilot":
+                assert autopilot.refresh_runtime_git_refs(use_repo) == (True, "")
+            elif site == "spec_table":
+                assert spec_table.refresh_git_spec_refs(use_repo) == (True, "")
+            else:
+                monkeypatch.setattr(cli, "_resolve_repo_root", lambda: use_repo)
+                monkeypatch.setattr(cli, "_lazy_config", lambda: load_repo_spec_runtime_config(use_repo))
+                assert cli._cmd_list(argparse.Namespace(all=False)) == 0
+                capsys.readouterr()
+
+        assert hold("alpha", "first reason") == 0
+        assert hold("gamma", "gamma reason") == 0
+        other = tmp_path / "other"
+        clone(origin, other)
+        monkeypatch.setattr(cli, "_resolve_repo_root", lambda: other)
+        monkeypatch.setattr(cli, "_lazy_config", lambda: load_repo_spec_runtime_config(other))
+        # Replace alpha's hold elsewhere: origin's tag is force-updated, and
+        # a plain --tags fetch here now rejects clobbering the local copy.
+        assert hold("alpha", "second reason") == 0
+        assert unhold("gamma") == 0
+        rejected = subprocess.run(
+            ["git", "fetch", "--quiet", "--tags", "origin"], cwd=use_repo, capture_output=True, text=True
+        )
+        assert rejected.returncode != 0
+
+        refresh()
+        assert read_hold_tag(use_repo, "alpha").reason == "second reason"
+        assert read_hold_tag(use_repo, "gamma") is None
+
+        # The replaced tag is gone remotely too; the next refresh drops it.
+        assert unhold("alpha") == 0
+        refresh()
+        assert read_hold_tag(use_repo, "alpha") is None
+
     def test_refresh_failure_is_reported(self, repo: Path):
         git(repo, "remote", "remove", "origin")
         ok, error = refresh_hold_tags(repo)
@@ -450,6 +491,17 @@ class TestDependents:
         assert orch.check_dependencies_merged(use_repo, "beta") == ["alpha (held: vendor switch)"]
         git(use_repo, "tag", "-f", "spec/hold/alpha")
         assert orch.check_dependencies_merged(use_repo, "beta") == [f"alpha (held: {NO_REASON_RECORDED})"]
+
+    def test_held_dependency_blocks_even_when_forge_reports_merged(self, use_repo: Path, monkeypatch):
+        """Without a usable merge tag, the forge fallback must not bypass a hold."""
+        monkeypatch.setattr(
+            orch, "get_forge_adapter", lambda: SimpleNamespace(is_spec_merged=lambda *a, **kw: True)
+        )
+        assert hold("alpha", "vendor switch") == 0
+        assert orch.check_dependencies_merged(use_repo, "beta") == ["alpha (held: vendor switch)"]
+        assert unhold("alpha") == 0
+        # Unheld: the existing forge fallback (merged without a usable tag) applies again.
+        assert orch.check_dependencies_merged(use_repo, "beta") == []
 
     def test_unhold_leaves_dependent_blocked_until_merge(self, use_repo: Path):
         assert hold("alpha", "reason") == 0

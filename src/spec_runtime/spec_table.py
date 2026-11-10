@@ -40,12 +40,21 @@ def _render_dependencies(
 
 
 def refresh_git_spec_refs(repo_root: Path) -> tuple[bool, str]:
-    """Refresh and prune origin refs so table rendering uses current merge/run refs."""
+    """Refresh and prune origin refs so table rendering uses current merge/run/hold refs.
+
+    ``spec/hold/*`` is mirrored first and independently with a forced,
+    pruning refspec: ``spec hold`` force-replaces a tag, and the plain
+    ``--tags`` fetch refuses to clobber the stale local copy (and never
+    prunes tags), so gating the hold refresh on it would leave holds stale.
+    """
     from spec_runtime.control_plane import (
         DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
         GitFetchTimeoutError,
         run_git_fetch_with_timeout,
     )
+    from spec_runtime.spec_hold_tags import refresh_hold_tags
+
+    holds_ok, holds_error = refresh_hold_tags(repo_root)
 
     try:
         outcome = run_git_fetch_with_timeout(
@@ -54,15 +63,16 @@ def refresh_git_spec_refs(repo_root: Path) -> tuple[bool, str]:
             timeout_seconds=DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
         )
     except GitFetchTimeoutError as exc:
-        return False, f"git fetch timed out after {exc.timeout_seconds:.0f}s"
+        output = f"git fetch timed out after {exc.timeout_seconds:.0f}s"
+        return False, "; ".join(error for error in (holds_error, output) if error)
 
     if outcome.is_success:
-        return True, ""
+        return holds_ok, holds_error
 
     output = (outcome.stderr or outcome.stdout).strip()
     if not output:
         output = "git fetch failed"
-    return False, output
+    return False, "; ".join(error for error in (holds_error, output) if error)
 
 
 def render_specs_table(repo_root: Path, *, include_merged: bool) -> str:

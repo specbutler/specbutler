@@ -4852,6 +4852,15 @@ def check_dependencies_merged(repo_root: Path, spec_id: str) -> list[str]:
                 continue
         if is_spec_merged(repo_root, dep):
             continue
+        # A held dependency without a usable merge tag stays blocked: the
+        # forge fallback must not let a hold be bypassed (local status is
+        # ``held``, so dispatch would also refuse it).
+        dep_status = read_spec_status(repo_root, dep, dep_path) if dep_path is not None else ""
+        if dep_status == "held":
+            hold = read_hold_tag(repo_root, dep)
+            reason = hold.display_reason if hold is not None else NO_REASON_RECORDED
+            blockers.append(f"{dep} (held: {reason})")
+            continue
         try:
             merged = get_forge_adapter().is_spec_merged(dep, base_branch=PR_BASE_BRANCH, cwd=repo_root)
         except (RuntimeError, OSError, AttributeError) as exc:
@@ -4866,12 +4875,7 @@ def check_dependencies_merged(repo_root: Path, spec_id: str) -> list[str]:
         if dep_path is None:
             blockers.append(f"{dep} (missing spec file)")
             continue
-        dep_status = read_spec_status(repo_root, dep, dep_path)
-        if dep_status == "held":
-            hold = read_hold_tag(repo_root, dep)
-            reason = hold.display_reason if hold is not None else NO_REASON_RECORDED
-            blockers.append(f"{dep} (held: {reason})")
-        elif dep_status != "merged":
+        if dep_status != "merged":
             blockers.append(f"{dep} ({dep_status})")
     if blockers and fetch_error:
         blockers[-1] += f"; {fetch_error}. Fetch merge tags and retry"

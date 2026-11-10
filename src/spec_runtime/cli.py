@@ -138,6 +138,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
         GitFetchTimeoutError,
         run_git_fetch_with_timeout,
     )
+    from .spec_hold_tags import refresh_hold_tags
+
+    # Mirror hold tags first: a replaced hold is force-updated on origin, and
+    # the plain ``--tags`` fetch below refuses to clobber a stale local copy.
+    holds_refreshed, holds_error = refresh_hold_tags(repo_root)
+    if not holds_refreshed:
+        print(f"warning: {holds_error}; using local hold tags.", file=sys.stderr)
 
     try:
         run_git_fetch_with_timeout(
@@ -150,11 +157,6 @@ def _cmd_list(args: argparse.Namespace) -> int:
             f"warning: git fetch timed out after {exc.timeout_seconds:.0f}s; spec status may be stale.",
             file=sys.stderr,
         )
-    from .spec_hold_tags import refresh_hold_tags
-
-    holds_refreshed, holds_error = refresh_hold_tags(repo_root)
-    if not holds_refreshed:
-        print(f"warning: {holds_error}; using local hold tags.", file=sys.stderr)
 
     from .autopilot import load_run_record_index, resolve_autopilot_backend_policy, spec_graph_skip_reasons
     from .container import container_image_source
