@@ -11,6 +11,8 @@ Primary commands (happy-path)::
     spec create      — author a new spec interactively
     spec implement   — start or resume an implementation workflow
     spec stop        — stop the active workflow process group for a spec
+    spec hold        — hold a spec out of autopilot dispatch (pushed spec/hold/<id> tag)
+    spec unhold      — release a hold
     spec status      — show run state and gate status
     spec review      — inspect full machine-readable PR review feedback
     spec list        — list specs with status and dependencies
@@ -148,6 +150,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
             f"warning: git fetch timed out after {exc.timeout_seconds:.0f}s; spec status may be stale.",
             file=sys.stderr,
         )
+    from .spec_hold_tags import refresh_hold_tags
+
+    holds_refreshed, holds_error = refresh_hold_tags(repo_root)
+    if not holds_refreshed:
+        print(f"warning: {holds_error}; using local hold tags.", file=sys.stderr)
 
     from .autopilot import load_run_record_index, resolve_autopilot_backend_policy, spec_graph_skip_reasons
     from .container import container_image_source
@@ -159,6 +166,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     run_index = load_run_record_index(repo_root, config=config)
     autopilot_policy = resolve_autopilot_backend_policy(config)
 
+    held_rows: dict[str, object] = {}
     fmt = "%-22s %-14s %-24s %-15s %-20s %-10s %s"
     lines = [
         fmt % ("SPEC", "AREA", "DEPENDS ON", "STATUS", "BACKEND", "SAFETY", "DESCRIPTION"),
@@ -180,6 +188,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
             )
             if not include_merged and status in {"merged", "obsolete"}:
                 continue
+            if status == "held":
+                hold = git_state.hold_for(record.spec_id)
+                if hold is not None:
+                    held_rows[record.spec_id] = hold
 
         deps_display = ""
         if record.depends_on:
@@ -231,6 +243,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
         lines.append("")
         lines.append("Dependency problems (these specs will not be dispatched):")
         lines.extend(f"  {spec_id}: {reason}" for spec_id, reason in sorted(graph_problems.items()))
+
+    if held_rows:
+        lines.append("")
+        lines.append("Held (not dispatched):")
+        lines.extend(f"  {spec_id}: {hold.describe()}" for spec_id, hold in sorted(held_rows.items()))
 
     print("\n".join(lines))
     return 0
@@ -734,6 +751,145 @@ def _cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_holdable_spec(repo_root: Path, spec_id: str, config) -> str:
+    """Return an error message when ``spec_id`` cannot be held, else ``""``."""
+    from .spec_identity import SPEC_ID_RE
+    from .spec_metadata import parse_spec_metadata
+
+    if not SPEC_ID_RE.fullmatch(spec_id):
+        return f"Unknown spec '{spec_id}': not a valid spec id."
+    spec_path = repo_root / config.paths.specs_dir / f"{spec_id}.md"
+    if not spec_path.is_file():
+        task_path = repo_root / config.paths.task_specs_dir / f"{spec_id}.md"
+        if task_path.is_file():
+            return f"Spec '{spec_id}' is a task spec ({task_path}); task specs cannot be held."
+        return f"Unknown spec '{spec_id}': no spec file at {spec_path}."
+    metadata = parse_spec_metadata(spec_path)
+    if metadata.obsolete:
+        return f"Spec '{spec_id}' is obsolete; there is nothing to hold."
+    return ""
+
+
+def _cmd_hold(args: argparse.Namespace) -> int:
+    """Hold a spec out of autopilot dispatch with a pushed spec/hold/<id> tag."""
+    from .spec_hold_tags import (
+        build_hold_message,
+        create_hold_tag_command,
+        hold_tag_name,
+        push_hold_tag_command,
+        read_hold_tag,
+    )
+    from .spec_merge_tags import resolve_actor, shellify, utc_timestamp_now
+    from .spec_status import is_spec_merged, refresh_merge_completion_state
+
+    spec_id = str(args.spec_id).strip()
+    reason = str(args.reason or "").strip()
+    if not reason:
+        print("Error: --reason must not be blank.", file=sys.stderr)
+        return 1
+    repo_root = _resolve_repo_root()
+    config = _lazy_config()
+    problem = _validate_holdable_spec(repo_root, spec_id, config)
+    if problem:
+        print(f"Error: {problem}", file=sys.stderr)
+        return 1
+
+    # Fetch first so the tag points at a base commit origin already has.
+    action, fetch_error, fenced_ref = refresh_merge_completion_state(repo_root, config=config)
+    if fetch_error:
+        print(f"Error: could not refresh {fenced_ref} from origin ({action}): {fetch_error}", file=sys.stderr)
+        return 1
+    if is_spec_merged(repo_root, spec_id, config=config, base_ref=fenced_ref) or is_spec_merged(
+        repo_root, spec_id, config=config
+    ):
+        print(f"Error: Spec '{spec_id}' is already merged; there is nothing to hold.", file=sys.stderr)
+        return 1
+    target = run_git(["rev-parse", "--verify", "--quiet", f"{fenced_ref}^{{commit}}"], cwd=repo_root)
+    target_sha = target.stdout.strip()
+    if target.returncode != 0 or not target_sha:
+        print(
+            f"Error: base branch {fenced_ref} has no commits; push the base branch before holding a spec.",
+            file=sys.stderr,
+        )
+        return 1
+
+    tag_name = hold_tag_name(spec_id)
+    previous = read_hold_tag(repo_root, spec_id)
+    message = build_hold_message(
+        spec_id=spec_id,
+        reason=reason,
+        actor=resolve_actor(),
+        timestamp=utc_timestamp_now(),
+    )
+    created = run_git(create_hold_tag_command(tag_name, target_sha, message)[1:], cwd=repo_root)
+    if created.returncode != 0:
+        detail = created.stderr.strip() or created.stdout.strip() or "git tag failed"
+        print(f"Error: could not create tag {tag_name}: {detail}", file=sys.stderr)
+        return 1
+
+    push_command = push_hold_tag_command(tag_name)
+    pushed = run_git(push_command[1:], cwd=repo_root)
+    if pushed.returncode != 0:
+        detail = pushed.stderr.strip() or pushed.stdout.strip() or "git push failed"
+        print(
+            f"Error: could not push {tag_name} to origin: {detail}\n"
+            f"The hold is recorded locally but is not shared yet. Push it with: {shellify(push_command)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Held spec '{spec_id}': {reason}")
+    print(f"  Tag: {tag_name}")
+    if previous is not None:
+        print(f"  Replaced previous hold: {previous.describe()}")
+    return 0
+
+
+def _cmd_unhold(args: argparse.Namespace) -> int:
+    """Release a hold: delete spec/hold/<id> on origin, then locally."""
+    from .spec_hold_tags import (
+        delete_local_hold_tag_command,
+        delete_remote_hold_tag_command,
+        hold_tag_name,
+        read_hold_tag,
+        refresh_hold_tags,
+    )
+    from .spec_merge_tags import shellify
+
+    spec_id = str(args.spec_id).strip()
+    repo_root = _resolve_repo_root()
+    refreshed, refresh_error = refresh_hold_tags(repo_root)
+    if not refreshed:
+        print(f"warning: {refresh_error}; using local hold tags.", file=sys.stderr)
+    previous = read_hold_tag(repo_root, spec_id)
+    if previous is None:
+        print(f"Spec '{spec_id}' is not held.")
+        return 0
+
+    tag_name = hold_tag_name(spec_id)
+    delete_command = delete_remote_hold_tag_command(tag_name)
+    deleted = run_git(delete_command[1:], cwd=repo_root)
+    if deleted.returncode != 0:
+        detail = deleted.stderr.strip() or deleted.stdout.strip() or "git push failed"
+        # A hold whose original push never reached origin has nothing to
+        # delete there; that is not a reason to keep it held locally.
+        if "remote ref does not exist" not in detail:
+            print(
+                f"Error: could not delete {tag_name} on origin: {detail}\n"
+                f"The hold is still in place. Retry, or delete it with: {shellify(delete_command)}",
+                file=sys.stderr,
+            )
+            return 1
+
+    local = run_git(delete_local_hold_tag_command(tag_name)[1:], cwd=repo_root)
+    if local.returncode != 0:
+        detail = local.stderr.strip() or local.stdout.strip() or "git tag -d failed"
+        print(f"Error: could not delete local tag {tag_name}: {detail}", file=sys.stderr)
+        return 1
+    print(f"Released hold on spec '{spec_id}' (was: {previous.describe()}).")
+    return 0
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     """Display run state and gate status."""
     orch = _lazy_orchestrator()
@@ -1228,6 +1384,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     p_implement.add_argument(
+        "--ignore-hold",
+        action="store_true",
+        help="Start or resume even if the spec is held (spec/hold/<id> tag); the hold stays in place",
+    )
+    p_implement.add_argument(
         "--reset-intake",
         action="store_true",
         help="Force re-capture intake answers",
@@ -1242,6 +1403,16 @@ def main(argv: list[str] | None = None) -> int:
     # stop
     p_stop = subparsers.add_parser("stop", help="Stop the active workflow for a spec")
     p_stop.add_argument("--spec", required=True, help="Spec ID")
+
+    # hold / unhold
+    p_hold = subparsers.add_parser(
+        "hold",
+        help="Hold a spec out of spec auto run with a pushed spec/hold/<id> tag",
+    )
+    p_hold.add_argument("spec_id", help="Spec ID")
+    p_hold.add_argument("--reason", required=True, help="Why the spec is held (required, non-blank)")
+    p_unhold = subparsers.add_parser("unhold", help="Release a spec hold (deletes spec/hold/<id> on origin and locally)")
+    p_unhold.add_argument("spec_id", help="Spec ID")
 
     # status
     p_status = subparsers.add_parser("status", help="Show run state and gate status")
@@ -1658,6 +1829,8 @@ def main(argv: list[str] | None = None) -> int:
         "create": _cmd_create,
         "implement": _cmd_implement,
         "stop": _cmd_stop,
+        "hold": _cmd_hold,
+        "unhold": _cmd_unhold,
         "status": _cmd_status,
         "review": _cmd_review,
         "list": _cmd_list,
