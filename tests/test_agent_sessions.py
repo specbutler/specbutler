@@ -200,6 +200,15 @@ if AGENT == "claude":
         )
         if not found:
             print(f"No conversation found with session ID: {sid}", file=sys.stderr)
+            # Like the real CLI (2.1.x), stream-json mode still emits an error
+            # result that echoes the id it was asked to resume.
+            print(json.dumps({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "num_turns": 0,
+                "session_id": sid,
+            }), flush=True)
             raise SystemExit(1)
     else:
         sid = args[args.index("--session-id") + 1] if "--session-id" in args else ""
@@ -620,6 +629,60 @@ def test_resume_with_new_workspace_changes_is_not_a_resume_failure(
         assert orch._resume_failure_reason(run, plan, 1, worktree, "before") == ""
         assert "could not resume session sess-1" in orch._resume_failure_reason(
             run, plan, 1, worktree, "after"
+        )
+
+
+@pytest.mark.parametrize(
+    ("event", "confirmed"),
+    [
+        ({"type": "system", "subtype": "init", "session_id": "s"}, True),
+        ({"type": "result", "subtype": "success", "num_turns": 3, "session_id": "s"}, True),
+        # A session that ran and then failed (for example at max turns) existed.
+        (
+            {"type": "result", "subtype": "error_max_turns", "is_error": True, "num_turns": 4,
+             "session_id": "s"},
+            True,
+        ),
+        # `claude --resume` of a missing session echoes the requested id (#116).
+        (
+            {"type": "result", "subtype": "error_during_execution", "is_error": True,
+             "num_turns": 0, "session_id": "s"},
+            False,
+        ),
+        ({"type": "result", "is_error": True, "session_id": "s"}, False),
+        ({"type": "assistant", "session_id": "s"}, False),
+        ({"type": "system", "subtype": "init"}, False),
+    ],
+)
+def test_claude_event_confirms_session(event: dict, confirmed: bool) -> None:
+    assert orch._claude_event_confirms_session(event) is confirmed
+
+
+def test_missing_session_error_result_is_a_resume_failure(repo: Path) -> None:
+    run, worktree = _make_run(repo, "claude")
+    tracker = orch.AgentProgressTracker(agent="claude")
+    orch._handle_claude_stream_line(
+        json.dumps({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "num_turns": 0,
+            "session_id": "sess-1",
+        }),
+        tracker,
+    )
+    assert tracker.provider_session_id() == ""
+    plan = orch.ImplementLaunchPlan(
+        use_stream_json=True,
+        agent_env={},
+        agent_cmd=["claude"],
+        popen_kwargs={},
+        progress_tracker=tracker,
+        session=orch.AgentSessionPlan(resume_session_id="sess-1"),
+    )
+    with patch.object(orch, "_worktree_change_fingerprint", return_value="same"):
+        assert "could not resume session sess-1" in orch._resume_failure_reason(
+            run, plan, 1, worktree, "same"
         )
 
 

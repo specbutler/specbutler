@@ -21334,6 +21334,25 @@ def _load_completion_outbox_result(
         return None
 
 
+def _claude_event_confirms_session(event: dict) -> bool:
+    """Whether a Claude stream event shows the session actually started.
+
+    ``claude --resume <id>`` for a session the CLI can't find prints "No
+    conversation found" and still emits an error result that echoes the
+    requested id after running no turns. Counting that id as confirmed makes
+    ``_resume_failure_reason`` miss the failed resume, so the fresh-session
+    fallback never runs (#116).
+    """
+    if not isinstance(event.get("session_id"), str):
+        return False
+    event_type = event.get("type")
+    if event_type == "system":
+        return True
+    if event_type != "result":
+        return False
+    return not (event.get("is_error") is True and not event.get("num_turns"))
+
+
 def _handle_claude_stream_line(
     line: str,
     tracker: AgentProgressTracker | None = None,
@@ -21362,7 +21381,7 @@ def _handle_claude_stream_line(
     if tracker is not None:
         _track_claude_inflight_tools(event, tracker)
         tracker.record_sandbox_denials(claude_event_denials(event))
-        if event_type in ("system", "result") and isinstance(event.get("session_id"), str):
+        if _claude_event_confirms_session(event):
             tracker.record_provider_session(event["session_id"])
         if event_type == "result" and "structured_output" in event:
             tracker.record_structured_output(event.get("structured_output"))
