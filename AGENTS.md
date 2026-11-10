@@ -154,13 +154,15 @@ ruff check .            # lint gate
 |---------|-------------|
 | `spec init` | Bootstrap a repo for spec-driven development |
 | `spec create [--spec ID]` | Author a new spec interactively |
-| `spec implement --spec ID [--agent A] [--review-agent R]` | Start/resume implementation workflow |
+| `spec implement --spec ID [--agent A] [--review-agent R] [--ignore-hold]` | Start/resume implementation workflow (refuses a held spec unless `--ignore-hold`) |
 | `spec status --spec ID` | Show run state and gate status |
 | `spec review --pr NUMBER` | Inspect full machine-readable PR review feedback |
 | `spec list [--all]` | List specs with status and dependencies |
 | `spec show --spec ID` | Display a spec's content |
 | `spec report --status ok\|blocked\|error\|needs-input` | Report implement-phase completion |
 | `spec stop --spec ID` | Stop an active run without deleting its workspace |
+| `spec hold ID --reason TEXT` | Hold a spec out of `spec auto run` with a pushed `spec/hold/<id>` tag |
+| `spec unhold ID` | Release a hold (deletes `spec/hold/<id>` on origin, then locally) |
 | `spec steer --spec ID --message TEXT` | Attach guidance delivered through the resumed session at the next attempt |
 | `spec attach --spec ID [--exec] [--fork]` | Print or run the command that resumes the latest run's agent session in its workspace |
 | `spec clean --spec ID` | Remove execution workspaces and branches |

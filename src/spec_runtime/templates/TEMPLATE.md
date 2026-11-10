@@ -7,6 +7,7 @@ description: Short one-line description of the feature
 ---
 
 To permanently exclude a spec from dispatch, add `obsolete: true` to frontmatter.
+To keep it out of dispatch temporarily, use `spec hold <id> --reason TEXT` instead.
 
 # Example Feature
 

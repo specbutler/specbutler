@@ -19,12 +19,14 @@ The `spec` command is the primary interface for humans and agents.
 | Command | What it does |
 |---------|-------------|
 | `spec create [--spec ID]` | Author a new spec interactively |
-| `spec implement --spec ID [--agent claude\|codex] [--review-agent claude\|codex]` | Start/resume implementation workflow |
+| `spec implement --spec ID [--agent claude\|codex] [--review-agent claude\|codex] [--ignore-hold]` | Start/resume implementation workflow (refuses a held spec unless `--ignore-hold`) |
 | `spec status --spec ID` | Show run state and gate status |
 | `spec list [--all]` | List specs with status and dependencies |
 | `spec show --spec ID` | Display a spec's content |
 | `spec report --status ok\|blocked\|error\|needs-input` | Report implement-phase completion |
 | `spec stop --spec ID` | Stop an active run without deleting its workspace |
+| `spec hold ID --reason TEXT` | Hold a spec out of `spec auto run` with a pushed `spec/hold/<id>` tag |
+| `spec unhold ID` | Release a hold (deletes `spec/hold/<id>` on origin, then locally) |
 | `spec clean --spec ID` | Remove execution workspaces and branches |
 | `spec task [--agent claude\|codex] [--review-agent claude\|codex]` | Describe and execute a quick task |
 
