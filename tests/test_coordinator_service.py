@@ -983,6 +983,11 @@ def test_http_worker_cannot_spoof_another_tokens_lease_owner(tmp_path: Path):
         store.close()
 
 
+def test_http_server_listen_backlog_accepts_concurrent_workers():
+    # The socketserver default of 5 makes macOS reset concurrent connects.
+    assert CoordinatorHTTPServer.request_queue_size >= 64
+
+
 @pytest.mark.requires_network
 def test_http_concurrent_acquire_requests_are_serialized(tmp_path: Path):
     store = CoordinatorStore(tmp_path / "coord.sqlite")
