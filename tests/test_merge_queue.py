@@ -168,7 +168,9 @@ def test_cancel_dequeues_before_disabling_auto(tmp_path, monkeypatch):
     monkeypatch.setattr(forge, "merge_queue_status", lambda *a, **kw: dict(
         queue_status(entry={"id": "q"}), autoMergeRequest={"enabledAt": "now"}))
     assert forge.cancel_merge_queue(12, cwd=tmp_path) == ""
-    assert "dequeuePullRequest" in runner.call_args_list[0].args[0][-1]
+    assert runner.call_args_list[0].args[0][-1] == (
+        'query=mutation{dequeuePullRequest(input:{id:"PR"}){clientMutationId}}'
+    )
     assert "--disable-auto" in runner.call_args_list[1].args[0]
 
 

@@ -364,7 +364,8 @@ class GitHubForge:
             if status.get("state") == "MERGED":
                 return ""
             if status.get("mergeQueueEntry"):
-                query = "mutation{dequeuePullRequest(input:{pullRequestId:" + json.dumps(status["id"]) + "}){clientMutationId}}"
+                # DequeuePullRequestInput takes the pull request node id as `id`.
+                query = "mutation{dequeuePullRequest(input:{id:" + json.dumps(status["id"]) + "}){clientMutationId}}"
                 result = self._gh(["api", "graphql", "-f", "query=" + query], cwd=cwd)
                 payload = json.loads(result.stdout or "{}")
                 if result.returncode or payload.get("errors"):
