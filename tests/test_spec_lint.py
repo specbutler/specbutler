@@ -53,6 +53,98 @@ def test_errors(tmp_path, frontmatter, body, message):
     assert any(message in error for error in lint_specs(tmp_path)[0].errors)
 
 
+@pytest.mark.parametrize("default_agent", ["claude", "codex"])
+def test_unmapped_area_is_a_warning_naming_the_default_agent(tmp_path, default_agent):
+    (tmp_path / ".spec.toml").write_text(f'[agents]\ndefault = "{default_agent}"\n')
+    write_spec(tmp_path, frontmatter="area: api")
+    result = lint_specs(tmp_path)[0]
+    assert result.errors == []
+    assert any("'api'" in warning and default_agent in warning for warning in result.warnings)
+
+
+@pytest.mark.parametrize("area", ["frontend", "backend", "fullstack", "orchestrator"])
+def test_built_in_areas_lint_cleanly(tmp_path, area):
+    write_spec(tmp_path, frontmatter=f"area: {area}")
+    result = lint_specs(tmp_path)[0]
+    assert result.errors == [] and result.warnings == []
+
+
+def test_frontmatterless_markdown_is_not_linted(tmp_path, monkeypatch, capsys):
+    from spec_runtime.autopilot import spec_graph_skip_reasons
+    from spec_runtime.spec_lint import format_lint
+    from spec_runtime.spec_metadata import iter_spec_metadata
+
+    write_spec(tmp_path)
+    (tmp_path / "specs" / "README.md").write_text("# Specs\n\nThis directory holds specs.\n")
+    results = lint_specs(tmp_path)
+    assert [result.spec_id for result in results] == ["feature"]
+    assert "in 1 specs" in format_lint(results)
+    assert lint_specs(tmp_path, "README")[0].errors == ["spec not found"]
+    assert "README" not in spec_graph_skip_reasons(tmp_path, iter_spec_metadata(tmp_path))
+    monkeypatch.setattr(cli, "_resolve_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_lazy_config", lambda: load_repo_spec_runtime_config(tmp_path))
+    assert cli.main(["lint"]) == 0
+    assert "README" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("frontmatter_text", ["---\n---\n", "---\narea: backend\n---\n"])
+def test_frontmatter_without_id_is_still_linted(tmp_path, frontmatter_text):
+    path = tmp_path / "specs" / "broken.md"
+    path.parent.mkdir()
+    path.write_text(frontmatter_text + "## Goal\nWorks\n## Acceptance Criteria\n- [ ] Works\n")
+    results = lint_specs(tmp_path)
+    assert [result.spec_id for result in results] == ["broken"]
+    assert "id must match the filename stem" in results[0].errors
+
+
+@pytest.mark.parametrize("default_agent", ["claude", "codex"])
+def test_unmapped_area_spec_is_queued_with_default_agent(tmp_path, monkeypatch, default_agent):
+    from spec_runtime import autopilot
+    from spec_runtime.spec_metadata import iter_spec_metadata
+
+    (tmp_path / ".spec.toml").write_text(f'[agents]\ndefault = "{default_agent}"\n')
+    write_spec(tmp_path, frontmatter="area: api")
+    assert "feature" not in autopilot.spec_graph_skip_reasons(tmp_path, iter_spec_metadata(tmp_path))
+    monkeypatch.setattr(autopilot, "resolve_resume_run", lambda *a, **kw: ("", ""))
+    monkeypatch.setattr(autopilot, "read_latest_run_record", lambda *a, **kw: {})
+    monkeypatch.setattr(autopilot, "get_spec_status", lambda *a, **kw: "ready")
+    monkeypatch.setattr(autopilot, "project_canonical_spec_status", lambda *a, **kw: None)
+    monkeypatch.setattr(autopilot, "_annotate_candidate_with_lease", lambda candidate, snapshot: candidate)
+    queue = autopilot.build_dispatch_queue(
+        tmp_path, git_state=SimpleNamespace(merged_specs=set()), run_index=Mock()
+    )
+    assert [(candidate.spec_id, candidate.agent) for candidate in queue] == [("feature", default_agent)]
+
+
+def test_implement_accepts_unmapped_area(tmp_path, monkeypatch):
+    (tmp_path / ".spec.toml").write_text("[specs]\nrequire_merged_spec = false\n")
+    write_spec(tmp_path, frontmatter="area: worker")
+    monkeypatch.setattr(orch, "resolve_repo_root", lambda: tmp_path)
+    workflow = Mock(return_value=0)
+    monkeypatch.setattr(orch, "run_full_workflow", workflow)
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    orch.cmd_run(argparse.Namespace(spec="feature", agent="codex", base="origin/main"))
+    workflow.assert_called_once()
+
+
+def test_area_agent_mapping_is_unchanged():
+    from spec_runtime.autopilot import AREA_AGENT_MAP, select_agent
+    from spec_runtime.config import SpecRuntimeConfig
+    from spec_runtime.spec_metadata import SpecMetadata
+
+    assert AREA_AGENT_MAP == {"frontend": "claude", "fullstack": "claude", "backend": "codex", "orchestrator": "codex"}
+    config = SpecRuntimeConfig()
+
+    def spec(area, body=""):
+        return SpecMetadata("x", False, (), "", "", area, 50, False, body)
+
+    for area, agent in AREA_AGENT_MAP.items():
+        assert select_agent(spec(area), config=config) == agent
+    assert select_agent(spec("backend"), override="claude", config=config) == "claude"
+    assert select_agent(spec("api", "Build the React component"), config=config) == "claude"
+    assert select_agent(spec("api"), config=config) == config.agents.default
+
+
 def test_warnings_do_not_become_errors(tmp_path):
     write_spec(
         tmp_path,

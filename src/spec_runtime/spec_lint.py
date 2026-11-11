@@ -31,7 +31,11 @@ def lint_specs(
 ) -> list[LintResult]:
     from .orchestrator import _extract_acceptance_checklist_items
 
-    paths = sorted(p for p in resolve_specs_root(repo_root).glob("*.md") if p.name != "TEMPLATE.md")
+    paths = sorted(
+        p
+        for p in resolve_specs_root(repo_root).glob("*.md")
+        if p.name != "TEMPLATE.md" and _has_frontmatter_block(p)
+    )
     if source_path is not None:
         if spec_id is None:
             raise ValueError("An explicit spec ID is required for a pinned source")
@@ -42,10 +46,10 @@ def lint_specs(
             metadata.append(parse_spec_metadata(path))
         except InvalidSpecIdError:
             pass
+    config = load_repo_spec_runtime_config(repo_root)
     if merged_spec_ids is None:
         from .spec_status import _git_lines
 
-        config = load_repo_spec_runtime_config(repo_root)
         merged_spec_ids = {
             tag.removeprefix("spec/merged/")
             for tag in _git_lines("tag", "--merged", config.base_ref, "--list", "spec/merged/*", cwd=repo_root)
@@ -78,8 +82,11 @@ def lint_specs(
         for key, kind in types.items():
             if key in fm and (not isinstance(fm[key], kind) or (kind is int and isinstance(fm[key], bool))):
                 errors.append(f"{key} has an invalid type")
-        if "area" in fm and fm["area"] not in VALID_SPEC_AREAS:
-            errors.append("area must be frontend, backend, fullstack, or orchestrator")
+        if isinstance(fm.get("area"), str) and fm["area"] not in VALID_SPEC_AREAS:
+            warnings.append(
+                f"area {fm['area']!r} is not a built-in area ({', '.join(VALID_SPEC_AREAS)}); "
+                f"it will be implemented by the [agents] default agent: {config.agents.default}"
+            )
         if isinstance(fm.get("depends_on"), list) and any(
             not isinstance(dep, str) or not dep for dep in fm["depends_on"]
         ):
@@ -103,6 +110,19 @@ def lint_specs(
     if spec_id is not None and not results:
         results.append(LintResult(spec_id, ["spec not found"], []))
     return results
+
+
+def _has_frontmatter_block(path: Path) -> bool:
+    """Return whether *path* starts with a ``---`` frontmatter block, as specs do.
+
+    Markdown without one (a plain README) is not a spec and is not linted.
+    """
+    try:
+        with path.open(encoding="utf-8") as handle:
+            first = handle.readline()
+    except (OSError, UnicodeDecodeError):
+        return True
+    return first.strip() == "---"
 
 
 def format_lint(results: list[LintResult]) -> str:

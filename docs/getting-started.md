@@ -561,7 +561,12 @@ spec analytics                             # summarize run history
 
 Run `spec lint` to validate all specs, or `spec lint --spec my-feature --json`
 for machine-readable diagnostics. Errors block implementation and autopilot;
-warnings (including more than eight criteria) are advisory. `spec doctor` also
+warnings (including more than eight criteria) are advisory. The `area` field is
+free-form: the four built-in areas (`frontend`, `backend`, `fullstack`,
+`orchestrator`) pick an implementing agent, and any other area, such as `api` or
+`worker`, uses `[agents] default` with a lint warning. Markdown files in `specs/`
+without a frontmatter block, such as a plain `README.md`, are not specs and are
+not linted. `spec doctor` also
 prints a lint summary. `spec lint --critique --spec my-feature` asks the configured
 review agent for read-only, advisory suggestions about ambiguity, testability,
 out-of-scope gaps, and decomposition. Critique suggestions never block a run.
