@@ -995,9 +995,11 @@ class CoordinatorRequestHandler(BaseHTTPRequestHandler):
 
 
 class CoordinatorHTTPServer(ThreadingHTTPServer):
-    # The socketserver default backlog of 5 makes macOS reset connections when
-    # several workers connect at once.
-    request_queue_size = 128
+    # socketserver's default listen backlog is 5. Workers acquire and heartbeat
+    # concurrently, and when the accept queue overflows macOS resets the extra
+    # connections (ECONNRESET) where Linux silently retries the SYN. Ask for the
+    # platform maximum; the kernel clamps it to its own limit.
+    request_queue_size = socket.SOMAXCONN
 
     def __init__(
         self,
