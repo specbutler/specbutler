@@ -200,10 +200,25 @@ if AGENT == "claude":
         )
         if not found:
             print(f"No conversation found with session ID: {sid}", file=sys.stderr)
+            # Like the real CLI (2.1.x), stream-json mode still emits an error
+            # result that echoes the id it was asked to resume.
+            print(json.dumps({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "num_turns": 0,
+                "session_id": sid,
+            }), flush=True)
             raise SystemExit(1)
     else:
         sid = args[args.index("--session-id") + 1] if "--session-id" in args else ""
-    if sid and scenario.get("transcripts"):
+    # Like the real CLI (2.1.x), CLAUDE_CODE_SKIP_PROMPT_HISTORY disables
+    # session persistence as completely as --no-session-persistence does.
+    persists = (
+        "--no-session-persistence" not in args
+        and not os.environ.get("CLAUDE_CODE_SKIP_PROMPT_HISTORY")
+    )
+    if sid and scenario.get("transcripts") and persists:
         project_dir.mkdir(parents=True, exist_ok=True)
         with (project_dir / f"{sid}.jsonl").open("a", encoding="utf-8") as transcript:
             transcript.write(json.dumps({"sessionId": sid}) + "\\n")
@@ -227,7 +242,8 @@ else:
         while not (STATE / "release").exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         rollout.write_text("{}\\n{}\\n", encoding="utf-8")
-if sid and sid not in known:
+    persists = True
+if sid and persists and sid not in known:
     known.append(sid)
     known_path.write_text(json.dumps(known), encoding="utf-8")
 
@@ -620,6 +636,60 @@ def test_resume_with_new_workspace_changes_is_not_a_resume_failure(
         assert orch._resume_failure_reason(run, plan, 1, worktree, "before") == ""
         assert "could not resume session sess-1" in orch._resume_failure_reason(
             run, plan, 1, worktree, "after"
+        )
+
+
+@pytest.mark.parametrize(
+    ("event", "confirmed"),
+    [
+        ({"type": "system", "subtype": "init", "session_id": "s"}, True),
+        ({"type": "result", "subtype": "success", "num_turns": 3, "session_id": "s"}, True),
+        # A session that ran and then failed (for example at max turns) existed.
+        (
+            {"type": "result", "subtype": "error_max_turns", "is_error": True, "num_turns": 4,
+             "session_id": "s"},
+            True,
+        ),
+        # `claude --resume` of a missing session echoes the requested id (#116).
+        (
+            {"type": "result", "subtype": "error_during_execution", "is_error": True,
+             "num_turns": 0, "session_id": "s"},
+            False,
+        ),
+        ({"type": "result", "is_error": True, "session_id": "s"}, False),
+        ({"type": "assistant", "session_id": "s"}, False),
+        ({"type": "system", "subtype": "init"}, False),
+    ],
+)
+def test_claude_event_confirms_session(event: dict, confirmed: bool) -> None:
+    assert orch._claude_event_confirms_session(event) is confirmed
+
+
+def test_missing_session_error_result_is_a_resume_failure(repo: Path) -> None:
+    run, worktree = _make_run(repo, "claude")
+    tracker = orch.AgentProgressTracker(agent="claude")
+    orch._handle_claude_stream_line(
+        json.dumps({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "num_turns": 0,
+            "session_id": "sess-1",
+        }),
+        tracker,
+    )
+    assert tracker.provider_session_id() == ""
+    plan = orch.ImplementLaunchPlan(
+        use_stream_json=True,
+        agent_env={},
+        agent_cmd=["claude"],
+        popen_kwargs={},
+        progress_tracker=tracker,
+        session=orch.AgentSessionPlan(resume_session_id="sess-1"),
+    )
+    with patch.object(orch, "_worktree_change_fingerprint", return_value="same"):
+        assert "could not resume session sess-1" in orch._resume_failure_reason(
+            run, plan, 1, worktree, "same"
         )
 
 

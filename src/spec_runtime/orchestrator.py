@@ -2655,6 +2655,7 @@ def _build_implement_agent_env(
     worktree_path: Path,
     *,
     git_isolation: AgentGitIsolation | None = None,
+    persist_session: bool = False,
 ) -> dict[str, str]:
     # Repository code runs inside the provider process and can read every
     # inherited variable. Start from a provider-specific allowlist; project
@@ -2670,7 +2671,13 @@ def _build_implement_agent_env(
         # while the scrub is set; with the explicit --allowedTools list that
         # still runs unattended (anything else is denied, never prompted).
         env["CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"] = "1"
-        env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
+        # Claude Code also disables session persistence while this is set
+        # (reason "skip_prompt_history"), which silently defeats
+        # `--session-id`: no transcript is written, so every retry's
+        # `--resume` finds no conversation (#116). Only launches that keep no
+        # session may set it.
+        if not persist_session:
+            env["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"
     _inject_worktree_venv_into_env(env, worktree_path)
     _apply_implement_run_identity(env, run)
     _apply_agent_git_environment(env, worktree_path, git_isolation)
@@ -18714,6 +18721,7 @@ def _prepare_implement_launch_plan(
         run,
         worktree_path,
         git_isolation=git_isolation,
+        persist_session=bool(session.session_id or session.resume_session_id),
     )
     referenced_mcp_environment = (
         claude_mcp_materialization.referenced_environment_keys
@@ -21343,6 +21351,25 @@ def _load_completion_outbox_result(
         return None
 
 
+def _claude_event_confirms_session(event: dict) -> bool:
+    """Whether a Claude stream event shows the session actually started.
+
+    ``claude --resume <id>`` for a session the CLI can't find prints "No
+    conversation found" and still emits an error result that echoes the
+    requested id after running no turns. Counting that id as confirmed makes
+    ``_resume_failure_reason`` miss the failed resume, so the fresh-session
+    fallback never runs (#116).
+    """
+    if not isinstance(event.get("session_id"), str):
+        return False
+    event_type = event.get("type")
+    if event_type == "system":
+        return True
+    if event_type != "result":
+        return False
+    return not (event.get("is_error") is True and not event.get("num_turns"))
+
+
 def _handle_claude_stream_line(
     line: str,
     tracker: AgentProgressTracker | None = None,
@@ -21371,7 +21398,7 @@ def _handle_claude_stream_line(
     if tracker is not None:
         _track_claude_inflight_tools(event, tracker)
         tracker.record_sandbox_denials(claude_event_denials(event))
-        if event_type in ("system", "result") and isinstance(event.get("session_id"), str):
+        if _claude_event_confirms_session(event):
             tracker.record_provider_session(event["session_id"])
         if event_type == "result" and "structured_output" in event:
             tracker.record_structured_output(event.get("structured_output"))
