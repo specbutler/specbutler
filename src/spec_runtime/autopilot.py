@@ -96,6 +96,7 @@ from spec_runtime.process_supervisor import (
     process_cwd,
     request_legacy_process_shutdown,
 )
+from spec_runtime.spec_hold_tags import HoldTag
 from spec_runtime.spec_identity import SPEC_ID_RE
 from spec_runtime.spec_merge_tags import (
     MergeTagProvenance,
@@ -1447,6 +1448,11 @@ def build_dispatch_queue(
         spec_path = resolve_spec_path(repo_root, spec.spec_id, config=repo_config)
         run_id, reason = resolve_resume_run(repo_root, spec, spec_path=spec_path, run_index=run_index)
         status = get_spec_status(repo_root, spec.spec_id, spec_path, git_state=git_state, config=repo_config)
+        if status == "held":
+            # A hold tag keeps the spec out of every dispatch path: new runs
+            # and resumes alike. ``spec unhold`` (or ``--ignore-hold`` on a
+            # manual ``spec implement``) is the way forward.
+            continue
         if status in {"merged", "needs-attention", "obsolete"}:
             # needs-attention driven purely by pending intake is actionable by
             # the operator, so surface it when the caller asked for intake rows.
@@ -1684,29 +1690,51 @@ class SourceStalenessWatch:
 
 
 def refresh_runtime_git_refs(repo_root: Path) -> tuple[bool, str]:
-    """Refresh remote refs used by spec_status before queue evaluation."""
-    from .control_plane import (
-        DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
-        GitFetchTimeoutError,
-        run_git_fetch_with_timeout,
-    )
+    """Refresh remote refs used by spec_status before queue evaluation.
 
-    try:
-        outcome = run_git_fetch_with_timeout(
-            ["--quiet", "--tags", "--prune", "origin"],
-            cwd=repo_root,
-            timeout_seconds=DEFAULT_GIT_FETCH_TIMEOUT_SECONDS,
+    Also mirrors ``spec/hold/*`` tags with pruning, because ``--tags --prune``
+    never removes a local tag whose remote counterpart was deleted. The hold
+    fetch runs first and independently: ``spec hold`` force-replaces a tag,
+    and a plain ``--tags`` fetch refuses to clobber the stale local copy, so
+    gating the hold refresh on that fetch would leave holds stale forever.
+    """
+    from .spec_table import refresh_git_spec_refs
+
+    return refresh_git_spec_refs(repo_root)
+
+
+def held_spec_reasons(repo_root: Path, git_state) -> dict[str, HoldTag]:
+    """Return held, dispatchable-catalog specs whose status resolves to ``held``.
+
+    Merged and obsolete specs with a leftover hold tag are excluded, matching
+    ``get_spec_status`` precedence.
+    """
+    holds = dict(getattr(git_state, "holds_by_spec", {}) or {})
+    if not holds:
+        return {}
+    repo_config = load_repo_spec_runtime_config(repo_root)
+    held: dict[str, HoldTag] = {}
+    for spec in iter_spec_metadata(repo_root):
+        hold = holds.get(spec.spec_id)
+        if hold is None or spec.obsolete or spec.superseded_by:
+            continue
+        status = get_spec_status(
+            repo_root,
+            spec.spec_id,
+            resolve_spec_path(repo_root, spec.spec_id, config=repo_config),
+            git_state=git_state,
+            config=repo_config,
         )
-    except GitFetchTimeoutError as exc:
-        return False, f"git fetch timed out after {exc.timeout_seconds:.0f}s"
+        if status == "held":
+            held[spec.spec_id] = hold
+    return held
 
-    if outcome.is_success:
-        return True, ""
 
-    output = (outcome.stderr or outcome.stdout).strip()
-    if not output:
-        output = "git fetch failed"
-    return False, output
+def render_held_specs(held: dict[str, HoldTag]) -> str:
+    lines = ["Held (not dispatched):"]
+    for spec_id, hold in sorted(held.items()):
+        lines.append(f"  {spec_id}: {hold.describe()}")
+    return "\n".join(lines)
 
 
 def write_active_state(repo_root: Path, active: dict[str, ActiveRunProcess]) -> None:
@@ -2720,6 +2748,7 @@ def run_loop(args: argparse.Namespace) -> int:
     last_queue_signature: tuple[tuple[str, str, str], ...] = ()
     last_refresh_error = ""
     last_graph_skip_reasons: dict[str, str] = {}
+    last_held_specs: dict[str, HoldTag] = {}
     low_memory_active = False
     lease_backoff_until: dict[str, float] = {}
     dispatch_breaker = DispatchCircuitBreaker()
@@ -3010,6 +3039,17 @@ def run_loop(args: argparse.Namespace) -> int:
                             )
                         )
                 last_graph_skip_reasons = graph_skip_reasons
+                held_specs = held_spec_reasons(repo_root, git_state)
+                for held_spec_id, hold in sorted(held_specs.items()):
+                    previous_hold = last_held_specs.get(held_spec_id)
+                    if previous_hold is None or previous_hold.display_reason != hold.display_reason:
+                        print(
+                            format_status_line(
+                                "skip",
+                                f"{held_spec_id} is held and will not be dispatched: {hold.display_reason}",
+                            )
+                        )
+                last_held_specs = held_specs
                 coordinator_snapshot = fetch_coordinator_lease_snapshot(repo_root)
                 full_queue = [
                     candidate
@@ -3089,6 +3129,8 @@ def run_loop(args: argparse.Namespace) -> int:
                             },
                         )
                     )
+                    if held_specs:
+                        print(render_held_specs(held_specs))
                     return 0
 
                 free_memory = available_memory_bytes()

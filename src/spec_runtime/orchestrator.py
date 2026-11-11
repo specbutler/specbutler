@@ -224,6 +224,7 @@ from .sandbox_denials import (
     is_sandbox_denial_text,
     sandbox_denial_summary,
 )
+from .spec_hold_tags import NO_REASON_RECORDED, read_hold_tag, refresh_hold_tags
 from .spec_identity import (
     LOCAL_REVIEW_OWNER,
     SPEC_ID_RE,
@@ -4851,6 +4852,15 @@ def check_dependencies_merged(repo_root: Path, spec_id: str) -> list[str]:
                 continue
         if is_spec_merged(repo_root, dep):
             continue
+        # A held dependency without a usable merge tag stays blocked: the
+        # forge fallback must not let a hold be bypassed (local status is
+        # ``held``, so dispatch would also refuse it).
+        dep_status = read_spec_status(repo_root, dep, dep_path) if dep_path is not None else ""
+        if dep_status == "held":
+            hold = read_hold_tag(repo_root, dep)
+            reason = hold.display_reason if hold is not None else NO_REASON_RECORDED
+            blockers.append(f"{dep} (held: {reason})")
+            continue
         try:
             merged = get_forge_adapter().is_spec_merged(dep, base_branch=PR_BASE_BRANCH, cwd=repo_root)
         except (RuntimeError, OSError, AttributeError) as exc:
@@ -4865,7 +4875,6 @@ def check_dependencies_merged(repo_root: Path, spec_id: str) -> list[str]:
         if dep_path is None:
             blockers.append(f"{dep} (missing spec file)")
             continue
-        dep_status = read_spec_status(repo_root, dep, dep_path)
         if dep_status != "merged":
             blockers.append(f"{dep} ({dep_status})")
     if blockers and fetch_error:
@@ -30835,6 +30844,28 @@ def _validate_new_spec_run(repo_root: Path, spec_id: str, base_ref: str) -> None
             raise RuntimeError("Spec must exist on the base ref; merge it first or set [specs] require_merged_spec = false.")
 
 
+def _spec_hold_refusal(repo_root: Path, spec_id: str) -> str:
+    """Return the refusal message when ``spec_id`` is held, else ``""``.
+
+    Refreshes ``spec/hold/*`` from origin first (best effort): a failed
+    refresh warns and falls back to the local tags.
+    """
+    refreshed, refresh_error = refresh_hold_tags(repo_root)
+    if not refreshed:
+        logger.warning("%s; using local hold tags", refresh_error)
+    hold = read_hold_tag(repo_root, spec_id)
+    if hold is None:
+        return ""
+    if read_spec_status(repo_root, spec_id) != "held":
+        # Merged/obsolete take precedence over a leftover hold tag; later
+        # checks report those states.
+        return ""
+    return (
+        f"Spec '{spec_id}' is held: {hold.describe()}. "
+        f"Run `spec unhold {spec_id}` to release the hold, or pass --ignore-hold to run it anyway."
+    )
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Start or resume a full workflow run."""
     repo_root = resolve_repo_root()
@@ -30858,6 +30889,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     if review_agent not in VALID_AGENTS:
         print(f"Error: REVIEW_AGENT must be one of {VALID_AGENTS}", file=sys.stderr)
         return 1
+
+    # The hold gate runs before any lease, run record or workspace exists, and
+    # only here: a hold set while a run is active does not stop it.
+    if not bool(getattr(args, "ignore_hold", False)):
+        hold_error = _spec_hold_refusal(repo_root, spec_id)
+        if hold_error:
+            print(f"Error: {hold_error}", file=sys.stderr)
+            return 1
 
     def planned_new_run_lease() -> tuple[RunState, str, str | None]:
         preallocated_run_id = os.environ.get("SPEC_PREALLOCATED_RUN_ID", "").strip()
@@ -31505,6 +31544,9 @@ def cmd_status(args: argparse.Namespace) -> int:
         status = read_spec_status(repo_root, spec_id, spec_path, git_state=git_state)
     print(f"Spec: {spec_id}")
     print(f"  Status: {status}")
+    if status == "held":
+        hold = git_state.hold_for(spec_id)
+        print(f"  Hold: {hold.describe() if hold is not None else NO_REASON_RECORDED}")
     for breaker in open_breakers_for_spec(infra_breaker_state_path(_state_root(repo_root)), spec_id):
         print(f"  Dispatch: {breaker.describe()}")
         print(f"    Next Probe: {breaker.to_payload().get('next_probe_at') or 'unknown'}")

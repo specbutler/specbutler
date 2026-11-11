@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 from dataclasses import dataclass
@@ -23,6 +24,17 @@ class MergeTagProvenance:
     actor: str
     timestamp: str
     schema_version: int = MERGE_TAG_SCHEMA_VERSION
+
+
+def resolve_actor() -> str:
+    """Resolve the tag actor the same way merge tags do."""
+    return (
+        os.getenv("SPEC_ACTOR")
+        or os.getenv("USER")
+        or os.getenv("LOGNAME")
+        or os.getenv("USERNAME")
+        or "unknown"
+    )
 
 
 def merge_tag_name(spec_id: str) -> str:

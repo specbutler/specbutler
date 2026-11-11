@@ -435,6 +435,58 @@ View the contents of a spec:
 spec show --spec my-first-feature
 ```
 
+### Holding a spec
+
+Use a hold when a spec must not run *yet*: the work waits on something outside
+the repository (a manual switch-on, a vendor, a decision), or someone is
+building it by hand. A hold is temporary and changes nothing in the spec
+itself. Use `obsolete: true` when the spec will never be implemented, and
+`superseded_by` when another spec replaces it; both are commits that change
+what the spec means.
+
+```bash
+spec hold my-first-feature --reason "waiting on the billing switch-on"
+spec unhold my-first-feature
+```
+
+`spec hold` writes an annotated tag `spec/hold/<id>` at the base branch tip,
+with a JSON message recording the reason, actor and timestamp, and pushes it
+to `origin`. Every checkout sees the hold after a fetch; `spec auto run`,
+`spec list` and `spec implement` refresh hold tags from `origin` and drop
+holds that were removed there. Running `spec hold` again replaces the reason.
+If the push fails the hold stays local only, and the command prints how to
+push it. `spec unhold` deletes the tag on `origin`, then locally.
+
+While a spec is held:
+
+- `spec list` and `spec status` show the status `held`, and `spec list` adds a
+  `Held (not dispatched):` section with each reason.
+- `spec auto run` never dispatches it, as a new run or a resume, and
+  `spec auto run --dry-run` lists it under `Held (not dispatched):`. A run that
+  was already active when the hold was set keeps going; use `spec stop` to
+  stop it.
+- Specs that depend on it stay blocked, and `spec implement` on a dependent
+  reports `<dep> (held: <reason>)`. Releasing the hold does not unblock them:
+  dependents still wait for the dependency to merge.
+- `spec implement --spec <id>` refuses to start or resume it. Pass
+  `--ignore-hold` to run it anyway; the hold tag stays in place.
+  `--ignore-hold` does not bypass dependency checks.
+
+A merged or obsolete spec is never shown as held, even if a hold tag remains.
+
+You can also create or remove a hold with plain git. A lightweight tag, or one
+whose message is not JSON, still holds the spec; its reason shows as
+`no reason recorded`:
+
+```bash
+git fetch origin
+git tag -a spec/hold/my-first-feature origin/main -m '{"schema_version":1,"spec_id":"my-first-feature","reason":"waiting on vendor","actor":"me","timestamp":"2026-01-01T00:00:00Z"}'
+git push origin refs/tags/spec/hold/my-first-feature
+
+git push origin :refs/tags/spec/hold/my-first-feature   # release
+git tag -d spec/hold/my-first-feature
+```
+
 ## 7. Quick tasks
 
 For small changes that do not warrant a full spec (one-off fixes, minor
@@ -493,6 +545,8 @@ spec doctor                                # validate local readiness
 spec create --spec <id>                    # author a spec
 spec implement --spec <id>                 # run full lifecycle
 spec stop --spec <id>                      # stop a live run, preserving work
+spec hold <id> --reason TEXT               # hold a spec out of spec auto run
+spec unhold <id>                           # release a hold
 spec status --spec <id>                    # check run state
 spec attach --spec <id> [--exec] [--fork]  # resume the run's agent session
 spec list                                  # list all specs

@@ -3,6 +3,8 @@
 
 Status is resolved from stable merge tags plus run state:
 - merged:           tag refs/tags/spec/merged/<spec-id> reachable from the configured base ref
+- held:             local tag refs/tags/spec/hold/<spec-id> exists (``spec hold``); ranks below
+                    obsolete and merged, above every run-derived status
 - in-progress:      active run record for the spec or remote implementation branch/ref
 - needs-attention:  spec requires intake but has no intake-complete run to resume
 - obsolete:         spec frontmatter contains ``obsolete: true``
@@ -17,17 +19,18 @@ import argparse
 import json
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .config import SpecRuntimeConfig, load_repo_spec_runtime_config, load_spec_runtime_config, resolve_spec_path
 from .git_common import resolve_common_root as _resolve_common_root
 from .git_common import run_git
 from .platform_fs import read_bounded_regular_text
+from .spec_hold_tags import HoldTag, read_hold_tag, read_hold_tags
 from .spec_identity import SPEC_ID_RE, implementation_branch_identity, parse_worktree_name
 from .spec_metadata import SpecMetadata, parse_spec_metadata
 
-VALID_STATUSES = ("not-started", "in-progress", "needs-attention", "merged", "obsolete")
+VALID_STATUSES = ("not-started", "in-progress", "needs-attention", "held", "merged", "obsolete")
 ACTIVE_RUN_STATUSES = frozenset(("pending", "running", "failed", "blocked", "waiting-for-input"))
 LIVE_ACTIVE_RUN_STATUSES = frozenset(("pending", "running"))
 TERMINAL_RUN_STATUSES = frozenset(("passed", "abandoned", "superseded"))
@@ -75,6 +78,14 @@ class SpecGitState:
     active_runs_by_spec: dict[str, tuple[ActiveRunRecord, ...]]
     orphaned_local_branches_by_spec: dict[str, tuple[str, ...]]
     orphaned_local_worktrees_by_spec: dict[str, tuple[str, ...]]
+    holds_by_spec: dict[str, HoldTag] = field(default_factory=dict)
+
+    @property
+    def held_specs(self) -> frozenset[str]:
+        return frozenset(self.holds_by_spec)
+
+    def hold_for(self, spec_id: str) -> HoldTag | None:
+        return self.holds_by_spec.get(spec_id)
 
     def is_in_progress(self, spec_id: str) -> bool:
         return spec_id in self.active_run_specs or spec_id in self.remote_in_progress_specs
@@ -532,7 +543,20 @@ def collect_git_spec_state(
             active_runs_by_spec,
             config=runtime_config,
         ),
+        holds_by_spec=read_hold_tags(repo_root),
     )
+
+
+def spec_hold(
+    repo_root: Path,
+    spec_id: str,
+    git_state: SpecGitState | None = None,
+) -> HoldTag | None:
+    """Return the parsed hold tag for ``spec_id``, or ``None`` when not held."""
+    if git_state is not None:
+        holds = getattr(git_state, "holds_by_spec", None)
+        return holds.get(spec_id) if isinstance(holds, dict) else None
+    return read_hold_tag(repo_root, spec_id)
 
 
 def is_spec_merged(
@@ -702,6 +726,8 @@ def get_spec_status(
         return "obsolete"
     if is_spec_merged(repo_root, spec_id, git_state=git_state, config=config):
         return "merged"
+    if spec_hold(repo_root, spec_id, git_state=git_state) is not None:
+        return "held"
     if blocks_on_required_intake(
         repo_root,
         spec_id,
