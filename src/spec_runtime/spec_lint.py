@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .config import load_repo_spec_runtime_config, resolve_specs_root
+from .run_hooks import reads_frontmatter_key
 from .spec_metadata import (
     VALID_SPEC_AREAS,
     InvalidSpecIdError,
@@ -93,7 +94,8 @@ def lint_specs(
             errors.append("depends_on must contain nonempty spec IDs")
         errors.extend(p.detail for p in graph.get(str(fm.get("id")), ()))
         for key in fm:
-            if key not in types:
+            # A key a lifecycle hook reads belongs to the project, not to a typo.
+            if key not in types and not reads_frontmatter_key(config.hooks, key):
                 warnings.append(f"unknown frontmatter key: {key}")
         headings = set(re.findall(r"^##\s+(.+?)\s*$", parse_spec_body(path), re.MULTILINE))
         for heading in ("Goal", "Acceptance Criteria"):
