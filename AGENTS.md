@@ -53,6 +53,7 @@ src/spec_runtime/
 ├── init.py                 # spec init — repo bootstrapping
 ├── orchestrator.py         # Lifecycle engine and phase state machine
 ├── config.py               # .spec.toml loader
+├── run_hooks.py            # [hooks] — project commands run at run lifecycle events
 ├── forge.py                # ForgeAdapter protocol + GitHubForge
 ├── agent_adapter.py        # AgentAdapter protocol + Claude/Codex
 ├── spec_identity.py        # Branch/worktree naming conventions

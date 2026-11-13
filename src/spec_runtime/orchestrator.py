@@ -65,7 +65,7 @@ from pathlib import Path, PurePosixPath
 from urllib import parse as urllib_parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import review_convergence, review_feedback, worktree_process_registry
+from . import review_convergence, review_feedback, run_hooks, worktree_process_registry
 from .agent_adapter import (
     CODEX_REVIEW_CHECKOUT_SHELL,
     COMPLETION_SCHEMA,
@@ -29673,7 +29673,108 @@ def _maybe_wait_out_infrastructure_failure(
     return True
 
 
+def _run_hook_message(run: RunState, event: str, detail: str = "") -> str:
+    subject = f"Run {run.run_id} for spec {run.spec_id} on branch {run.branch}"
+    if event == "needs_input":
+        return f"{subject} needs input: {run.input_question or run.last_error or 'see spec status'}"
+    if event == "blocked":
+        return f"{subject} is blocked: {run.last_error or 'see spec status'}"
+    if event == "abandoned":
+        return f"{subject} was abandoned: {detail or 'no reason recorded'}"
+    if event == "resumed":
+        return f"{subject} resumed at phase {run.phase}."
+    if event == "finished":
+        return f"{subject} finished: the change is merged."
+    return f"{subject} started."
+
+
+def _fire_run_hook(
+    repo_root: Path,
+    run: RunState,
+    event: str,
+    *,
+    detail: str = "",
+    spec_path: Path | None = None,
+) -> str:
+    """Run the project's ``[hooks]`` command for a lifecycle event.
+
+    Returns the failure detail, or ``""``. Only the caller of ``start`` acts on
+    a failure; every other event is reported here and the run carries on.
+    """
+    from .config import load_repo_spec_runtime_config
+
+    try:
+        hooks = load_repo_spec_runtime_config(repo_root).hooks
+    except ValueError as exc:
+        return f"could not read [hooks]: {exc}"
+    if not hooks.enabled:
+        return ""
+    frontmatter: dict = {}
+    try:
+        path = spec_path or _spec_path_for_run_id(repo_root, run, run.spec_id)
+        if path.is_file():
+            frontmatter = load_spec_frontmatter(path)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    result = run_hooks.run_hook(
+        hooks,
+        event,
+        run_hooks.hook_values(
+            event=event,
+            spec_id=run.spec_id,
+            run_id=run.run_id,
+            branch=run.branch,
+            state=run.status,
+            phase=run.phase,
+            run_mode=run.run_mode,
+            frontmatter=frontmatter,
+        ),
+        cwd=repo_root,
+        message=_run_hook_message(run, event, detail),
+        redact=redact_sensitive,
+    )
+    failure = result.detail if result is not None and not result.ok else ""
+    if event == "start" and failure:
+        return failure
+    # The marker records what was announced, so ``resumed`` and ``abandoned``
+    # fire only for runs that have something to resume or give up.
+    run_hooks.record_event(_state_root(repo_root) / "runs" / run.run_id, event)
+    if failure:
+        logger.warning("Lifecycle hook failed for run %s: %s", run.run_id, failure)
+        _emit_user_progress(f"[spec] {run.spec_id}: warning: lifecycle hook failed: {failure}")
+    return failure
+
+
+def fire_abandoned_run_hooks(repo_root: Path, runs: list[RunState], reason: str) -> None:
+    """Announce ``abandoned`` for runs that announced a start and never finished."""
+    for run in runs:
+        last = run_hooks.last_event(_state_root(repo_root) / "runs" / run.run_id)
+        if last and last not in ("finished", "abandoned") and run.status != "passed":
+            _fire_run_hook(repo_root, run, "abandoned", detail=reason)
+
+
+_RUN_RESULT_HOOK_EVENTS = {
+    "passed": "finished",
+    "waiting-for-input": "needs_input",
+    "blocked": "blocked",
+}
+
+
 def run_full_workflow(
+    run: RunState,
+    repo_root: Path,
+    *,
+    retry_cap: int = RETRY_CAP,
+) -> str:
+    """Run all phases, then tell the project's lifecycle hooks how the run stopped."""
+    result = _run_workflow_phases(run, repo_root, retry_cap=retry_cap)
+    event = _RUN_RESULT_HOOK_EVENTS.get(result)
+    if event:
+        _fire_run_hook(repo_root, run, event)
+    return result
+
+
+def _run_workflow_phases(
     run: RunState,
     repo_root: Path,
     *,
@@ -30823,6 +30924,12 @@ def cmd_task(args: argparse.Namespace) -> int:
 
     try:
         run = _create_task_run(repo_root, agent=agent, review_agent=review_agent, base_ref=base_ref)
+        refusal = _fire_run_hook(repo_root, run, "start")
+        if refusal:
+            run.status = "abandoned"
+            run.last_error = f"Run refused by the start hook: {refusal}"
+            run.save(repo_root)
+            raise RuntimeError(run.last_error)
         logger.info("Starting new task run %s", run.run_id)
         retry_cap = getattr(args, "retry_cap", None) or run.retry_cap
         # Task IDs are unique, so this normally has no contention cost. It
@@ -31027,6 +31134,25 @@ def cmd_run(args: argparse.Namespace) -> int:
                 spec_path = _command_spec_path(repo_root, spec_id, None)
                 if not spec_path.exists():
                     raise RuntimeError(f"Spec not found: {spec_path}")
+                # Lifecycle hooks: release what this run replaces, then let
+                # the project refuse the run before any record or workspace
+                # exists for it.
+                supersedes = force_new_run or (
+                    latest_existing_run is not None and latest_existing_run.status == "failed"
+                )
+                if supersedes:
+                    fire_abandoned_run_hooks(
+                        repo_root,
+                        [
+                            candidate
+                            for candidate in RunState.list_for_spec(repo_root, spec_id)
+                            if not candidate.is_superseded and candidate.is_non_terminal
+                        ],
+                        f"superseded by run {preallocated_run_id}",
+                    )
+                refusal = _fire_run_hook(repo_root, lease_run, "start", spec_path=spec_path)
+                if refusal:
+                    raise RuntimeError(f"Run refused by the start hook: {refusal}")
                 try:
                     os.environ["SPEC_PREALLOCATED_RUN_ID"] = preallocated_run_id
                     run = _create_spec_run(
@@ -31038,6 +31164,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                         requested_by=_current_actor(),
                         branch=branch,
                     )
+                except BaseException:
+                    fire_abandoned_run_hooks(repo_root, [lease_run], "the run could not be created")
+                    raise
                 finally:
                     if previous_preallocated_run_id is None or previous_preallocated_run_id == preallocated_run_id:
                         os.environ.pop("SPEC_PREALLOCATED_RUN_ID", None)
@@ -31110,6 +31239,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                             run.last_block_debugger_guided_retry_signature = ""
                 else:
                     logger.info("Resuming run %s at phase %s", run.run_id, run.phase)
+                if run_hooks.last_event(_state_root(repo_root) / "runs" / run.run_id) in (
+                    "needs_input",
+                    "blocked",
+                ):
+                    _fire_run_hook(repo_root, run, "resumed")
 
             if reset_intake:
                 run.intake_reset_requested = True
