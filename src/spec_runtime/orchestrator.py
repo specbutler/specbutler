@@ -65,7 +65,7 @@ from pathlib import Path, PurePosixPath
 from urllib import parse as urllib_parse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import review_convergence, review_feedback, worktree_process_registry
+from . import review_convergence, review_diff_evidence, review_feedback, worktree_process_registry
 from .agent_adapter import (
     CODEX_REVIEW_CHECKOUT_SHELL,
     COMPLETION_SCHEMA,
@@ -357,6 +357,9 @@ LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT = "high"
 # rereview_reasoning_effort overrides it: a cheaper re-review was a source of
 # goalpost-moving findings.
 LOCAL_REVIEW_REASONING_EFFORT = LOCAL_REVIEW_FIRST_PASS_REASONING_EFFORT
+# The most host-materialized diff a review prompt carries; the rest is read on
+# demand (review_diff_evidence).
+LOCAL_REVIEW_INLINE_DIFF_MAX_CHARS = review_diff_evidence.INLINE_DIFF_MAX_CHARS
 LOCAL_REVIEW_TIMEOUT_STDIO_MAX_LINES = 40
 LOCAL_REVIEW_TIMEOUT_STDIO_MAX_CHARS = 4000
 LOCAL_REVIEW_TIMEOUT_RAW_REVIEW_MAX_CHARS = 4000
@@ -13534,6 +13537,7 @@ def _local_review_artifact_paths(repo_root: Path, run_id: str) -> dict[str, Path
         "job_summary": output_dir / "review-decision-summary.md",
         "timeout_debug": output_dir / "timeout-debug.json",
         "bootstrap_warning": output_dir / "review-bootstrap-warning.json",
+        "diff_evidence": output_dir / "review-diff-evidence.json",
     }
 
 
@@ -14254,6 +14258,7 @@ def _build_local_review_command(
     writable_temp_dir: Path | None = None,
     review_checkout: Path | None = None,
     provider_home: Path | None = None,
+    review_diff_evidence: Path | None = None,
 ) -> list[str]:
     from .agent_adapter import get_agent_adapter
 
@@ -14271,6 +14276,7 @@ def _build_local_review_command(
         "review_checkout": review_checkout,
         "provider_home": provider_home,
         "reasoning_effort": reasoning_effort,
+        "review_diff_evidence": review_diff_evidence,
     }
     for key, value in optional_kwargs.items():
         if value and _adapter_method_accepts_kwarg(agent.build_review_command, key):
@@ -25364,14 +25370,102 @@ def _custom_review_checkout_prompt_note(
     )
 
 
+def _review_generated_paths(
+    review_worktree: Path,
+    *,
+    base_sha: str,
+    paths: Sequence[str],
+) -> frozenset[str]:
+    """Paths the base commit's ``.gitattributes`` marks ``linguist-generated``.
+
+    Attributes come from the base commit, not the PR head, so a pull request
+    cannot mark its own hand-written changes as generated to keep them out of
+    the review prompt.
+    """
+    if not paths or not base_sha:
+        return frozenset()
+    result = run_subprocess(
+        ["git", "check-attr", "-z", f"--source={base_sha}", "linguist-generated", "--", *paths],
+        cwd=review_worktree,
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "Could not read linguist-generated attributes for the review diff: %s",
+            (result.stderr or "").strip() or "unknown error",
+        )
+        return frozenset()
+    fields = str(result.stdout or "").split("\0")
+    return frozenset(
+        fields[i]
+        for i in range(0, len(fields) - 2, 3)
+        if fields[i + 1] == "linguist-generated" and fields[i + 2] in {"set", "true"}
+    )
+
+
+def _codex_review_diff_prompt_text(
+    diff_text: str,
+    *,
+    review_worktree: Path,
+    base_sha: str,
+    head_sha: str,
+    evidence_path: Path | None,
+) -> str:
+    """Return the diff section of a Codex review prompt, bounded in size."""
+    if evidence_path is None:
+        plan = review_diff_evidence.plan_review_diff(diff_text, budget=len(diff_text))
+    else:
+        paths = [f.path for f in review_diff_evidence.split_diff_by_file(diff_text)]
+        plan = review_diff_evidence.plan_review_diff(
+            diff_text,
+            generated=_review_generated_paths(review_worktree, base_sha=base_sha, paths=paths),
+            budget=LOCAL_REVIEW_INLINE_DIFF_MAX_CHARS,
+        )
+        review_diff_evidence.write_evidence(evidence_path, plan, base_sha=base_sha, head_sha=head_sha)
+    if plan.complete:
+        return (
+            "The orchestrator materialized the authoritative diff on the host below; "
+            "the gate results already in this prompt are authoritative.\n\n"
+            "<BEGIN_HOST_MATERIALIZED_DIFF>\n"
+            f"{diff_text}"
+            "\n<END_HOST_MATERIALIZED_DIFF>"
+        )
+    return (
+        "The orchestrator materialized the authoritative diff "
+        f"(`git diff --unified=80 {base_sha}...{head_sha}`) on the host; the gate results "
+        f"already in this prompt are authoritative. The diff is {plan.total_chars} characters "
+        f"across {len(plan.files)} files, too large to include in full, so this prompt "
+        "includes only the files marked `inline` in the manifest below. Every file's exact "
+        "diff is available through the review_inspection `read_diff` tool: pass `path` "
+        "exactly as the manifest gives it, and pass the previous result's `next_offset` as "
+        "`offset` to page through a long diff. Without a path it returns this manifest.\n\n"
+        "Review every changed file. A file marked `read_diff` is part of the change under "
+        "review: read its diff before you decide. A file marked `generated` is "
+        "linguist-generated according to the base branch's .gitattributes; read it as far "
+        "as the hand-written change depends on it (for example, a generated API schema "
+        "matching its handlers).\n\n"
+        "<BEGIN_REVIEW_DIFF_MANIFEST>\n"
+        f"{review_diff_evidence.render_manifest(plan)}"
+        "<END_REVIEW_DIFF_MANIFEST>\n\n"
+        "<BEGIN_HOST_MATERIALIZED_DIFF>\n"
+        f"{plan.inline_text()}"
+        "\n<END_HOST_MATERIALIZED_DIFF>"
+    )
+
+
 def _codex_review_sandbox_prompt_note(
     review_worktree: Path,
     scratch_dir: Path,
     *,
     base_sha: str,
     head_sha: str,
+    evidence_path: Path | None = None,
 ) -> str:
-    """Inline host-materialized evidence and the checkout inspection boundary."""
+    """Host-materialized diff evidence and the checkout inspection boundary.
+
+    With *evidence_path*, the full diff is written there for the review
+    inspection server, and the prompt carries at most
+    ``LOCAL_REVIEW_INLINE_DIFF_MAX_CHARS`` of it.
+    """
     diff_text = _local_review_diff_text(
         review_worktree,
         base_sha=base_sha,
@@ -25393,13 +25487,12 @@ def _codex_review_sandbox_prompt_note(
             "Paths are relative to the checkout; git_show requires explicit file paths. "
             "Shell execution is unavailable. Do not rerun tests or execute PR code. "
         )
-    return (
-        boundary
-        + "The orchestrator materialized the authoritative diff on the host below; "
-        "the gate results already in this prompt are authoritative.\n\n"
-        "<BEGIN_HOST_MATERIALIZED_DIFF>\n"
-        f"{diff_text}"
-        "\n<END_HOST_MATERIALIZED_DIFF>"
+    return boundary + _codex_review_diff_prompt_text(
+        diff_text,
+        review_worktree=review_worktree,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        evidence_path=evidence_path,
     )
 
 
@@ -25527,7 +25620,19 @@ def _local_review_incremental_diff(
             "been rewritten, so treat the full diff as the change under review)\n",
             None,
         )
-    return full.stdout, review_convergence.changed_line_ranges(zero.stdout)
+    incremental = full.stdout
+    if len(incremental) > LOCAL_REVIEW_INLINE_DIFF_MAX_CHARS:
+        # A rebase onto a moved base can make the incremental diff as large
+        # as the whole PR; list the files rather than overflow the prompt.
+        incremental = (
+            f"(the incremental diff {revision_range} is {len(incremental)} characters, too "
+            "large to include. Files changed since the last reviewed head:\n"
+            f"{review_diff_evidence.summarize_oversized_diff(incremental)}"
+            "Inspect their current content in the checkout; the review inspection "
+            f"git_show tool with operation diff and revision {revision_range} shows one "
+            "file's incremental diff.)\n"
+        )
+    return incremental, review_convergence.changed_line_ranges(zero.stdout)
 
 
 def _local_review_rereview_context(
@@ -25719,6 +25824,7 @@ def _run_local_review(
                 review_scratch_dir,
                 base_sha=expected_base_sha,
                 head_sha=expected_head_sha,
+                evidence_path=artifact_paths["diff_evidence"],
             )
             if agent.name == "codex"
             else _claude_review_evidence_prompt_note(
@@ -25774,6 +25880,11 @@ def _run_local_review(
             writable_temp_dir=review_scratch_dir,
             review_checkout=review_worktree if agent.name == "codex" else None,
             provider_home=review_codex_home,
+            review_diff_evidence=(
+                artifact_paths["diff_evidence"]
+                if agent.name == "codex" and artifact_paths["diff_evidence"].is_file()
+                else None
+            ),
         )
         review_env = _build_local_review_env(
             temp_dir=review_scratch_dir,
@@ -25860,6 +25971,11 @@ def _run_local_review(
             if review_exec.returncode != 0:
                 detail = _format_subprocess_failure(review_exec)
                 review_exec_failed_summary = f"Local review agent failed (exit_code={review_exec.returncode})"
+                if "input_too_large" in detail:
+                    review_exec_failed_summary += (
+                        f". The review prompt ({len(prompt)} characters) is over the "
+                        f"{review_agent} input limit; a retry rebuilds the same prompt"
+                    )
                 if detail:
                     review_exec_failed_summary = f"{review_exec_failed_summary}: {detail}"
         finally:
