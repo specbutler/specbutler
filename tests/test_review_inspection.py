@@ -157,7 +157,8 @@ def test_directory_tool_escapes(checkout, tool):
 
 
 @pytest.mark.requires_network
-def test_real_codex_inspection_smoke(checkout, tmp_path, record_property):
+@pytest.mark.parametrize("tool", ["read_file", "read_diff"])
+def test_real_codex_inspection_smoke(checkout, tmp_path, record_property, tool):
     """Exercise the installed CLI using local Responses SSE; no provider or credentials."""
     if os.environ.get("SPEC_CODEX_INSPECTION_SMOKE") != "1":
         pytest.skip("set SPEC_CODEX_INSPECTION_SMOKE=1 for the real CLI smoke")
@@ -176,8 +177,8 @@ def test_real_codex_inspection_smoke(checkout, tmp_path, record_property):
             requests.append(request)
             if len(requests) == 1:
                 item = {"type": "function_call", "id": "fc_1", "call_id": "call_1",
-                        "namespace": "mcp__review_inspection", "name": "read_file",
-                        "arguments": json.dumps({"path": "hello.txt"})}
+                        "namespace": "mcp__review_inspection", "name": tool,
+                        "arguments": json.dumps({"path": tool_path})}
             else:
                 item = {"type": "message", "id": "msg_1", "role": "assistant",
                         "status": "completed", "content": [{"type": "output_text",
@@ -201,9 +202,20 @@ def test_real_codex_inspection_smoke(checkout, tmp_path, record_property):
 
     home = tmp_path / "codex-home"
     home.mkdir()
+    diff_evidence = None
+    tool_path, expected = "hello.txt", "hello review"
+    if tool == "read_diff":
+        from spec_runtime import review_diff_evidence
+        diff = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n"
+                "-old line\n+diff evidence line\n")
+        diff_evidence = tmp_path / "state" / "evidence.json"
+        review_diff_evidence.write_evidence(
+            diff_evidence, review_diff_evidence.plan_review_diff(diff, budget=1),
+            base_sha="b", head_sha="h")
+        tool_path, expected = "a.py", "diff evidence line"
     cmd = CodexAgent().build_review_command(
         prompt="", output_path=tmp_path / "result", review_checkout=checkout,
-        writable_temp_dir=tmp_path, provider_home=home)
+        writable_temp_dir=tmp_path, provider_home=home, review_diff_evidence=diff_evidence)
     server = HTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -215,7 +227,7 @@ def test_real_codex_inspection_smoke(checkout, tmp_path, record_property):
     ]
     cmd[cmd.index("-o"):cmd.index("-o")] = [arg for value in overrides for arg in ("-c", value)]
     try:
-        result = subprocess.run(cmd, input="Read hello.txt with read_file.", text=True,
+        result = subprocess.run(cmd, input=f"Read {tool_path} with {tool}.", text=True,
                                 capture_output=True, timeout=45,
                                 env={**os.environ, "CODEX_HOME": str(home)})
     finally:
@@ -227,8 +239,8 @@ def test_real_codex_inspection_smoke(checkout, tmp_path, record_property):
     calls = [e["item"] for e in events if e.get("type") == "item.completed"
              and e.get("item", {}).get("type") == "mcp_tool_call"]
     assert len(calls) == 1
-    assert calls[0]["tool"] == "read_file" and calls[0]["status"] == "completed"
-    assert "hello review" in json.dumps(calls[0]["result"])
+    assert calls[0]["tool"] == tool and calls[0]["status"] == "completed"
+    assert expected in json.dumps(calls[0]["result"])
     assert len(requests) == 2
     tools = requests[0]["tools"]
     assert not any(t.get("name") in {"shell", "exec_command", "apply_patch"} for t in tools)

@@ -1399,6 +1399,7 @@ class CodexAgent:
         review_checkout: Path | None = None,
         provider_home: Path | None = None,
         reasoning_effort: str = "",
+        review_diff_evidence: Path | None = None,
     ) -> list[str]:
         del prompt, mcp_config_path  # Prompt arrives on stdin.
         inspection_checkout = review_checkout
@@ -1464,6 +1465,10 @@ class CodexAgent:
                              + repr(str(Path(__file__).resolve().parent.parent))
                              + "); from spec_runtime.review_inspection import main; main()",
                              str(inspection_checkout.resolve()),
+                             # Host-written diff evidence, served by read_diff;
+                             # it lives in host state the reviewer cannot reach.
+                             *([f"--diff-evidence={review_diff_evidence.resolve()}"]
+                               if review_diff_evidence else []),
                              *(str(p) for p in protected_operator_paths()),
                              *([str(provider_home.resolve())] if provider_home else [])],
                 },
