@@ -54,11 +54,37 @@ def glob_matches(relative: str, pattern: str) -> bool:
 
 
 class Inspection:
-    def __init__(self, root: Path, protected: tuple[Path, ...] | None = None):
+    def __init__(self, root: Path, protected: tuple[Path, ...] | None = None,
+                 diff_evidence: Path | None = None):
         self.root = root.resolve(strict=True)
         self.protected = tuple(p.resolve() for p in (
             protected_operator_paths() if protected is None else protected
         ))
+        # Host-written per-file diffs (review_diff_evidence); loaded on first use.
+        self.diff_evidence = diff_evidence
+        self._evidence: dict | None = None
+
+    def read_diff(self, path: str = "", offset: int = 0) -> dict:
+        """Page through the host-materialized diff of one changed file."""
+        if self.diff_evidence is None:
+            raise ValueError("This review has no host-materialized diff evidence")
+        if not isinstance(path, str) or isinstance(offset, bool) or not isinstance(offset, int) \
+                or offset < 0:
+            raise ValueError("read_diff takes a manifest path and a nonnegative offset")
+        if self._evidence is None:
+            from .review_diff_evidence import load_evidence
+            self._evidence = load_evidence(self.diff_evidence)
+        if path:
+            text = self._evidence["files"].get(path)
+            if text is None:
+                raise ValueError("No diff for that path; call read_diff without a path for the "
+                                 "manifest and use a path exactly as it lists it")
+        else:
+            text = self._evidence["manifest"]
+        chunk = text[offset:offset + LIMIT]
+        end = offset + len(chunk)
+        return {"text": chunk, "offset": offset, "total_chars": len(text),
+                "next_offset": end if end < len(text) else None}
 
     def path(self, path: str = ".") -> Path:
         raw = Path(path)
@@ -162,6 +188,8 @@ class Inspection:
                 "truncated": len(data) > LIMIT}
 
     def call(self, name: str, arguments: dict) -> dict:
+        if name == "read_diff":
+            return self.read_diff(**arguments)
         if name == "read_file":
             return self.read(**arguments)
         if name == "git_show":
@@ -227,11 +255,30 @@ TOOLS = [
                              "revision": STRING, "paths": {"type": "array", "items": STRING}},
                 ["paths"]),
 ]
+READ_DIFF_TOOL = {
+    "name": "read_diff",
+    "description": "The exact pull-request diff the host materialized for this review, one "
+    "changed file at a time. Without a path it returns the manifest of changed files. Pass "
+    "path exactly as the manifest lists it, and offset (the previous result's next_offset) "
+    "to page through a long diff.",
+    "inputSchema": {"type": "object", "properties": {
+        "path": STRING, "offset": {"type": "integer", "minimum": 0}},
+        "required": [], "additionalProperties": False},
+}
+
+
+def tools_for(inspection: Inspection) -> list[dict]:
+    return [*TOOLS, READ_DIFF_TOOL] if inspection.diff_evidence is not None else list(TOOLS)
 
 
 def main():
+    evidence_flag = "--diff-evidence="
+    evidence = next((Path(a[len(evidence_flag):]) for a in sys.argv[2:]
+                     if a.startswith(evidence_flag)), None)
     inspection = Inspection(Path(sys.argv[1]),
-                            (*protected_operator_paths(), *(Path(p) for p in sys.argv[2:])))
+                            (*protected_operator_paths(),
+                             *(Path(p) for p in sys.argv[2:] if not p.startswith(evidence_flag))),
+                            diff_evidence=evidence)
     for line in sys.stdin.buffer:
         request = {}
         try:
@@ -248,7 +295,7 @@ def main():
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
-                result = {"tools": TOOLS}
+                result = {"tools": tools_for(inspection)}
             elif method == "tools/call":
                 params = request["params"]
                 try:
