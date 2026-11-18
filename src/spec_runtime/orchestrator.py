@@ -4019,6 +4019,7 @@ CLAUDE_CREDENTIALS_EXPIRY_WARN_SECONDS = 1800
 AGENT_CAPACITY_DEFAULT_BACKOFF_SECONDS = 300.0
 AGENT_CAPACITY_MAX_BACKOFF_SECONDS = 24 * 60 * 60.0
 AGENT_CAPACITY_LEASE_REFRESH_SECONDS = 30.0
+AGENT_CAPACITY_RESET_SLACK_SECONDS = 5.0
 
 
 def _claude_credentials_preflight_error(
@@ -4118,6 +4119,48 @@ def _is_agent_auth_failure_message(message: object) -> bool:
     return any(marker in text for marker in auth_markers) and any(marker in text for marker in agent_markers)
 
 
+# Claude names the spent window in the message itself: "You've hit your
+# 5-hour limit · resets 11:20am (America/Los_Angeles)", "You've hit your weekly
+# limit · resets ...", "You've hit your Opus limit ...". Spend and credit caps
+# ("monthly spend limit") are not time windows and are left to the ordinary
+# failure path unless the provider advertises a reset.
+_AGENT_LIMIT_HIT_RE = re.compile(
+    r"\byou(?:'ve| have) (?:hit|reached) your (?P<name>[\w' -]{1,40}?) limit\b(?P<rest>[^\n]*)"
+)
+_AGENT_TIME_WINDOW_LIMIT_WORDS = (
+    "5-hour",
+    "five-hour",
+    "session",
+    "daily",
+    "weekly",
+    "7-day",
+    "opus",
+    "sonnet",
+    "fable",
+    "usage",
+)
+# Prefix of the summary recorded from Claude's structured rate_limit_event.
+CLAUDE_STRUCTURED_CAPACITY_PREFIX = "claude usage limit reached"
+_AGENT_CAPACITY_LINE_START_RE = re.compile(
+    r"\s*(?:you(?:'ve| have) (?:hit|reached) your |(?:session|weekly) usage limit reached"
+    + "|" + CLAUDE_STRUCTURED_CAPACITY_PREFIX + ")"
+)
+_AGENT_CAPACITY_RESETS_AT_RE = re.compile(r"\[resets_at=(\d{9,11})\]")
+_AGENT_CAPACITY_RESET_TEXT_RE = re.compile(
+    r"\bresets\s+(?:at\s+)?"
+    r"(?:(?P<month>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?P<day>\d{1,2})"
+    r"(?:,?\s+(?P<year>\d{4}))?,?\s+(?:at\s+)?)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)"
+    r"(?:\s*\((?P<tz>[^)]+)\))?",
+    flags=re.IGNORECASE,
+)
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def _normalize_capacity_text(message: object) -> str:
+    return str(message or "").strip().replace("\u2019", "'")
+
+
 def _is_agent_capacity_failure_message(message: object) -> bool:
     """Return True when an agent provider says the account window is spent.
 
@@ -4126,18 +4169,102 @@ def _is_agent_capacity_failure_message(message: object) -> bool:
     usage window with an advertised reset time cannot recover by immediately
     relaunching the agent and must not consume convergence attempts.
     """
-    text = str(message or "").strip().lower().replace("’", "'")
+    text = _normalize_capacity_text(message).lower()
     if not text:
         return False
     markers = (
-        "you've hit your session limit",
-        "you have hit your session limit",
-        "you've reached your usage limit",
-        "you have reached your usage limit",
         "session usage limit reached",
         "weekly usage limit reached",
+        CLAUDE_STRUCTURED_CAPACITY_PREFIX,
     )
-    return any(marker in text for marker in markers)
+    if any(marker in text for marker in markers):
+        return True
+    for match in _AGENT_LIMIT_HIT_RE.finditer(text):
+        name = match.group("name")
+        if "spend" in name or "credit" in name:
+            # A spend or credit cap only clears when someone raises it, unless
+            # the provider says when it resets.
+            if "resets" in match.group("rest"):
+                return True
+            continue
+        if "resets" in match.group("rest") or any(
+            word in name for word in _AGENT_TIME_WINDOW_LIMIT_WORDS
+        ):
+            return True
+    return False
+
+
+def _is_agent_capacity_failure_line(line: object) -> bool:
+    """Return True when an agent output line *is* a capacity notice.
+
+    Progress lines include the agent's own prose and tool arguments, which can
+    quote a limit message (for example while working on this very detector).
+    Only a line that starts with the notice counts as the provider speaking.
+    """
+    text = _normalize_capacity_text(line).lower()
+    return bool(_AGENT_CAPACITY_LINE_START_RE.match(text)) and _is_agent_capacity_failure_message(text)
+
+
+def _agent_capacity_reset_at(
+    message: object,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Return when the provider says its spent window resets, if it says.
+
+    Claude's structured ``rate_limit_event`` gives an epoch, which the tracker
+    keeps as ``[resets_at=<epoch>]``; that wins over the human text, such as
+    ``resets 11:20am (America/Los_Angeles)`` or ``resets Nov 14, 3pm (UTC)``.
+    """
+    text = _normalize_capacity_text(message)
+    epoch_match = _AGENT_CAPACITY_RESETS_AT_RE.search(text)
+    if epoch_match is not None:
+        try:
+            return datetime.fromtimestamp(int(epoch_match.group(1)), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            pass
+    match = _AGENT_CAPACITY_RESET_TEXT_RE.search(text)
+    if match is None:
+        return None
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or 0)
+    if not 1 <= hour <= 12 or minute > 59:
+        return None
+    hour %= 12
+    if match.group("ampm").lower() == "pm":
+        hour += 12
+    timezone_name = (match.group("tz") or "UTC").strip()
+    try:
+        reset_tz = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        reset_tz = timezone.utc
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    local_now = current.astimezone(reset_tz)
+    try:
+        if match.group("month"):
+            month = _MONTHS.index(match.group("month").lower()[:3]) + 1
+            year = int(match.group("year") or local_now.year)
+            reset = local_now.replace(
+                year=year,
+                month=month,
+                day=int(match.group("day")),
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+            if not match.group("year") and reset < local_now - timedelta(days=180):
+                # "resets Jan 2" read on Dec 30 means next year.
+                reset = reset.replace(year=year + 1)
+        else:
+            reset = local_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if reset <= local_now:
+                reset += timedelta(days=1)
+    except ValueError:
+        return None
+    return reset.astimezone(timezone.utc)
 
 
 def _agent_capacity_retry_delay_seconds(
@@ -4147,42 +4274,22 @@ def _agent_capacity_retry_delay_seconds(
 ) -> float | None:
     """Return the provider-window delay, or None for a non-capacity error.
 
-    Claude currently reports values such as ``resets 8:30pm
-    (America/Los_Angeles)``. Parse that when available and retain a bounded
-    five-minute fallback for wording without a timestamp.
+    Wait until a few seconds after the advertised reset. Without a usable
+    reset time, or with one already in the past, back off by a bounded
+    five-minute fallback and look again.
     """
     if not _is_agent_capacity_failure_message(message):
         return None
-    text = str(message or "").strip().replace("’", "'")
-    match = re.search(
-        r"\bresets\s+(\d{1,2}):(\d{2})\s*(am|pm)(?:\s*\(([^)]+)\))?",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if match is None:
-        return AGENT_CAPACITY_DEFAULT_BACKOFF_SECONDS
-
-    hour = int(match.group(1)) % 12
-    if match.group(3).lower() == "pm":
-        hour += 12
-    minute = int(match.group(2))
-    if minute > 59:
-        return AGENT_CAPACITY_DEFAULT_BACKOFF_SECONDS
-
-    timezone_name = (match.group(4) or "UTC").strip()
-    try:
-        reset_tz = ZoneInfo(timezone_name)
-    except ZoneInfoNotFoundError:
-        reset_tz = timezone.utc
     current = now or datetime.now(timezone.utc)
     if current.tzinfo is None:
         current = current.replace(tzinfo=timezone.utc)
-    local_now = current.astimezone(reset_tz)
-    reset = local_now.replace(hour=hour, minute=minute, second=5, microsecond=0)
-    if reset <= local_now:
-        reset += timedelta(days=1)
-    delay = (reset - local_now).total_seconds()
-    return min(max(delay, 1.0), AGENT_CAPACITY_MAX_BACKOFF_SECONDS)
+    reset = _agent_capacity_reset_at(message, now=current)
+    if reset is None:
+        return AGENT_CAPACITY_DEFAULT_BACKOFF_SECONDS
+    delay = (reset - current).total_seconds() + AGENT_CAPACITY_RESET_SLACK_SECONDS
+    if delay <= AGENT_CAPACITY_RESET_SLACK_SECONDS:
+        return AGENT_CAPACITY_DEFAULT_BACKOFF_SECONDS
+    return min(delay, AGENT_CAPACITY_MAX_BACKOFF_SECONDS)
 
 
 def _is_forge_auth_failure_message(message: object) -> bool:
@@ -10050,6 +10157,9 @@ class AgentProgressTracker:
     _sandbox_denial: SandboxDenial | None = field(default=None, repr=False)
     _auth_failure_summary: str = field(default="", repr=False)
     _network_failure_summary: str = field(default="", repr=False)
+    _capacity_failure_text: str = field(default="", repr=False)
+    _capacity_structured_summary: str = field(default="", repr=False)
+    _capacity_resets_at: int | None = field(default=None, repr=False)
     _provider_session_id: str = field(default="", repr=False)
     _structured_output: object = field(default=None, repr=False)
     _final_agent_message: str = field(default="", repr=False)
@@ -10155,8 +10265,53 @@ class AgentProgressTracker:
                 self._auth_failure_summary = clean_summary
             if not self._network_failure_summary and _is_agent_network_failure_message(clean_summary):
                 self._network_failure_summary = clean_summary
+            if not self._capacity_failure_text and _is_agent_capacity_failure_line(clean_summary):
+                # Claude prints the limit notice, then a result event that
+                # replaces the last event summary with "session complete".
+                self._capacity_failure_text = clean_summary
         self._maybe_persist_heartbeat()
         return clean_summary
+
+    def record_capacity_failure(
+        self,
+        notice: str = "",
+        *,
+        structured_summary: str = "",
+        resets_at: object = None,
+    ) -> None:
+        """Remember a provider capacity refusal reported outside progress lines.
+
+        ``notice`` is the provider's own text (an error result event's),
+        which is preferred for display. ``structured_summary`` describes a
+        structured refusal that carried no text, and ``resets_at`` is the
+        epoch second the window reopens.
+        """
+        clean_notice = redact_sensitive(str(notice or "").strip())[:240]
+        epoch: int | None = None
+        if isinstance(resets_at, (int, float)) and not isinstance(resets_at, bool) and resets_at > 0:
+            epoch = int(resets_at)
+        with self._lock:
+            if clean_notice and not self._capacity_failure_text:
+                self._capacity_failure_text = clean_notice
+            if structured_summary and not self._capacity_structured_summary:
+                self._capacity_structured_summary = structured_summary
+            if epoch is not None:
+                self._capacity_resets_at = epoch
+
+    def capacity_failure_summary(self) -> str:
+        """Return the capacity notice this launch saw, or "".
+
+        The structured reset epoch is appended as ``[resets_at=<epoch>]`` so
+        the workflow wait uses it instead of parsing the human text.
+        """
+        with self._lock:
+            text = self._capacity_failure_text or self._capacity_structured_summary
+            resets_at = self._capacity_resets_at
+        if not text:
+            return ""
+        if resets_at is not None:
+            text = f"{text} [resets_at={resets_at}]"
+        return text
 
     def network_failure_summary(self) -> str:
         with self._lock:
@@ -17596,7 +17751,11 @@ def _resume_failure_reason(
     if tracker is not None:
         if tracker.provider_session_id() or tracker.structured_completion() is not None:
             return ""
-        if tracker.auth_failure_summary() or tracker.network_failure_summary():
+        if (
+            tracker.auth_failure_summary()
+            or tracker.network_failure_summary()
+            or tracker.capacity_failure_summary()
+        ):
             return ""
         _, last_event = tracker.snapshot()
         if _is_agent_capacity_failure_message(last_event):
@@ -19476,6 +19635,31 @@ def _interpret_implement_attempt_result(
     completion_instruction = COMPLETE_HANDSHAKE_INSTRUCTION.replace("<spec-id>", run.spec_id)
     manual_completion_command = _manual_completion_helper_command(run)
 
+    # A provider that refused the launch (not logged in, usage window spent)
+    # explains the missing handshake, whatever earlier attempts left in the
+    # worktree. Classify it before the uncommitted-changes recovery, which
+    # would only launch into the same refusal and report unreported_work.
+    if outcome.progress_tracker is not None:
+        _, last_event = outcome.progress_tracker.snapshot()
+        auth_event = outcome.progress_tracker.auth_failure_summary() or (
+            last_event if _is_agent_auth_failure_message(last_event) else ""
+        )
+        if auth_event:
+            run.last_error = (
+                f"Agent CLI is not authenticated in this execution environment "
+                f"(no_handshake). Agent output: {auth_event}"
+            )
+            return "blocked"
+        capacity_event = outcome.progress_tracker.capacity_failure_summary() or (
+            last_event if _is_agent_capacity_failure_message(last_event) else ""
+        )
+        if capacity_event:
+            run.last_error = (
+                "Agent provider capacity window is exhausted "
+                f"(provider_capacity, no_handshake). Last agent output: {capacity_event}"
+            )
+            return "failed"
+
     if outcome.has_uncommitted_changes:
         recovery_status = _attempt_no_handshake_recovery(
             run,
@@ -19527,22 +19711,6 @@ def _interpret_implement_attempt_result(
         return "failed"
 
     if outcome.progress_tracker is not None:
-        _, last_event = outcome.progress_tracker.snapshot()
-        auth_event = outcome.progress_tracker.auth_failure_summary() or (
-            last_event if _is_agent_auth_failure_message(last_event) else ""
-        )
-        if auth_event:
-            run.last_error = (
-                f"Agent CLI is not authenticated in this execution environment "
-                f"(no_handshake). Agent output: {auth_event}"
-            )
-            return "blocked"
-        if _is_agent_capacity_failure_message(last_event):
-            run.last_error = (
-                "Agent provider capacity window is exhausted "
-                f"(provider_capacity, no_handshake). Last agent output: {last_event}"
-            )
-            return "failed"
         network_event = outcome.progress_tracker.network_failure_summary()
         if network_event:
             run.last_error = (
@@ -21402,6 +21570,7 @@ def _handle_claude_stream_line(
             tracker.record_provider_session(event["session_id"])
         if event_type == "result" and "structured_output" in event:
             tracker.record_structured_output(event.get("structured_output"))
+        _track_claude_capacity_refusal(event, tracker)
     if event_type == "assistant":
         content = _claude_message_content(event)
         if not content and tracker is not None:
@@ -21441,6 +21610,33 @@ def _handle_claude_stream_line(
         print(" | ".join(parts), file=sys.stderr, flush=True)
     elif tracker is not None:
         tracker.heartbeat()
+
+
+def _track_claude_capacity_refusal(event: dict, tracker: AgentProgressTracker) -> None:
+    """Record Claude's structured signs that the subscription window is spent.
+
+    ``rate_limit_event`` carries ``rate_limit_info`` with ``status``,
+    ``resetsAt`` (epoch seconds) and ``rateLimitType`` (``five_hour``,
+    ``seven_day``...). ``rejected`` means requests are refused, unless the
+    account is spending usage credits past the window. An error ``result``
+    event repeats the notice text.
+    """
+    event_type = event.get("type")
+    if event_type == "rate_limit_event":
+        info = event.get("rate_limit_info")
+        if not isinstance(info, dict) or info.get("status") != "rejected":
+            return
+        if info.get("isUsingOverage") is True or info.get("overageInUse") is True:
+            return
+        window = str(info.get("rateLimitType") or "").strip() or "unknown window"
+        tracker.record_capacity_failure(
+            structured_summary=f"Claude usage limit reached ({window})",
+            resets_at=info.get("resetsAt"),
+        )
+    elif event_type == "result" and event.get("is_error") is True:
+        result_text = str(event.get("result") or "").strip()
+        if _is_agent_capacity_failure_line(result_text):
+            tracker.record_capacity_failure(result_text.split("\n", 1)[0])
 
 
 def _claude_message_content(event: dict) -> list[dict]:
@@ -29785,15 +29981,20 @@ def run_full_workflow(
                     else None
                 )
                 if capacity_delay is not None:
+                    resume_at = (
+                        datetime.now(timezone.utc) + timedelta(seconds=capacity_delay)
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
                     logger.warning(
                         "Agent provider capacity exhausted for %s; waiting %.0fs "
-                        "before relaunching the same implement attempt.",
+                        "(until %s) before relaunching the same implement attempt.",
                         run.spec_id,
                         capacity_delay,
+                        resume_at,
                     )
                     _emit_user_progress(
                         f"[spec] {run.spec_id}: agent capacity exhausted; "
-                        f"waiting {capacity_delay:.0f}s without consuming an attempt"
+                        f"waiting {capacity_delay:.0f}s (until {resume_at}) "
+                        "without consuming an attempt"
                     )
                     _wait_for_agent_capacity_window(
                         run,
