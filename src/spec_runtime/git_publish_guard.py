@@ -20,6 +20,13 @@ _SCP_REMOTE_RE = re.compile(
 )
 _REMOTE_HELPER_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*::")
 _PUBLICATION_URL_SCHEMES = frozenset({"file", "git", "http", "https", "ssh"})
+# Shared-config keys that tools running beside a spec run legitimately write
+# and that cannot influence host publication. ``extensions.worktreeConfig`` is
+# set by worktree managers (the Claude desktop app sets it when it creates a
+# session worktree); every host publication command overrides it to false
+# (host_publication_git_environment), and config.worktree files are
+# fingerprinted on their own whether or not the extension is enabled.
+_PUBLICATION_INERT_CONFIG_KEYS = frozenset({"extensions.worktreeconfig"})
 
 # pushInsteadOf is applied only to push URLs, so fetch/pull keep their normal
 # transport. The synthetic protocol has no registered remote helper and fails
@@ -297,6 +304,7 @@ def capture_repository_publication_baseline(repo_root: Path) -> tuple[str, str]:
         # Host push with -u may update branch tracking. It cannot influence a
         # direct-URL push, so exclude only this Git-managed namespace.
         if not key.casefold().startswith("branch.")
+        and key.casefold() not in _PUBLICATION_INERT_CONFIG_KEYS
     ]
     digest = sha256(
         "".join(f"{key}\0{value}\0" for key, value in stable_entries).encode("utf-8")

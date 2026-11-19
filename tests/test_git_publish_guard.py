@@ -388,6 +388,77 @@ def test_publication_baseline_detects_linked_worktree_config_poisoning(
         )
 
 
+def _repo_with_linked_agent_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    worktree = tmp_path / "linked"
+    assert _git(tmp_path, "init", "-b", "main", str(repo)).returncode == 0
+    assert _git(repo, "config", "user.name", "Spec Butler test").returncode == 0
+    assert _git(repo, "config", "user.email", "specbutler@example.invalid").returncode == 0
+    assert _git(repo, "remote", "add", "origin", "https://github.com/acme/repo.git").returncode == 0
+    (repo / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    assert _git(repo, "add", "tracked.txt").returncode == 0
+    assert _git(repo, "commit", "-m", "initial").returncode == 0
+    assert _git(repo, "worktree", "add", "-b", "agent", str(worktree)).returncode == 0
+    return repo, worktree
+
+
+def test_publication_baseline_survives_a_worktree_manager_enabling_worktree_config(
+    tmp_path: Path,
+) -> None:
+    # A worktree manager running beside the spec run (the Claude desktop app
+    # creating a session worktree) enables extensions.worktreeConfig in the
+    # shared config and adds its own worktree. That must not fail the run.
+    repo, worktree = _repo_with_linked_agent_worktree(tmp_path)
+    remote_url, fingerprint = capture_repository_publication_baseline(worktree)
+
+    assert _git(repo, "config", "extensions.worktreeConfig", "true").returncode == 0
+    session = tmp_path / "session"
+    assert _git(repo, "worktree", "add", "-b", "session", str(session)).returncode == 0
+    assert _git(session, "config", "--worktree", "core.bare", "false").returncode == 0
+
+    assert_repository_publication_baseline(
+        worktree,
+        expected_remote_url=remote_url,
+        expected_config_fingerprint=fingerprint,
+    )
+
+
+def test_publication_baseline_still_detects_agent_worktree_config_after_enabling_it(
+    tmp_path: Path,
+) -> None:
+    repo, worktree = _repo_with_linked_agent_worktree(tmp_path)
+    remote_url, fingerprint = capture_repository_publication_baseline(worktree)
+
+    assert _git(repo, "config", "extensions.worktreeConfig", "true").returncode == 0
+    assert _git(worktree, "config", "--worktree", "core.sshCommand", "hostile-ssh").returncode == 0
+
+    with pytest.raises(UnsafeRepositoryGitConfigError, match="changed") as caught:
+        assert_repository_publication_baseline(
+            worktree,
+            expected_remote_url=remote_url,
+            expected_config_fingerprint=fingerprint,
+        )
+
+    assert "hostile-ssh" not in str(caught.value)
+
+
+def test_publication_baseline_still_detects_other_shared_config_changes(
+    tmp_path: Path,
+) -> None:
+    repo, worktree = _repo_with_linked_agent_worktree(tmp_path)
+    remote_url, fingerprint = capture_repository_publication_baseline(worktree)
+
+    assert _git(repo, "config", "extensions.worktreeConfig", "true").returncode == 0
+    assert _git(repo, "config", "core.sshCommand", "post-launch-helper").returncode == 0
+
+    with pytest.raises(UnsafeRepositoryGitConfigError, match="changed"):
+        assert_repository_publication_baseline(
+            worktree,
+            expected_remote_url=remote_url,
+            expected_config_fingerprint=fingerprint,
+        )
+
+
 @pytest.mark.parametrize(
     ("remote_url", "expected"),
     [
