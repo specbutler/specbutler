@@ -410,8 +410,9 @@ boundaries around the coding agent and the forge.
 
 ### Persistent State
 
-- `.spec.toml` configures paths, verify gates, agents, retry limits, and
-  optional setup/teardown hooks.
+- `.spec.toml` configures paths, verify gates, agents, retry limits,
+  optional setup/teardown hooks, and optional
+  [run lifecycle hooks](docs/lifecycle-hooks.md).
 - `specs/` holds normal dispatchable specs. `specs/tasks/` holds task-flow
   specs created by `spec task`.
 - `.worktrees/` contains implementation and task worktrees; branch and worktree

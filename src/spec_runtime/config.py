@@ -12,6 +12,7 @@ from typing import TextIO
 
 from .command_runtime import CommandConfigurationError, CommandVariants, parse_command_variants
 from .git_common import run_git
+from .run_hooks import HookConfigError, RunHooksConfig, parse_hooks_section
 
 _LOCAL_CONFIG_FILENAME = ".spec.local.toml"
 
@@ -374,6 +375,7 @@ class SpecRuntimeConfig:
     execution: ExecutionConfig = ExecutionConfig()
     coordination: CoordinationConfig = CoordinationConfig()
     mcp: McpConfig = McpConfig()
+    hooks: RunHooksConfig = RunHooksConfig()
 
     @property
     def pr_base_branch(self) -> str:
@@ -1058,6 +1060,10 @@ def load_spec_runtime_config(
     merge_payload = raw.get("merge", {})
     if not isinstance(merge_payload, dict) or merge_payload.get("queue", "auto") not in ("auto", "on", "off"):
         raise SpecConfigError("merge.queue must be auto, on or off")
+    try:
+        hooks = parse_hooks_section(raw.get("hooks"))
+    except HookConfigError as exc:
+        raise SpecConfigError(str(exc)) from exc
     return SpecRuntimeConfig(
         merge=MergeConfig(queue=merge_payload.get("queue", "auto")),
         budget=BudgetConfig(max_cost_usd_per_run=max_cost),
@@ -1101,6 +1107,7 @@ def load_spec_runtime_config(
         execution=execution,
         coordination=coordination,
         mcp=_parse_mcp_section(mcp_payload),
+        hooks=hooks,
     )
 
 

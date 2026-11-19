@@ -324,12 +324,15 @@ def _cmd_clean(args: argparse.Namespace) -> int:
             if live_blockers:
                 _print_clean_refusal(spec_id, live_blockers, _runs_use_container(runs))
                 return 1
-            return _clean_inactive_spec_artifacts(
+            status = _clean_inactive_spec_artifacts(
                 spec_id=spec_id,
                 common_root=common_root,
                 config=config,
                 runs=runs,
             )
+            if status == 0:
+                orch.fire_abandoned_run_hooks(common_root, runs, "cleaned up without merging")
+            return status
     except RuntimeError as exc:
         print(f"Error: Refusing to clean '{spec_id}': {exc}", file=sys.stderr)
         _print_clean_remediation(spec_id, _runs_use_container(runs))

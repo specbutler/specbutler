@@ -58,6 +58,7 @@ def _orch(
     return SimpleNamespace(
         RunState=run_state,
         SpecLock=_SpecLock,
+        fire_abandoned_run_hooks=lambda *_args, **_kwargs: None,
         _resolve_recorded_process_group=MagicMock(return_value=process_group),
         read_process_identity=MagicMock(return_value=identity),
         is_process_group_alive=MagicMock(return_value=group_alive),

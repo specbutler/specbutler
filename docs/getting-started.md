@@ -168,6 +168,11 @@ Key things to check:
 - **`agents.default`** -- the agent used when `--agent` is not passed to
   `spec implement`.
 
+To keep an issue tracker or another shared board in step with runs, or to
+refuse a run someone else already owns, add `[hooks]` commands that fire when
+a run starts, waits for input, continues, finishes or is abandoned: see
+[Run lifecycle hooks](lifecycle-hooks.md).
+
 For multi-machine dispatch with the SQLite coordinator, keep secrets out of
 committed `.spec.toml` and follow
 [SQLite Coordinator with Tailscale or SSH](coordinator-tailscale.md), including
