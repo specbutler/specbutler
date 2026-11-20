@@ -108,6 +108,9 @@ def test_launch(checkout, tmp_path):
     assert "--strict-config" in cmd
     assert "features.shell_tool=false" in cmd
     assert "features.unified_exec=false" in cmd
+    # Code-mode-only models reach MCP tools only through the code-mode host.
+    assert "features.code_mode_host=false" not in cmd
+    assert cmd[cmd.index("-s") + 1] == "read-only"
     servers = [a for a in cmd if a.startswith("mcp_servers.")]
     assert servers and all(a.startswith("mcp_servers.review_inspection.") for a in servers)
     assert str(checkout).replace("\\", "\\\\") in " ".join(servers)
@@ -158,8 +161,14 @@ def test_directory_tool_escapes(checkout, tool):
 
 @pytest.mark.requires_network
 @pytest.mark.parametrize("tool", ["read_file", "read_diff"])
-def test_real_codex_inspection_smoke(checkout, tmp_path, record_property, tool):
-    """Exercise the installed CLI using local Responses SSE; no provider or credentials."""
+@pytest.mark.parametrize("surface", ["direct", "code_mode"])
+def test_real_codex_inspection_smoke(checkout, tmp_path, record_property, tool, surface):
+    """Exercise the installed CLI using local Responses SSE; no provider or credentials.
+
+    ``code_mode`` reproduces what Codex offers a code-mode-only model such as
+    gpt-6.1-sol: no direct MCP functions, only an ``exec`` tool that runs
+    JavaScript in the code-mode host with the MCP tools nested inside it.
+    """
     if os.environ.get("SPEC_CODEX_INSPECTION_SMOKE") != "1":
         pytest.skip("set SPEC_CODEX_INSPECTION_SMOKE=1 for the real CLI smoke")
     if not shutil.which("codex"):
@@ -175,7 +184,12 @@ def test_real_codex_inspection_smoke(checkout, tmp_path, record_property, tool):
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             requests.append(request)
-            if len(requests) == 1:
+            if len(requests) == 1 and surface == "code_mode":
+                item = {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1",
+                        "name": "exec",
+                        "input": f"text(JSON.stringify(await tools.mcp__review_inspection__{tool}"
+                                 f"({json.dumps({'path': tool_path})})));"}
+            elif len(requests) == 1:
                 item = {"type": "function_call", "id": "fc_1", "call_id": "call_1",
                         "namespace": "mcp__review_inspection", "name": tool,
                         "arguments": json.dumps({"path": tool_path})}
@@ -225,6 +239,9 @@ def test_real_codex_inspection_smoke(checkout, tmp_path, record_property, tool):
         f'model_providers.inspection_smoke.base_url="http://127.0.0.1:{server.server_port}/v1"',
         'model_providers.inspection_smoke.wire_api="responses"',
     ]
+    if surface == "code_mode":
+        # What the model catalog turns on for code-mode-only models.
+        overrides.append("features.code_mode_only=true")
     cmd[cmd.index("-o"):cmd.index("-o")] = [arg for value in overrides for arg in ("-c", value)]
     try:
         result = subprocess.run(cmd, input=f"Read {tool_path} with {tool}.", text=True,
@@ -244,7 +261,12 @@ def test_real_codex_inspection_smoke(checkout, tmp_path, record_property, tool):
     assert len(requests) == 2
     tools = requests[0]["tools"]
     assert not any(t.get("name") in {"shell", "exec_command", "apply_patch"} for t in tools)
-    assert [t["name"] for t in tools if t["type"] == "namespace"] == ["mcp__review_inspection"]
+    if surface == "code_mode":
+        assert [t["name"] for t in tools if t["type"] == "custom"] == ["exec"]
+        assert not any(t["type"] == "namespace" for t in tools)
+        assert expected in json.dumps(requests[1]["input"][-1])
+    else:
+        assert [t["name"] for t in tools if t["type"] == "namespace"] == ["mcp__review_inspection"]
 
 
 def test_git_disables_checkout_execution(checkout, tmp_path):
