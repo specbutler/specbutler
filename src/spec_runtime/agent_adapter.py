@@ -1068,8 +1068,8 @@ CODEX_AMBIENT_CAPABILITY_OVERRIDES = (
     "features.code_mode=false",
     # Do not add features.code_mode_host=false here: Codex 0.164 routes the
     # shell tool itself through the code-mode host, so disabling it makes every
-    # tool call fail ("code-mode host is disabled"). Only the no-checkout
-    # review, which has no shell, disables it. features.code_mode=true
+    # tool call fail ("code-mode host is disabled"). Only a review with no
+    # tools at all disables it (see build_review_command). features.code_mode=true
     # reproducibly hangs exec; code_mode=false works (probe on codex-cli
     # 0.164.0).
     "features.computer_use=false",
@@ -1428,10 +1428,23 @@ class CodexAgent:
             # re-enable inherit no environment. Strict config turns an older
             # CLI that does not recognize a boundary control into a
             # fail-closed launch error.
+            #
+            # The code-mode host is disabled only when the review has no
+            # tools. For code-mode-only models (gpt-6.1-sol on codex-cli
+            # 0.167.0) Codex offers MCP tools solely as functions nested in
+            # the host's ``exec`` tool, so with the host disabled every
+            # review_inspection call, read_diff included, fails with
+            # "code-mode host is disabled" and a diff larger than the inline
+            # budget cannot be reviewed. The host runs model JavaScript in a
+            # V8 isolate with no filesystem, network or process access; with
+            # the shell and unified exec off, its nested tools are the
+            # inspection server plus apply_patch, which ``-s read-only``
+            # rejects (probe on codex-cli 0.167.0).
             overrides: tuple[str, ...] = (
                 "features.shell_tool=false",
                 "features.unified_exec=false",
-                "features.code_mode_host=false",
+                *(() if inspection_checkout is not None
+                  else ("features.code_mode_host=false",)),
                 *CODEX_AMBIENT_CAPABILITY_OVERRIDES,
                 "shell_environment_policy.inherit=none",
             )

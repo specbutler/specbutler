@@ -1808,6 +1808,9 @@ def test_codex_review_without_checkout_keeps_no_tool_boundary(tmp_path: Path):
 
     assert cmd[cmd.index("-s") + 1] == "read-only"
     assert "features.shell_tool=false" in cmd
+    # No inspection server, so nothing needs the code-mode host.
+    assert "features.code_mode_host=false" in cmd
+    assert not any(c.startswith("mcp_servers.") for c in cmd)
     assert not any(c.startswith("default_permissions=") for c in cmd)
 
 

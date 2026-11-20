@@ -4,7 +4,18 @@ The review adapter registers only `review_inspection` when a pinned checkout is
 available. It starts the host installation's Python and server code, rather than
 code from the reviewed checkout. The reviewer still has no shell or unified
 execution tool; `CODEX_REVIEW_CHECKOUT_SHELL` remains false. Without a checkout,
-review retains its previous tool-free boundary.
+review retains its previous tool-free boundary, with the code-mode host disabled.
+
+With the inspection server registered, the code-mode host stays enabled. For
+code-mode-only models (`gpt-6.1-sol` on codex-cli 0.167.0) Codex does not offer
+MCP tools as direct functions: the model gets one `exec` tool that runs
+JavaScript in the host, with the MCP tools nested inside it. Disabling the host
+made every inspection call fail with "code-mode host is disabled", so a diff
+larger than the inline budget could not be read through `read_diff`. The host
+runs that JavaScript in a V8 isolate with no filesystem, network or process
+access. With the shell and unified execution off, the nested tools are the
+inspection server, Codex's goal and MCP-resource helpers, and `apply_patch`,
+which the `read-only` sandbox rejects.
 
 The MCP server supports `read_file`, `list_dir`, `glob`, literal-text `grep`, and
 `git_show`. Paths are relative to the launch root. Absolute paths, parent
@@ -37,8 +48,13 @@ starts the real `codex exec` with the production review argv and stdio MCP
 server. A local mock Responses endpoint requests `read_file`; assertions check
 the actual completed MCP tool event contains the fixture file contents. The
 mock endpoint replaces only the model provider, so no authentication or remote
-network service is needed. Shell, unified execution, and the code-mode host
-remain disabled throughout this check.
+network service is needed. Shell and unified execution remain disabled
+throughout this check.
+
+Re-verified with **codex-cli 0.167.0** on macOS, 2026-11-20. The smoke now also
+runs each tool through the code-mode surface (`features.code_mode_only=true`,
+which is what the model catalog enables for code-mode-only models): the mock
+endpoint calls `exec` with a script that calls the nested inspection tool.
 
 Run it with:
 
